@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { Link } from 'react-router-dom'
 import { format, startOfWeek, addDays, addWeeks, subWeeks, addMonths, isSameDay, parse } from 'date-fns'
-import { ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Calendar, Plus, Trash2, X, Download, Eye, EyeOff, Check, ExternalLink, Loader2, Search, Bell, BellOff, Network, CalendarPlus, Copy, RefreshCw, PanelLeftClose, PanelLeftOpen } from 'lucide-react'
+import { ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Calendar, Plus, Trash2, X, Download, Eye, EyeOff, Check, ExternalLink, Loader2, Search, Bell, BellOff, Network, CalendarPlus, Copy, RefreshCw, PanelLeftClose, PanelLeftOpen, Repeat2 } from 'lucide-react'
 import { apiClient } from '../lib/api-client'
 import { useAuth } from '../contexts/AuthContext'
 import { computeDayLayout } from '../lib/calendarOverlapLayout'
@@ -14,7 +14,13 @@ import { findTimezone, convertUtcTimeToTimezone, convertUtcTimeToTimezoneOnDate,
 function LinkifyText({ text }: { text: string }) {
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null)
   const stripped = text.replace(/<[^>]*>/g, '')
-  const parts = stripped.split(/(https?:\/\/[^\s]+)/g)
+  const markdownLinkRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g
+  const normalized = stripped.replace(markdownLinkRegex, (_match, label: string, url: string) => {
+    const trimmedLabel = label.trim()
+    const trimmedUrl = url.trim()
+    return trimmedLabel === trimmedUrl ? trimmedUrl : `${trimmedLabel} ${trimmedUrl}`
+  })
+  const parts = normalized.split(/(https?:\/\/[^\s]+)/g)
   return (
     <>
       {parts.map((part, i) =>
@@ -36,7 +42,7 @@ function LinkifyText({ text }: { text: string }) {
     </>
   )
 }
-import { downloadICSFile, buildOutlookCalendarUrl, isSafeUrl } from '../lib/calendar-utils'
+import { downloadICSFile, buildOutlookCalendarUrl, isSafeUrl, resolveMeetingTitle } from '../lib/calendar-utils'
 import ConfirmDialog from '../components/ConfirmDialog'
 import { useToast } from '../components/Toast'
 
@@ -57,8 +63,31 @@ type UserEvent = {
   start_time: string
   end_time: string
   is_public: boolean
+  recurrence_rule?: unknown
   created_at: string
   updated_at: string
+}
+
+type RecurrenceType = 'none' | 'weekly' | 'biweekly' | 'monthly' | 'custom'
+type RecurrenceUnit = 'day' | 'week' | 'month'
+type RecurrenceEndType = 'never' | 'on' | 'after'
+
+type RecurrenceRule = {
+  type: RecurrenceType
+  interval?: number
+  unit?: RecurrenceUnit
+  weekDays?: number[]
+  endType?: RecurrenceEndType
+  endDate?: string
+  endCount?: number
+  exceptions?: string[]
+}
+
+type EventOccurrence = {
+  event: UserEvent
+  start_time: string
+  end_time: string
+  isRecurringOccurrence: boolean
 }
 
 type CalendarSource = {
@@ -107,6 +136,8 @@ type PublishOptions = {
   autoPublishNew: boolean
 }
 
+type PublishSyncOptionsMode = 'imported' | 'manual-recurring' | 'none'
+
 type EventGroupIdentity = {
   title: string
   meetingLink: string
@@ -129,6 +160,168 @@ const NETWORK_FILTER_MODES_KEY = 'coordinateEventsNetworkFilterModes'
 const MAIN_NETWORK_LABEL = 'Secret Swarm'
 const MAIN_CALENDAR_MODE_LABEL = 'Main'
 const MAIN_CALENDAR_DATA_CONTROLLER_LABEL = 'Volatire Swarm as data controller'
+const DAY_MS = 24 * 60 * 60 * 1000
+const RECURRENCE_MAX_LOOKAHEAD_DAYS = 365 * 20
+
+const isRecurrenceType = (value: unknown): value is RecurrenceRule['type'] =>
+  value === 'none' || value === 'weekly' || value === 'biweekly' || value === 'monthly' || value === 'custom'
+
+const isRecurrenceUnit = (value: unknown): value is NonNullable<RecurrenceRule['unit']> =>
+  value === 'day' || value === 'week' || value === 'month'
+
+const isRecurrenceEndType = (value: unknown): value is NonNullable<RecurrenceRule['endType']> =>
+  value === 'never' || value === 'on' || value === 'after'
+
+const normalizeRecurrenceRule = (value: unknown): RecurrenceRule => {
+  if (!value || typeof value !== 'object') return { type: 'none' }
+
+  const candidate = value as Record<string, unknown>
+  const type = isRecurrenceType(candidate.type) ? candidate.type : 'none'
+  if (type === 'none') return { type: 'none' }
+
+  const intervalValue = typeof candidate.interval === 'number' ? candidate.interval : Number(candidate.interval)
+  const interval = Number.isFinite(intervalValue) && intervalValue > 0 ? Math.min(99, Math.floor(intervalValue)) : 1
+  const unit = isRecurrenceUnit(candidate.unit) ? candidate.unit : 'week'
+  const weekDays = Array.isArray(candidate.weekDays)
+    ? Array.from(new Set(candidate.weekDays.filter((entry): entry is number => Number.isInteger(entry) && entry >= 0 && entry <= 6)))
+    : undefined
+  const endType = isRecurrenceEndType(candidate.endType) ? candidate.endType : 'never'
+  const endDate = typeof candidate.endDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(candidate.endDate) ? candidate.endDate : undefined
+  const endCountValue = typeof candidate.endCount === 'number' ? candidate.endCount : Number(candidate.endCount)
+  const endCount = Number.isFinite(endCountValue) && endCountValue > 0 ? Math.min(500, Math.floor(endCountValue)) : undefined
+  const exceptions = Array.isArray(candidate.exceptions)
+    ? Array.from(new Set(candidate.exceptions.filter((entry): entry is string => typeof entry === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(entry)))).slice(0, 500)
+    : undefined
+
+  return {
+    type,
+    interval,
+    unit,
+    weekDays: weekDays && weekDays.length > 0 ? weekDays : undefined,
+    endType,
+    endDate,
+    endCount,
+    exceptions: exceptions && exceptions.length > 0 ? exceptions : undefined,
+  }
+}
+
+const getUtcDateKey = (date: Date): string => date.toISOString().slice(0, 10)
+
+const getRecurrenceWeekdayIndex = (date: Date): number => {
+  const jsDay = date.getUTCDay()
+  return jsDay === 0 ? 6 : jsDay - 1
+}
+
+const buildRecurrenceOccurrenceStart = (baseStart: Date, day: Date): string => {
+  return new Date(Date.UTC(
+    day.getUTCFullYear(),
+    day.getUTCMonth(),
+    day.getUTCDate(),
+    baseStart.getUTCHours(),
+    baseStart.getUTCMinutes(),
+    0,
+    0,
+  )).toISOString()
+}
+
+const isRecurringOccurrenceDate = (candidate: Date, baseStart: Date, rule: RecurrenceRule): boolean => {
+  const dayDiff = Math.floor((candidate.getTime() - baseStart.getTime()) / DAY_MS)
+  if (dayDiff < 0) return false
+
+  if (rule.type === 'weekly' || rule.type === 'biweekly') {
+    const interval = rule.type === 'biweekly' ? 14 : 7
+    return dayDiff % interval === 0 && getRecurrenceWeekdayIndex(candidate) === getRecurrenceWeekdayIndex(baseStart)
+  }
+
+  if (rule.type === 'monthly') {
+    const monthDiff = (candidate.getUTCFullYear() - baseStart.getUTCFullYear()) * 12 + (candidate.getUTCMonth() - baseStart.getUTCMonth())
+    return candidate.getUTCDate() === baseStart.getUTCDate() && monthDiff % 1 === 0
+  }
+
+  if (rule.type !== 'custom') return false
+
+  const interval = rule.interval || 1
+  const unit = rule.unit || 'week'
+  if (unit === 'day') {
+    return dayDiff % interval === 0
+  }
+
+  if (unit === 'week') {
+    const allowedWeekDays = rule.weekDays && rule.weekDays.length > 0 ? rule.weekDays : [getRecurrenceWeekdayIndex(baseStart)]
+    const weekDiff = Math.floor(dayDiff / 7)
+    return weekDiff % interval === 0 && allowedWeekDays.includes(getRecurrenceWeekdayIndex(candidate))
+  }
+
+  const monthDiff = (candidate.getUTCFullYear() - baseStart.getUTCFullYear()) * 12 + (candidate.getUTCMonth() - baseStart.getUTCMonth())
+  return candidate.getUTCDate() === baseStart.getUTCDate() && monthDiff % interval === 0
+}
+
+const getRecurringEventStartsInWeek = (event: UserEvent, currentWeekStart: Date): string[] => {
+  const recurrenceRule = normalizeRecurrenceRule(event.recurrence_rule)
+  if (recurrenceRule.type === 'none') return []
+
+  const baseStart = new Date(event.start_time)
+  if (Number.isNaN(baseStart.getTime())) return []
+
+  const weekStart = new Date(currentWeekStart.getTime())
+  const weekEnd = addDays(currentWeekStart, 7)
+  const endDate = recurrenceRule.endType === 'on' && recurrenceRule.endDate ? new Date(`${recurrenceRule.endDate}T00:00:00Z`) : null
+  const exceptionDates = recurrenceRule.exceptions && recurrenceRule.exceptions.length > 0 ? new Set(recurrenceRule.exceptions) : null
+  const matchedStarts: string[] = []
+  let matchedCount = 0
+
+  const baseDay = new Date(Date.UTC(baseStart.getUTCFullYear(), baseStart.getUTCMonth(), baseStart.getUTCDate()))
+  if (weekEnd.getTime() <= baseDay.getTime()) return []
+
+  const daysUntilWeekEnd = Math.max(0, Math.floor((weekEnd.getTime() - baseDay.getTime()) / DAY_MS))
+  const maxOffset = Math.min(RECURRENCE_MAX_LOOKAHEAD_DAYS, daysUntilWeekEnd + 7)
+
+  for (let offset = 0; offset <= maxOffset; offset++) {
+    const candidate = addDays(baseStart, offset)
+    const candidateDay = new Date(Date.UTC(candidate.getUTCFullYear(), candidate.getUTCMonth(), candidate.getUTCDate()))
+    if (candidateDay.getTime() < baseDay.getTime()) continue
+    if (endDate && candidateDay.getTime() > Date.UTC(endDate.getUTCFullYear(), endDate.getUTCMonth(), endDate.getUTCDate())) break
+    if (!isRecurringOccurrenceDate(candidate, baseStart, recurrenceRule)) continue
+
+    matchedCount++
+    if (recurrenceRule.endType === 'after' && recurrenceRule.endCount && matchedCount > recurrenceRule.endCount) {
+      break
+    }
+
+    if (exceptionDates && exceptionDates.has(getUtcDateKey(candidate))) {
+      if (candidateDay.getTime() >= weekEnd.getTime()) break
+      continue
+    }
+
+    if (candidateDay.getTime() >= weekStart.getTime() && candidateDay.getTime() < weekEnd.getTime()) {
+      matchedStarts.push(buildRecurrenceOccurrenceStart(baseStart, candidate))
+    }
+
+    if (candidateDay.getTime() >= weekEnd.getTime()) {
+      break
+    }
+  }
+
+  return matchedStarts
+}
+
+const formatRecurrenceSummary = (rule: RecurrenceRule): string => {
+  if (rule.type === 'none') return 'One-off'
+
+  let base = 'Recurring'
+  if (rule.type === 'weekly') base = 'Weekly'
+  else if (rule.type === 'biweekly') base = 'Bi-weekly'
+  else if (rule.type === 'monthly') base = 'Monthly'
+  else if (rule.type === 'custom') {
+    const interval = rule.interval || 1
+    const unit = rule.unit || 'week'
+    base = interval === 1 ? `Every ${unit}` : `Every ${interval} ${unit}s`
+  }
+
+  if (rule.endType === 'on' && rule.endDate) return `${base} until ${rule.endDate}`
+  if (rule.endType === 'after' && rule.endCount) return `${base} (${rule.endCount} times)`
+  return base
+}
 
 const normalizeIdentityField = (value: string | null | undefined): string =>
   (value || '').trim().toLowerCase()
@@ -212,6 +405,8 @@ export default function CoordinateEventsPage() {
     const [onConfirmAction, setOnConfirmAction] = useState<(() => void) | null>(null);
   const { user, isAuthenticated } = useAuth()
   const { showToast } = useToast()
+  const calendarGridRef = useRef<HTMLDivElement>(null)
+  const nowLineRef = useRef<HTMLDivElement>(null)
 
   // Calendar grid state
   const [currentWeekStart, setCurrentWeekStart] = useState(() =>
@@ -278,7 +473,7 @@ export default function CoordinateEventsPage() {
   })
 
   // Selected event for details
-  type GridItem = { kind: 'event'; data: UserEvent } | { kind: 'sub'; data: SubscribedMeeting }
+  type GridItem = { kind: 'event'; data: EventOccurrence } | { kind: 'sub'; data: SubscribedMeeting }
   const [selectedEvent, setSelectedEvent] = useState<UserEvent | null>(null)
   const [selectedSubMeeting, setSelectedSubMeeting] = useState<SubscribedMeeting | null>(null)
   const [copiedLink, setCopiedLink] = useState(false)
@@ -375,6 +570,20 @@ export default function CoordinateEventsPage() {
   const [currentTime, setCurrentTime] = useState(new Date())
   const [utcNow, setUtcNow] = useState(() => new Date())
   const tzState = useTimezones()
+  const [isPhoneViewport, setIsPhoneViewport] = useState(() =>
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(max-width: 767px)').matches
+      : false
+  )
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
+    const mq = window.matchMedia('(max-width: 767px)')
+    const onChange = (event: MediaQueryListEvent) => setIsPhoneViewport(event.matches)
+    setIsPhoneViewport(mq.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
 
   // ─── Data fetching ──────────────────────────────────────────
 
@@ -682,6 +891,32 @@ export default function CoordinateEventsPage() {
     return () => clearInterval(interval)
   }, [])
 
+  // Center the scrollable grid so the current-time line starts near the middle.
+  useEffect(() => {
+    const now = new Date()
+    const currentHourUTC = now.getUTCHours()
+    if (currentHourUTC < startHour || currentHourUTC >= endHour) {
+      return
+    }
+
+    if (!calendarGridRef.current || !nowLineRef.current) {
+      return
+    }
+
+    let raf1 = 0
+    let raf2 = 0
+    raf1 = window.requestAnimationFrame(() => {
+      raf2 = window.requestAnimationFrame(() => {
+        nowLineRef.current?.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'nearest' })
+      })
+    })
+
+    return () => {
+      if (raf1) window.cancelAnimationFrame(raf1)
+      if (raf2) window.cancelAnimationFrame(raf2)
+    }
+  }, [startHour, endHour, timeInterval])
+
   // Update UTC clock every second for accurate display
   useEffect(() => {
     const interval = setInterval(() => {
@@ -784,12 +1019,46 @@ export default function CoordinateEventsPage() {
     return byId
   }, [eventGroups])
 
-  const eventsInWeek = useMemo(() => {
-    return representativeEvents.filter(ev => {
-      const evStart = new Date(ev.start_time)
-      const evEnd = new Date(ev.end_time)
-      return evStart < weekEnd && evEnd > currentWeekStart && isNetworkVisibleByName(getNetworkLabel(ev.source_type, ev.source_id))
-    })
+  const eventOccurrencesInWeek = useMemo(() => {
+    const occurrences: EventOccurrence[] = []
+
+    for (const ev of representativeEvents) {
+      if (!isNetworkVisibleByName(getNetworkLabel(ev.source_type, ev.source_id))) continue
+
+      const baseStart = new Date(ev.start_time)
+      const baseEnd = new Date(ev.end_time)
+      const durationMs = baseEnd.getTime() - baseStart.getTime()
+      if (!Number.isFinite(durationMs) || durationMs <= 0) continue
+
+      const recurrenceRule = normalizeRecurrenceRule(ev.recurrence_rule)
+      if (recurrenceRule.type === 'none') {
+        if (baseStart < weekEnd && baseEnd > currentWeekStart) {
+          occurrences.push({
+            event: ev,
+            start_time: ev.start_time,
+            end_time: ev.end_time,
+            isRecurringOccurrence: false,
+          })
+        }
+        continue
+      }
+
+      const recurringStarts = getRecurringEventStartsInWeek(ev, currentWeekStart)
+      for (const occStartIso of recurringStarts) {
+        const occStart = new Date(occStartIso)
+        const occEnd = new Date(occStart.getTime() + durationMs)
+        if (occStart < weekEnd && occEnd > currentWeekStart) {
+          occurrences.push({
+            event: ev,
+            start_time: occStart.toISOString(),
+            end_time: occEnd.toISOString(),
+            isRecurringOccurrence: occStartIso !== ev.start_time,
+          })
+        }
+      }
+    }
+
+    return occurrences
   }, [representativeEvents, currentWeekStart, weekEnd, getNetworkLabel, isNetworkVisibleByName])
 
   const subMeetingsInWeek = useMemo(() => {
@@ -811,10 +1080,10 @@ export default function CoordinateEventsPage() {
       const dayEndMs = Date.UTC(day.getFullYear(), day.getMonth(), day.getDate(), endHour, 0, 0, 0)
 
       const dayItems: GridItem[] = []
-      for (const ev of eventsInWeek) {
-        const evStart = new Date(ev.start_time).getTime()
-        const evEnd = new Date(ev.end_time).getTime()
-        if (evStart < dayEndMs && evEnd > dayStartMs) dayItems.push({ kind: 'event', data: ev })
+      for (const occ of eventOccurrencesInWeek) {
+        const evStart = new Date(occ.start_time).getTime()
+        const evEnd = new Date(occ.end_time).getTime()
+        if (evStart < dayEndMs && evEnd > dayStartMs) dayItems.push({ kind: 'event', data: occ })
       }
       for (const m of subMeetingsInWeek) {
         const mStart = new Date(m.start_time).getTime()
@@ -823,7 +1092,13 @@ export default function CoordinateEventsPage() {
       }
 
       const layout = computeDayLayout(
-        dayItems.map(item => ({ id: item.data.id, start_time: item.data.start_time, end_time: item.data.end_time })),
+        dayItems.map(item => ({
+          id: item.kind === 'event'
+            ? `${item.data.event.id}_${item.data.start_time}`
+            : item.data.id,
+          start_time: item.data.start_time,
+          end_time: item.data.end_time,
+        })),
         dayStartMs,
         dayEndMs,
         SLOT_HEIGHT,
@@ -832,7 +1107,7 @@ export default function CoordinateEventsPage() {
 
       return { dayItems, layout }
     })
-  }, [eventsInWeek, subMeetingsInWeek, timeInterval, startHour, endHour, weekDays])
+  }, [eventOccurrencesInWeek, subMeetingsInWeek, timeInterval, startHour, endHour, weekDays])
 
   // ─── Grid cell helpers for drag selection ─────────────────
 
@@ -897,6 +1172,22 @@ export default function CoordinateEventsPage() {
     setDragStart(null)
   }
 
+  const handleCellPointerDown = (e: React.PointerEvent<HTMLDivElement>, day: Date, time: string) => {
+    if (e.pointerType === 'mouse') return
+    e.preventDefault()
+    try {
+      e.currentTarget.setPointerCapture(e.pointerId)
+    } catch {
+      // Ignore when pointer capture is not available.
+    }
+    handleCellMouseDown(day, time)
+  }
+
+  const handleCellPointerEnter = (e: React.PointerEvent<HTMLDivElement>, day: Date, time: string) => {
+    if (e.pointerType === 'mouse') return
+    handleCellMouseEnter(day, time)
+  }
+
   useEffect(() => {
     setShowEventSourceNetworks(false)
   }, [selectedEvent?.id])
@@ -914,11 +1205,11 @@ export default function CoordinateEventsPage() {
       const slotStart = new Date(Date.UTC(cellDate.getFullYear(), cellDate.getMonth(), cellDate.getDate(), hours, mins, 0, 0))
       const slotEnd = new Date(slotStart.getTime() + timeInterval * 60 * 1000)
 
-      for (const ev of events) {
+      for (const occ of eventOccurrencesInWeek) {
+        const ev = occ.event
         if (eventIds.has(ev.id)) continue
-        if (!isNetworkVisibleByName(getNetworkLabel(ev.source_type, ev.source_id))) continue
-        const evStart = new Date(ev.start_time)
-        const evEnd = new Date(ev.end_time)
+        const evStart = new Date(occ.start_time)
+        const evEnd = new Date(occ.end_time)
         if (evStart < slotEnd && evEnd > slotStart) {
           eventIds.add(ev.id)
           result.push(ev)
@@ -926,7 +1217,7 @@ export default function CoordinateEventsPage() {
       }
     }
     return result
-  }, [selectedCells, events, timeInterval, getNetworkLabel, isNetworkVisibleByName])
+  }, [selectedCells, eventOccurrencesInWeek, timeInterval])
 
   const handleBulkDeleteSelected = async () => {
     if (selectedEvents.length === 0) return
@@ -1187,8 +1478,11 @@ export default function CoordinateEventsPage() {
   const [publishModalOpen, setPublishModalOpen] = useState(false)
   const [publishModalEvents, setPublishModalEvents] = useState<UserEvent[]>([])
   const [publishModalSelectedIds, setPublishModalSelectedIds] = useState<Set<string>>(new Set())
+  const [publishModalSearch, setPublishModalSearch] = useState('')
+  const [publishModalHistoryExpanded, setPublishModalHistoryExpanded] = useState(false)
   const [publishModalAutoSync, setPublishModalAutoSync] = useState(true)
   const [publishModalAutoPublishNew, setPublishModalAutoPublishNew] = useState(false)
+  const [publishModalSyncOptionsMode, setPublishModalSyncOptionsMode] = useState<PublishSyncOptionsMode>('none')
   const [publishModalOnConfirm, setPublishModalOnConfirm] = useState<((ids: string[], options: PublishOptions) => Promise<void>) | null>(null)
 
   const openPublishModal = (
@@ -1196,10 +1490,29 @@ export default function CoordinateEventsPage() {
     onConfirm: (ids: string[], options: PublishOptions) => Promise<void>,
     defaults?: Partial<PublishOptions>
   ) => {
+    const historyCutoffTs = startOfWeek(new Date(), { weekStartsOn: 1 }).getTime()
+    const defaultSelectedIds = evts
+      .filter(e => new Date(e.start_time).getTime() >= historyCutoffTs)
+      .map(e => e.id)
+    const hasImportedSources = evts.some(e => e.source_type !== 'manual' && !!e.source_id)
+    const hasManualRecurring = evts.some((e) => {
+      if (e.source_type !== 'manual') return false
+      const rule = normalizeRecurrenceRule(e.recurrence_rule)
+      return rule.type !== 'none'
+    })
+    const syncOptionsMode: PublishSyncOptionsMode = hasImportedSources
+      ? 'imported'
+      : hasManualRecurring
+        ? 'manual-recurring'
+        : 'none'
+
     setPublishModalEvents(evts)
-    setPublishModalSelectedIds(new Set(evts.map(e => e.id)))
-    setPublishModalAutoSync(defaults?.autoSync ?? true)
-    setPublishModalAutoPublishNew(defaults?.autoPublishNew ?? false)
+    setPublishModalSelectedIds(new Set(defaultSelectedIds))
+    setPublishModalSearch('')
+    setPublishModalHistoryExpanded(false)
+    setPublishModalSyncOptionsMode(syncOptionsMode)
+    setPublishModalAutoSync(syncOptionsMode === 'imported' ? (defaults?.autoSync ?? true) : false)
+    setPublishModalAutoPublishNew(syncOptionsMode === 'imported' ? (defaults?.autoPublishNew ?? false) : false)
     setPublishModalOnConfirm(() => onConfirm)
     setPublishModalOpen(true)
   }
@@ -1407,7 +1720,7 @@ export default function CoordinateEventsPage() {
     }
 
     if (sourceKey.startsWith('sub:')) {
-      return { isInSync: true, statusLabel: 'Following live' }
+      return { isInSync: true, statusLabel: 'Subscribed live' }
     }
 
     const prefKey = getPrefKeyFromSourceKey(sourceKey)
@@ -1479,16 +1792,13 @@ export default function CoordinateEventsPage() {
   }
 
   /** Get the display label for an event based on selected networks */
-  const getEventChipLabel = (ev: UserEvent) => {
-    const networkName = getNetworkLabelForEvent(ev)
-    if (networkFilters.actionable.has(networkName)) return ev.title
-    return networkName
+  const getEventChipLabel = (ev: UserEvent, isRecurringOccurrence = false) => {
+    const baseTitle = resolveMeetingTitle({ title: ev.title })
+    return isRecurringOccurrence ? `${baseTitle} (recurring)` : baseTitle
   }
 
   const getSubChipLabel = (m: SubscribedMeeting) => {
-    const networkName = m.calendar_title || 'Subscription'
-    if (networkFilters.actionable.has(networkName)) return m.title
-    return networkName
+    return resolveMeetingTitle({ title: m.title, calendarTitle: m.calendar_title })
   }
 
   const formatUTC = (iso: string, fmt: string) => {
@@ -1521,6 +1831,13 @@ export default function CoordinateEventsPage() {
     return selectedEventSyncPrefKeys.every(key => !!sourceSyncPrefs[key])
   }, [selectedEventSyncPrefKeys, sourceSyncPrefs])
 
+  const selectedEventRecurrenceSummary = useMemo(() => {
+    if (!selectedEvent) return null
+    const rule = normalizeRecurrenceRule(selectedEvent.recurrence_rule)
+    if (rule.type === 'none') return null
+    return formatRecurrenceSummary(rule)
+  }, [selectedEvent])
+
   const latestServerSyncAt = useMemo(() => {
     const times = Object.values(sourceSyncMeta)
       .map(meta => meta.lastSyncedAt)
@@ -1543,6 +1860,63 @@ export default function CoordinateEventsPage() {
     return importSyncMode === 'once' ? 'Import Events (once)' : 'Import Events'
   }, [importType, importSyncMode])
 
+  const publishModalFilteredGroups = useMemo(() => {
+    const historyCutoffTs = startOfWeek(new Date(), { weekStartsOn: 1 }).getTime()
+    const query = publishModalSearch.trim().toLowerCase()
+
+    const matchesSearch = (ev: UserEvent): boolean => {
+      if (!query) return true
+      const title = (ev.title || '').toLowerCase()
+      const dateLabel = format(new Date(ev.start_time), 'MMM d, yyyy HH:mm').toLowerCase()
+      return title.includes(query) || dateLabel.includes(query)
+    }
+
+    const current: UserEvent[] = []
+    const history: UserEvent[] = []
+
+    for (const ev of publishModalEvents) {
+      if (!matchesSearch(ev)) continue
+      const isHistory = new Date(ev.start_time).getTime() < historyCutoffTs
+      if (isHistory) history.push(ev)
+      else current.push(ev)
+    }
+
+    return {
+      current,
+      history,
+      totalMatched: current.length + history.length,
+    }
+  }, [publishModalEvents, publishModalSearch])
+
+  const renderPublishModalEventRow = (ev: UserEvent) => (
+    <label key={ev.id} className="flex items-start gap-3 px-3 py-2.5 rounded-lg hover:bg-muted/50 cursor-pointer transition-colors">
+      <input
+        type="checkbox"
+        checked={publishModalSelectedIds.has(ev.id)}
+        onChange={() => {
+          setPublishModalSelectedIds(prev => {
+            const next = new Set(prev)
+            if (next.has(ev.id)) next.delete(ev.id)
+            else next.add(ev.id)
+            return next
+          })
+        }}
+        className="mt-0.5 accent-green-600 w-4 h-4 shrink-0"
+      />
+      <div className="min-w-0 flex-1">
+        <p className="text-sm font-medium text-foreground truncate">{ev.title}</p>
+        <p className="text-xs text-muted-foreground">
+          {format(new Date(ev.start_time), 'MMM d, yyyy HH:mm')} -- {format(new Date(ev.end_time), 'HH:mm')}
+        </p>
+      </div>
+      {ev.is_public && (
+        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300 shrink-0">
+          already public
+        </span>
+      )}
+    </label>
+  )
+
   // ─── Render ───────────────────────────────────────────────
 
   if (!isAuthenticated) {
@@ -1561,11 +1935,21 @@ export default function CoordinateEventsPage() {
     <>
       <LeftPanelPortal>
         <aside
-          className={`sticky top-0 h-screen shrink-0 overflow-hidden border-r border-border bg-card transition-all duration-300 ${
-            isLeftToolsPanelOpen ? 'w-96' : 'w-0'
-          }`}
+          className={isPhoneViewport
+            ? `${isLeftToolsPanelOpen ? 'fixed inset-0 z-40 bg-background/70 backdrop-blur-[1px]' : 'hidden'}`
+            : `sticky top-0 h-screen shrink-0 overflow-hidden border-r border-border bg-card transition-all duration-300 ${
+              isLeftToolsPanelOpen ? 'w-96' : 'w-0'
+            }`
+          }
         >
-          <div className="flex h-full w-96 min-w-[24rem] flex-col">
+          {isPhoneViewport && (
+            <button
+              aria-label="Close tools drawer"
+              onClick={() => setIsLeftToolsPanelOpen(false)}
+              className="absolute inset-0"
+            />
+          )}
+          <div className={`flex h-full flex-col ${isPhoneViewport ? 'relative z-10 w-full min-w-0 bg-card shadow-xl' : 'w-96 min-w-[24rem]'}`}>
             <div className="flex items-center justify-between border-b border-border px-4 py-3">
               <div className="flex items-center gap-2">
                 <PanelLeftOpen className="h-4 w-4 text-blue-600" />
@@ -1609,14 +1993,14 @@ export default function CoordinateEventsPage() {
                     ) : (
                       <>
                         <p className="mb-2 text-[10px] text-muted-foreground leading-tight">
-                          View controls visibility only. Select controls which networks are used by the action buttons below. Hidden networks cannot be selected. Pin keeps a network visible without hiding others, Only hides everything else except other selected networks, and Hide removes just that network. Calendar mode shows whether events are Main, Following live, or using imported sync.
+                          View controls visibility only. Select controls which networks are used by the action buttons below. Hidden networks cannot be selected. Pin keeps a network visible without hiding others, Only hides everything else except other selected networks, and Hide removes just that network. Calendar mode shows whether events are Main, Subscribed live, or using imported sync.
                         </p>
-                        <table className="w-full table-fixed text-[10px] leading-tight mb-3">
+                        <table className={`w-full text-[10px] leading-tight mb-3 ${isPhoneViewport ? 'table-auto' : 'table-fixed'}`}>
                           <thead>
                             <tr className="text-muted-foreground">
                               <th className="w-[56px] text-left font-medium py-1">View</th>
                               <th className="w-[62px] text-left font-medium py-1">Select</th>
-                              <th className="w-[46px] text-left font-medium py-1">#</th>
+                              {!isPhoneViewport && <th className="w-[46px] text-left font-medium py-1">#</th>}
                               <th className="text-left font-medium py-1">Network</th>
                               <th className="w-[130px] text-left font-medium py-1">Calendar mode</th>
                             </tr>
@@ -1661,7 +2045,7 @@ export default function CoordinateEventsPage() {
                                       />
                                     </label>
                                   </td>
-                                  <td className="py-1">{net.count}</td>
+                                  {!isPhoneViewport && <td className="py-1">{net.count}</td>}
                                   <td className="py-1">
                                     <div className="flex items-center gap-2 min-w-0">
                                       <span className="w-2.5 h-2.5 rounded-full inline-block shrink-0" style={{ backgroundColor: net.color }} />
@@ -1846,7 +2230,7 @@ export default function CoordinateEventsPage() {
                   className="w-full flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-muted-foreground hover:bg-accent/50 transition-colors"
                 >
                   <Bell className="w-3.5 h-3.5" />
-                  <span>Following</span>
+                  <span>Subscribed</span>
                   <span className="text-[10px] opacity-60">{subscriptions.length}</span>
                   <span className="ml-auto">{followingExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}</span>
                 </button>
@@ -1854,7 +2238,7 @@ export default function CoordinateEventsPage() {
                   <div className="px-3 pb-2 flex flex-wrap items-center gap-2">
                     {subscriptions.length === 0 ? (
                       <p className="rounded-md border border-border bg-background/50 p-3 text-xs text-muted-foreground w-full">
-                        You are not following any coordination calendars yet.
+                        You are not subscribed to any coordination calendars yet.
                       </p>
                     ) : (
                       subscriptions.map(sub => (
@@ -1864,7 +2248,7 @@ export default function CoordinateEventsPage() {
                           <button
                             onClick={() => sub.calendars?.hash && handleUnsubscribe(sub.calendars.hash)}
                             className="ml-1 p-0.5 hover:bg-purple-200 dark:hover:bg-purple-800 rounded transition-colors"
-                            title="Unfollow"
+                            title="Unsubscribe"
                           >
                             <X className="w-3 h-3" />
                           </button>
@@ -1883,61 +2267,81 @@ export default function CoordinateEventsPage() {
       {/* Header */}
       <div className="mb-2 md:mb-4">
         <div className="flex flex-col gap-2">
-          <div className="flex items-center justify-between">
+          <div className={`flex ${isPhoneViewport ? 'flex-col items-start gap-2' : 'items-center justify-between'}`}>
             <h1 className="text-base md:text-2xl font-bold">Your Event Calendar</h1>
-            <div className="flex items-center gap-2">
-              <button
-                onClick={() => {
-                  if (!isLeftToolsPanelOpen) {
-                    setIsLeftToolsPanelOpen(true)
-                    setNetworksExpanded(true)
-                  } else {
-                    setNetworksExpanded(prev => !prev)
-                  }
-                }}
-                className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md transition-colors border ${
-                  isLeftToolsPanelOpen && networksExpanded
-                    ? 'bg-blue-600 text-white border-blue-600 hover:bg-blue-700'
-                    : 'bg-background text-foreground border-border hover:bg-accent/50'
-                }`}
-                title={isLeftToolsPanelOpen && networksExpanded ? 'Collapse networks section' : 'Show networks'}
+            <div className={`flex items-center gap-2 flex-wrap ${isPhoneViewport ? 'w-full' : 'justify-end'}`}>
+              <Link
+                to="/events-calendar"
+                className="flex items-center justify-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md transition-colors border border-border bg-background text-foreground hover:bg-accent/50 w-full sm:w-auto"
               >
-                {isLeftToolsPanelOpen ? <PanelLeftClose className="w-4 h-4" /> : <PanelLeftOpen className="w-4 h-4" />}
-                <Network className="w-4 h-4" />
-                Networks
-                <span className="text-[10px] opacity-80">{networks.length}</span>
-                {selectedPublishNetworks.length > 0 && (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/15">
-                    {selectedPublishNetworks.length}
-                  </span>
-                )}
-                {networkFilters.hidden.size > 0 && (
-                  <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-500/25 text-amber-100">
-                    {networkFilters.hidden.size} hidden
-                  </span>
-                )}
-              </button>
-              <button
-                onClick={() => {
-                  if (!isLeftToolsPanelOpen) {
-                    setIsLeftToolsPanelOpen(true)
-                    setFollowingExpanded(true)
-                  } else {
-                    setFollowingExpanded(prev => !prev)
-                  }
-                }}
-                className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md transition-colors border ${
-                  isLeftToolsPanelOpen && followingExpanded
-                    ? 'bg-purple-600 text-white border-purple-600 hover:bg-purple-700'
-                    : 'bg-background text-foreground border-border hover:bg-accent/50'
-                }`}
-                title={isLeftToolsPanelOpen && followingExpanded ? 'Collapse following section' : 'Show following'}
-              >
-                {isLeftToolsPanelOpen ? <PanelLeftClose className="w-4 h-4" /> : <PanelLeftOpen className="w-4 h-4" />}
-                <Bell className="w-4 h-4" />
-                Following
-                <span className="text-[10px] opacity-80">{subscriptions.length}</span>
-              </button>
+                <Calendar className="w-4 h-4" />
+                Discover Events
+              </Link>
+              {isPhoneViewport ? (
+                <button
+                  onClick={() => setIsLeftToolsPanelOpen(true)}
+                  className="flex items-center justify-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md transition-colors border bg-background text-foreground border-border hover:bg-accent/50"
+                >
+                  <PanelLeftOpen className="w-4 h-4" />
+                  Tools
+                  <span className="text-[10px] opacity-80">{networks.length + subscriptions.length}</span>
+                </button>
+              ) : (
+                <>
+                  <button
+                    onClick={() => {
+                      if (!isLeftToolsPanelOpen) {
+                        setIsLeftToolsPanelOpen(true)
+                        setNetworksExpanded(true)
+                      } else {
+                        setNetworksExpanded(prev => !prev)
+                      }
+                    }}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md transition-colors border ${
+                      isLeftToolsPanelOpen && networksExpanded
+                        ? 'bg-blue-600 text-white border-blue-600 hover:bg-blue-700'
+                        : 'bg-background text-foreground border-border hover:bg-accent/50'
+                    }`}
+                    title={isLeftToolsPanelOpen && networksExpanded ? 'Collapse networks section' : 'Show networks'}
+                  >
+                    {isLeftToolsPanelOpen ? <PanelLeftClose className="w-4 h-4" /> : <PanelLeftOpen className="w-4 h-4" />}
+                    <Network className="w-4 h-4" />
+                    Networks
+                    <span className="text-[10px] opacity-80">{networks.length}</span>
+                    {selectedPublishNetworks.length > 0 && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/15">
+                        {selectedPublishNetworks.length}
+                      </span>
+                    )}
+                    {networkFilters.hidden.size > 0 && (
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-500/25 text-amber-100">
+                        {networkFilters.hidden.size} hidden
+                      </span>
+                    )}
+                  </button>
+                  <button
+                    onClick={() => {
+                      if (!isLeftToolsPanelOpen) {
+                        setIsLeftToolsPanelOpen(true)
+                        setFollowingExpanded(true)
+                      } else {
+                        setFollowingExpanded(prev => !prev)
+                      }
+                    }}
+                    className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md transition-colors border ${
+                      isLeftToolsPanelOpen && followingExpanded
+                        ? 'bg-purple-600 text-white border-purple-600 hover:bg-purple-700'
+                        : 'bg-background text-foreground border-border hover:bg-accent/50'
+                    }`}
+                    title={isLeftToolsPanelOpen && followingExpanded ? 'Collapse subscribed section' : 'Show subscribed'}
+                  >
+                    {isLeftToolsPanelOpen ? <PanelLeftClose className="w-4 h-4" /> : <PanelLeftOpen className="w-4 h-4" />}
+                    <Bell className="w-4 h-4" />
+                    Subscribed
+                    <span className="text-[10px] opacity-80">{subscriptions.length}</span>
+                  </button>
+                </>
+              )}
               <button
                 onClick={() => setShowCreateModal(true)}
                 className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium bg-primary text-primary-foreground rounded-md hover:bg-primary/90 transition-colors"
@@ -1955,38 +2359,62 @@ export default function CoordinateEventsPage() {
             </div>
           </div>
 
-          <div className="flex items-center gap-2 text-sm text-muted-foreground">
-            <TimezoneSelector timezones={tzState} />
-            <span className="text-border mx-1">|</span>
-            <span>{events.length} event{events.length !== 1 ? 's' : ''}</span>
-            <span className="text-border mx-1">|</span>
-            <span>{events.filter(e => e.is_public).length} public</span>
-            <span className="text-border mx-1">|</span>
-            <span className="text-xs opacity-80">Auto-sync sources: {sourceSyncConfigs.length}</span>
-            <button
-              onClick={() => runImportedSourcesSync(true)}
-              disabled={isAutoSyncing || sourceSyncConfigs.length === 0}
-              className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-border hover:bg-accent/50 disabled:opacity-50"
-            >
-              {isAutoSyncing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
-              Sync now
-            </button>
-            {lastAutoSyncAt && (
-              <span className="text-xs opacity-80">
-                Last sync {format(new Date(lastAutoSyncAt), 'HH:mm')} ({autoSyncSummary || 'no changes'})
-              </span>
-            )}
-            {latestServerSyncAt && (
-              <span className="text-xs opacity-80">
-                Server sync {format(new Date(latestServerSyncAt), 'MMM d, yyyy HH:mm')}
-              </span>
-            )}
-            {serverSyncErrorCount > 0 && (
-              <span className="text-xs text-amber-600 dark:text-amber-400">
-                {serverSyncErrorCount} source{serverSyncErrorCount !== 1 ? 's' : ''} with sync errors
-              </span>
-            )}
-          </div>
+          {isPhoneViewport ? (
+            <div className="flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <TimezoneSelector timezones={tzState} />
+              <span>{events.length} event{events.length !== 1 ? 's' : ''}</span>
+              <span>{events.filter(e => e.is_public).length} public</span>
+              <button
+                onClick={() => runImportedSourcesSync(true)}
+                disabled={isAutoSyncing || sourceSyncConfigs.length === 0}
+                className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-border hover:bg-accent/50 disabled:opacity-50"
+              >
+                {isAutoSyncing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                Sync
+              </button>
+              {lastAutoSyncAt && (
+                <span className="opacity-80">Last sync {format(new Date(lastAutoSyncAt), 'HH:mm')}</span>
+              )}
+              {serverSyncErrorCount > 0 && (
+                <span className="text-amber-600 dark:text-amber-400">
+                  {serverSyncErrorCount} source{serverSyncErrorCount !== 1 ? 's' : ''} with sync errors
+                </span>
+              )}
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 text-sm text-muted-foreground">
+              <TimezoneSelector timezones={tzState} />
+              <span className="text-border mx-1">|</span>
+              <span>{events.length} event{events.length !== 1 ? 's' : ''}</span>
+              <span className="text-border mx-1">|</span>
+              <span>{events.filter(e => e.is_public).length} public</span>
+              <span className="text-border mx-1">|</span>
+              <span className="text-xs opacity-80">Auto-sync sources: {sourceSyncConfigs.length}</span>
+              <button
+                onClick={() => runImportedSourcesSync(true)}
+                disabled={isAutoSyncing || sourceSyncConfigs.length === 0}
+                className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-border hover:bg-accent/50 disabled:opacity-50"
+              >
+                {isAutoSyncing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
+                Sync now
+              </button>
+              {lastAutoSyncAt && (
+                <span className="text-xs opacity-80">
+                  Last sync {format(new Date(lastAutoSyncAt), 'HH:mm')} ({autoSyncSummary || 'no changes'})
+                </span>
+              )}
+              {latestServerSyncAt && (
+                <span className="text-xs opacity-80">
+                  Server sync {format(new Date(latestServerSyncAt), 'MMM d, yyyy HH:mm')}
+                </span>
+              )}
+              {serverSyncErrorCount > 0 && (
+                <span className="text-xs text-amber-600 dark:text-amber-400">
+                  {serverSyncErrorCount} source{serverSyncErrorCount !== 1 ? 's' : ''} with sync errors
+                </span>
+              )}
+            </div>
+          )}
         </div>
       </div>
 
@@ -2073,9 +2501,12 @@ export default function CoordinateEventsPage() {
 
       {/* Calendar Grid */}
       <div
+        ref={calendarGridRef}
         className="flex-1 overflow-auto border border-border rounded-lg bg-card select-none"
         onMouseUp={handleMouseUp}
         onMouseLeave={handleMouseUp}
+        onPointerUp={handleMouseUp}
+        onPointerCancel={handleMouseUp}
       >
         {eventsLoading ? (
           <div className="flex items-center justify-center h-full">
@@ -2197,9 +2628,11 @@ export default function CoordinateEventsPage() {
                     return (
                       <div
                         key={slot.dayIdx}
+                        onPointerDown={(e) => handleCellPointerDown(e, day, time)}
+                        onPointerEnter={(e) => handleCellPointerEnter(e, day, time)}
                         onMouseDown={(e) => { e.preventDefault(); handleCellMouseDown(day, time) }}
                         onMouseEnter={() => handleCellMouseEnter(day, time)}
-                        className={`border-r border-border last:border-r-0 cursor-crosshair ${
+                        className={`border-r border-border last:border-r-0 cursor-crosshair touch-none ${
                           isSelected
                             ? 'bg-blue-100 dark:bg-blue-900/30 ring-1 ring-inset ring-blue-400 dark:ring-blue-600'
                             : isToday ? 'bg-blue-50/30 dark:bg-blue-950/10' : ''
@@ -2240,11 +2673,12 @@ export default function CoordinateEventsPage() {
                           if (!item) return null
 
                           if (item.kind === 'event') {
-                            const ev = item.data
+                            const ev = item.data.event
+                            const occ = item.data
                             const color = getEventColor(ev)
                             return (
                               <button
-                                key={`${seg.eventId}-${i}`}
+                                key={`${seg.eventId}-${occ.start_time}-${i}`}
                                 onClick={(e) => { e.stopPropagation(); setSelectedEvent(ev); setSelectedSubMeeting(null) }}
                                 onMouseDown={(e) => e.stopPropagation()}
                                 className="flex flex-col items-start justify-start px-1 rounded-sm text-[10px] leading-tight transition-colors hover:opacity-80 overflow-hidden"
@@ -2260,16 +2694,17 @@ export default function CoordinateEventsPage() {
                                   color: color,
                                   zIndex: 5,
                                 }}
-                                title={getEventChipLabel(ev)}
+                                title={getEventChipLabel(ev, occ.isRecurringOccurrence)}
                               >
                                 {seg.isFirstSegment && (
                                   <>
                                     <div className="flex items-center gap-0.5 min-w-0 pt-0.5 max-w-full">
                                       {ev.is_public && <Eye className="w-2.5 h-2.5 shrink-0 text-green-500" />}
-                                      <span className="block truncate font-medium min-w-0">{getEventChipLabel(ev)}</span>
+                                      {occ.isRecurringOccurrence && <Repeat2 className="w-2.5 h-2.5 shrink-0 text-blue-600 dark:text-blue-400" />}
+                                      <span className="block truncate font-medium min-w-0">{getEventChipLabel(ev, occ.isRecurringOccurrence)}</span>
                                     </div>
                                     <div className="text-[9px] opacity-70 truncate max-w-full">
-                                      {formatUTC(ev.start_time, 'HH:mm')} – {formatUTC(ev.end_time, 'HH:mm')}
+                                      {formatUTC(occ.start_time, 'HH:mm')} – {formatUTC(occ.end_time, 'HH:mm')}
                                     </div>
                                   </>
                                 )}
@@ -2350,6 +2785,7 @@ export default function CoordinateEventsPage() {
                 
                 return (
                   <div 
+                    ref={nowLineRef}
                     className="absolute left-0 right-0 pointer-events-none z-[15]"
                     style={{ 
                       top: `${position}px`,
@@ -2383,21 +2819,23 @@ export default function CoordinateEventsPage() {
             <div className="space-y-2 max-h-[60vh] overflow-auto">
               {overflowPanelItems.map(item => {
                 if (item.kind === 'event') {
-                  const ev = item.data
+                  const ev = item.data.event
+                  const occ = item.data
                   const color = getEventColor(ev)
                   return (
                     <button
-                      key={ev.id}
+                      key={`${ev.id}_${occ.start_time}`}
                       onClick={() => { setOverflowPanelItems(null); setSelectedEvent(ev); setSelectedSubMeeting(null) }}
                       className="w-full text-left p-3 rounded-lg border border-border hover:bg-accent/50 transition-colors"
                       style={{ borderLeft: `4px solid ${color}` }}
                     >
                       <div className="flex items-center gap-1 font-medium text-sm" style={{ color }}>
                         {ev.is_public && <Eye className="w-3 h-3 shrink-0 text-green-500" />}
-                        {ev.title}
+                        {occ.isRecurringOccurrence && <Repeat2 className="w-3 h-3 shrink-0 text-blue-600 dark:text-blue-400" />}
+                        {getEventChipLabel(ev, occ.isRecurringOccurrence)}
                       </div>
                       <div className="text-xs text-muted-foreground mt-1">
-                        {formatUTC(ev.start_time, 'EEE, MMM d')} · {formatUTC(ev.start_time, 'HH:mm')} – {formatUTC(ev.end_time, 'HH:mm')}
+                        {formatUTC(occ.start_time, 'EEE, MMM d')} · {formatUTC(occ.start_time, 'HH:mm')} – {formatUTC(occ.end_time, 'HH:mm')}
                       </div>
                     </button>
                   )
@@ -2410,7 +2848,7 @@ export default function CoordinateEventsPage() {
                       className="w-full text-left p-3 rounded-lg border border-border hover:bg-accent/50 transition-colors"
                       style={{ borderLeft: '4px solid #8B5CF6' }}
                     >
-                      <div className="font-medium text-sm" style={{ color: '#8B5CF6' }}>{m.calendar_title || m.title}</div>
+                      <div className="font-medium text-sm" style={{ color: '#8B5CF6' }}>{resolveMeetingTitle({ title: m.title, calendarTitle: m.calendar_title })}</div>
                       <div className="text-xs text-muted-foreground mt-1">
                         {formatUTC(m.start_time, 'EEE, MMM d')} · {formatUTC(m.start_time, 'HH:mm')} – {formatUTC(m.end_time, 'HH:mm')}
                       </div>
@@ -2428,7 +2866,7 @@ export default function CoordinateEventsPage() {
         <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setSelectedEvent(null)}>
           <div className="bg-card text-card-foreground rounded-lg p-5 max-w-md w-full mx-4 my-4 max-h-[90vh] overflow-y-auto shadow-xl border border-border" onClick={e => e.stopPropagation()}>
             <div className="flex items-center justify-between mb-3">
-              <h2 className="text-lg font-bold truncate pr-4">{selectedEvent.title}</h2>
+              <h2 className="text-lg font-bold truncate pr-4">{resolveMeetingTitle({ title: selectedEvent.title })}</h2>
               <button onClick={() => setSelectedEvent(null)} className="p-1 rounded hover:bg-muted transition-colors">
                 <X className="w-4 h-4" />
               </button>
@@ -2443,6 +2881,13 @@ export default function CoordinateEventsPage() {
                   {formatUTC(selectedEvent.end_time, 'HH:mm')}
                 </span>
               </div>
+
+              {selectedEventRecurrenceSummary && (
+                <div className="flex items-center gap-2 text-muted-foreground">
+                  <Repeat2 className="w-4 h-4 shrink-0 text-blue-600 dark:text-blue-400" />
+                  <span className="text-xs">{selectedEventRecurrenceSummary}</span>
+                </div>
+              )}
 
               {selectedEvent.description && (
                 <p className="text-muted-foreground text-xs whitespace-pre-wrap break-all border-l-2 border-border pl-3 py-1">
@@ -2640,7 +3085,7 @@ export default function CoordinateEventsPage() {
                 }`}
               >
                 {selectedEvent.is_public ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
-                {selectedEvent.is_public ? 'Public' : 'Private'}
+                {selectedEvent.is_public ? 'Public' : 'Publish'}
               </button>
               <button
                 onClick={() => {
@@ -2697,7 +3142,7 @@ export default function CoordinateEventsPage() {
         <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setSelectedSubMeeting(null)}>
           <div className="bg-card text-card-foreground rounded-lg p-5 max-w-md w-full mx-4 my-4 max-h-[90vh] overflow-y-auto shadow-xl border border-border" onClick={e => e.stopPropagation()}>
             <div className="flex items-center justify-between mb-3">
-              <h2 className="text-lg font-bold pr-4">{selectedSubMeeting.calendar_title || selectedSubMeeting.title}</h2>
+              <h2 className="text-lg font-bold pr-4">{resolveMeetingTitle({ title: selectedSubMeeting.title, calendarTitle: selectedSubMeeting.calendar_title })}</h2>
               <button onClick={() => setSelectedSubMeeting(null)} className="p-1 rounded hover:bg-muted transition-colors shrink-0">
                 <X className="w-4 h-4" />
               </button>
@@ -2738,7 +3183,7 @@ export default function CoordinateEventsPage() {
 
               <div className="flex items-center gap-1.5 text-xs text-muted-foreground border-t border-border pt-2 mt-2">
                 <Bell className="w-3.5 h-3.5 shrink-0" />
-                <span>Following: <a href={`/calendar/${selectedSubMeeting.calendar_hash}`} className="text-blue-600 hover:underline font-medium">{selectedSubMeeting.calendar_title}</a></span>
+                <span>Subscribed: <a href={`/calendar/${selectedSubMeeting.calendar_hash}`} className="text-blue-600 hover:underline font-medium">{selectedSubMeeting.calendar_title}</a></span>
               </div>
             </div>
 
@@ -2746,7 +3191,7 @@ export default function CoordinateEventsPage() {
             <div className="flex items-center gap-2 mt-4 pt-3 border-t border-border">
               <a
                 href={buildOutlookCalendarUrl({
-                  title: selectedSubMeeting.title,
+                  title: resolveMeetingTitle({ title: selectedSubMeeting.title, calendarTitle: selectedSubMeeting.calendar_title }),
                   description: selectedSubMeeting.description,
                   start_time: selectedSubMeeting.start_time,
                   end_time: selectedSubMeeting.end_time,
@@ -2762,7 +3207,7 @@ export default function CoordinateEventsPage() {
               </a>
               <button
                 onClick={() => downloadICSFile({
-                  title: selectedSubMeeting.title,
+                  title: resolveMeetingTitle({ title: selectedSubMeeting.title, calendarTitle: selectedSubMeeting.calendar_title }),
                   description: selectedSubMeeting.description,
                   start_time: selectedSubMeeting.start_time,
                   end_time: selectedSubMeeting.end_time,
@@ -2777,7 +3222,7 @@ export default function CoordinateEventsPage() {
               {googleOAuthSources.length === 1 ? (
                 <button
                   onClick={() => handleSyncToGoogle({
-                    title: selectedSubMeeting.title, description: selectedSubMeeting.description,
+                    title: resolveMeetingTitle({ title: selectedSubMeeting.title, calendarTitle: selectedSubMeeting.calendar_title }), description: selectedSubMeeting.description,
                     start_time: selectedSubMeeting.start_time, end_time: selectedSubMeeting.end_time,
                     meeting_link: selectedSubMeeting.meeting_link,
                   })}
@@ -2791,7 +3236,7 @@ export default function CoordinateEventsPage() {
               ) : googleOAuthSources.length > 1 ? (
                 <button
                   onClick={() => setShowGoogleSyncPicker({
-                    title: selectedSubMeeting.title, description: selectedSubMeeting.description,
+                    title: resolveMeetingTitle({ title: selectedSubMeeting.title, calendarTitle: selectedSubMeeting.calendar_title }), description: selectedSubMeeting.description,
                     start_time: selectedSubMeeting.start_time, end_time: selectedSubMeeting.end_time,
                     meeting_link: selectedSubMeeting.meeting_link,
                   })}
@@ -2803,7 +3248,7 @@ export default function CoordinateEventsPage() {
                 </button>
               ) : (
                 <a
-                  href={`https://calendar.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(selectedSubMeeting.title)}&dates=${new Date(selectedSubMeeting.start_time).toISOString().replace(/[-:]/g, '').replace(/\.\\d{3}/, '')}/${new Date(selectedSubMeeting.end_time).toISOString().replace(/[-:]/g, '').replace(/\.\\d{3}/, '')}${selectedSubMeeting.description ? `&details=${encodeURIComponent(selectedSubMeeting.description)}` : ''}${selectedSubMeeting.meeting_link ? `&location=${encodeURIComponent(selectedSubMeeting.meeting_link)}` : ''}`}
+                  href={`https://calendar.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(resolveMeetingTitle({ title: selectedSubMeeting.title, calendarTitle: selectedSubMeeting.calendar_title }))}&dates=${new Date(selectedSubMeeting.start_time).toISOString().replace(/[-:]/g, '').replace(/\.\\d{3}/, '')}/${new Date(selectedSubMeeting.end_time).toISOString().replace(/[-:]/g, '').replace(/\.\\d{3}/, '')}${selectedSubMeeting.description ? `&details=${encodeURIComponent(selectedSubMeeting.description)}` : ''}${selectedSubMeeting.meeting_link ? `&location=${encodeURIComponent(selectedSubMeeting.meeting_link)}` : ''}`}
                   target="_blank"
                   rel="noopener noreferrer"
                   className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors"
@@ -2832,7 +3277,7 @@ export default function CoordinateEventsPage() {
                 className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium text-red-600 bg-red-50 dark:bg-red-950/30 hover:bg-red-100 dark:hover:bg-red-950/50 transition-colors"
               >
                 <BellOff className="w-4 h-4" />
-                Unfollow Calendar
+                Unsubscribe from Calendar
               </button>
             </div>
           </div>
@@ -3286,72 +3731,130 @@ export default function CoordinateEventsPage() {
                     </button>
                   </div>
                 </div>
+                <div className="relative mb-2">
+                  <Search className="w-3.5 h-3.5 absolute left-2.5 top-1/2 -translate-y-1/2 text-muted-foreground pointer-events-none" />
+                  <input
+                    type="text"
+                    value={publishModalSearch}
+                    onChange={e => setPublishModalSearch(e.target.value)}
+                    placeholder="Search events in this list..."
+                    className="w-full pl-8 pr-8 py-1.5 text-sm border border-border rounded-md bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-blue-500"
+                  />
+                  {publishModalSearch && (
+                    <button
+                      onClick={() => setPublishModalSearch('')}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-muted transition-colors"
+                    >
+                      <X className="w-3 h-3 text-muted-foreground" />
+                    </button>
+                  )}
+                </div>
                 {publishModalEvents.length === 0 ? (
                   <p className="text-sm text-muted-foreground text-center py-4">No events in the selected range.</p>
+                ) : publishModalFilteredGroups.totalMatched === 0 ? (
+                  <p className="text-sm text-muted-foreground text-center py-4">No events match your search.</p>
                 ) : (
-                  publishModalEvents.map(ev => (
-                    <label key={ev.id} className="flex items-start gap-3 px-3 py-2.5 rounded-lg hover:bg-muted/50 cursor-pointer transition-colors">
-                      <input
-                        type="checkbox"
-                        checked={publishModalSelectedIds.has(ev.id)}
-                        onChange={() => {
-                          setPublishModalSelectedIds(prev => {
-                            const next = new Set(prev)
-                            if (next.has(ev.id)) next.delete(ev.id)
-                            else next.add(ev.id)
-                            return next
-                          })
-                        }}
-                        className="mt-0.5 accent-green-600 w-4 h-4 shrink-0"
-                      />
-                      <div className="min-w-0 flex-1">
-                        <p className="text-sm font-medium text-foreground truncate">{ev.title}</p>
-                        <p className="text-xs text-muted-foreground">
-                          {format(new Date(ev.start_time), 'MMM d, yyyy HH:mm')} -- {format(new Date(ev.end_time), 'HH:mm')}
+                  <>
+                    {publishModalFilteredGroups.current.length > 0 && (
+                      <div className="space-y-1">
+                        <p className="px-1 pt-1 text-[11px] font-medium uppercase tracking-wide text-muted-foreground">
+                          Current and upcoming
                         </p>
+                        {publishModalFilteredGroups.current.map(ev => renderPublishModalEventRow(ev))}
                       </div>
-                      {ev.is_public && (
-                        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300 shrink-0">
-                          already public
-                        </span>
-                      )}
-                    </label>
-                  ))
+                    )}
+
+                    {publishModalFilteredGroups.history.length > 0 && (
+                      <div className="mt-2 border border-border rounded-lg overflow-hidden">
+                        <button
+                          type="button"
+                          onClick={() => setPublishModalHistoryExpanded(prev => !prev)}
+                          className="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-muted/40 transition-colors"
+                        >
+                          {publishModalHistoryExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+                          <span>History (last week and earlier)</span>
+                          <span className="ml-auto text-[10px]">{publishModalFilteredGroups.history.length}</span>
+                        </button>
+                        {publishModalHistoryExpanded && (
+                          <div className="border-t border-border py-1">
+                            {publishModalFilteredGroups.history.map(ev => renderPublishModalEventRow(ev))}
+                          </div>
+                        )}
+                      </div>
+                    )}
+                  </>
                 )}
               </div>
             </div>
 
             <div className="border-t border-border px-5 py-4 space-y-3">
-              <div className="space-y-2.5">
-                <label className="flex items-start gap-3 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={publishModalAutoSync}
-                    onChange={e => setPublishModalAutoSync(e.target.checked)}
-                    className="mt-0.5 accent-blue-600 w-4 h-4 shrink-0"
-                  />
-                  <div>
-                    <p className="text-sm font-medium text-foreground">Auto-sync updates</p>
-                    <p className="text-xs text-muted-foreground">
-                      When a source event changes (time, title, or is removed), the public calendar updates automatically.
-                    </p>
-                  </div>
-                </label>
-                <label className="flex items-start gap-3 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={publishModalAutoPublishNew}
-                    onChange={e => setPublishModalAutoPublishNew(e.target.checked)}
-                    className="mt-0.5 accent-blue-600 w-4 h-4 shrink-0"
-                  />
-                  <div>
-                    <p className="text-sm font-medium text-foreground">Auto-publish new meetings</p>
-                    <p className="text-xs text-muted-foreground">
-                      Any new meetings arriving from the same source calendar will be published automatically.
-                    </p>
-                  </div>
-                </label>
-              </div>
+              {publishModalSyncOptionsMode === 'imported' ? (
+                <div className="space-y-2.5">
+                  <label className="flex items-start gap-3 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={publishModalAutoSync}
+                      onChange={e => setPublishModalAutoSync(e.target.checked)}
+                      className="mt-0.5 accent-blue-600 w-4 h-4 shrink-0"
+                    />
+                    <div>
+                      <p className="text-sm font-medium text-foreground">Auto-sync imported source updates</p>
+                      <p className="text-xs text-muted-foreground">
+                        Applies only to imported calendars. If source items change (time, title, or are removed), the published copy updates automatically.
+                      </p>
+                    </div>
+                  </label>
+                  <label className="flex items-start gap-3 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={publishModalAutoPublishNew}
+                      onChange={e => setPublishModalAutoPublishNew(e.target.checked)}
+                      className="mt-0.5 accent-blue-600 w-4 h-4 shrink-0"
+                    />
+                    <div>
+                      <p className="text-sm font-medium text-foreground">Auto-publish new imported meetings</p>
+                      <p className="text-xs text-muted-foreground">
+                        Applies only to imported calendars. New items from the same imported source will be published automatically.
+                      </p>
+                    </div>
+                  </label>
+                </div>
+              ) : publishModalSyncOptionsMode === 'manual-recurring' ? (
+                <div className="space-y-2.5">
+                  <label className="flex items-start gap-3">
+                    <input
+                      type="checkbox"
+                      checked
+                      readOnly
+                      className="mt-0.5 accent-blue-600 w-4 h-4 shrink-0 cursor-default"
+                    />
+                    <div>
+                      <p className="text-sm font-medium text-foreground">Sync with recurrence</p>
+                      <p className="text-xs text-muted-foreground">
+                        This recurring Time Item keeps its public visibility while recurrence settings change.
+                      </p>
+                    </div>
+                  </label>
+                  <label className="flex items-start gap-3">
+                    <input
+                      type="checkbox"
+                      checked
+                      readOnly
+                      className="mt-0.5 accent-blue-600 w-4 h-4 shrink-0 cursor-default"
+                    />
+                    <div>
+                      <p className="text-sm font-medium text-foreground">Sync with this specific Time Item changes</p>
+                      <p className="text-xs text-muted-foreground">
+                        Edits and cut/move on this same item continue to sync with public visibility. Copy now inherits this link, including visibility and recurrence settings.
+                      </p>
+                    </div>
+                  </label>
+                </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  Sync automation is not shown for Time Items (manual calendar mode) because they do not use imported source sync.
+                </p>
+              )}
               <div className="flex gap-3 pt-1">
                 <button
                   onClick={() => setPublishModalOpen(false)}

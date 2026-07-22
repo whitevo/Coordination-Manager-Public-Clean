@@ -24,7 +24,7 @@
     "@tiptap/markdown": "^3.26.0",
     "@tiptap/react": "^3.26.0",
     "@tiptap/starter-kit": "^3.26.0",
-    "axios": "^1.16.0",
+    "axios": "^1.18.0",
     "date-fns": "^3.0.6",
     "lucide-react": "^0.303.0",
     "react": "^18.2.0",

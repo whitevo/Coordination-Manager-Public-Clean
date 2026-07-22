@@ -58,7 +58,12 @@ vi.mock('../../middleware/auth.js', () => ({
 // ─── Mock fetch (for Google OAuth) ──────────────────────────
 
 const mockFetch = vi.fn()
+const mockLookup = vi.fn()
 vi.stubGlobal('fetch', mockFetch)
+
+vi.mock('dns/promises', () => ({
+  lookup: mockLookup,
+}))
 
 // ─── Mock environment variables ─────────────────────────────
 
@@ -132,6 +137,8 @@ describe('Calendar Sources API', () => {
   beforeEach(async () => {
     vi.clearAllMocks()
     mockFetch.mockReset()
+    mockLookup.mockReset()
+    mockLookup.mockResolvedValue([{ address: '8.8.8.8', family: 4 }])
     await createApp()
   })
 
@@ -219,7 +226,8 @@ describe('Calendar Sources API', () => {
       expect(url.searchParams.get('response_type')).toBe('code')
       expect(url.searchParams.get('access_type')).toBe('offline')
       expect(url.searchParams.get('prompt')).toBe('consent')
-      expect(url.searchParams.get('scope')).toContain('calendar')
+      expect(url.searchParams.get('scope')).toContain('https://www.googleapis.com/auth/calendar.readonly')
+      expect(url.searchParams.get('scope')).toContain('https://www.googleapis.com/auth/calendar.events')
     })
 
     it('should encode user context in the state parameter', async () => {
@@ -551,6 +559,22 @@ describe('Calendar Sources API', () => {
 
       expect(res.status).toBe(400)
       expect(res.body.error).toContain('not accessible')
+    })
+
+    it('should reject URLs whose hostname resolves to a private address', async () => {
+      mockLookup.mockResolvedValueOnce([{ address: '10.0.0.25', family: 4 }])
+
+      const res = await request(app)
+        .post('/api/calendar-sources/public-url')
+        .set('Authorization', 'Bearer test-token')
+        .send({
+          public_url: 'https://calendar-proxy.example.com/feed.ics',
+          display_name: 'Private Target',
+        })
+
+      expect(res.status).toBe(400)
+      expect(res.body.error).toContain('private or internal')
+      expect(mockFetch).not.toHaveBeenCalled()
     })
   })
 
@@ -1172,6 +1196,124 @@ describe('Calendar Sources API', () => {
       expect(res.body.busyBlocks).toHaveLength(1)
       expect(res.body.busyBlocks[0].sourceId).toBe('src-2')
       expect(res.body.busyBlocks[0].color).toBe('#FBBC04')
+    })
+
+    it('should fall back to Events API when FreeBusy fails with insufficient scope', async () => {
+      const oauthSource = {
+        id: 'src-1',
+        source_type: 'google_oauth',
+        google_email: 'test@gmail.com',
+        google_access_token: 'valid-access-token',
+        google_refresh_token: 'refresh-token',
+        token_expires_at: new Date(Date.now() + 3600000).toISOString(),
+        color: '#4285F4',
+        display_name: 'SingularityNET Calendar',
+      }
+      const chain = createChain()
+      chain.order.mockResolvedValue({ data: [oauthSource], error: null })
+      mockFrom.mockReturnValue(chain)
+      mockSelect.mockReturnValue(chain)
+      mockEq.mockReturnValue(chain)
+      mockIn.mockReturnValue({ data: [oauthSource], error: null })
+      mockUpdate.mockReturnValue(chain)
+
+      // CalendarList
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ items: [{ id: 'primary', accessRole: 'owner' }] }),
+      })
+
+      // FreeBusy fails for legacy tokens with narrow scopes
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        json: async () => ({ error: { message: 'Request had insufficient authentication scopes.' } }),
+      })
+
+      // Events fallback
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          items: [
+            {
+              id: 'evt-1',
+              summary: 'Team Sync',
+              start: { dateTime: '2026-01-02T09:00:00Z' },
+              end: { dateTime: '2026-01-02T10:00:00Z' },
+            },
+          ],
+        }),
+      })
+
+      const res = await request(app)
+        .post('/api/calendar-sources/busy')
+        .set('Authorization', 'Bearer test-token')
+        .send({ sourceIds: ['src-1'], timeMin: '2026-01-01T00:00:00Z', timeMax: '2026-01-08T00:00:00Z' })
+
+      expect(res.status).toBe(200)
+      expect(res.body.sourceErrors).toEqual([])
+      expect(res.body.busyBlocks).toEqual([
+        {
+          start: '2026-01-02T09:00:00.000Z',
+          end: '2026-01-02T10:00:00.000Z',
+          sourceId: 'src-1',
+          color: '#4285F4',
+          summary: 'Team Sync',
+        },
+      ])
+    })
+
+    it('should surface reconnect guidance when Google returns insufficient scope', async () => {
+      const oauthSource = {
+        id: 'src-1',
+        source_type: 'google_oauth',
+        google_email: 'test@gmail.com',
+        google_access_token: 'valid-access-token',
+        google_refresh_token: 'refresh-token',
+        token_expires_at: new Date(Date.now() + 3600000).toISOString(),
+        color: '#4285F4',
+        display_name: 'SingularityNET Calendar',
+      }
+      const chain = createChain()
+      chain.order.mockResolvedValue({ data: [oauthSource], error: null })
+      mockFrom.mockReturnValue(chain)
+      mockSelect.mockReturnValue(chain)
+      mockEq.mockReturnValue(chain)
+      mockIn.mockReturnValue({ data: [oauthSource], error: null })
+      mockUpdate.mockReturnValue(chain)
+
+      mockFetch.mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({ items: [{ id: 'primary', accessRole: 'owner' }] }),
+      })
+
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        json: async () => ({ error: { message: 'Request had insufficient authentication scopes.' } }),
+      })
+
+      // Events fallback also fails due insufficient permissions
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 403,
+        json: async () => ({ error: { message: 'Insufficient Permission' } }),
+      })
+
+      const res = await request(app)
+        .post('/api/calendar-sources/busy')
+        .set('Authorization', 'Bearer test-token')
+        .send({ sourceIds: ['src-1'], timeMin: '2026-01-01T00:00:00Z', timeMax: '2026-01-08T00:00:00Z' })
+
+      expect(res.status).toBe(200)
+      expect(res.body.busyBlocks).toEqual([])
+      expect(res.body.sourceErrors).toEqual([
+        {
+          sourceId: 'src-1',
+          displayName: 'SingularityNET Calendar',
+          error: 'Calendar authorization is missing required access -- reconnect this calendar in Settings.',
+        },
+      ])
     })
 
     it('should return busy blocks from a public ICS URL source', async () => {

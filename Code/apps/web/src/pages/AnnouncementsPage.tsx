@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
 import { useSearchParams, Link } from 'react-router-dom'
+import { resolveMeetingTitle } from '../lib/calendar-utils'
 import LearnerHelpIcon from '../components/LearnerHelpIcon'
 import ResponsesTab from '../components/announcements/ResponsesTab'
 import {
@@ -1574,10 +1575,8 @@ export default function AnnouncementsPage() {
     const tz = getPrimaryTimezone()
     const endTimeStr = formatDateTimeDDMMYYYYInTimezone(endDate, tz).split(' ').slice(-2).join(' ')
 
-    // calendar_title = Coordination Calendar name (the meeting name)
-    // meeting.title = meeting description text (confusingly named in the DB)
-    const meetingName = meeting.calendar_title || meeting.title
-    const descText = meeting.title?.replace(/[*`]/g, '') || null
+    const meetingName = resolveMeetingTitle({ title: meeting.title, calendarTitle: meeting.calendar_title })
+    const descText = meeting.description?.replace(/[*`]/g, '') || null
 
     let block = ''
     if (meetingContextFields.title) block += `\n🎯 **${meetingName}**`
@@ -1605,8 +1604,8 @@ export default function AnnouncementsPage() {
       if (group.length === 1) return buildMeetingBlock(group[0])
 
       const first = group[0]
-      const meetingName = first.calendar_title || first.title
-      const descText = first.title?.replace(/[*`]/g, '') || null
+      const meetingName = resolveMeetingTitle({ title: first.title, calendarTitle: first.calendar_title })
+      const descText = first.description?.replace(/[*`]/g, '') || null
 
       let block = ''
       if (meetingContextFields.title) block += `\n🎯 **${meetingName}**`

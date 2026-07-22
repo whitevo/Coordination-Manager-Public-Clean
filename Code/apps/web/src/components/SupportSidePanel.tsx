@@ -1,21 +1,24 @@
 import { Clock, Mail, MessageSquare, BookOpen, Headphones, ExternalLink, X, LifeBuoy, AlertCircle } from 'lucide-react'
 import { Link } from 'react-router-dom'
+import MobilePanelSwitcher from './MobilePanelSwitcher'
+import type { PanelId } from './FloatingPanels'
 
 interface SupportSidePanelProps {
   isOpen: boolean
   onClose: () => void
+  onPanelChange: (panel: Exclude<PanelId, null>) => void
 }
 
-export function SupportSidePanel({ isOpen, onClose }: SupportSidePanelProps) {
+export function SupportSidePanel({ isOpen, onClose, onPanelChange }: SupportSidePanelProps) {
   return (
     <aside
       className={`
-        shrink-0 sticky top-0 h-screen overflow-hidden
-        transition-all duration-300 ease-in-out
-        ${isOpen ? 'w-[22rem] sm:w-96' : 'w-0'}
+        fixed inset-y-0 right-0 z-50 w-screen transition-transform duration-300 ease-in-out
+        ${isOpen ? 'translate-x-0 pointer-events-auto sm:w-[22rem] md:w-96' : 'translate-x-full pointer-events-none sm:w-0'}
+        sm:sticky sm:top-0 sm:h-screen sm:shrink-0 sm:overflow-hidden sm:translate-x-0 sm:pointer-events-auto
       `}
     >
-      <div className={`w-[22rem] sm:w-96 min-w-[22rem] sm:min-w-[24rem] h-full flex flex-col bg-card border-l-2 border-blue-400 dark:border-blue-500 shadow-xl`}>
+      <div className={`ml-auto h-full w-screen flex flex-col bg-card border-l-2 border-blue-400 dark:border-blue-500 shadow-xl sm:w-[22rem] sm:min-w-[22rem] md:w-96 md:min-w-[24rem]`}>
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-blue-50 dark:bg-blue-950/40">
         <div className="flex items-center gap-2">
@@ -29,6 +32,7 @@ export function SupportSidePanel({ isOpen, onClose }: SupportSidePanelProps) {
           <X className="h-4 w-4" />
         </button>
       </div>
+      <MobilePanelSwitcher activePanel="support" onPanelChange={onPanelChange} />
 
       {/* Content */}
       <div className="flex-1 overflow-y-auto px-4 py-4 space-y-4">

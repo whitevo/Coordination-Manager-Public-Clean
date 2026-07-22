@@ -14,6 +14,7 @@ interface TimezoneSelectorProps {
 type PanelTarget = 'primary' | 'add' | number // number = additional slot index
 
 export default function TimezoneSelector({ timezones, compact: _compact }: TimezoneSelectorProps) {
+  const compact = _compact ?? false
   const [expanded, setExpanded] = useState(false)
   const [searchTarget, setSearchTarget] = useState<PanelTarget | null>(null)
   const containerRef = useRef<HTMLDivElement>(null)
@@ -64,8 +65,9 @@ export default function TimezoneSelector({ timezones, compact: _compact }: Timez
         type="button"
         onClick={handleToggle}
         className={`
-          group flex items-center gap-2 text-sm transition-all duration-200
-          rounded-lg border-2 px-4 py-1.5 font-semibold
+          group flex items-center text-sm transition-all duration-200
+          rounded-lg border-2 font-semibold
+          ${compact ? 'gap-1 px-2 py-1 text-xs' : 'gap-2 px-4 py-1.5'}
           ${expanded
             ? 'bg-blue-600 dark:bg-blue-500 border-blue-600 dark:border-blue-500 text-white shadow-md shadow-blue-500/25'
             : 'bg-blue-600/10 dark:bg-blue-500/15 border-blue-500/40 dark:border-blue-400/30 text-blue-700 dark:text-blue-300 hover:bg-blue-600/20 dark:hover:bg-blue-500/25 hover:border-blue-500/60 hover:shadow-sm hover:shadow-blue-500/15'
@@ -73,8 +75,8 @@ export default function TimezoneSelector({ timezones, compact: _compact }: Timez
           cursor-pointer
         `}
       >
-        <Globe className={`w-4 h-4 flex-shrink-0 transition-transform duration-500 ${expanded ? 'animate-spin-once' : 'group-hover:rotate-12'}`} />
-        <span>Timezone: {primaryLabel}</span>
+        <Globe className={`${compact ? 'w-3.5 h-3.5' : 'w-4 h-4'} flex-shrink-0 transition-transform duration-500 ${expanded ? 'animate-spin-once' : 'group-hover:rotate-12'}`} />
+        <span>{compact ? primaryLabel : `Timezone: ${primaryLabel}`}</span>
         {timezones.additional.length > 0 && (
           <span className={`px-1.5 py-0.5 text-xs rounded-full font-medium ${
             expanded

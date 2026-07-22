@@ -152,7 +152,7 @@ export default function LoginPage() {
             {/* Google Sign In */}
             <button
               onClick={handleGoogleLogin}
-              className="w-full flex items-center justify-center gap-3 px-4 py-3 border border-border rounded-lg hover:bg-muted transition-colors mb-4"
+              className="w-full flex items-center justify-center gap-3 px-4 py-3 border border-border rounded-xl bg-card hover:bg-muted/60 transition-colors mb-4"
             >
               <svg className="w-5 h-5" viewBox="0 0 24 24">
                 <path
@@ -182,7 +182,7 @@ export default function LoginPage() {
             {/* Divider */}
             <div className="relative mb-6">
               <div className="absolute inset-0 flex items-center">
-                <div className="w-full border-t border-gray-200"></div>
+                <div className="w-full border-t border-border"></div>
               </div>
               <div className="relative flex justify-center text-sm">
                 <span className="px-4 bg-card text-muted-foreground">or</span>
@@ -193,7 +193,7 @@ export default function LoginPage() {
             <button
               onClick={isUpgradeFlow && isTraveler ? () => navigate(-1) : handleTravelerLogin}
               disabled={isLoading}
-              className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 rounded-lg hover:bg-amber-100 dark:hover:bg-amber-900 transition-colors disabled:opacity-50 disabled:cursor-not-allowed mb-3"
+              className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-amber-50/70 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 rounded-xl hover:bg-amber-100/80 dark:hover:bg-amber-900/60 transition-colors disabled:opacity-50 disabled:cursor-not-allowed mb-3"
             >
               <Compass className="w-5 h-5 text-amber-600 dark:text-amber-400" />
               <span className="font-medium text-amber-800 dark:text-amber-200">
@@ -218,8 +218,18 @@ export default function LoginPage() {
               </div>
             </div>
 
+            {/* Divider */}
+            <div className="relative my-4">
+              <div className="absolute inset-0 flex items-center">
+                <div className="w-full border-t border-border"></div>
+              </div>
+              <div className="relative flex justify-center text-sm">
+                <span className="px-4 bg-card text-muted-foreground">or</span>
+              </div>
+            </div>
+
             {/* Cardano Wallet Sign In — for existing Cardano users with a browser extension */}
-            <div className="mt-4">
+            <div>
               <CardanoWalletButton
                 getCaptchaToken={() => captchaTokenRef.current}
                 isCaptchaReady={!captchaActive || captchaReady}

@@ -1,10 +1,10 @@
 import { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { apiClient } from '../lib/api-client';
-import { Link } from 'react-router-dom';
+import { Link, useLocation } from 'react-router-dom';
 import { getPrimaryTimezone, formatDateInTimezone } from '../lib/timezone-data';
 import LearnerHelpIcon from '../components/LearnerHelpIcon';
 import { useLearnerMode } from '../contexts/LearnerModeContext';
-import { Plus, Trash2, Lock, Globe, CalendarDays, User, Search, X, ChevronDown, ShieldAlert, Copy, Repeat2 } from 'lucide-react';
+import { Plus, Trash2, Lock, Globe, CalendarDays, User, Search, X, ChevronDown, ShieldAlert, Copy, Repeat2, Star, Loader2 } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
 
 type CalendarConfig = {
@@ -80,6 +80,7 @@ function SkeletonGrid() {
 }
 
 export default function EventsPage() {
+  const location = useLocation();
   const [calendars, setCalendars] = useState<Calendar[]>([]);
   const [subscribedCalendarIds, setSubscribedCalendarIds] = useState<Set<string>>(new Set());
   const [loading, setLoading] = useState(true);
@@ -87,6 +88,7 @@ export default function EventsPage() {
   const [deleteConfirm, setDeleteConfirm] = useState<Calendar | null>(null);
   const [isDeleting, setIsDeleting] = useState(false);
   const [copiedUserId, setCopiedUserId] = useState<string | null>(null);
+  const [subscribingId, setSubscribingId] = useState<string | null>(null);
   const deletePopoverRef = useRef<HTMLDivElement>(null);
   const { user, session, isAuthenticated, isLoading: authLoading } = useAuth();
   const { learnerMode } = useLearnerMode();
@@ -105,10 +107,19 @@ export default function EventsPage() {
 
   // Collapsible section states — persisted in localStorage
   const [yourSectionCollapsed, setYourSectionCollapsed] = useCollapsedState('events-your-collapsed');
-  const [publicSectionCollapsed, setPublicSectionCollapsed] = useCollapsedState('events-public-collapsed', true);
+  const [publicSectionCollapsed, setPublicSectionCollapsed] = useCollapsedState('events-public-collapsed');
   const [yourPastCollapsed, setYourPastCollapsed] = useCollapsedState('events-your-past-collapsed', true);
   const [publicPastCollapsed, setPublicPastCollapsed] = useCollapsedState('events-public-past-collapsed', true);
   const [learnerGuideCollapsed, setLearnerGuideCollapsed] = useCollapsedState('events-learner-guide-collapsed');
+
+  // If the user came from an individual calendar page via top nav,
+  // open key sections so available events are immediately visible.
+  useEffect(() => {
+    const state = location.state as { fromCalendarView?: boolean } | null;
+    if (!state?.fromCalendarView) return;
+    setYourSectionCollapsed(false);
+    setPublicSectionCollapsed(false);
+  }, [location.state, setPublicSectionCollapsed, setYourSectionCollapsed]);
 
   // Admin powers — read from localStorage
   const isAdmin = user?.roles?.includes('admin');
@@ -235,6 +246,28 @@ export default function EventsPage() {
       || (session?.user?.email != null && createdBy === session.user.email);
   };
 
+  const handleToggleSubscription = async (calendar: Calendar) => {
+    if (!isAuthenticated) return;
+    setSubscribingId(calendar.id);
+    try {
+      if (subscribedCalendarIds.has(calendar.id)) {
+        await apiClient.delete(`/api/calendar-subscriptions/${calendar.hash}`);
+        setSubscribedCalendarIds(prev => {
+          const next = new Set(prev);
+          next.delete(calendar.id);
+          return next;
+        });
+      } else {
+        await apiClient.post('/api/calendar-subscriptions', { calendar_hash: calendar.hash });
+        setSubscribedCalendarIds(prev => new Set([...prev, calendar.id]));
+      }
+    } catch (err) {
+      console.error('Failed to toggle subscription', err);
+    } finally {
+      setSubscribingId(null);
+    }
+  };
+
   const handleDelete = async (calendar: Calendar) => {
     setIsDeleting(true);
     try {
@@ -337,7 +370,7 @@ export default function EventsPage() {
     return true;
   };
 
-  // Apply all filters, partition into your/followed vs public, each with active vs past
+  // Apply all filters, partition into your/subscribed vs public, each with active vs past
   const { yourActive, yourPast, publicActive, publicPast } = useMemo(() => {
     const filtered = calendars
       .filter(cal => matchesSearch(cal, searchQuery))
@@ -352,10 +385,15 @@ export default function EventsPage() {
       const isYours = isOwner(cal) || subscribedCalendarIds.has(cal.id);
       const past = isArchived(cal);
 
+      // Always place owned/subscribed calendars in the Subscribed or Your Coordination Calendars section
       if (isYours) {
         if (past) yPast.push(cal);
         else yActive.push(cal);
-      } else {
+      }
+
+      // Public calendars always appear in the Public Coordination Calendars section too
+      // (even when already subscribed, so they show in both sections)
+      if (cal.visibility === 'public' || !isYours) {
         if (past) pPast.push(cal);
         else pActive.push(cal);
       }
@@ -372,9 +410,10 @@ export default function EventsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- isOwner/isArchived are pure helpers over the listed reactive inputs and stable auth context
   }, [calendars, searchQuery, selectedMonth, subscribedCalendarIds]);
 
-  const renderCalendarCard = (calendar: Calendar, index: number) => (
+  const renderCalendarCard = (calendar: Calendar, index: number, opts?: { showSubscribeButton?: boolean }) => {
+    return (
     <div
-      key={calendar.id}
+      key={`${calendar.id}-${opts?.showSubscribeButton ? 'public' : 'subscribed'}`}
       className={`relative bg-card border border-border rounded-lg p-4 shadow hover:bg-accent/50 transition-all duration-300 ease-out animate-in fade-in slide-in-from-bottom-2 ${isArchived(calendar) ? 'opacity-70' : ''}`}
       style={{ animationDelay: `${index * 50}ms`, animationFillMode: 'backwards' }}
     >
@@ -391,11 +430,12 @@ export default function EventsPage() {
                 e.stopPropagation();
                 setDeleteConfirm(deleteConfirm?.id === calendar.id ? null : calendar);
               }}
-              className={`p-1.5 rounded transition-colors ${
+              className={`p-2 rounded-md transition-colors ${
                 !isOwner(calendar) && adminDeletePower
                   ? 'text-red-400 hover:text-red-600 dark:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950'
                   : 'text-muted-foreground hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950'
               }`}
+              aria-label={!isOwner(calendar) ? 'Admin delete calendar' : 'Delete calendar'}
               title={!isOwner(calendar) ? 'Admin: Delete calendar' : 'Delete calendar'}
             >
               {!isOwner(calendar) && adminDeletePower ? (
@@ -475,7 +515,7 @@ export default function EventsPage() {
               {getDateRange(calendar)}
             </p>
           )}
-          <div className="flex items-center gap-2 mt-0.5">
+          <div className="flex items-center gap-2 mt-0.5 flex-wrap">
             {calendar.visibility === 'unlisted' && (
               <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 dark:text-amber-400 bg-amber-100 dark:bg-amber-900/50 border border-amber-300 dark:border-amber-700 px-2 py-0.5 rounded-full">
                 <Lock className="w-3 h-3" />
@@ -499,11 +539,32 @@ export default function EventsPage() {
                 Past
               </span>
             )}
+            {isAuthenticated && (
+              <button
+                onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleToggleSubscription(calendar); }}
+                disabled={subscribingId === calendar.id}
+                className={`ml-auto inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1 rounded-full border transition-all duration-300 ${
+                  subscribedCalendarIds.has(calendar.id)
+                    ? 'bg-yellow-50 dark:bg-yellow-950/30 border-yellow-300 dark:border-yellow-700 text-yellow-700 dark:text-yellow-300 hover:bg-red-50 hover:border-red-200 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:border-red-800 dark:hover:text-red-400'
+                    : 'bg-gray-100 dark:bg-gray-800 border-gray-300 dark:border-gray-600 text-gray-500 dark:text-gray-400 hover:bg-yellow-50 hover:border-yellow-400 hover:text-yellow-700 dark:hover:bg-yellow-950/30 dark:hover:border-yellow-600 dark:hover:text-yellow-300'
+                } disabled:opacity-50`}
+                aria-label={subscribedCalendarIds.has(calendar.id) ? 'Unsubscribe from calendar' : 'Subscribe to calendar'}
+                title={subscribedCalendarIds.has(calendar.id) ? 'Unsubscribe -- stop receiving updates' : 'Subscribe -- keep meetings in sync'}
+              >
+                {subscribingId === calendar.id ? (
+                  <Loader2 className="w-3 h-3 animate-spin" />
+                ) : (
+                  <Star className={`w-3 h-3 ${subscribedCalendarIds.has(calendar.id) ? 'fill-current text-yellow-500' : ''}`} />
+                )}
+                {subscribingId === calendar.id ? 'Saving...' : subscribedCalendarIds.has(calendar.id) ? 'Subscribed' : 'Subscribe'}
+              </button>
+            )}
           </div>
         </div>
       </Link>
     </div>
-  );
+    );
+  };
 
   const totalFiltered = yourActive.length + yourPast.length + publicActive.length + publicPast.length;
   const yourTotal = yourActive.length + yourPast.length;
@@ -514,7 +575,7 @@ export default function EventsPage() {
     <div>
       <h1 className="text-3xl font-bold mb-2">Coordination Calendars</h1>
       <p className="text-sm text-muted-foreground mb-4">
-        Browse, create, and manage coordination calendars. Click any card to open a calendar and mark your availability.
+        Browse and manage Coordination Calendars -- shared scheduling tools used to find the best meeting times for a group. Subscribe to calendars you want to track.
       </p>
       {learnerMode && (
         <div className="mb-6 rounded-xl border border-blue-200 dark:border-blue-800/60 bg-blue-50 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-sm leading-relaxed">
@@ -532,18 +593,20 @@ export default function EventsPage() {
             <div className="px-4 pb-3">
               <p className="font-semibold text-blue-700 dark:text-blue-300 mb-1.5">What is this page?</p>
               <p className="mb-2">
-                This is your personal dashboard for all coordination calendars you have created or are following.
-                Each card below represents one calendar where a group is planning an event or meeting.
+                This page lists all Coordination Calendars -- tools used to plan meeting times for events and
+                group activities. Each card represents one calendar where participants mark their available time slots
+                so the best meeting time can be identified.
               </p>
               <p className="font-semibold text-blue-700 dark:text-blue-300 mb-1.5">How to navigate</p>
               <ul className="list-disc list-inside space-y-1 mb-2">
                 <li>Use the <strong>search bar</strong> to find calendars by name, creator, or ID.</li>
                 <li>Filter by <strong>month</strong> to narrow down active or past calendars.</li>
-                <li>Click any card to open that calendar and view or mark availability.</li>
+                <li>Click any card to open a calendar and mark your available times.</li>
+                <li>Use the <strong>Subscribe</strong> button to track a calendar -- subscribed calendars sync meeting times into your personal event view.</li>
               </ul>
               <p>
-                Calendars you own or follow appear under <strong>"Followed Events"</strong>.
-                All other public calendars are listed under <strong>"Public Events"</strong>.
+                Calendars you own or subscribe to appear under <strong>"Subscribed or Your Coordination Calendars"</strong>.
+                All public calendars are also listed under <strong>"Public Coordination Calendars"</strong> -- if you subscribe to one it appears in both sections.
               </p>
             </div>
           )}
@@ -557,40 +620,40 @@ export default function EventsPage() {
           <div className="flex flex-col sm:flex-row gap-3 mb-6">
             <Link
               to="/calendar"
-              className="inline-flex items-center gap-2 bg-primary text-primary-foreground hover:bg-primary/90 px-4 py-2 rounded-lg font-medium transition-colors shrink-0"
+              className="inline-flex items-center justify-center gap-2 w-full sm:w-auto bg-primary text-primary-foreground hover:bg-primary/90 px-4 py-2.5 rounded-lg font-medium transition-colors shrink-0"
             >
               <Plus className="w-4 h-4" />
               Create New Calendar
             </Link>
           </div>
 
-          {/* ── Followed Events ── */}
+          {/* -- Subscribed or Your Coordination Calendars (empty state) -- */}
           <div className="mb-8">
             <button
               onClick={() => setYourSectionCollapsed(!yourSectionCollapsed)}
               className="flex items-center gap-2 text-lg font-semibold text-foreground hover:text-primary mb-3 transition-colors"
             >
               <ChevronDown className={`w-5 h-5 transition-transform ${yourSectionCollapsed ? '-rotate-90' : 'rotate-0'}`} />
-              Followed Events
+              Subscribed or Your Coordination Calendars
               <span className="text-sm font-normal text-muted-foreground">(0)</span>
             </button>
             {!yourSectionCollapsed && (
               <p className="text-sm text-muted-foreground py-4 pl-1">
                 {isAuthenticated
-                  ? 'No calendars yet. Create one or follow a public calendar to see it here.'
-                  : 'Sign in to see your own and followed calendars here.'}
+                  ? 'No calendars yet. Create one or subscribe to a public calendar to see it here.'
+                  : 'Sign in to see your own and subscribed calendars here.'}
               </p>
             )}
           </div>
 
-          {/* ── Public Events ── */}
+          {/* -- Public Coordination Calendars (empty state) -- */}
           <div className="mb-8">
             <button
               onClick={() => setPublicSectionCollapsed(!publicSectionCollapsed)}
               className="flex items-center gap-2 text-lg font-semibold text-foreground hover:text-primary mb-3 transition-colors"
             >
               <ChevronDown className={`w-5 h-5 transition-transform ${publicSectionCollapsed ? '-rotate-90' : 'rotate-0'}`} />
-              Public Events
+              Public Coordination Calendars
               <span className="text-sm font-normal text-muted-foreground">(0)</span>
             </button>
             {!publicSectionCollapsed && (
@@ -606,7 +669,7 @@ export default function EventsPage() {
           <div className="flex flex-col sm:flex-row gap-3 mb-6">
             <Link
               to="/calendar"
-              className="inline-flex items-center gap-2 bg-primary text-primary-foreground hover:bg-primary/90 px-4 py-2 rounded-lg font-medium transition-colors shrink-0"
+              className="inline-flex items-center justify-center gap-2 w-full sm:w-auto bg-primary text-primary-foreground hover:bg-primary/90 px-4 py-2.5 rounded-lg font-medium transition-colors shrink-0"
             >
               <Plus className="w-4 h-4" />
               Create New Calendar
@@ -617,6 +680,8 @@ export default function EventsPage() {
               <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
               <input
                 type="text"
+                name="eventsSearch"
+                aria-label="Search events"
                 placeholder="Search by name, creator, or ID..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
@@ -636,6 +701,8 @@ export default function EventsPage() {
             {availableMonths.length > 0 && (
               <div className="relative shrink-0">
                 <select
+                  name="eventsMonthFilter"
+                  aria-label="Filter events by month"
                   value={selectedMonth}
                   onChange={(e) => setSelectedMonth(e.target.value)}
                   className="appearance-none pl-3 pr-8 py-2 border border-border rounded-lg bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/50 cursor-pointer"
@@ -670,23 +737,23 @@ export default function EventsPage() {
             </div>
           )}
 
-          {/* ── Followed Events ── */}
+          {/* -- Subscribed or Your Coordination Calendars -- */}
           <div className="mb-8">
             <button
               onClick={() => setYourSectionCollapsed(!yourSectionCollapsed)}
               className="flex items-center gap-2 text-lg font-semibold text-foreground hover:text-primary mb-3 transition-colors"
             >
               <ChevronDown className={`w-5 h-5 transition-transform ${yourSectionCollapsed ? '-rotate-90' : 'rotate-0'}`} />
-              Followed Events
+              Subscribed or Your Coordination Calendars
               <span className="text-sm font-normal text-muted-foreground">({yourTotal})</span>
             </button>
             {!yourSectionCollapsed && (
               <div>
                 {!isAuthenticated && (
-                  <p className="text-sm text-muted-foreground py-4 pl-1">Sign in to see your own and followed calendars here.</p>
+                  <p className="text-sm text-muted-foreground py-4 pl-1">Sign in to see your own and subscribed calendars here.</p>
                 )}
                 {isAuthenticated && yourActive.length === 0 && yourPast.length === 0 && (
-                  <p className="text-sm text-muted-foreground py-4 pl-1">No calendars yet. Create one or follow a public calendar to see it here.</p>
+                  <p className="text-sm text-muted-foreground py-4 pl-1">No calendars yet. Create one or subscribe to a public calendar to see it here.</p>
                 )}
                 {yourActive.length > 0 && (
                   <div className="mb-4">
@@ -715,14 +782,14 @@ export default function EventsPage() {
             )}
           </div>
 
-          {/* ── Public Events ── */}
+          {/* -- Public Coordination Calendars -- */}
           <div className="mb-8">
             <button
               onClick={() => setPublicSectionCollapsed(!publicSectionCollapsed)}
               className="flex items-center gap-2 text-lg font-semibold text-foreground hover:text-primary mb-3 transition-colors"
             >
               <ChevronDown className={`w-5 h-5 transition-transform ${publicSectionCollapsed ? '-rotate-90' : 'rotate-0'}`} />
-              Public Events
+              Public Coordination Calendars
               <span className="text-sm font-normal text-muted-foreground">({publicTotal})</span>
             </button>
             {!publicSectionCollapsed && (
@@ -733,7 +800,7 @@ export default function EventsPage() {
                 {publicActive.length > 0 && (
                   <div className="mb-4">
                     <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                      {publicActive.map((cal, i) => renderCalendarCard(cal, i))}
+                      {publicActive.map((cal, i) => renderCalendarCard(cal, i, { showSubscribeButton: true }))}
                     </div>
                   </div>
                 )}
@@ -748,7 +815,7 @@ export default function EventsPage() {
                     </button>
                     {!publicPastCollapsed && (
                       <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
-                        {publicPast.map((cal, i) => renderCalendarCard(cal, i))}
+                        {publicPast.map((cal, i) => renderCalendarCard(cal, i, { showSubscribeButton: true }))}
                       </div>
                     )}
                   </div>

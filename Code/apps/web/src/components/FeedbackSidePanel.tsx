@@ -3,13 +3,16 @@ import { X, MessageSquare, Send, CheckCircle, AlertTriangle, ExternalLink, Loade
 import { Link } from 'react-router-dom'
 import { apiClient } from '../lib/api-client'
 import LearnerHelpIcon from './LearnerHelpIcon'
+import MobilePanelSwitcher from './MobilePanelSwitcher'
+import type { PanelId } from './FloatingPanels'
 
 interface FeedbackSidePanelProps {
   isOpen: boolean
   onClose: () => void
+  onPanelChange: (panel: Exclude<PanelId, null>) => void
 }
 
-export function FeedbackSidePanel({ isOpen, onClose }: FeedbackSidePanelProps) {
+export function FeedbackSidePanel({ isOpen, onClose, onPanelChange }: FeedbackSidePanelProps) {
   const [message, setMessage] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [submitSuccess, setSubmitSuccess] = useState(false)
@@ -77,12 +80,12 @@ export function FeedbackSidePanel({ isOpen, onClose }: FeedbackSidePanelProps) {
   return (
     <aside
       className={`
-        shrink-0 sticky top-0 h-screen overflow-hidden
-        transition-all duration-300 ease-in-out
-        ${isOpen ? 'w-[22rem] sm:w-96' : 'w-0'}
+        fixed inset-y-0 right-0 z-50 w-screen transition-transform duration-300 ease-in-out
+        ${isOpen ? 'translate-x-0 pointer-events-auto sm:w-[22rem] md:w-96' : 'translate-x-full pointer-events-none sm:w-0'}
+        sm:sticky sm:top-0 sm:h-screen sm:shrink-0 sm:overflow-hidden sm:translate-x-0 sm:pointer-events-auto
       `}
     >
-      <div className={`w-[22rem] sm:w-96 min-w-[22rem] sm:min-w-[24rem] h-full flex flex-col bg-card border-l-2 border-amber-400 dark:border-amber-500 shadow-xl`}>
+      <div className={`ml-auto h-full w-screen flex flex-col bg-card border-l-2 border-amber-400 dark:border-amber-500 shadow-xl sm:w-[22rem] sm:min-w-[22rem] md:w-96 md:min-w-[24rem]`}>
       {/* ── Header ──────────────────────────────────────────────────────── */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-amber-50 dark:bg-amber-950/40">
         <div className="flex items-center gap-2">
@@ -97,6 +100,7 @@ export function FeedbackSidePanel({ isOpen, onClose }: FeedbackSidePanelProps) {
           <X className="h-4 w-4" />
         </button>
       </div>
+      <MobilePanelSwitcher activePanel="feedback" onPanelChange={onPanelChange} />
 
       {/* ── Body ────────────────────────────────────────────────────────── */}
       <div className="flex-1 overflow-y-auto p-4 flex flex-col">
@@ -119,6 +123,9 @@ export function FeedbackSidePanel({ isOpen, onClose }: FeedbackSidePanelProps) {
           {/* Hidden file input */}
           <input
             ref={attachFileRef}
+            id="feedback-attachments"
+            name="feedbackAttachments"
+            aria-label="Attach feedback images"
             type="file"
             accept="image/jpeg,image/png,image/gif,image/webp"
             multiple

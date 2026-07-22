@@ -106,6 +106,8 @@ This repository uses the following development skills (in `.claude/skills/`):
 | monorepo-conventions | pnpm workspaces, scripts, cross-app patterns |
 | testing-strategy | Vitest, Supertest, React Testing Library |
 | side-panel-design | FloatingPanel architecture, FAB cluster, side panel patterns |
+| mobile-audit | Audit mobile UX, accessibility, performance risks, and recommend fitting mobile UI libraries |
+| mobile-interaction-refactor | Refactor screens into touch-safe phone/tablet/desktop variants with bottom sheets and non-drag fallbacks |
 | environment-variables | Env var management across all apps and services |
 | deployment | Vercel frontend + Railway backend deployment workflows |
 | vercel-deploy | Build locally + deploy to Vercel CLI with zero build minutes |

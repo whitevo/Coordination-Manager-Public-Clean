@@ -2,7 +2,7 @@ import { useState, useEffect, useMemo } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
 import { Calendar, ExternalLink, Download, CalendarPlus, MapPin, ArrowLeft, Loader2, Copy, Check, Clock, Bell, BellOff } from 'lucide-react'
 import { apiClient } from '../lib/api-client'
-import { downloadICSFile, buildOutlookCalendarUrl, isSafeUrl } from '../lib/calendar-utils'
+import { downloadICSFile, buildOutlookCalendarUrl, isSafeUrl, resolveMeetingTitle } from '../lib/calendar-utils'
 import { getPrimaryTimezone, getTimezoneAbbr } from '../lib/timezone-data'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from '../components/Toast'
@@ -11,7 +11,13 @@ import { useToast } from '../components/Toast'
 function LinkifyText({ text }: { text: string }) {
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null)
   const stripped = text.replace(/<[^>]*>/g, '')
-  const parts = stripped.split(/(https?:\/\/[^\s]+)/g)
+  const markdownLinkRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g
+  const normalized = stripped.replace(markdownLinkRegex, (_match, label: string, url: string) => {
+    const trimmedLabel = label.trim()
+    const trimmedUrl = url.trim()
+    return trimmedLabel === trimmedUrl ? trimmedUrl : `${trimmedLabel} ${trimmedUrl}`
+  })
+  const parts = normalized.split(/(https?:\/\/[^\s]+)/g)
   return (
     <>
       {parts.map((part, i) =>
@@ -52,13 +58,13 @@ function formatInUserTz(iso: string, options: Intl.DateTimeFormatOptions) {
 }
 
 function buildGoogleCalendarUrl(meeting: MeetingData): string {
+  const displayTitle = resolveMeetingTitle({ title: meeting.title, calendarTitle: meeting.calendar_title })
   const params = new URLSearchParams({
     action: 'TEMPLATE',
-    text: meeting.calendar_title || meeting.title,
+    text: displayTitle,
     dates: `${new Date(meeting.start_time).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '')}/${new Date(meeting.end_time).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '')}`,
   })
-  const details = meeting.title !== meeting.calendar_title ? meeting.title : meeting.description
-  if (details) params.set('details', details)
+  if (meeting.description) params.set('details', meeting.description)
   if (meeting.meeting_link) params.set('location', meeting.meeting_link)
   return `https://calendar.google.com/calendar/render?${params.toString()}`
 }
@@ -140,7 +146,7 @@ export default function MeetingPage() {
       try {
         await login()
       } catch {
-        showToast('Sign in is required to follow this calendar.', 'error')
+        showToast('Sign in is required to subscribe to this calendar.', 'error')
       }
       return
     }
@@ -172,6 +178,9 @@ export default function MeetingPage() {
   const now = useNow(nearStart ? 1_000 : 60_000)
   const isPast = meeting ? endMs < now : false
   const hasStarted = meeting ? startMs <= now : true
+  const displayTitle = meeting
+    ? resolveMeetingTitle({ title: meeting.title, calendarTitle: meeting.calendar_title })
+    : 'Meeting'
   const countdown = useMemo(
     () => buildCountdown(meeting && !hasStarted ? meeting.start_time : null, now),
     [meeting, hasStarted, now]
@@ -221,7 +230,7 @@ export default function MeetingPage() {
           )}
 
           <h1 className="text-2xl md:text-3xl font-bold text-foreground mb-4 break-words overflow-hidden">
-            {meeting.calendar_title || meeting.title}
+            {displayTitle}
           </h1>
 
           <div className="space-y-3 mb-6">
@@ -249,10 +258,9 @@ export default function MeetingPage() {
               </div>
             )}
 
-            {/* Meeting title as description when calendar_title is the header */}
-            {meeting.title && meeting.title !== (meeting.calendar_title || meeting.title) && (
+            {meeting.description && (
               <div className="text-muted-foreground text-sm whitespace-pre-wrap border-l-2 border-border pl-4 py-1 mt-2 break-words overflow-hidden">
-                <LinkifyText text={meeting.title} />
+                <LinkifyText text={meeting.description} />
               </div>
             )}
           </div>
@@ -274,8 +282,8 @@ export default function MeetingPage() {
 
               <a
                 href={buildOutlookCalendarUrl({
-                  title: meeting.calendar_title || meeting.title,
-                  description: meeting.title !== meeting.calendar_title ? meeting.title : meeting.description,
+                  title: displayTitle,
+                  description: meeting.description,
                   start_time: meeting.start_time,
                   end_time: meeting.end_time,
                   meeting_link: meeting.meeting_link,
@@ -290,8 +298,8 @@ export default function MeetingPage() {
 
               <button
                 onClick={() => downloadICSFile({
-                  title: meeting.calendar_title || meeting.title,
-                  description: meeting.title !== meeting.calendar_title ? meeting.title : meeting.description,
+                  title: displayTitle,
+                  description: meeting.description,
                   start_time: meeting.start_time,
                   end_time: meeting.end_time,
                   meeting_link: meeting.meeting_link,
@@ -312,7 +320,7 @@ export default function MeetingPage() {
                 <div>
                   <p className="text-sm font-medium text-foreground">Subscribe mode</p>
                   <p className="text-xs text-muted-foreground">
-                    Follow this Coordination Calendar to keep new and changed meetings synced without re-adding manually.
+                    Subscribe to this Coordination Calendar to keep new and changed meetings synced without re-adding manually.
                   </p>
                 </div>
                 <button

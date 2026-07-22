@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type CSSProperties, type DragEvent, type MouseEvent, type PointerEvent as ReactPointerEvent, type ReactNode } from 'react'
+import { createPortal } from 'react-dom'
 import { EditorContent, Extension, InputRule, useEditor, wrappingInputRule } from '@tiptap/react'
 import { Markdown } from '@tiptap/markdown'
 import StarterKit from '@tiptap/starter-kit'
@@ -56,6 +57,12 @@ import { useAiAssistant } from '../contexts/AiAssistantContext'
 import { LeftPanelPortal } from '../contexts/LayoutContext'
 import TimezoneSelector from '../components/TimezoneSelector'
 import ColorGridPicker from '../components/ColorGridPicker'
+import ConfirmDialog from '../components/ConfirmDialog'
+import {
+  buildDiffuseTimeBackgroundFill,
+  inferRequestedTimezoneForAiResponse,
+  isExplicitPrimaryTimezoneChangeRequest,
+} from './time-management-page-helpers'
 import { useTimezones } from '../lib/use-timezones'
 import { isSafeUrl } from '../lib/calendar-utils'
 import { convertUtcTimeToTimezone, getCurrentTimeInTimezone, findTimezone } from '../lib/timezone-data'
@@ -146,7 +153,18 @@ interface SyncImportsResponse {
   updated?: number
   deleted?: number
   totalFound?: number
+  results?: Array<{
+    sourceType: 'google_oauth' | 'google_public_url' | 'coordination_calendar'
+    sourceId: string
+    inserted: number
+    updated: number
+    deleted: number
+    totalFound: number
+    error?: string
+  }>
 }
+
+type SourceLoadState = 'disabled' | 'loading' | 'synced' | 'error'
 
 interface WeekWindowCacheEntry {
   events: UserEventRecord[]
@@ -155,6 +173,7 @@ interface WeekWindowCacheEntry {
 
 interface TimeItem {
   id: string
+  interactionId: string
   sourceEventId: string
   occurrenceStartTime: string
   title: string
@@ -162,11 +181,14 @@ interface TimeItem {
   dayIndex: number
   startMinute: number
   durationMinutes: number
+  totalDurationMinutes?: number
   categoryIds: string[]
   sourceId: string
   sourceType: UserEventRecord['source_type']
   recurrenceRule?: RecurrenceRule | null
   isRecurringOccurrence: boolean
+  isStartSegment: boolean
+  isEndSegment: boolean
 }
 
 interface UserEventRecord {
@@ -177,6 +199,7 @@ interface UserEventRecord {
   location: string | null
   start_time: string
   end_time: string
+  is_public?: boolean
   source_type: 'manual' | 'google_oauth' | 'google_public_url' | 'coordination_calendar'
   source_id: string | null
   category_ids?: string[]
@@ -187,6 +210,15 @@ interface SelectionDraft {
   dayIndex: number
   startMinute: number
   endMinute: number
+}
+
+type PendingUnsavedAction =
+  | { type: 'switch-item'; itemId: string }
+  | { type: 'new-selection'; dayIndex: number; minute: number }
+
+interface PendingUnsavedAnchor {
+  x: number
+  y: number
 }
 
 interface ResizeState {
@@ -229,9 +261,11 @@ interface CopiedItemMetadata {
   meetingLink: string | null
   location: string | null
   durationMinutes: number
+  isPublic: boolean
   sourceId: string
   sourceType: UserEventRecord['source_type']
   categoryIds: string[]
+  recurrenceRule: RecurrenceRule
 }
 
 interface QuickTemplate {
@@ -240,6 +274,7 @@ interface QuickTemplate {
   title: string
   notes: string
   categoryIds: string[]
+  autoSaveEnabled: boolean
   sourceItemId: string
   createdAt: string
 }
@@ -258,6 +293,8 @@ interface StoredPreferences {
 }
 
 type LeftPanelSectionId = 'month' | 'modes' | 'sources' | 'categories' | 'editor' | 'timeWidth' | 'quickObjects'
+type TimeManagementLayoutMode = 'phone' | 'tablet' | 'desktop'
+type MobileSurface = 'calendar' | 'tools' | 'quickObjects'
 
 interface TimeManagementAiAction {
   type: string
@@ -314,6 +351,7 @@ const AUTO_SAVE_DELAY_MS = 15000
 const SAVE_SUCCESS_HOLD_MS = 2500
 const RECURRENCE_MAX_LOOKAHEAD_DAYS = 365 * 20
 const WEEK_WINDOW_CACHE_RADIUS = 1
+const WEEK_WINDOW_CACHE_TTL_MS = 60 * 1000
 
 const TAGS_LEGEND_COLOR = '#6b7280'
 const HEX_COLOR_RE = /^#[0-9a-fA-F]{6}$/
@@ -337,6 +375,10 @@ const CALENDAR_REPEAT_MIDDLE_INDEX = 1
 const DEFAULT_LEFT_PANEL_WIDTH_PX = 320
 const MIN_LEFT_PANEL_WIDTH_PX = 260
 const LEFT_PANEL_MAX_VIEWPORT_RATIO = 0.5
+const PHONE_BREAKPOINT_PX = 768
+const TABLET_BREAKPOINT_PX = 1024
+const MAX_MODE_COUNT = 3
+const MODE_NAME_SUGGESTIONS = ['Planning', 'test'] as const
 
 const formatAutoSaveCountdown = (milliseconds: number) => {
   const seconds = Math.max(0, Math.ceil(milliseconds / 1000))
@@ -355,6 +397,21 @@ const DEFAULT_SYNC_CALENDARS: SyncCalendar[] = [
 
 function isTimeWidth(value: unknown): value is TimeWidth {
   return value === 15 || value === 30 || value === 60
+}
+
+function getSuggestedModeName(modes: Pick<TimeManagementMode, 'name'>[]): string {
+  const used = new Set(
+    modes
+      .map((mode) => mode.name.trim().toLowerCase())
+      .filter((name) => name.length > 0)
+  )
+
+  const [primaryName, fallbackName] = MODE_NAME_SUGGESTIONS
+  if (!used.has(primaryName.toLowerCase())) {
+    return primaryName
+  }
+
+  return fallbackName
 }
 
 function isLeftPanelSectionId(value: unknown): value is LeftPanelSectionId {
@@ -693,6 +750,35 @@ function notesToEventDescription(notes: string): string | null {
   return notes.trim().length > 0 ? notes : null
 }
 
+function buildCopiedDescriptionWithLocation(description: string | null, location: string | null): string | null {
+  const rawDescription = typeof description === 'string' ? description : ''
+  const trimmedDescription = rawDescription.trim()
+  const trimmedLocation = typeof location === 'string' ? location.trim() : ''
+
+  if (!trimmedLocation) {
+    return trimmedDescription.length > 0 ? rawDescription : null
+  }
+
+  const locationLine = `Location: ${trimmedLocation}`
+  const hasLocationLine = rawDescription
+    .split(/\r?\n/)
+    .some((line) => line.trim().toLowerCase() === locationLine.toLowerCase())
+
+  if (hasLocationLine) {
+    return trimmedDescription.length > 0 ? rawDescription : locationLine
+  }
+
+  if (trimmedDescription.length === 0) {
+    return locationLine
+  }
+
+  return `${trimmedDescription}\n\n${locationLine}`
+}
+
+function buildEventDraftNotes(event: Pick<UserEventRecord, 'description'>): string {
+  return event.description || ''
+}
+
 function areStringArraysEqual(left: string[], right: string[]): boolean {
   if (left.length !== right.length) return false
   for (let index = 0; index < left.length; index += 1) {
@@ -747,6 +833,8 @@ function normaliseStoredQuickTemplate(source: unknown): QuickTemplate | null {
     title,
     notes,
     categoryIds,
+    // Legacy templates persisted before this flag existed should still auto-apply.
+    autoSaveEnabled: candidate.autoSaveEnabled !== false,
     sourceItemId,
     createdAt,
   }
@@ -827,6 +915,7 @@ function serialiseQuickTemplatesForCompare(value: unknown): string {
       template.title,
       template.notes,
       template.categoryIds,
+      template.autoSaveEnabled,
       template.sourceItemId,
       template.createdAt,
     ])
@@ -886,67 +975,6 @@ function hexToRgba(hex: string, alpha: number): string {
   return `rgba(${red}, ${green}, ${blue}, ${clampOpacity(alpha)})`
 }
 
-interface DiffuseTimeBackgroundFillOptions {
-  fadeStart?: boolean
-  fadeEnd?: boolean
-}
-
-// eslint-disable-next-line react-refresh/only-export-components -- pure fill helper exported for unit tests; intentionally co-located
-export function buildDiffuseTimeBackgroundFill(
-  color: string,
-  opacity: number,
-  options: DiffuseTimeBackgroundFillOptions = {}
-): string {
-  const coreOpacity = clampOpacity(opacity)
-  const edgeOpacity = coreOpacity * 0.45
-  const startOpacity = options.fadeStart === false ? coreOpacity : edgeOpacity
-  const endOpacity = options.fadeEnd === false ? coreOpacity : edgeOpacity
-
-  return `linear-gradient(180deg, ${hexToRgba(color, startOpacity)} 0%, ${hexToRgba(color, coreOpacity)} 20%, ${hexToRgba(color, coreOpacity)} 80%, ${hexToRgba(color, endOpacity)} 100%)`
-}
-
-const PRIMARY_TIMEZONE_PRESERVE_RE = /\b(keep|preserve|leave)\b.{0,28}\b(primary|default|main)\b.{0,28}\b(timezone|time zone|utc)\b/i
-const PRIMARY_TIMEZONE_CHANGE_RE = /\b(primary|default|main)\s+(timezone|time zone)\b|\b(timezone|time zone)\s+(primary|default|main)\b|\b(set|switch|change|make|replace)\b.{0,36}\b(primary|default|main)\b.{0,36}\b(timezone|time zone)\b/i
-
-// eslint-disable-next-line react-refresh/only-export-components -- exported for targeted AI safety regression tests
-export function isExplicitPrimaryTimezoneChangeRequest(message: string): boolean {
-  if (!message.trim()) return false
-  if (PRIMARY_TIMEZONE_PRESERVE_RE.test(message)) return false
-  return PRIMARY_TIMEZONE_CHANGE_RE.test(message)
-}
-
-function inferIanaFromFreeText(text: string): string | null {
-  if (!text.trim()) return null
-  if (/\beston/i.test(text)) return 'Europe/Tallinn'
-
-  const ianaMatch = text.match(/\b([A-Za-z_]+\/[A-Za-z_]+)\b/)
-  if (ianaMatch?.[1]) {
-    return ianaMatch[1]
-  }
-
-  const lower = text.toLowerCase()
-  if (lower.includes('utc')) return 'UTC'
-  return null
-}
-
-// eslint-disable-next-line react-refresh/only-export-components -- exported for regression tests around AI timezone omission edge-cases
-export function inferRequestedTimezoneForAiResponse(
-  userMessage: string,
-  explanation?: string,
-  summary?: string,
-): string | null {
-  const fromUser = inferIanaFromFreeText(userMessage)
-  if (fromUser && fromUser !== 'UTC') return fromUser
-
-  const fromExplanation = inferIanaFromFreeText(explanation || '')
-  if (fromExplanation && fromExplanation !== 'UTC') return fromExplanation
-
-  const fromSummary = inferIanaFromFreeText(summary || '')
-  if (fromSummary && fromSummary !== 'UTC') return fromSummary
-
-  return null
-}
-
 function persistStoredPreferences(state: StoredPreferences): boolean {
   try {
     localStorage.setItem(STORAGE_KEY, JSON.stringify(state))
@@ -974,17 +1002,123 @@ function normaliseStoredSyncCalendar(source: unknown): SyncCalendar | null {
   const id = typeof candidate.id === 'string' ? candidate.id : ''
   if (!id) return null
 
+  const resolvedName =
+    typeof candidate.name === 'string'
+      ? candidate.name
+      : typeof candidate.displayName === 'string'
+        ? candidate.displayName
+        : typeof candidate.display_name === 'string'
+          ? candidate.display_name
+          : id === MAIN_SOURCE_ID
+            ? 'Coordination Manager Main'
+            : 'Calendar'
+
+  const resolvedSourceType =
+    candidate.sourceType === 'external' || candidate.source_type === 'external'
+      ? 'external'
+      : 'app'
+
+  let resolvedExternalKind: SyncCalendar['externalKind']
+  if (candidate.externalKind === 'google_oauth' || candidate.externalKind === 'google_public_url') {
+    resolvedExternalKind = candidate.externalKind
+  } else if (candidate.external_kind === 'google_oauth' || candidate.external_kind === 'google_public_url') {
+    resolvedExternalKind = candidate.external_kind
+  } else {
+    resolvedExternalKind = undefined
+  }
+
+  const resolvedSecondaryLabel =
+    typeof candidate.secondaryLabel === 'string'
+      ? candidate.secondaryLabel
+      : typeof candidate.secondary_label === 'string'
+        ? candidate.secondary_label
+        : undefined
+
   return {
     id,
-    name: typeof candidate.name === 'string' ? candidate.name : id === MAIN_SOURCE_ID ? 'Coordination Manager Main' : 'Calendar',
+    name: resolvedName,
     color: typeof candidate.color === 'string' ? candidate.color : '#0f766e',
     enabled: typeof candidate.enabled === 'boolean' ? candidate.enabled : true,
-    sourceType: candidate.sourceType === 'external' ? 'external' : 'app',
-    externalKind: candidate.externalKind === 'google_oauth' || candidate.externalKind === 'google_public_url'
-      ? candidate.externalKind
-      : undefined,
-    secondaryLabel: typeof candidate.secondaryLabel === 'string' ? candidate.secondaryLabel : undefined,
+    sourceType: resolvedSourceType,
+    externalKind: resolvedExternalKind,
+    secondaryLabel: resolvedSecondaryLabel,
   }
+}
+
+function isPlaceholderExternalSourceName(value: string): boolean {
+  const trimmed = value.trim().toLowerCase()
+  return trimmed.length === 0 || trimmed === 'calendar'
+}
+
+function mergeModeExternalSource(params: {
+  existingSource: SyncCalendar | undefined
+  modeSource: SyncCalendar
+  enabledFromMode: boolean
+}): SyncCalendar {
+  const { existingSource, modeSource, enabledFromMode } = params
+  const nextName =
+    isPlaceholderExternalSourceName(modeSource.name) && existingSource?.name
+      ? existingSource.name
+      : modeSource.name
+
+  return {
+    ...modeSource,
+    name: nextName,
+    enabled: enabledFromMode,
+    secondaryLabel: modeSource.secondaryLabel ?? existingSource?.secondaryLabel,
+  }
+}
+
+function isReadOnlySource(source: SyncCalendar | null | undefined): boolean {
+  if (!source) return false
+  return source.sourceType === 'external' || (source.sourceType === 'app' && source.id !== MAIN_SOURCE_ID)
+}
+
+function buildAppSyncSourcesForMode(params: {
+  allModes: TimeManagementMode[]
+  activeModeId: string
+  activeModeName: string
+  activeModeColor: string
+  modeSyncById: Map<string, SyncCalendar>
+  previousSources: SyncCalendar[]
+  mainEnabled: boolean
+}): SyncCalendar[] {
+  const {
+    allModes,
+    activeModeId,
+    activeModeName,
+    activeModeColor,
+    modeSyncById,
+    previousSources,
+    mainEnabled,
+  } = params
+
+  const previousById = new Map(previousSources.map((source) => [source.id, source]))
+  const secondarySources = allModes
+    .filter((mode) => mode.id !== activeModeId)
+    .map((mode) => {
+      const modeSource = modeSyncById.get(mode.id)
+      const previousSource = previousById.get(mode.id)
+      return {
+        id: mode.id,
+        name: mode.name?.trim() || previousSource?.name || 'Mode',
+        color: isHexColor(mode.main_color) ? mode.main_color : previousSource?.color || '#0f766e',
+        enabled: modeSource ? Boolean(modeSource.enabled) : (previousSource?.enabled ?? false),
+        sourceType: 'app' as const,
+        secondaryLabel: 'Read-only mirror',
+      }
+    })
+
+  return [
+    {
+      id: MAIN_SOURCE_ID,
+      name: activeModeName,
+      color: activeModeColor,
+      enabled: mainEnabled,
+      sourceType: 'app' as const,
+    },
+    ...secondarySources,
+  ]
 }
 
 function buildModeJsonPayload(params: {
@@ -1049,29 +1183,42 @@ function snapMinute(minute: number, slotMinutes: number): number {
   return clampMinute(Math.floor(minute / slotMinutes) * slotMinutes, slotMinutes)
 }
 
-function snapMinuteToNearestEdge(minute: number, slotMinutes: number): number {
-  const slotIndex = Math.floor(minute / slotMinutes)
-  const slotStart = slotIndex * slotMinutes
-  const slotOffset = minute - slotStart
-  const shouldSnapDown = slotOffset < slotMinutes / 2
-  const snapped = shouldSnapDown ? slotStart : slotStart + slotMinutes
-  return clampMinute(snapped, slotMinutes)
-}
-
-function snapEdgeMinute(minute: number, slotMinutes: number): number {
-  const snapped = Math.round(minute / slotMinutes) * slotMinutes
-  return Math.max(0, Math.min(MINUTES_IN_DAY, snapped))
+function snapMinuteUnbounded(minute: number, slotMinutes: number): number {
+  return Math.round(minute / slotMinutes) * slotMinutes
 }
 
 function resolveDropStartMinute(
   pointerMinute: number,
   dragTopOffsetMinutes: number,
   slotMinutes: number,
-  durationMinutes: number
+  _durationMinutes: number
 ): number {
-  const snapped = snapMinuteToNearestEdge(pointerMinute - dragTopOffsetMinutes, slotMinutes)
-  const maxStartMinute = Math.max(0, MINUTES_IN_DAY - durationMinutes)
-  return Math.max(0, Math.min(snapped, maxStartMinute))
+  return snapMinuteUnbounded(pointerMinute - dragTopOffsetMinutes, slotMinutes)
+}
+
+function wrapMinuteWithinDay(minute: number): number {
+  return ((minute % MINUTES_IN_DAY) + MINUTES_IN_DAY) % MINUTES_IN_DAY
+}
+
+function normaliseDroppedMinuteToWeekDay(dayIndex: number, startMinute: number): { dayIndex: number; startMinute: number } | null {
+  let nextDayIndex = dayIndex
+  let nextMinute = startMinute
+
+  while (nextMinute < 0) {
+    nextDayIndex -= 1
+    nextMinute += MINUTES_IN_DAY
+  }
+
+  while (nextMinute >= MINUTES_IN_DAY) {
+    nextDayIndex += 1
+    nextMinute -= MINUTES_IN_DAY
+  }
+
+  if (nextDayIndex < 0 || nextDayIndex > 6) {
+    return null
+  }
+
+  return { dayIndex: nextDayIndex, startMinute: nextMinute }
 }
 
 function formatMinuteLabel(minute: number, iana: string, slotMinutes: number): string {
@@ -1292,7 +1439,6 @@ function mapEventToTimeItems(
     return []
   }
 
-  const startMinute = start.getUTCHours() * 60 + start.getUTCMinutes()
   const durationMinutes = Math.max(slotMinutes, Math.round((end.getTime() - start.getTime()) / 60_000))
   const recurrenceRule = normaliseRecurrenceRule(event.recurrence_rule)
 
@@ -1302,39 +1448,70 @@ function mapEventToTimeItems(
     Boolean(activeModeId) &&
     (event.source_id === activeModeId || event.source_id === MAIN_SOURCE_ID)
 
-  if (
-    event.source_type === 'manual' &&
-    activeModeId &&
-    typeof event.source_id === 'string' &&
-    event.source_id !== activeModeId &&
-    event.source_id !== MAIN_SOURCE_ID
-  ) {
-    return []
-  }
-
-  const dayIndex = getWeekDayIndex(start, currentWeekStart)
-
-  const baseItem: TimeItem = {
-    id: event.id,
+  const baseItemTemplate: Omit<TimeItem, 'id' | 'interactionId' | 'occurrenceStartTime' | 'dayIndex' | 'startMinute' | 'durationMinutes' | 'totalDurationMinutes' | 'isRecurringOccurrence' | 'isStartSegment' | 'isEndSegment'> = {
     sourceEventId: event.id,
-    occurrenceStartTime: event.start_time,
     title: event.title || 'Untitled meeting',
-    notes: [event.description, event.location].filter((value): value is string => Boolean(value)).join(' - '),
-    dayIndex,
-    startMinute: clampMinute(startMinute, slotMinutes),
-    durationMinutes,
+    notes: buildEventDraftNotes(event),
     categoryIds: Array.isArray(event.category_ids) ? event.category_ids : [],
     sourceId: isActiveManualModeEvent ? MAIN_SOURCE_ID : (event.source_id || MAIN_SOURCE_ID),
     sourceType: event.source_type,
     recurrenceRule,
-    isRecurringOccurrence: false,
+  }
+
+  const buildOccurrenceSegments = (
+    occurrenceStartIso: string,
+    occurrenceId: string,
+    isRecurringOccurrence: boolean
+  ): TimeItem[] => {
+    const occurrenceStart = new Date(occurrenceStartIso)
+    if (Number.isNaN(occurrenceStart.getTime())) return []
+
+    const occurrenceEndMs = occurrenceStart.getTime() + durationMinutes * 60_000
+    let segmentStartMs = occurrenceStart.getTime()
+    let continuationIndex = 0
+    const segments: TimeItem[] = []
+
+    while (segmentStartMs < occurrenceEndMs) {
+      const segmentStartDate = new Date(segmentStartMs)
+      const segmentDayStartMs = Date.UTC(
+        segmentStartDate.getUTCFullYear(),
+        segmentStartDate.getUTCMonth(),
+        segmentStartDate.getUTCDate(),
+        0,
+        0,
+        0
+      )
+      const segmentDayEndMs = segmentDayStartMs + DAY_MS
+      const segmentEndMs = Math.min(segmentDayEndMs, occurrenceEndMs)
+      const segmentDuration = Math.max(slotMinutes, Math.round((segmentEndMs - segmentStartMs) / 60_000))
+      const segmentStartMinute = Math.max(0, Math.round((segmentStartMs - segmentDayStartMs) / 60_000))
+      const segmentDayIndex = getWeekDayIndex(new Date(segmentDayStartMs), currentWeekStart)
+
+      if (segmentDayIndex >= 0 && segmentDayIndex <= 6) {
+        segments.push({
+          ...baseItemTemplate,
+          id: continuationIndex === 0 ? occurrenceId : `${occurrenceId}__seg-${continuationIndex}`,
+          interactionId: occurrenceId,
+          occurrenceStartTime: occurrenceStartIso,
+          dayIndex: segmentDayIndex,
+          startMinute: clampMinute(segmentStartMinute, slotMinutes),
+          durationMinutes: segmentDuration,
+          totalDurationMinutes: durationMinutes,
+          isRecurringOccurrence,
+          isStartSegment: continuationIndex === 0,
+          isEndSegment: segmentEndMs >= occurrenceEndMs,
+        })
+      }
+
+      segmentStartMs = segmentEndMs
+      continuationIndex += 1
+    }
+
+    return segments
   }
 
   if (recurrenceRule.type === 'none') {
-    if (dayIndex < 0 || dayIndex > 6) {
-      return []
-    }
-    return [baseItem]
+    return buildOccurrenceSegments(event.start_time, event.id, false)
   }
 
   const occurrenceStarts = getRecurringOccurrenceStartsInWeek(event, currentWeekStart)
@@ -1342,25 +1519,33 @@ function mapEventToTimeItems(
     return []
   }
 
-  return occurrenceStarts.map((occurrenceStart) => {
-    const occurrenceDate = new Date(occurrenceStart)
-    const occurrenceDayIndex = getWeekDayIndex(occurrenceDate, currentWeekStart)
-    const occurrenceMinute = occurrenceDate.getUTCHours() * 60 + occurrenceDate.getUTCMinutes()
-    return {
-      ...baseItem,
-      id: occurrenceStart === event.start_time ? event.id : `${event.id}_${occurrenceStart}`,
-      occurrenceStartTime: occurrenceStart,
-      dayIndex: occurrenceDayIndex,
-      startMinute: clampMinute(occurrenceMinute, slotMinutes),
-      recurrenceRule,
-      isRecurringOccurrence: occurrenceStart !== event.start_time,
-    }
-  })
+  return occurrenceStarts.flatMap((occurrenceStart) =>
+    buildOccurrenceSegments(
+      occurrenceStart,
+      occurrenceStart === event.start_time ? event.id : `${event.id}_${occurrenceStart}`,
+      occurrenceStart !== event.start_time
+    )
+  )
 }
 
 function buildEventTimestamp(day: Date, minute: number): string {
-  const startMs = Date.UTC(day.getFullYear(), day.getMonth(), day.getDate(), 0, 0, 0) + minute * 60_000
+  const safeMinute = Number.isFinite(minute) ? minute : 0
+  const startMs = Date.UTC(day.getFullYear(), day.getMonth(), day.getDate(), 0, 0, 0) + safeMinute * 60_000
   return new Date(startMs).toISOString()
+}
+
+function getTimeItemInteractionId(item: Pick<TimeItem, 'interactionId' | 'id'>): string {
+  return item.interactionId || item.id
+}
+
+function getTimeItemTotalDurationMinutes(
+  item: Pick<TimeItem, 'durationMinutes'> & { totalDurationMinutes?: number },
+  slotMinutes: number
+): number {
+  const rawDuration = Number.isFinite(item.totalDurationMinutes) ? item.totalDurationMinutes : item.durationMinutes
+  const normalizedDuration = Number(rawDuration)
+  if (!Number.isFinite(normalizedDuration)) return slotMinutes
+  return Math.max(slotMinutes, Math.round(normalizedDuration))
 }
 
 function normaliseCreatedManualEvent(
@@ -1676,7 +1861,7 @@ function MarkdownComposer({
   const [isGuideOpen, setIsGuideOpen] = useState(false)
   const editorSizeClasses = compact
     ? 'min-h-[10rem]'
-    : 'min-h-[13rem] max-h-[58vh] overflow-y-auto'
+    : 'h-full min-h-[10rem] sm:min-h-[13rem] overflow-y-auto'
 
   const handleToolbarMouseDownCapture = useCallback((event: MouseEvent<HTMLDivElement>) => {
     const target = event.target
@@ -1736,7 +1921,21 @@ function MarkdownComposer({
   const editor = useEditor({
     immediatelyRender: false,
     extensions: [
-      Markdown,
+      (() => {
+        const markdownExtension = Markdown as typeof Markdown & {
+          configure?: (options: { markedOptions?: { breaks?: boolean } }) => typeof Markdown
+        }
+
+        if (typeof markdownExtension.configure === 'function') {
+          return markdownExtension.configure({
+            markedOptions: {
+              breaks: true,
+            },
+          })
+        }
+
+        return Markdown
+      })(),
       StarterKit.configure({
         codeBlock: {
           HTMLAttributes: {
@@ -2407,7 +2606,7 @@ function MarkdownComposer({
 interface NoteEditorModalProps {
   open: boolean
   title: string
-  subtitle?: string
+  subtitle?: ReactNode
   titleValue?: string
   onTitleChange?: (value: string) => void
   titlePlaceholder?: string
@@ -2420,7 +2619,9 @@ interface NoteEditorModalProps {
   saveState?: 'idle' | 'dirty' | 'autosaving' | 'saved' | 'error'
   saveMetaLabel?: string | null
   saveLabel?: string
+  closeLabel?: string
   readOnly?: boolean
+  beforeTitleContent?: ReactNode
   children?: ReactNode
   autoFocusTitle?: boolean
   onAutoFocusComplete?: () => void
@@ -2442,13 +2643,16 @@ function NoteEditorModal({
   saveState = 'dirty',
   saveMetaLabel = null,
   saveLabel = 'Save notes',
+  closeLabel = 'Close',
   readOnly = false,
+  beforeTitleContent,
   children,
   autoFocusTitle = false,
   onAutoFocusComplete,
 }: NoteEditorModalProps) {
   const modalShellRef = useRef<HTMLDivElement | null>(null)
   const titleInputRef = useRef<HTMLInputElement | null>(null)
+  const isBackdropPressActiveRef = useRef(false)
 
   useEffect(() => {
     if (!open) return
@@ -2517,14 +2721,30 @@ function NoteEditorModal({
   const shouldRenderSaveButton = !readOnly && (showSaveButton ?? Boolean(onSave))
   const isSavedState = saveState === 'saved'
 
+  const handleBackdropMouseDown = useCallback((event: MouseEvent<HTMLDivElement>) => {
+    isBackdropPressActiveRef.current = event.target === event.currentTarget
+  }, [])
+
+  const handleBackdropMouseUp = useCallback((event: MouseEvent<HTMLDivElement>) => {
+    const shouldClose = isBackdropPressActiveRef.current && event.target === event.currentTarget
+    isBackdropPressActiveRef.current = false
+    if (shouldClose) {
+      onClose()
+    }
+  }, [onClose])
+
   if (!open) return null
 
-  return (
-    <div className="fixed inset-0 z-[120] flex items-center justify-center bg-black/55 p-3 backdrop-blur-sm" onClick={onClose}>
+  const modalContent = (
+    <div
+      className="fixed inset-0 z-[120] flex items-start justify-center overflow-y-auto bg-black/55 p-2 pt-[calc(env(safe-area-inset-top)+0.5rem)] pb-[calc(env(safe-area-inset-bottom)+0.5rem)] backdrop-blur-sm sm:items-center sm:p-3"
+      onMouseDown={handleBackdropMouseDown}
+      onMouseUp={handleBackdropMouseUp}
+    >
       <div
         ref={modalShellRef}
         tabIndex={-1}
-        className="flex h-[min(92vh,56rem)] w-full max-w-7xl flex-col overflow-hidden rounded-2xl border border-border bg-card text-card-foreground shadow-2xl"
+        className="flex h-auto max-h-full w-full max-w-7xl flex-col overflow-hidden rounded-2xl border border-border bg-card text-card-foreground shadow-2xl"
         onClick={(event) => event.stopPropagation()}
       >
         <div className="flex flex-wrap items-start justify-between gap-3 border-b border-border px-4 py-3">
@@ -2535,9 +2755,9 @@ function NoteEditorModal({
             </div>
             {subtitle && <p className="mt-1 text-xs text-muted-foreground">{subtitle}</p>}
           </div>
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 self-start sm:self-auto">
             <div
-              className={`w-[15.75rem] shrink-0 overflow-hidden transition-[opacity,transform] [transition-duration:900ms] ease-out ${
+              className={`w-[10.75rem] shrink-0 overflow-hidden transition-[opacity,transform] [transition-duration:900ms] ease-out sm:w-[15.75rem] ${
                 shouldRenderSaveButton ? 'translate-x-0 opacity-100' : 'pointer-events-none translate-x-6 opacity-0'
               }`}
             >
@@ -2545,7 +2765,7 @@ function NoteEditorModal({
                 type="button"
                 onClick={() => { void handleSaveClick() }}
                 disabled={saveDisabled || !onSave || isSavedState}
-                className={`flex h-10 w-full items-center gap-2 rounded-md px-3 text-sm font-medium text-white transition-colors disabled:cursor-not-allowed disabled:opacity-90 ${
+                className={`flex h-9 w-full items-center gap-1.5 rounded-md px-2.5 text-xs font-medium text-white transition-colors sm:h-10 sm:gap-2 sm:px-3 sm:text-sm disabled:cursor-not-allowed disabled:opacity-90 ${
                   saveState === 'autosaving'
                     ? 'bg-blue-600 hover:bg-blue-700'
                     : isSavedState
@@ -2575,16 +2795,18 @@ function NoteEditorModal({
             <button
               type="button"
               onClick={onClose}
-              className="rounded-md border border-border px-3 py-2 text-sm font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
+              className="h-9 min-w-[4.75rem] rounded-md border border-border px-3 py-1.5 text-sm font-medium text-muted-foreground hover:bg-muted hover:text-foreground sm:h-10 sm:min-w-[5.25rem]"
             >
-              Close
+              {closeLabel}
             </button>
           </div>
         </div>
 
         <div className="flex min-h-0 flex-1 flex-col px-4 py-4">
+          {beforeTitleContent}
+
           {!readOnly && onTitleChange && (
-            <div className="mb-3">
+            <div className="mb-3 shrink-0">
               <label className="mb-1 block text-xs font-semibold text-muted-foreground">Item title</label>
               <input
                    ref={titleInputRef}
@@ -2617,13 +2839,15 @@ function NoteEditorModal({
             onChange={onChange}
             readOnly={readOnly}
             placeholder="Write notes, paste documents, and organize them with markdown."
-            className="min-h-[24rem] flex-1"
+            className="min-h-0 flex-1"
             showToolbar={!readOnly}
           />
         </div>
       </div>
     </div>
   )
+
+  return createPortal(modalContent, document.body)
 }
 
 interface RecurrenceEndOptionsProps {
@@ -2689,13 +2913,13 @@ interface RecurrenceEditorProps {
   value: RecurrenceRule
   onChange: (nextRule: RecurrenceRule) => void
   expanded: boolean
-  onToggle: () => void
+  onExpandedChange: (nextExpanded: boolean) => void
   dateSeed: string
   readOnly?: boolean
   compact?: boolean
 }
 
-function RecurrenceEditor({ value, onChange, expanded, onToggle, dateSeed, readOnly = false, compact = false }: RecurrenceEditorProps) {
+function RecurrenceEditor({ value, onChange, expanded, onExpandedChange, dateSeed, readOnly = false, compact = false }: RecurrenceEditorProps) {
   const updateRule = (patch: Partial<RecurrenceRule>) => onChange({ ...value, ...patch })
   const seedDate = new Date(dateSeed)
 
@@ -2703,7 +2927,7 @@ function RecurrenceEditor({ value, onChange, expanded, onToggle, dateSeed, readO
     <div className={`overflow-hidden rounded-lg border border-border ${compact ? 'bg-background' : 'bg-card'}`}>
       <button
         type="button"
-        onClick={onToggle}
+        onClick={() => onExpandedChange(!expanded)}
         className="flex w-full items-center justify-between gap-2 bg-muted/50 px-3 py-2 text-xs font-medium text-foreground transition-colors hover:bg-muted"
       >
         <span className="flex items-center gap-1.5">
@@ -2837,12 +3061,23 @@ export default function TimeManagementPage() {
   }, [])
   const [slotMinutes, setSlotMinutes] = useState<TimeWidth>(() => persistedPreferences?.slotMinutes ?? DEFAULT_SLOT_MINUTES)
   const [isLeftPanelOpen, setIsLeftPanelOpen] = useState(() => persistedPreferences?.isLeftPanelOpen ?? true)
-  const [leftPanelWidthPx, setLeftPanelWidthPx] = useState(() => persistedPreferences?.leftPanelWidthPx ?? DEFAULT_LEFT_PANEL_WIDTH_PX)
+  const leftPanelPreferredWidthPxRef = useRef(persistedPreferences?.leftPanelWidthPx ?? DEFAULT_LEFT_PANEL_WIDTH_PX)
+  const [leftPanelWidthPx, setLeftPanelWidthPx] = useState(() => leftPanelPreferredWidthPxRef.current)
   const [isLeftPanelResizing, setIsLeftPanelResizing] = useState(false)
+  const [viewportWidth, setViewportWidth] = useState(() => (
+    typeof window === 'undefined' ? TABLET_BREAKPOINT_PX : window.innerWidth
+  ))
+  const [mobileSurface, setMobileSurface] = useState<MobileSurface>('calendar')
   const [expandedSections, setExpandedSections] = useState<Set<LeftPanelSectionId>>(
     () => new Set(persistedPreferences?.expandedSections ?? [])
   )
   const [selectionDraft, setSelectionDraft] = useState<SelectionDraft | null>(null)
+  const [isSelectionAdjusterExpanded, setIsSelectionAdjusterExpanded] = useState(false)
+  const [selectionAdjustStepSlots, setSelectionAdjustStepSlots] = useState(1)
+  const [isItemAdjusterExpanded, setIsItemAdjusterExpanded] = useState(false)
+  const [itemAdjustStepSlots, setItemAdjustStepSlots] = useState(1)
+  const [selectionLastChangedEdge, setSelectionLastChangedEdge] = useState<'start' | 'end' | null>(null)
+  const [itemLastChangedEdge, setItemLastChangedEdge] = useState<'start' | 'end' | null>(null)
   const [isHiddenModeEnabled, setIsHiddenModeEnabled] = useState(false)
   const [isSelecting, setIsSelecting] = useState(false)
   const [isDraggingItem, setIsDraggingItem] = useState(false)
@@ -2864,12 +3099,17 @@ export default function TimeManagementPage() {
   const [isExternalSyncing, setIsExternalSyncing] = useState(false)
   const [eventsError, setEventsError] = useState<string | null>(null)
   const [externalSyncStatus, setExternalSyncStatus] = useState<string | null>(null)
+  const [sourceLoadStates, setSourceLoadStates] = useState<Record<string, SourceLoadState>>({})
+  const [isAggregateSourceStatusVisible, setIsAggregateSourceStatusVisible] = useState(false)
   const [activeModeId, setActiveModeId] = useState<string | null>(null)
   const [modes, setModes] = useState<TimeManagementMode[]>([])
   const [isModesLoading, setIsModesLoading] = useState(false)
   const [isModeSettingsOpen, setIsModeSettingsOpen] = useState(false)
   const [modeNameDraft, setModeNameDraft] = useState('')
   const [isCreatingMode, setIsCreatingMode] = useState(false)
+  const [isDuplicatingMode, setIsDuplicatingMode] = useState(false)
+  const [highlightedModeId, setHighlightedModeId] = useState<string | null>(null)
+  const [isModeNameInputHighlighted, setIsModeNameInputHighlighted] = useState(false)
   const [isModeJsonImportOpen, setIsModeJsonImportOpen] = useState(false)
   const [modeJsonImportDraft, setModeJsonImportDraft] = useState('')
   const [isImportingModeJson, setIsImportingModeJson] = useState(false)
@@ -2889,6 +3129,9 @@ export default function TimeManagementPage() {
     }, 2200)
   }
   const [isModeJsonExportOpen, setIsModeJsonExportOpen] = useState(false)
+  const [modeJsonCopyFeedback, setModeJsonCopyFeedback] = useState<string | null>(null)
+  const [modeNameSaveFeedback, setModeNameSaveFeedback] = useState<string | null>(null)
+  const [isModeNameSaveNoChangePulse, setIsModeNameSaveNoChangePulse] = useState(false)
   const [isRenamingMode, setIsRenamingMode] = useState(false)
   const [modeDeleteState, setModeDeleteState] = useState<{ open: boolean; action: 'move' | null; transferToModeId: string | null }>({
     open: false,
@@ -2898,6 +3141,7 @@ export default function TimeManagementPage() {
   const [copiedItem, setCopiedItem] = useState<CopiedItemMetadata | null>(null)
   const [clipboardStatus, setClipboardStatus] = useState<string | null>(null)
   const [categories, setCategories] = useState<Category[]>([])
+  const [categoryDeleteTarget, setCategoryDeleteTarget] = useState<Category | null>(null)
   const [prefs, setPrefs] = useState<TimeManagementPrefs>({
     main_color: '#2563eb',
     main_label: 'Coordination Manager Main',
@@ -2912,6 +3156,9 @@ export default function TimeManagementPage() {
   const [exportStatus, setExportStatus] = useState<string | null>(null)
   const [isExporting, setIsExporting] = useState(false)
   const [isDeleteConfirmOpen, setIsDeleteConfirmOpen] = useState(false)
+  const [pendingUnsavedAction, setPendingUnsavedAction] = useState<PendingUnsavedAction | null>(null)
+  const [pendingUnsavedAnchor, setPendingUnsavedAnchor] = useState<PendingUnsavedAnchor | null>(null)
+  const [isPendingUnsavedActionSaving, setIsPendingUnsavedActionSaving] = useState(false)
   const [calendarItemContextMenu, setCalendarItemContextMenu] = useState<{
     itemId: string
     x: number
@@ -2921,6 +3168,12 @@ export default function TimeManagementPage() {
   const [contextMenuDeleteConfirmOpen, setContextMenuDeleteConfirmOpen] = useState(false)
   const [contextMenuCategorySubmenuOpen, setContextMenuCategorySubmenuOpen] = useState(false)
   const calendarItemContextMenuRef = useRef<HTMLDivElement | null>(null)
+  const modeJsonCopyFeedbackTimerRef = useRef<number | null>(null)
+  const modeNameSaveFeedbackTimerRef = useRef<number | null>(null)
+  const modeNameNoChangePulseTimerRef = useRef<number | null>(null)
+  const highlightedModeTimerRef = useRef<number | null>(null)
+  const modeNameInputHighlightTimerRef = useRef<number | null>(null)
+  const modeNameInputRef = useRef<HTMLInputElement | null>(null)
   const [contextMenuPosition, setContextMenuPosition] = useState<{ left: number; top: number } | null>(null)
   const [selectionPasteContextMenu, setSelectionPasteContextMenu] = useState<{ x: number; y: number } | null>(null)
   const activeModeIdRef = useRef<string | null>(null)
@@ -2936,6 +3189,15 @@ export default function TimeManagementPage() {
   const syncChannelRef = useRef<BroadcastChannel | null>(null)
   const hasBroadcastedInitialSyncRef = useRef(false)
   const enabledExternalSourceIdsRef = useRef<string[]>([])
+  const aggregateSourceStatusFadeTimerRef = useRef<number | null>(null)
+
+  useEffect(() => {
+    return () => {
+      if (aggregateSourceStatusFadeTimerRef.current !== null) {
+        window.clearTimeout(aggregateSourceStatusFadeTimerRef.current)
+      }
+    }
+  }, [])
 
   useEffect(() => {
     activeModeIdRef.current = activeModeId
@@ -2944,8 +3206,16 @@ export default function TimeManagementPage() {
   useEffect(() => {
     currentWeekStartRef.current = currentWeekStart
   }, [currentWeekStart])
+
+  useEffect(() => {
+    setEditingCategoryId(null)
+    setCategoryDraft(null)
+    setCategoryDeleteTarget(null)
+  }, [activeModeId])
+
   const [deletingBackgroundId, setDeletingBackgroundId] = useState<string | null>(null)
   const [deletingTemplateId, setDeletingTemplateId] = useState<string | null>(null)
+  const [deletingTemplatePopoverPosition, setDeletingTemplatePopoverPosition] = useState<{ left: number; top: number } | null>(null)
   const [pendingTemplateSourceId, setPendingTemplateSourceId] = useState<string | null>(null)
   const [pendingTemplateQuickName, setPendingTemplateQuickName] = useState('')
   const [isTemplateSelectionMode, setIsTemplateSelectionMode] = useState(false)
@@ -2971,19 +3241,132 @@ export default function TimeManagementPage() {
   const [timeBackgrounds, setTimeBackgrounds] = useState<TimeBackgroundPeriod[]>(
     () => persistedPreferences?.timeBackgrounds ?? []
   )
+  const layoutMode: TimeManagementLayoutMode = viewportWidth < PHONE_BREAKPOINT_PX
+    ? 'phone'
+    : viewportWidth < TABLET_BREAKPOINT_PX
+      ? 'tablet'
+      : 'desktop'
+  const isPhoneLayout = layoutMode === 'phone'
+  const isDesktopLayout = layoutMode === 'desktop'
+  const showDesktopLeftPanel = !isPhoneLayout && isLeftPanelOpen
+  const showMobileToolsOverlay = isPhoneLayout && mobileSurface === 'tools'
+  const showMobileQuickObjectsOverlay = isPhoneLayout && mobileSurface === 'quickObjects'
+  const isToolsSurfaceVisible = showDesktopLeftPanel || showMobileToolsOverlay || showMobileQuickObjectsOverlay
+  const showMainQuickTemplates = showQuickTemplatesInMain && !showMobileQuickObjectsOverlay
+
+  useEffect(() => {
+    if (typeof window === 'undefined') return undefined
+
+    const handleResize = () => {
+      setViewportWidth(window.innerWidth)
+    }
+
+    window.addEventListener('resize', handleResize)
+    return () => window.removeEventListener('resize', handleResize)
+  }, [])
+
+  useEffect(() => {
+    if (!isPhoneLayout) {
+      setMobileSurface('calendar')
+      return
+    }
+
+    if (isFullEditorOpen) {
+      setMobileSurface('calendar')
+      return
+    }
+
+    if (showQuickTemplatesInMain && mobileSurface === 'quickObjects') {
+      return
+    }
+
+    if (!isLeftPanelOpen && mobileSurface === 'tools') {
+      setMobileSurface('calendar')
+    }
+  }, [isFullEditorOpen, isLeftPanelOpen, isPhoneLayout, mobileSurface, showQuickTemplatesInMain])
+
+  useEffect(() => {
+    if (!isPhoneLayout && !showQuickTemplatesInMain) return
+    if (isPhoneLayout && quickTemplatesMainExpanded) {
+      setQuickTemplatesMainExpanded(false)
+    }
+  }, [isPhoneLayout, quickTemplatesMainExpanded, showQuickTemplatesInMain])
+
+  useEffect(() => {
+    if (!showMobileQuickObjectsOverlay || !isLeftPanelOpen) return
+
+    setExpandedSections((prev) => {
+      if (prev.has('quickObjects')) return prev
+      const next = new Set(prev)
+      next.add('quickObjects')
+      return next
+    })
+
+    window.setTimeout(() => {
+      sectionQuickObjectsRef.current?.scrollIntoView({ behavior: 'smooth', block: 'start' })
+    }, 80)
+  }, [isLeftPanelOpen, showMobileQuickObjectsOverlay])
+
+  const openLeftPanelSection = useCallback((section: LeftPanelSectionId) => {
+    setIsLeftPanelOpen(true)
+    setExpandedSections((prev) => {
+      const next = new Set(prev)
+      next.add(section)
+      return next
+    })
+
+    if (isPhoneLayout) {
+      setMobileSurface(section === 'quickObjects' ? 'quickObjects' : 'tools')
+    }
+  }, [isPhoneLayout])
+
+  const openMobileCalendarSurface = useCallback(() => {
+    if (isPhoneLayout) {
+      setMobileSurface('calendar')
+    }
+  }, [isPhoneLayout])
+
+  const openQuickObjectsSurface = useCallback(() => {
+    if (isPhoneLayout) {
+      setIsLeftPanelOpen(true)
+      setMobileSurface('quickObjects')
+      return
+    }
+
+    openLeftPanelSection('quickObjects')
+  }, [isPhoneLayout, openLeftPanelSection])
+
+  const openEditorSurface = useCallback((options?: { autoFocusTitle?: boolean }) => {
+    setShowItemRecurrencePanel(false)
+    setAutoFocusTitleOnEditorOpen(Boolean(options?.autoFocusTitle))
+    setIsFullEditorOpen(true)
+
+    if (isPhoneLayout) {
+      setMobileSurface('calendar')
+    }
+  }, [isPhoneLayout])
+
   const closeLeftPanel = useCallback(() => {
     setIsLeftPanelOpen(false)
     setExpandedSections(new Set())
-  }, [])
+    if (isPhoneLayout) {
+      setMobileSurface('calendar')
+    }
+  }, [isPhoneLayout])
   const collapseLeftPanelSections = useCallback(() => {
     setExpandedSections(new Set())
   }, [])
   const reopenLeftPanelCollapsed = useCallback(() => {
     setIsLeftPanelOpen(true)
     setExpandedSections(new Set())
-  }, [])
+    if (isPhoneLayout) {
+      setMobileSurface('tools')
+    }
+  }, [isPhoneLayout])
   const titleTypingHintTimeoutRef = useRef<number | null>(null)
   const descriptionHintTimeoutRef = useRef<number | null>(null)
+  const selectionChangePulseTimeoutRef = useRef<number | null>(null)
+  const itemChangePulseTimeoutRef = useRef<number | null>(null)
   const selectionTitleInputRef = useRef<HTMLInputElement | null>(null)
   const isCreatingItemRef = useRef(false)
   const eventsRef = useRef<UserEventRecord[]>([])
@@ -2992,12 +3375,19 @@ export default function TimeManagementPage() {
   const currentWeekStartRef = useRef(currentWeekStart)
   const weekWindowCacheRef = useRef(new Map<string, WeekWindowCacheEntry>())
   const weekWindowRequestsRef = useRef(new Map<string, Promise<UserEventRecord[]>>())
+  const crossTabRefreshTimerRef = useRef<number | null>(null)
+  // Unique per-tab id so this tab can ignore the sync pings it broadcasts itself.
+  // Without this, the tab's own state-change broadcast would trigger a silent
+  // refetch that overwrites optimistic/in-progress edits, causing a visible
+  // backtrack render (the item briefly reverts to server state, then updates).
+  const syncTabIdRef = useRef<string>(`tab-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`)
 
   const notifyTimeManagementDataChanged = useCallback((reason: string) => {
     if (typeof window === 'undefined') return
     const payload = {
       type: 'time-management-updated',
       reason,
+      tabId: syncTabIdRef.current,
       updatedAt: Date.now(),
     }
     syncChannelRef.current?.postMessage(payload)
@@ -3128,6 +3518,7 @@ export default function TimeManagementPage() {
     selectionDraft,
   ])
   const dragTopOffsetMinutesRef = useRef(0)
+  const selectionAnchorDayColumnRef = useRef<HTMLDivElement | null>(null)
   const editorSectionRef = useRef<HTMLElement | null>(null)
   const calendarScrollContainerRef = useRef<HTMLDivElement>(null)
   const hasAutoScrolledToWeekItemRef = useRef(false)
@@ -3184,12 +3575,12 @@ export default function TimeManagementPage() {
   }, [isLeftPanelOpen])
 
   useEffect(() => {
-    setLeftPanelWidthPx((prev) => clampLeftPanelWidth(prev))
+    setLeftPanelWidthPx(clampLeftPanelWidth(leftPanelPreferredWidthPxRef.current))
   }, [clampLeftPanelWidth])
 
   useEffect(() => {
     const handleWindowResize = () => {
-      setLeftPanelWidthPx((prev) => clampLeftPanelWidth(prev))
+      setLeftPanelWidthPx(clampLeftPanelWidth(leftPanelPreferredWidthPxRef.current))
     }
 
     window.addEventListener('resize', handleWindowResize)
@@ -3211,7 +3602,9 @@ export default function TimeManagementPage() {
       }
 
       const asideRect = aside.getBoundingClientRect()
-      const nextWidth = clampLeftPanelWidth(event.clientX - asideRect.left)
+      const nextPreferredWidth = Math.max(MIN_LEFT_PANEL_WIDTH_PX, Math.round(event.clientX - asideRect.left))
+      leftPanelPreferredWidthPxRef.current = nextPreferredWidth
+      const nextWidth = clampLeftPanelWidth(nextPreferredWidth)
       setLeftPanelWidthPx(nextWidth)
     }
 
@@ -3279,7 +3672,7 @@ export default function TimeManagementPage() {
       showQuickTemplatesInMain,
       quickTemplatesMainExpanded,
       isLeftPanelOpen,
-      leftPanelWidthPx,
+      leftPanelWidthPx: leftPanelPreferredWidthPxRef.current,
       expandedSections: Array.from(expandedSections),
     }
     persistStoredPreferences(state)
@@ -3439,22 +3832,30 @@ export default function TimeManagementPage() {
             mergedExternalSources.set(source.id, source)
           }
           for (const source of modeSyncCalendars.filter((entry) => entry.sourceType === 'external')) {
-            mergedExternalSources.set(source.id, {
-              ...source,
-              enabled: modeSyncById.has(source.id)
-                ? Boolean(modeSyncById.get(source.id)?.enabled)
-                : source.enabled,
-            })
+            mergedExternalSources.set(
+              source.id,
+              mergeModeExternalSource({
+                existingSource: mergedExternalSources.get(source.id),
+                modeSource: source,
+                enabledFromMode: modeSyncById.has(source.id)
+                  ? Boolean(modeSyncById.get(source.id)?.enabled)
+                  : source.enabled,
+              })
+            )
           }
 
+          const appSources = buildAppSyncSourcesForMode({
+            allModes: modes,
+            activeModeId: activeMode.id,
+            activeModeName: activeMode.name?.trim() || 'Coordination Manager Main',
+            activeModeColor: isHexColor(activeMode.main_color) ? activeMode.main_color : '#2563eb',
+            modeSyncById,
+            previousSources: prev,
+            mainEnabled: modeMainSource ? Boolean(modeMainSource.enabled) : (previousMainSource?.enabled ?? true),
+          })
+
           return [
-            {
-              id: MAIN_SOURCE_ID,
-              name: activeMode.name?.trim() || 'Coordination Manager Main',
-              color: isHexColor(activeMode.main_color) ? activeMode.main_color : '#2563eb',
-              enabled: modeMainSource ? Boolean(modeMainSource.enabled) : (previousMainSource?.enabled ?? true),
-              sourceType: 'app',
-            },
+            ...appSources,
             ...Array.from(mergedExternalSources.values()),
           ]
         })
@@ -3486,12 +3887,13 @@ export default function TimeManagementPage() {
     )
   }, [prefs.main_color, prefs.main_label])
 
-  // Fetch user-defined categories and Time-Management prefs.
+  // Fetch user-defined categories for the currently active mode.
   useEffect(() => {
     if (!isAuthenticated) {
       setCategories([])
       return
     }
+
     let cancelled = false
     dedupedGet<{ categories: Category[] }>('/api/time-management/categories')
       .then((res) => {
@@ -3511,6 +3913,20 @@ export default function TimeManagementPage() {
         if (cancelled) return
         console.error('Failed to fetch categories:', err)
       })
+
+    return () => {
+      cancelled = true
+    }
+  }, [activeModeId, isAuthenticated])
+
+  // Fetch Time-Management prefs.
+  useEffect(() => {
+    if (!isAuthenticated) {
+      return
+    }
+
+    let cancelled = false
+
     dedupedGet<{ prefs: TimeManagementPrefs }>('/api/time-management/prefs')
       .then((res) => {
         if (cancelled) return
@@ -3591,6 +4007,88 @@ export default function TimeManagementPage() {
 
     return () => {
       cancelled = true
+    }
+  }, [fetchEvents, isAuthenticated])
+
+  useEffect(() => {
+    if (weekWindowCacheRef.current.size === 0) {
+      return
+    }
+
+    const updatedAt = Date.now()
+    for (const [cacheKey, cacheEntry] of weekWindowCacheRef.current.entries()) {
+      weekWindowCacheRef.current.set(cacheKey, {
+        ...cacheEntry,
+        events,
+        updatedAt,
+      })
+    }
+  }, [events])
+
+  useEffect(() => {
+    if (!isAuthenticated || typeof window === 'undefined') {
+      return
+    }
+
+    const scheduleRefresh = () => {
+      if (crossTabRefreshTimerRef.current !== null) {
+        window.clearTimeout(crossTabRefreshTimerRef.current)
+      }
+
+      crossTabRefreshTimerRef.current = window.setTimeout(() => {
+        crossTabRefreshTimerRef.current = null
+        void fetchEvents({ silent: true })
+      }, 180)
+    }
+
+    const isSelfOriginated = (raw: unknown): boolean => {
+      if (!raw || typeof raw !== 'object') return false
+      const tabId = (raw as { tabId?: unknown }).tabId
+      return typeof tabId === 'string' && tabId === syncTabIdRef.current
+    }
+
+    const onStorage = (event: StorageEvent) => {
+      if (event.key !== TIME_MANAGEMENT_SYNC_STORAGE_KEY || !event.newValue) return
+      try {
+        if (isSelfOriginated(JSON.parse(event.newValue))) return
+      } catch {
+        // Fall through and refresh if the payload cannot be parsed.
+      }
+      scheduleRefresh()
+    }
+
+    const onWindowFocus = () => {
+      scheduleRefresh()
+    }
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        scheduleRefresh()
+      }
+    }
+
+    let channel: BroadcastChannel | null = null
+    if (typeof BroadcastChannel !== 'undefined') {
+      channel = new BroadcastChannel(TIME_MANAGEMENT_SYNC_CHANNEL)
+      channel.onmessage = (event) => {
+        if (isSelfOriginated(event.data)) return
+        scheduleRefresh()
+      }
+    }
+
+    window.addEventListener('storage', onStorage)
+    window.addEventListener('focus', onWindowFocus)
+    document.addEventListener('visibilitychange', onVisibilityChange)
+
+    return () => {
+      if (crossTabRefreshTimerRef.current !== null) {
+        window.clearTimeout(crossTabRefreshTimerRef.current)
+        crossTabRefreshTimerRef.current = null
+      }
+      window.removeEventListener('storage', onStorage)
+      window.removeEventListener('focus', onWindowFocus)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+      channel?.close()
     }
   }, [fetchEvents, isAuthenticated])
 
@@ -3760,21 +4258,31 @@ export default function TimeManagementPage() {
   }, [activeModeId, modes, syncCalendars])
 
   useEffect(() => {
-    const onMouseUp = () => {
+    const onPointerUp = () => {
       setIsSelecting(false)
-      if (selectionDraft) {
-        setIsLeftPanelOpen(true)
-        setExpandedSections((prev) => {
-          const next = new Set(prev)
-          next.add('editor')
-          return next
-        })
+      selectionAnchorDayColumnRef.current = null
+      if (selectionDraft && isPhoneLayout && !movingItemId && !isFullEditorOpen) {
+        openEditorSurface({ autoFocusTitle: true })
+        return
+      }
+
+      if (selectionDraft && !isPhoneLayout) {
+        openLeftPanelSection('editor')
       }
     }
 
-    window.addEventListener('mouseup', onMouseUp)
-    return () => window.removeEventListener('mouseup', onMouseUp)
-  }, [selectionDraft])
+    const onPointerCancel = () => {
+      setIsSelecting(false)
+      selectionAnchorDayColumnRef.current = null
+    }
+
+    window.addEventListener('pointerup', onPointerUp)
+    window.addEventListener('pointercancel', onPointerCancel)
+    return () => {
+      window.removeEventListener('pointerup', onPointerUp)
+      window.removeEventListener('pointercancel', onPointerCancel)
+    }
+  }, [isFullEditorOpen, isPhoneLayout, movingItemId, openEditorSurface, openLeftPanelSection, selectionDraft])
 
   const weekDays = useMemo(
     () => Array.from({ length: 7 }, (_, idx) => addDays(currentWeekStart, idx)),
@@ -3801,6 +4309,37 @@ export default function TimeManagementPage() {
     enabledExternalSourceIdsRef.current = enabledExternalSources.map((source) => source.id)
   }, [enabledExternalSources])
 
+  useEffect(() => {
+    setSourceLoadStates((prev) => {
+      const next: Record<string, SourceLoadState> = {}
+      for (const source of syncCalendars) {
+        if (!source.enabled) {
+          next[source.id] = 'disabled'
+          continue
+        }
+
+        if (source.sourceType === 'app') {
+          if (isEventsLoading) {
+            next[source.id] = 'loading'
+          } else if (eventsError) {
+            next[source.id] = 'error'
+          } else {
+            next[source.id] = 'synced'
+          }
+          continue
+        }
+
+        if (isExternalSyncing) {
+          next[source.id] = 'loading'
+          continue
+        }
+
+        next[source.id] = prev[source.id] === 'error' ? 'error' : 'synced'
+      }
+      return next
+    })
+  }, [eventsError, isEventsLoading, isExternalSyncing, syncCalendars])
+
   const hydrateWeekWindow = useCallback(async (weekStart: Date, options?: { background?: boolean; forceRefresh?: boolean }) => {
     if (isAuthLoading || !isAuthenticated || isTraveler || enabledExternalSources.length === 0) {
       return [] as UserEventRecord[]
@@ -3814,6 +4353,16 @@ export default function TimeManagementPage() {
         setEventsError(null)
         setIsEventsLoading(false)
       }
+
+      // Keep week navigation instant, but refresh stale windows in the background
+      // so adds/updates/deletes appear without forcing a full page reload.
+      const isStale = (Date.now() - cachedEntry.updatedAt) > WEEK_WINDOW_CACHE_TTL_MS
+      if (isStale) {
+        void hydrateWeekWindow(weekStart, { background: true, forceRefresh: true }).catch(() => {
+          // Ignore background refresh errors; current cached data remains usable.
+        })
+      }
+
       return cachedEntry.events
     }
 
@@ -3831,6 +4380,13 @@ export default function TimeManagementPage() {
       if (shouldShowLoading) {
         setIsExternalSyncing(true)
         setExternalSyncStatus(null)
+        setSourceLoadStates((prev) => {
+          const next = { ...prev }
+          for (const source of enabledExternalSources) {
+            next[source.id] = 'loading'
+          }
+          return next
+        })
       }
 
       try {
@@ -3847,6 +4403,23 @@ export default function TimeManagementPage() {
         const inserted = Number(summary.inserted || 0)
         const updated = Number(summary.updated || 0)
         const deleted = Number(summary.deleted || 0)
+
+        if (shouldShowLoading) {
+          const resultsById = new Map(
+            Array.isArray(summary.results)
+              ? summary.results.map((result) => [result.sourceId, result])
+              : []
+          )
+          setSourceLoadStates((prev) => {
+            const next = { ...prev }
+            for (const source of enabledExternalSources) {
+              const sourceSummary = resultsById.get(source.id)
+              next[source.id] = sourceSummary?.error ? 'error' : 'synced'
+            }
+            return next
+          })
+        }
+
         const fetchedEvents = await fetchEvents({ silent: !shouldShowLoading, weekStart })
 
         weekWindowCacheRef.current.set(weekKey, {
@@ -3863,6 +4436,13 @@ export default function TimeManagementPage() {
         const message = err instanceof Error ? err.message : 'Failed to sync connected calendars.'
         if (shouldShowLoading) {
           setExternalSyncStatus(message)
+          setSourceLoadStates((prev) => {
+            const next = { ...prev }
+            for (const source of enabledExternalSources) {
+              next[source.id] = 'error'
+            }
+            return next
+          })
         }
         return [] as UserEventRecord[]
       } finally {
@@ -3914,6 +4494,18 @@ export default function TimeManagementPage() {
   }, [activeModeId, activeSourceIds, currentWeekStart, events, slotMinutes])
 
   const visibleItems = items
+
+  const interactionItemMap = useMemo(() => {
+    const map = new Map<string, TimeItem>()
+    for (const item of visibleItems) {
+      const interactionId = getTimeItemInteractionId(item)
+      const existing = map.get(interactionId)
+      if (!existing || item.isStartSegment) {
+        map.set(interactionId, item)
+      }
+    }
+    return map
+  }, [visibleItems])
 
   const dayColumnWeights = useMemo(() => {
     const usedDayIndexes = new Set(visibleItems.map((item) => item.dayIndex))
@@ -3994,8 +4586,13 @@ export default function TimeManagementPage() {
   }, [currentWeekStart])
 
   const selectedItem = useMemo(
-    () => items.find((item) => item.id === selectedItemId) || null,
-    [items, selectedItemId]
+    () => {
+      if (!selectedItemId) return null
+      return interactionItemMap.get(selectedItemId)
+        || items.find((item) => item.id === selectedItemId)
+        || null
+    },
+    [interactionItemMap, items, selectedItemId]
   )
 
   const selectedEvent = useMemo(
@@ -4008,17 +4605,33 @@ export default function TimeManagementPage() {
 
   const movingItemIsRecurring = useMemo(() => {
     if (!movingItemId) return false
-    const moving = items.find((item) => item.id === movingItemId)
+    const moving = interactionItemMap.get(movingItemId)
+      || items.find((item) => item.id === movingItemId)
       || (movingItemSnapshot?.id === movingItemId ? movingItemSnapshot : null)
     if (!moving) return false
     const source = events.find((event) => event.id === moving.sourceEventId)
     return Boolean(source?.recurrence_rule && source.recurrence_rule.type !== 'none')
-  }, [events, items, movingItemId, movingItemSnapshot])
+  }, [events, interactionItemMap, items, movingItemId, movingItemSnapshot])
 
   const draggingItem = useMemo(
-    () => items.find((item) => item.id === draggingItemId) || null,
-    [draggingItemId, items]
+    () => {
+      if (!draggingItemId) return null
+      return interactionItemMap.get(draggingItemId)
+        || items.find((item) => item.id === draggingItemId)
+        || null
+    },
+    [draggingItemId, interactionItemMap, items]
   )
+
+  const canCreateMoreModes = modes.length < MAX_MODE_COUNT
+  const activeMode = useMemo(
+    () => modes.find((mode) => mode.id === activeModeId) || null,
+    [activeModeId, modes]
+  )
+  const trimmedModeNameDraft = modeNameDraft.trim()
+  const hasModeNameValue = trimmedModeNameDraft.length > 0
+  const hasModeNameChanged = Boolean(activeMode && hasModeNameValue && activeMode.name.trim() !== trimmedModeNameDraft)
+  const canSaveModeName = !isRenamingMode && hasModeNameChanged
 
   const modeJsonExportText = useMemo(() => {
     if (!activeModeId) return ''
@@ -4048,10 +4661,47 @@ export default function TimeManagementPage() {
     timeBackgrounds,
   ])
 
+  const promptRenameForMode = useCallback((nextModeName: string) => {
+    setIsModeSettingsOpen(true)
+    setModeNameDraft(nextModeName)
+
+    setIsModeNameInputHighlighted(true)
+    if (modeNameInputHighlightTimerRef.current !== null) {
+      window.clearTimeout(modeNameInputHighlightTimerRef.current)
+    }
+    modeNameInputHighlightTimerRef.current = window.setTimeout(() => {
+      setIsModeNameInputHighlighted(false)
+      modeNameInputHighlightTimerRef.current = null
+    }, 1800)
+
+    window.requestAnimationFrame(() => {
+      const input = modeNameInputRef.current
+      if (!input) return
+      input.focus()
+      input.setSelectionRange(0, input.value.length)
+    })
+  }, [])
+
+  useEffect(() => {
+    if (!activeModeId) return
+
+    setHighlightedModeId(activeModeId)
+    if (highlightedModeTimerRef.current !== null) {
+      window.clearTimeout(highlightedModeTimerRef.current)
+    }
+
+    highlightedModeTimerRef.current = window.setTimeout(() => {
+      setHighlightedModeId((prev) => (prev === activeModeId ? null : prev))
+      highlightedModeTimerRef.current = null
+    }, 1200)
+  }, [activeModeId])
+
   const pendingTemplateSourceItem = useMemo(() => {
     if (!pendingTemplateSourceId) return null
-    return items.find((item) => item.id === pendingTemplateSourceId) || null
-  }, [items, pendingTemplateSourceId])
+    return interactionItemMap.get(pendingTemplateSourceId)
+      || items.find((item) => item.id === pendingTemplateSourceId)
+      || null
+  }, [interactionItemMap, items, pendingTemplateSourceId])
 
   const dayLayouts = useMemo(() => {
     return weekDays.map((day, dayIndex) => {
@@ -4107,18 +4757,28 @@ export default function TimeManagementPage() {
           const item = itemMap.get(segment.eventId)
           if (!item) return null
           const source = sourceMap.get(item.sourceId)
-          if (source?.sourceType === 'external') return null
+          if (isReadOnlySource(source)) return null
 
           return {
-            itemId: item.id,
+            itemId: getTimeItemInteractionId(item),
             top: segment.top,
             bottom: segment.top + segment.height,
             leftPercent: segment.leftPercent + DAY_COLUMN_ITEM_GUTTER_PERCENT,
             widthPercent: Math.max(segment.widthPercent - DAY_COLUMN_ITEM_GUTTER_PERCENT * 2, 8),
+            canResizeStart: item.isStartSegment,
+            canResizeEnd: item.isEndSegment,
           }
         })
         .filter(
-          (segment): segment is { itemId: string; top: number; bottom: number; leftPercent: number; widthPercent: number } =>
+          (segment): segment is {
+            itemId: string
+            top: number
+            bottom: number
+            leftPercent: number
+            widthPercent: number
+            canResizeStart: boolean
+            canResizeEnd: boolean
+          } =>
             Boolean(segment)
         )
     })
@@ -4189,22 +4849,30 @@ export default function TimeManagementPage() {
           mergedExternalSources.set(source.id, source)
         }
         for (const source of modeSyncCalendars.filter((entry) => entry.sourceType === 'external')) {
-          mergedExternalSources.set(source.id, {
-            ...source,
-            enabled: modeSyncById.has(source.id)
-              ? Boolean(modeSyncById.get(source.id)?.enabled)
-              : source.enabled,
-          })
+          mergedExternalSources.set(
+            source.id,
+            mergeModeExternalSource({
+              existingSource: mergedExternalSources.get(source.id),
+              modeSource: source,
+              enabledFromMode: modeSyncById.has(source.id)
+                ? Boolean(modeSyncById.get(source.id)?.enabled)
+                : source.enabled,
+            })
+          )
         }
 
+        const appSources = buildAppSyncSourcesForMode({
+          allModes: modes,
+          activeModeId: nextMode.id,
+          activeModeName: nextMode.name?.trim() || 'Coordination Manager Main',
+          activeModeColor: isHexColor(nextMode.main_color) ? nextMode.main_color : '#2563eb',
+          modeSyncById,
+          previousSources: prev,
+          mainEnabled: modeMainSource ? Boolean(modeMainSource.enabled) : (previousMainSource?.enabled ?? true),
+        })
+
         return [
-          {
-            id: MAIN_SOURCE_ID,
-            name: nextMode.name?.trim() || 'Coordination Manager Main',
-            color: isHexColor(nextMode.main_color) ? nextMode.main_color : '#2563eb',
-            enabled: modeMainSource ? Boolean(modeMainSource.enabled) : (previousMainSource?.enabled ?? true),
-            sourceType: 'app',
-          },
+          ...appSources,
           ...Array.from(mergedExternalSources.values()),
         ]
       })
@@ -4216,10 +4884,17 @@ export default function TimeManagementPage() {
 
   const handleCreateMode = useCallback(async () => {
     if (isCreatingMode) return
+    if (modes.length >= MAX_MODE_COUNT) {
+      setClipboardStatus(`You can create up to ${MAX_MODE_COUNT} modes.`)
+      return
+    }
+
+    const suggestedName = getSuggestedModeName(modes)
 
     setIsCreatingMode(true)
     try {
       const { data } = await apiClient.post<{ mode?: TimeManagementMode; activeModeId?: string }>('/api/time-management/modes', {
+        name: suggestedName,
       })
       const createdMode = data?.mode
       const nextActiveModeId = data?.activeModeId || createdMode?.id || null
@@ -4237,7 +4912,74 @@ export default function TimeManagementPage() {
     } finally {
       setIsCreatingMode(false)
     }
-  }, [handleActivateMode, isCreatingMode])
+  }, [handleActivateMode, isCreatingMode, modes])
+
+  const handleDuplicateMode = useCallback(async () => {
+    if (!activeModeId || isDuplicatingMode || isCreatingMode) return
+    if (modes.length >= MAX_MODE_COUNT) {
+      setClipboardStatus(`You can create up to ${MAX_MODE_COUNT} modes.`)
+      return
+    }
+
+    const currentMode = modes.find((mode) => mode.id === activeModeId)
+    if (!currentMode) {
+      setClipboardStatus('No active mode to duplicate.')
+      return
+    }
+
+    const suggestedName = getSuggestedModeName(modes)
+    const duplicatePayload = buildModeJsonPayload({
+      mode: currentMode,
+      syncCalendars,
+      categories,
+      timeBackgrounds,
+      collapsedBackgroundIds,
+      quickTemplates,
+      showQuickTemplatesInMain,
+    })
+
+    setIsDuplicatingMode(true)
+    try {
+      const { data } = await apiClient.post<{ mode?: TimeManagementMode; activeModeId?: string }>('/api/time-management/modes', {
+        name: suggestedName,
+        importMode: {
+          ...duplicatePayload,
+          name: suggestedName,
+        },
+      })
+
+      const createdMode = data?.mode
+      const nextActiveModeId = data?.activeModeId || createdMode?.id || null
+      if (createdMode) {
+        setModes((prev) => [...prev, createdMode])
+      }
+      if (nextActiveModeId) {
+        await handleActivateMode(nextActiveModeId)
+      }
+
+      promptRenameForMode(createdMode?.name || suggestedName)
+      setClipboardStatus('Mode duplicated.')
+    } catch (err) {
+      console.error('Failed to duplicate mode:', err)
+      const msg = (err as { response?: { data?: { error?: string } } })?.response?.data?.error || 'Could not duplicate mode.'
+      setClipboardStatus(msg)
+    } finally {
+      setIsDuplicatingMode(false)
+    }
+  }, [
+    activeModeId,
+    categories,
+    collapsedBackgroundIds,
+    handleActivateMode,
+    isCreatingMode,
+    isDuplicatingMode,
+    modes,
+    promptRenameForMode,
+    quickTemplates,
+    showQuickTemplatesInMain,
+    syncCalendars,
+    timeBackgrounds,
+  ])
 
   const handleImportMode = useCallback(async () => {
     if (isCreatingMode || isImportingModeJson) return
@@ -4464,19 +5206,42 @@ export default function TimeManagementPage() {
       return
     }
 
+    setModeJsonCopyFeedback(null)
     setIsModeJsonExportOpen(true)
-
-    try {
-      if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
-        await navigator.clipboard.writeText(modeJsonExportText)
-        setClipboardStatus('Mode JSON copied.')
-      } else {
-        setClipboardStatus('Mode JSON ready.')
-      }
-    } catch {
-      setClipboardStatus('Mode JSON ready. Copy from the window.')
-    }
   }, [activeModeId, modeJsonExportText])
+
+  const showModeJsonCopyFeedback = useCallback((message: string) => {
+    setModeJsonCopyFeedback(message)
+
+    if (modeJsonCopyFeedbackTimerRef.current !== null) {
+      window.clearTimeout(modeJsonCopyFeedbackTimerRef.current)
+    }
+
+    modeJsonCopyFeedbackTimerRef.current = window.setTimeout(() => {
+      setModeJsonCopyFeedback((prev) => (prev === message ? null : prev))
+      modeJsonCopyFeedbackTimerRef.current = null
+    }, 2200)
+  }, [])
+
+  useEffect(() => {
+    return () => {
+      if (modeJsonCopyFeedbackTimerRef.current !== null) {
+        window.clearTimeout(modeJsonCopyFeedbackTimerRef.current)
+      }
+      if (modeNameSaveFeedbackTimerRef.current !== null) {
+        window.clearTimeout(modeNameSaveFeedbackTimerRef.current)
+      }
+      if (modeNameNoChangePulseTimerRef.current !== null) {
+        window.clearTimeout(modeNameNoChangePulseTimerRef.current)
+      }
+      if (highlightedModeTimerRef.current !== null) {
+        window.clearTimeout(highlightedModeTimerRef.current)
+      }
+      if (modeNameInputHighlightTimerRef.current !== null) {
+        window.clearTimeout(modeNameInputHighlightTimerRef.current)
+      }
+    }
+  }, [])
 
   const handleRenameCurrentMode = useCallback(async () => {
     if (!activeModeId || isRenamingMode) return
@@ -4508,6 +5273,46 @@ export default function TimeManagementPage() {
       setIsRenamingMode(false)
     }
   }, [activeModeId, isRenamingMode, modeNameDraft, modes])
+
+  const handleSaveModeNameClick = useCallback(() => {
+    if (isRenamingMode) return
+
+    if (!hasModeNameValue) {
+      setClipboardStatus('Mode name is required.')
+      return
+    }
+
+    if (!hasModeNameChanged) {
+      setIsModeNameSaveNoChangePulse(true)
+      if (modeNameNoChangePulseTimerRef.current !== null) {
+        window.clearTimeout(modeNameNoChangePulseTimerRef.current)
+      }
+      modeNameNoChangePulseTimerRef.current = window.setTimeout(() => {
+        setIsModeNameSaveNoChangePulse(false)
+        modeNameNoChangePulseTimerRef.current = null
+      }, 420)
+
+      const message = 'no changes were made to Mode Name, save skipped'
+      setModeNameSaveFeedback(message)
+      if (modeNameSaveFeedbackTimerRef.current !== null) {
+        window.clearTimeout(modeNameSaveFeedbackTimerRef.current)
+      }
+      modeNameSaveFeedbackTimerRef.current = window.setTimeout(() => {
+        setModeNameSaveFeedback((prev) => (prev === message ? null : prev))
+        modeNameSaveFeedbackTimerRef.current = null
+      }, 2600)
+      return
+    }
+
+    setModeNameSaveFeedback(null)
+    void handleRenameCurrentMode()
+  }, [hasModeNameChanged, hasModeNameValue, handleRenameCurrentMode, isRenamingMode])
+
+  useEffect(() => {
+    if (hasModeNameChanged) {
+      setModeNameSaveFeedback(null)
+    }
+  }, [hasModeNameChanged, modeNameDraft])
 
   const handleDeleteCurrentMode = useCallback(async (transferToModeId: string | null) => {
     if (!activeModeId || modes.length <= 1) return
@@ -4583,22 +5388,30 @@ export default function TimeManagementPage() {
             mergedExternalSources.set(source.id, source)
           }
           for (const source of modeSyncCalendars.filter((entry) => entry.sourceType === 'external')) {
-            mergedExternalSources.set(source.id, {
-              ...source,
-              enabled: modeSyncById.has(source.id)
-                ? Boolean(modeSyncById.get(source.id)?.enabled)
-                : source.enabled,
-            })
+            mergedExternalSources.set(
+              source.id,
+              mergeModeExternalSource({
+                existingSource: mergedExternalSources.get(source.id),
+                modeSource: source,
+                enabledFromMode: modeSyncById.has(source.id)
+                  ? Boolean(modeSyncById.get(source.id)?.enabled)
+                  : source.enabled,
+              })
+            )
           }
 
+          const appSources = buildAppSyncSourcesForMode({
+            allModes: nextModes,
+            activeModeId: nextMode.id,
+            activeModeName: nextMode.name?.trim() || 'Coordination Manager Main',
+            activeModeColor: isHexColor(nextMode.main_color) ? nextMode.main_color : '#2563eb',
+            modeSyncById,
+            previousSources: prev,
+            mainEnabled: modeMainSource ? Boolean(modeMainSource.enabled) : (previousMainSource?.enabled ?? true),
+          })
+
           return [
-            {
-              id: MAIN_SOURCE_ID,
-              name: nextMode.name?.trim() || 'Coordination Manager Main',
-              color: isHexColor(nextMode.main_color) ? nextMode.main_color : '#2563eb',
-              enabled: modeMainSource ? Boolean(modeMainSource.enabled) : (previousMainSource?.enabled ?? true),
-              sourceType: 'app',
-            },
+            ...appSources,
             ...Array.from(mergedExternalSources.values()),
           ]
         })
@@ -4651,7 +5464,7 @@ export default function TimeManagementPage() {
         }
 
         const startDistance = Math.abs(pointerY - segment.top)
-        if (startDistance <= EDGE_HIT_PX) {
+        if (segment.canResizeStart && startDistance <= EDGE_HIT_PX) {
           candidates.push({
             itemId: segment.itemId,
             edge: 'start',
@@ -4661,7 +5474,7 @@ export default function TimeManagementPage() {
         }
 
         const endDistance = Math.abs(pointerY - segment.bottom)
-        if (endDistance <= EDGE_HIT_PX) {
+        if (segment.canResizeEnd && endDistance <= EDGE_HIT_PX) {
           candidates.push({
             itemId: segment.itemId,
             edge: 'end',
@@ -4711,14 +5524,52 @@ export default function TimeManagementPage() {
   }, [categories, categoryDraft, editingCategoryId])
 
   const selectedSource = selectedEvent ? sourceMap.get(selectedEvent.source_id || MAIN_SOURCE_ID) : null
-  const isSelectedReadOnly = Boolean(selectedSource && selectedSource.sourceType === 'external')
+  const isSelectedReadOnly = isReadOnlySource(selectedSource)
+  const selectedReadOnlyDisplayNotes = useMemo(() => {
+    if (!selectedEvent || !isSelectedReadOnly) return draft.notes
+    if (selectedEvent.source_type === 'manual') {
+      return buildEventDraftNotes(selectedEvent)
+    }
+
+    return buildCopiedDescriptionWithLocation(selectedEvent.description, selectedEvent.location) || ''
+  }, [draft.notes, isSelectedReadOnly, selectedEvent])
+  const selectionStartLabel = selectionDraft ? formatMinuteLabel(selectionDraft.startMinute, tzState.primary, slotMinutes) : ''
+  const selectionEndLabel = selectionDraft ? formatMinuteLabel(selectionDraft.endMinute, tzState.primary, slotMinutes) : ''
+  const selectedItemStartLabel = selectedItem ? formatMinuteLabel(selectedItem.startMinute, tzState.primary, slotMinutes) : ''
+  const selectedItemEndLabel = selectedItem
+    ? formatMinuteLabel(
+      selectedItem.startMinute + getTimeItemTotalDurationMinutes(selectedItem, slotMinutes),
+      tzState.primary,
+      slotMinutes
+    )
+    : ''
+  const selectedItemDateLabel = selectedItem ? format(weekDays[selectedItem.dayIndex], 'EEE d MMM') : ''
+  const isSelectionAdjusterOpen = isSelectionAdjusterExpanded
+  const isItemAdjusterOpen = isItemAdjusterExpanded
+  const isTimeAdjusterExpanded = selectionDraft && !selectedItem
+    ? isSelectionAdjusterExpanded
+    : isItemAdjusterExpanded
   const noteEditorTitle = selectedItem
     ? draft.title.trim() || selectedItem.title || 'Untitled item'
     : draft.title.trim() || 'New time item'
   const noteEditorSubtitle = selectedItem
-    ? `${format(weekDays[selectedItem.dayIndex], 'EEE d MMM')} ${formatMinuteLabel(selectedItem.startMinute, tzState.primary, slotMinutes)}-${formatMinuteLabel(selectedItem.startMinute + selectedItem.durationMinutes, tzState.primary, slotMinutes)}`
+    ? (
+      <span className="text-orange-600 dark:text-orange-300">
+        {selectedItemDateLabel} {' '}
+        <span className={itemLastChangedEdge === 'start' ? 'animate-[selection-time-pulse_0.75s_ease-out]' : ''}>{selectedItemStartLabel}</span>
+        {' - '}
+        <span className={itemLastChangedEdge === 'end' ? 'animate-[selection-time-pulse_0.75s_ease-out]' : ''}>{selectedItemEndLabel}</span>
+      </span>
+    )
     : selectionDraft
-      ? `${format(weekDays[selectionDraft.dayIndex], 'EEE d MMM')} ${formatMinuteLabel(selectionDraft.startMinute, tzState.primary, slotMinutes)}-${formatMinuteLabel(selectionDraft.endMinute, tzState.primary, slotMinutes)}`
+      ? (
+        <span className="text-orange-600 dark:text-orange-300">
+          {format(weekDays[selectionDraft.dayIndex], 'EEE d MMM')} {' '}
+          <span className={selectionLastChangedEdge === 'start' ? 'animate-[selection-time-pulse_0.75s_ease-out]' : ''}>{selectionStartLabel}</span>
+          {' - '}
+          <span className={selectionLastChangedEdge === 'end' ? 'animate-[selection-time-pulse_0.75s_ease-out]' : ''}>{selectionEndLabel}</span>
+        </span>
+      )
       : 'Use the full view to draft long notes, templates, and checklists.'
   const recurrenceEditorDateSeed = selectedItem?.occurrenceStartTime || selectedEvent?.start_time || (selectionDraft
     ? buildEventTimestamp(weekDays[selectionDraft.dayIndex], selectionDraft.startMinute)
@@ -4732,7 +5583,7 @@ export default function TimeManagementPage() {
   const getDraftSignature = useCallback((itemId: string | null, value: ItemDraft) => {
     return [
       itemId ?? '',
-      value.title.trim(),
+      value.title,
       value.notes,
       normaliseCategoryIds(value.categoryIds),
       value.sourceId,
@@ -4742,11 +5593,24 @@ export default function TimeManagementPage() {
 
   const isSelectedItemDirty = useMemo(() => {
     if (!selectedEvent || isSelectedReadOnly) return false
-    if (draft.title.trim() !== selectedEvent.title.trim()) return true
-    if (draft.notes !== [selectedEvent.description, selectedEvent.location].filter((value): value is string => Boolean(value)).join(' - ')) return true
+    if (draft.title !== selectedEvent.title) return true
+    if (draft.notes !== buildEventDraftNotes(selectedEvent)) return true
     if (normaliseCategoryIds(draft.categoryIds) !== normaliseCategoryIds(selectedEvent.category_ids || [])) return true
     return JSON.stringify(normaliseRecurrenceRule(draft.recurrenceRule)) !== JSON.stringify(normaliseRecurrenceRule(selectedEvent.recurrence_rule))
   }, [draft.categoryIds, draft.notes, draft.recurrenceRule, draft.title, isSelectedReadOnly, selectedEvent])
+
+  const isTitleDirty = Boolean(selectedEvent && !isSelectedReadOnly && draft.title !== selectedEvent.title)
+  const isNotesDirty = Boolean(selectedEvent && !isSelectedReadOnly && draft.notes !== buildEventDraftNotes(selectedEvent))
+  const isCategoryDirty = Boolean(
+    selectedEvent
+      && !isSelectedReadOnly
+      && normaliseCategoryIds(draft.categoryIds) !== normaliseCategoryIds(selectedEvent.category_ids || [])
+  )
+  const isRecurrenceDirty = Boolean(
+    selectedEvent
+      && !isSelectedReadOnly
+      && JSON.stringify(normaliseRecurrenceRule(draft.recurrenceRule)) !== JSON.stringify(normaliseRecurrenceRule(selectedEvent.recurrence_rule))
+  )
 
   const hasPendingUnsavedChanges = Boolean(
     selectedEvent && !isSelectedReadOnly && (isSelectedItemDirty || isAutoSaving || autoSaveError)
@@ -4810,16 +5674,72 @@ export default function TimeManagementPage() {
     return repeatElement?.offsetHeight ?? 0
   }, [])
 
+  const centerCurrentTimeIndicatorInViewport = useCallback(() => {
+    const scrollContainer = calendarScrollContainerRef.current
+    const repeatHeight = getCalendarRepeatHeight()
+    if (!scrollContainer || repeatHeight <= 0) return false
+
+    const containerHeight = scrollContainer.clientHeight
+    if (containerHeight <= 0) return false
+
+    const indicators = scrollContainer.querySelectorAll<HTMLElement>('[data-testid="current-time-indicator"]')
+    const middleIndicator = indicators.item(CALENDAR_REPEAT_MIDDLE_INDEX) || null
+
+    const containerRect = scrollContainer.getBoundingClientRect()
+    const indicatorRect = middleIndicator?.getBoundingClientRect()
+    const measuredDelta = indicatorRect ? (indicatorRect.top - containerRect.top) : Number.NaN
+
+    // Use measured geometry when available, and fall back to deterministic math in non-layout test environments.
+    const targetTop = Number.isFinite(measuredDelta) && Math.abs(measuredDelta) > 1
+      ? Math.max(0, scrollContainer.scrollTop + measuredDelta - containerHeight / 2)
+      : Math.max(0, repeatHeight * CALENDAR_REPEAT_MIDDLE_INDEX + currentTimeIndicatorTop - containerHeight / 2)
+
+    scrollContainer.scrollTop = targetTop
+    return true
+  }, [currentTimeIndicatorTop, getCalendarRepeatHeight])
+
+  useEffect(() => {
+    // Re-center only when the visible week/time scale changes.
+    hasCenteredCalendarScrollRef.current = false
+  }, [currentWeekStart, slotMinutes])
+
   useLayoutEffect(() => {
     if (hasCenteredCalendarScrollRef.current) return
 
-    const scrollContainer = calendarScrollContainerRef.current
-    const repeatHeight = getCalendarRepeatHeight()
-    if (!scrollContainer || repeatHeight <= 0) return
+    let raf1 = 0
+    let raf2 = 0
+    const timers: number[] = []
 
-    scrollContainer.scrollTop = repeatHeight * CALENDAR_REPEAT_MIDDLE_INDEX
-    hasCenteredCalendarScrollRef.current = true
-  }, [getCalendarRepeatHeight, dayHeight])
+    const runCenter = () => {
+      if (hasCenteredCalendarScrollRef.current) return
+      if (centerCurrentTimeIndicatorInViewport()) {
+        hasCenteredCalendarScrollRef.current = true
+      }
+    }
+
+    raf1 = window.requestAnimationFrame(() => {
+      raf2 = window.requestAnimationFrame(() => {
+        runCenter()
+      })
+    })
+
+    // Some layout shifts occur just after refresh (header/status row, viewport settling).
+    // Re-apply centering briefly during initial load to keep the red line in the middle.
+    timers.push(window.setTimeout(runCenter, 120))
+    timers.push(window.setTimeout(runCenter, 320))
+    timers.push(window.setTimeout(runCenter, 800))
+
+    return () => {
+      if (raf1) window.cancelAnimationFrame(raf1)
+      if (raf2) window.cancelAnimationFrame(raf2)
+      timers.forEach((id) => window.clearTimeout(id))
+    }
+  }, [
+    centerCurrentTimeIndicatorInViewport,
+    currentWeekStart,
+    dayHeight,
+    slotMinutes,
+  ])
 
   const normalizeCalendarLoopScrollTop = useCallback(
     (scrollTop: number, repeatHeight: number) => {
@@ -4866,33 +5786,61 @@ export default function TimeManagementPage() {
     }
   }, [getCalendarRepeatHeight, isDraggingItem, normalizeCalendarLoopScrollTop])
 
-  useEffect(() => {
-    if (hasAutoScrolledToWeekItemRef.current) return
-    if (isSourcesLoading || isEventsLoading || eventsError) return
-    if (currentWeekStart.getTime() !== entryWeekStartMsRef.current) return
-    if (visibleItems.length === 0) return
-
-    const firstVisibleItem = visibleItems.reduce((earliest, item) => {
+  const findEarliestVisibleItem = useCallback((candidates: TimeItem[]) => {
+    return candidates.reduce((earliest, item) => {
       if (!earliest) return item
       if (item.dayIndex < earliest.dayIndex) return item
       if (item.dayIndex > earliest.dayIndex) return earliest
       if (item.startMinute < earliest.startMinute) return item
       return earliest
     }, null as TimeItem | null)
+  }, [])
+
+  const scrollCalendarStartMinuteToScreenMiddle = useCallback(
+    (dayIndex: number, startMinute: number) => {
+      const dayColumn = dayColumnRefs.current[dayIndex]
+      const scrollContainer = calendarScrollContainerRef.current
+      if (!dayColumn || !scrollContainer) return false
+
+      const targetMinute = Math.max(0, Math.min(MINUTES_IN_DAY, startMinute))
+      const targetContentTop = dayColumn.offsetTop + (targetMinute / slotMinutes) * SLOT_HEIGHT
+      const containerRect = scrollContainer.getBoundingClientRect()
+      const screenMidY = window.innerHeight / 2
+      const anchorWithinContainer = Math.max(
+        0,
+        Math.min(scrollContainer.clientHeight, screenMidY - containerRect.top)
+      )
+      const maxTop = Math.max(0, scrollContainer.scrollHeight - scrollContainer.clientHeight)
+      const targetTop = Math.max(0, Math.min(maxTop, targetContentTop - anchorWithinContainer))
+
+      scrollContainer.scrollTo({ top: targetTop, behavior: 'auto' })
+      return true
+    },
+    [slotMinutes]
+  )
+
+  useEffect(() => {
+    if (hasAutoScrolledToWeekItemRef.current) return
+    if (isSourcesLoading || isEventsLoading || eventsError) return
+    if (currentWeekStart.getTime() !== entryWeekStartMsRef.current) return
+    if (visibleItems.length === 0) return
+
+    const firstVisibleItem = findEarliestVisibleItem(visibleItems)
 
     if (!firstVisibleItem) return
 
-    const dayColumn = dayColumnRefs.current[firstVisibleItem.dayIndex]
-    const scrollContainer = calendarScrollContainerRef.current
-    if (!dayColumn || !scrollContainer) return
-
-    const offsetMinutes = slotMinutes * 2
-    const targetMinute = Math.max(0, firstVisibleItem.startMinute - offsetMinutes)
-    const targetTop = dayColumn.offsetTop + (targetMinute / slotMinutes) * SLOT_HEIGHT
-
-    scrollContainer.scrollTo({ top: targetTop, behavior: 'auto' })
-    hasAutoScrolledToWeekItemRef.current = true
-  }, [currentWeekStart, eventsError, isEventsLoading, isSourcesLoading, slotMinutes, visibleItems])
+    if (scrollCalendarStartMinuteToScreenMiddle(firstVisibleItem.dayIndex, firstVisibleItem.startMinute)) {
+      hasAutoScrolledToWeekItemRef.current = true
+    }
+  }, [
+    currentWeekStart,
+    eventsError,
+    findEarliestVisibleItem,
+    isEventsLoading,
+    isSourcesLoading,
+    scrollCalendarStartMinuteToScreenMiddle,
+    visibleItems,
+  ])
 
   // Apply global ns-resize cursor while an edge resize is in progress.
   useEffect(() => {
@@ -4912,27 +5860,26 @@ export default function TimeManagementPage() {
       if (!dayColumn) return
 
       const rect = dayColumn.getBoundingClientRect()
-      // The stored ref points at the middle repeat copy, but the user's pointer
-      // may be over the top or bottom copy. Wrap into the middle copy's range
-      // so the same Y always maps to the same time of day.
-      let relativeY = event.clientY - rect.top
-      if (rect.height > 0) {
-        relativeY = ((relativeY % rect.height) + rect.height) % rect.height
-      }
-      const y = Math.max(0, Math.min(rect.height, relativeY))
-      const pointerMinute = snapEdgeMinute((y / rect.height) * MINUTES_IN_DAY, slotMinutes)
-
-      const minDuration = slotMinutes
-      const nextStart = resizeState.edge === 'start'
-        ? Math.max(0, Math.min(pointerMinute, resizeState.originalEndMinute - minDuration))
-        : resizeState.originalStartMinute
-      const nextEnd = resizeState.edge === 'end'
-        ? Math.min(MINUTES_IN_DAY, Math.max(pointerMinute, resizeState.originalStartMinute + minDuration))
-        : resizeState.originalEndMinute
+      const pointerMinuteRaw = (event.clientY - rect.top) / rect.height * MINUTES_IN_DAY
+      const pointerMinute = snapMinuteUnbounded(pointerMinuteRaw, slotMinutes)
 
       const day = weekDays[resizeState.dayIndex]
-      const startTime = buildEventTimestamp(day, nextStart)
-      const endTime = buildEventTimestamp(day, nextEnd)
+      const baseDayStartMs = Date.UTC(day.getFullYear(), day.getMonth(), day.getDate(), 0, 0, 0)
+      const pointerTimeMs = baseDayStartMs + pointerMinute * 60_000
+
+      const originalStartMs = new Date(resizeState.originalEvent.start_time).getTime()
+      const originalEndMs = new Date(resizeState.originalEvent.end_time).getTime()
+      const minDurationMs = slotMinutes * 60_000
+
+      const nextStartMs = resizeState.edge === 'start'
+        ? Math.min(pointerTimeMs, originalEndMs - minDurationMs)
+        : originalStartMs
+      const nextEndMs = resizeState.edge === 'end'
+        ? Math.max(pointerTimeMs, originalStartMs + minDurationMs)
+        : originalEndMs
+
+      const startTime = new Date(nextStartMs).toISOString()
+      const endTime = new Date(nextEndMs).toISOString()
 
       setEvents((prev) =>
         prev.map((candidate) =>
@@ -5000,6 +5947,12 @@ export default function TimeManagementPage() {
       if (titleTypingHintTimeoutRef.current) {
         window.clearTimeout(titleTypingHintTimeoutRef.current)
       }
+      if (selectionChangePulseTimeoutRef.current) {
+        window.clearTimeout(selectionChangePulseTimeoutRef.current)
+      }
+      if (itemChangePulseTimeoutRef.current) {
+        window.clearTimeout(itemChangePulseTimeoutRef.current)
+      }
     }
   }, [])
 
@@ -5013,6 +5966,8 @@ export default function TimeManagementPage() {
 
     setSelectionDraft({ dayIndex, startMinute: snapped, endMinute: snapped + slotMinutes })
     setIsSelecting(true)
+    setIsSelectionAdjusterExpanded(false)
+    setIsItemAdjusterExpanded(false)
     setSelectedItemId(null)
     setShowItemRecurrencePanel(false)
     setDraft((prev) => {
@@ -5028,12 +5983,13 @@ export default function TimeManagementPage() {
         recurrenceRule: { type: 'none' },
       }
     })
-    setIsLeftPanelOpen(true)
-    setExpandedSections((prev) => {
-      const next = new Set(prev)
-      next.add('editor')
-      return next
-    })
+    if (isPhoneLayout) {
+      setIsLeftPanelOpen(false)
+      setExpandedSections(new Set())
+      return
+    }
+
+    openLeftPanelSection('editor')
     // Auto-scroll to editor section after panel slide-in settles
     window.setTimeout(() => {
       editorSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' })
@@ -5043,15 +5999,17 @@ export default function TimeManagementPage() {
   const updateSelection = (dayIndex: number, minute: number) => {
     if (isResizing) return
     if (!isSelecting || !selectionDraft || selectionDraft.dayIndex !== dayIndex) return
-    const snapped = snapMinute(minute, slotMinutes)
+    const snapped = Math.floor(minute / slotMinutes) * slotMinutes
     const minMinute = Math.min(selectionDraft.startMinute, snapped)
     const maxMinute = Math.max(selectionDraft.startMinute, snapped) + slotMinutes
-    setSelectionDraft({ dayIndex, startMinute: minMinute, endMinute: Math.min(maxMinute, MINUTES_IN_DAY) })
+    setSelectionDraft({ dayIndex, startMinute: minMinute, endMinute: maxMinute })
   }
 
   const minuteFromPointer = (event: MouseEvent<HTMLDivElement>): number => {
-    const rect = event.currentTarget.getBoundingClientRect()
-    const y = Math.max(0, Math.min(rect.height, event.clientY - rect.top))
+    const anchorDayColumn = selectionAnchorDayColumnRef.current
+    const referenceElement = isSelecting && anchorDayColumn ? anchorDayColumn : event.currentTarget
+    const rect = referenceElement.getBoundingClientRect()
+    const y = event.clientY - rect.top
     return (y / rect.height) * MINUTES_IN_DAY
   }
 
@@ -5152,13 +6110,14 @@ export default function TimeManagementPage() {
     setDragDropPreview(null)
     clearDragPreview()
     const itemId = event.dataTransfer.getData('text/time-item')
-    const item = items.find((candidate) => candidate.id === itemId)
+    const item = interactionItemMap.get(itemId) || items.find((candidate) => candidate.id === itemId)
     if (!item) return
+    const itemTotalDurationMinutes = getTimeItemTotalDurationMinutes(item, slotMinutes)
     const sourceEventId = item.sourceEventId
 
     // External (read-only) items cannot be moved.
     const source = sourceMap.get(item.sourceId)
-    if (source?.sourceType === 'external') return
+    if (isReadOnlySource(source)) return
 
     const rect = event.currentTarget.getBoundingClientRect()
     const y = Math.max(0, Math.min(rect.height, event.clientY - rect.top))
@@ -5167,11 +6126,13 @@ export default function TimeManagementPage() {
       pointerMinute,
       dragTopOffsetMinutesRef.current,
       slotMinutes,
-      item.durationMinutes
+      itemTotalDurationMinutes
     )
-    const day = weekDays[dayIndex]
-    const startTime = buildEventTimestamp(day, minute)
-    const endTime = new Date(new Date(startTime).getTime() + item.durationMinutes * 60_000).toISOString()
+    const dropTarget = normaliseDroppedMinuteToWeekDay(dayIndex, minute)
+    if (!dropTarget) return
+    const day = weekDays[dropTarget.dayIndex]
+    const startTime = buildEventTimestamp(day, dropTarget.startMinute)
+    const endTime = new Date(new Date(startTime).getTime() + itemTotalDurationMinutes * 60_000).toISOString()
 
     const previous = events
     setEvents((prev) =>
@@ -5203,7 +6164,8 @@ export default function TimeManagementPage() {
     const end_time = new Date(new Date(start_time).getTime() + duration * 60_000).toISOString()
 
     if (movingItemId) {
-      const movingItem = items.find((entry) => entry.id === movingItemId)
+      const movingItem = interactionItemMap.get(movingItemId)
+        || items.find((entry) => entry.id === movingItemId)
         || (movingItemSnapshot?.id === movingItemId ? movingItemSnapshot : null)
       const sourceEvent = movingItem ? events.find((entry) => entry.id === movingItem.sourceEventId) : null
       if (!movingItem || !sourceEvent) {
@@ -5219,7 +6181,7 @@ export default function TimeManagementPage() {
       const originalDuration = Math.max(slotMinutes, Math.round((sourceEnd - sourceStart) / 60_000))
       const selectionDuration = Math.max(slotMinutes, selectionDraft.endMinute - selectionDraft.startMinute)
       const moveDuration = Math.max(originalDuration, selectionDuration)
-      const moveStartMinute = Math.min(selectionDraft.startMinute, Math.max(0, MINUTES_IN_DAY - moveDuration))
+      const moveStartMinute = selectionDraft.startMinute
       const moveStartTime = buildEventTimestamp(day, moveStartMinute)
       const moveEndTime = new Date(new Date(moveStartTime).getTime() + moveDuration * 60_000).toISOString()
 
@@ -5239,7 +6201,7 @@ export default function TimeManagementPage() {
         const newBaseEnd = new Date(sourceEnd + deltaMs).toISOString()
         const shiftedRule = shiftRecurrenceRuleByDays(existingRule, dayShift)
         const updatedFields = {
-          title: draft.title.trim(),
+          title: draft.title,
           description: notesToEventDescription(draft.notes),
           start_time: newBaseStart,
           end_time: newBaseEnd,
@@ -5271,11 +6233,31 @@ export default function TimeManagementPage() {
         const occurrenceKey = getUtcDateKey(new Date(movingItem.occurrenceStartTime))
         const nextExceptions = Array.from(new Set([...(existingRule.exceptions || []), occurrenceKey]))
         const updatedRule: RecurrenceRule = { ...existingRule, exceptions: nextExceptions }
+        const pendingId = `pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        const pendingEvent: UserEventRecord = {
+          id: pendingId,
+          title: draft.title,
+          description: notesToEventDescription(draft.notes),
+          meeting_link: null,
+          location: null,
+          start_time: moveStartTime,
+          end_time: moveEndTime,
+          source_type: 'manual',
+          source_id: activeModeId || MAIN_SOURCE_ID,
+          category_ids: draft.categoryIds,
+          recurrence_rule: { type: 'none' },
+        }
         setEvents((prev) => prev.map((entry) => (entry.id === sourceEvent.id ? { ...entry, recurrence_rule: updatedRule } : entry)))
+        setEvents((prev) => [...prev, pendingEvent])
+        setSelectedItemId(pendingId)
+        setSelectionDraft(null)
+        setMovingItemId(null)
+        setMovingItemSnapshot(null)
+        setIsMoveScopeOpen(false)
         try {
           await apiClient.put(`/api/user-events/${sourceEvent.id}`, { recurrence_rule: updatedRule })
           const { data } = await apiClient.post<{ event: UserEventRecord }>('/api/user-events', {
-            title: draft.title.trim(),
+            title: draft.title,
             description: notesToEventDescription(draft.notes),
             start_time: moveStartTime,
             end_time: moveEndTime,
@@ -5290,15 +6272,11 @@ export default function TimeManagementPage() {
               fallbackCategoryIds: draft.categoryIds,
               fallbackRecurrenceRule: { type: 'none' },
             })
-            setEvents((prev) => [...prev, normalised])
+            setEvents((prev) => prev.map((entry) => (entry.id === pendingId ? normalised : entry)))
             setSelectedItemId(normalised.id)
           } else {
             setSelectedItemId(null)
           }
-          setSelectionDraft(null)
-          setMovingItemId(null)
-          setMovingItemSnapshot(null)
-          setIsMoveScopeOpen(false)
           setLastSavedAt(Date.now())
           setAutoSaveError(null)
           showClipboardStatus('This occurrence moved.')
@@ -5312,7 +6290,7 @@ export default function TimeManagementPage() {
       }
 
       const updatedFields = {
-        title: draft.title.trim(),
+        title: draft.title,
         description: notesToEventDescription(draft.notes),
         start_time: moveStartTime,
         end_time: moveEndTime,
@@ -5344,9 +6322,41 @@ export default function TimeManagementPage() {
     isCreatingItemRef.current = true
     setIsCreatingItem(true)
 
+    const pendingId = `pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const pendingRecurrence = normaliseRecurrenceRule(draft.recurrenceRule)
+    const pendingSelection = { ...selectionDraft }
+    const pendingDraft = {
+      ...draft,
+      categoryIds: [...draft.categoryIds],
+      recurrenceRule: pendingRecurrence,
+    }
+    const pendingEvent: UserEventRecord = {
+      id: pendingId,
+      title: draft.title,
+      description: notesToEventDescription(draft.notes),
+      meeting_link: null,
+      location: null,
+      start_time,
+      end_time,
+      source_type: 'manual',
+      source_id: activeModeId || MAIN_SOURCE_ID,
+      category_ids: [...draft.categoryIds],
+      recurrence_rule: pendingRecurrence,
+    }
+
+    setEvents((prev) => [...prev, pendingEvent])
+    setSelectedItemId(pendingId)
+    setSelectionDraft(null)
+    setDraft((prev) => ({ ...prev, title: '', notes: '', categoryIds: [], recurrenceRule: { type: 'none' } }))
+    setExpandedSections((prev) => {
+      const next = new Set(prev)
+      next.add('editor')
+      return next
+    })
+
     try {
       const { data } = await apiClient.post<{ event: UserEventRecord }>('/api/user-events', {
-        title: draft.title.trim(),
+        title: draft.title,
         description: notesToEventDescription(draft.notes),
         start_time,
         end_time,
@@ -5356,23 +6366,40 @@ export default function TimeManagementPage() {
       })
       const created = data?.event
       if (!created) return false
+      const pendingCategoryIds = (() => {
+        const pendingMatch = eventsRef.current.find((entry) => entry.id === pendingId)
+        return Array.isArray(pendingMatch?.category_ids)
+          ? pendingMatch.category_ids
+          : draft.categoryIds
+      })()
       const normalised = normaliseCreatedManualEvent(created, {
         fallbackSourceId: activeModeId || MAIN_SOURCE_ID,
-        fallbackCategoryIds: draft.categoryIds,
+        fallbackCategoryIds: pendingCategoryIds,
         fallbackRecurrenceRule: draft.recurrenceRule,
       })
-      setEvents((prev) => [...prev, normalised])
-      setSelectedItemId(normalised.id)
-      setSelectionDraft(null)
-      setDraft((prev) => ({ ...prev, title: '', notes: '', categoryIds: [], recurrenceRule: { type: 'none' } }))
-      setExpandedSections((prev) => {
-        const next = new Set(prev)
-        next.add('editor')
-        return next
+      const resolvedEvent = areStringArraysEqual(normalised.category_ids || [], pendingCategoryIds)
+        ? normalised
+        : { ...normalised, category_ids: [...pendingCategoryIds] }
+
+      setEvents((prev) => prev.map((entry) => (entry.id === pendingId ? resolvedEvent : entry)))
+      setSelectedItemId(resolvedEvent.id)
+      setCalendarItemContextMenu((prev) => {
+        if (!prev || prev.itemId !== pendingId) return prev
+        return { ...prev, itemId: resolvedEvent.id }
       })
+
+      if (!areStringArraysEqual(Array.isArray(created.category_ids) ? created.category_ids : [], pendingCategoryIds)) {
+        void apiClient.put(`/api/user-events/${resolvedEvent.id}`, { category_ids: pendingCategoryIds }).catch((error) => {
+          console.error('Failed to persist pending category update:', error)
+        })
+      }
       return true
     } catch (err) {
       console.error('Failed to save item:', err)
+      setEvents((prev) => prev.filter((entry) => entry.id !== pendingId))
+      setSelectedItemId(null)
+      setSelectionDraft(pendingSelection)
+      setDraft(pendingDraft)
       showClipboardStatus('Could not save item. Try again.')
       return false
     } finally {
@@ -5402,6 +6429,8 @@ export default function TimeManagementPage() {
       setSelectedItemId(movingItemId)
       setSelectionDraft(null)
       setIsSelecting(false)
+      setIsSelectionAdjusterExpanded(false)
+      setIsItemAdjusterExpanded(false)
       setIsFullEditorOpen(false)
       setMovingItemId(null)
       setMovingItemSnapshot(null)
@@ -5412,6 +6441,8 @@ export default function TimeManagementPage() {
     setSelectedItemId(null)
     setSelectionDraft(null)
     setIsSelecting(false)
+    setIsSelectionAdjusterExpanded(false)
+    setIsItemAdjusterExpanded(false)
     setIsFullEditorOpen(false)
     setShowItemRecurrencePanel(false)
 
@@ -5435,8 +6466,7 @@ export default function TimeManagementPage() {
   }
 
   const openFullEditor = () => {
-    setShowItemRecurrencePanel(false)
-    setIsFullEditorOpen(true)
+    openEditorSurface()
   }
 
   const showClipboardStatus = useCallback((message: string) => {
@@ -5456,8 +6486,9 @@ export default function TimeManagementPage() {
   }, [])
 
   const applyQuickTemplate = useCallback(async (template: QuickTemplate): Promise<void> => {
+    const appliedTitle = template.quickName === '' ? template.title : template.quickName
     const nextDraft: ItemDraft = {
-      title: template.title,
+      title: appliedTitle,
       notes: template.notes,
       categoryIds: template.categoryIds,
       sourceId: MAIN_SOURCE_ID,
@@ -5466,16 +6497,25 @@ export default function TimeManagementPage() {
 
     setSelectedItemId(null)
     setDraft((prev) => ({ ...prev, ...nextDraft }))
-    setShowItemRecurrencePanel(false)
-    setIsLeftPanelOpen(true)
-    setExpandedSections((prev) => {
-      const next = new Set(prev)
-      next.add('editor')
-      return next
+    if (isPhoneLayout) {
+      openEditorSurface({ autoFocusTitle: !nextDraft.title.trim() })
+    } else {
+      setShowItemRecurrencePanel(false)
+      openLeftPanelSection('editor')
+    }
+
+    // Keep keyboard flow in the title field after template apply.
+    window.requestAnimationFrame(() => {
+      selectionTitleInputRef.current?.focus()
     })
 
     if (!selectionDraft) {
       showClipboardStatus(`Template "${template.quickName}" loaded. Select Time on the calendar.`)
+      return
+    }
+
+    if (!template.autoSaveEnabled) {
+      showClipboardStatus(`Template "${template.quickName}" loaded. Time selected -- press Save Item to create it.`)
       return
     }
 
@@ -5491,7 +6531,7 @@ export default function TimeManagementPage() {
 
     try {
       const { data } = await apiClient.post<{ event: UserEventRecord }>('/api/user-events', {
-        title: nextDraft.title.trim(),
+        title: nextDraft.title,
         description: notesToEventDescription(nextDraft.notes),
         start_time,
         end_time,
@@ -5529,7 +6569,7 @@ export default function TimeManagementPage() {
       isCreatingItemRef.current = false
       setIsCreatingItem(false)
     }
-  }, [activeModeId, selectionDraft, showClipboardStatus, showDescriptionHint, slotMinutes, weekDays])
+  }, [activeModeId, isPhoneLayout, openEditorSurface, openLeftPanelSection, selectionDraft, showClipboardStatus, showDescriptionHint, slotMinutes, weekDays])
 
   const saveSelectedItemAsTemplate = useCallback(() => {
     if (!pendingTemplateSourceItem) {
@@ -5537,13 +6577,16 @@ export default function TimeManagementPage() {
       return
     }
 
-    const quickName = pendingTemplateQuickName.trim() || buildDefaultQuickTemplateName(pendingTemplateSourceItem.title)
+    const quickName = pendingTemplateQuickName === ''
+      ? buildDefaultQuickTemplateName(pendingTemplateSourceItem.title)
+      : pendingTemplateQuickName
     const nextTemplate: QuickTemplate = {
       id: createQuickTemplateId(),
       quickName,
       title: pendingTemplateSourceItem.title,
       notes: pendingTemplateSourceItem.notes,
       categoryIds: pendingTemplateSourceItem.categoryIds,
+      autoSaveEnabled: false,
       sourceItemId: pendingTemplateSourceItem.id,
       createdAt: new Date().toISOString(),
     }
@@ -5562,12 +6605,19 @@ export default function TimeManagementPage() {
     )
   }, [])
 
-  const commitQuickTemplateName = useCallback((templateId: string, nextName: string) => {
-    const fallbackName = 'Quick template'
-    const trimmed = nextName.trim() || fallbackName
+  const updateQuickTemplateAutoSave = useCallback((templateId: string, enabled: boolean) => {
     quickTemplatesTouchedRef.current = true
     setQuickTemplates((prev) =>
-      prev.map((template) => (template.id === templateId ? { ...template, quickName: trimmed } : template))
+      prev.map((template) => (template.id === templateId ? { ...template, autoSaveEnabled: enabled } : template))
+    )
+  }, [])
+
+  const commitQuickTemplateName = useCallback((templateId: string, nextName: string) => {
+    const fallbackName = 'Quick template'
+    const nextStoredName = nextName === '' ? fallbackName : nextName
+    quickTemplatesTouchedRef.current = true
+    setQuickTemplates((prev) =>
+      prev.map((template) => (template.id === templateId ? { ...template, quickName: nextStoredName } : template))
     )
   }, [])
 
@@ -5581,11 +6631,12 @@ export default function TimeManagementPage() {
       return next
     })
     setDeletingTemplateId((current) => (current === templateId ? null : current))
+    setDeletingTemplatePopoverPosition(null)
     showClipboardStatus('Template deleted.')
   }, [showClipboardStatus])
 
   const copyItemById = useCallback((itemId: string): boolean => {
-    const item = items.find((entry) => entry.id === itemId)
+    const item = interactionItemMap.get(itemId) || items.find((entry) => entry.id === itemId)
     const sourceEvent = item ? events.find((event) => event.id === item.sourceEventId) : null
     if (!sourceEvent) {
       showClipboardStatus('Unable to copy item metadata right now.')
@@ -5597,19 +6648,25 @@ export default function TimeManagementPage() {
     const durationMinutes = Math.max(slotMinutes, Math.round((end.getTime() - start.getTime()) / 60_000))
     const sourceId = sourceEvent.source_id || MAIN_SOURCE_ID
 
+    const copiedDescription = sourceEvent.source_type === 'manual'
+      ? notesToEventDescription(sourceEvent.description || '')
+      : buildCopiedDescriptionWithLocation(sourceEvent.description, sourceEvent.location)
+
     setCopiedItem({
       title: sourceEvent.title,
-      description: sourceEvent.description,
+      description: copiedDescription,
       meetingLink: sourceEvent.meeting_link,
       location: sourceEvent.location,
       durationMinutes,
+      isPublic: !!sourceEvent.is_public,
       sourceId,
       sourceType: sourceEvent.source_type,
       categoryIds: Array.isArray(sourceEvent.category_ids) ? sourceEvent.category_ids : [],
+      recurrenceRule: normaliseRecurrenceRule(sourceEvent.recurrence_rule),
     })
     showClipboardStatus('Item metadata copied. Select a new slot and paste.')
     return true
-  }, [events, items, showClipboardStatus, slotMinutes])
+  }, [events, interactionItemMap, items, showClipboardStatus, slotMinutes])
 
   const copySelectedItem = useCallback((): boolean => {
     if (!selectedItem) {
@@ -5635,6 +6692,32 @@ export default function TimeManagementPage() {
     const startMinute = Math.min(selectionDraft.startMinute, maxStart)
     const startTime = buildEventTimestamp(targetDay, startMinute)
     const endTime = new Date(new Date(startTime).getTime() + copiedItem.durationMinutes * 60_000).toISOString()
+    const pendingId = `pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+    const pendingSelection = { ...selectionDraft }
+    const pendingEvent: UserEventRecord = {
+      id: pendingId,
+      title: copiedItem.title,
+      description: copiedItem.description,
+      meeting_link: copiedItem.meetingLink,
+      location: copiedItem.location,
+      start_time: startTime,
+      end_time: endTime,
+      is_public: copiedItem.isPublic,
+      source_type: 'manual',
+      source_id: activeModeId || MAIN_SOURCE_ID,
+      category_ids: copiedItem.categoryIds,
+      recurrence_rule: copiedItem.recurrenceRule,
+    }
+
+    setEvents((prev) => [...prev, pendingEvent])
+    setSelectedItemId(pendingId)
+    setSelectionDraft(null)
+    setIsLeftPanelOpen(true)
+    setExpandedSections((prev) => {
+      const next = new Set(prev)
+      next.add('editor')
+      return next
+    })
 
     try {
       const { data } = await apiClient.post<{ event: UserEventRecord }>('/api/user-events', {
@@ -5644,29 +6727,44 @@ export default function TimeManagementPage() {
         location: copiedItem.location,
         start_time: startTime,
         end_time: endTime,
+        is_public: copiedItem.isPublic,
         category_ids: copiedItem.categoryIds,
         source_id: activeModeId || undefined,
+        recurrence_rule: copiedItem.recurrenceRule,
       })
       const created = data?.event
       if (!created) return false
+      const pendingCategoryIds = (() => {
+        const pendingMatch = eventsRef.current.find((entry) => entry.id === pendingId)
+        return Array.isArray(pendingMatch?.category_ids)
+          ? pendingMatch.category_ids
+          : copiedItem.categoryIds
+      })()
       const normalised = normaliseCreatedManualEvent(created, {
         fallbackSourceId: activeModeId || MAIN_SOURCE_ID,
-        fallbackCategoryIds: copiedItem.categoryIds,
-        fallbackRecurrenceRule: { type: 'none' },
+        fallbackCategoryIds: pendingCategoryIds,
+        fallbackRecurrenceRule: copiedItem.recurrenceRule,
       })
-      setEvents((prev) => [...prev, normalised])
-      setSelectedItemId(normalised.id)
-      setSelectionDraft(null)
-      setIsLeftPanelOpen(true)
-      setExpandedSections((prev) => {
-        const next = new Set(prev)
-        next.add('editor')
-        return next
-      })
+      const resolvedEvent = areStringArraysEqual(normalised.category_ids || [], pendingCategoryIds)
+        ? normalised
+        : { ...normalised, category_ids: [...pendingCategoryIds] }
+
+      setEvents((prev) => prev.map((entry) => (entry.id === pendingId ? resolvedEvent : entry)))
+      setSelectedItemId(resolvedEvent.id)
       showClipboardStatus('Pasted item with original metadata and duration.')
+
+      if (!areStringArraysEqual(Array.isArray(created.category_ids) ? created.category_ids : [], pendingCategoryIds)) {
+        void apiClient.put(`/api/user-events/${resolvedEvent.id}`, { category_ids: pendingCategoryIds }).catch((error) => {
+          console.error('Failed to persist pending category update:', error)
+        })
+      }
+
       return true
     } catch (err) {
       console.error('Failed to paste item:', err)
+      setEvents((prev) => prev.filter((entry) => entry.id !== pendingId))
+      setSelectedItemId(null)
+      setSelectionDraft(pendingSelection)
       showClipboardStatus('Could not paste item. Try again.')
       return false
     }
@@ -5682,7 +6780,7 @@ export default function TimeManagementPage() {
     const showErrorToast = options?.showErrorToast ?? true
     const previous = events
     const updatedFields = {
-      title: nextDraft.title.trim(),
+      title: nextDraft.title,
       description: notesToEventDescription(nextDraft.notes),
       category_ids: nextDraft.categoryIds,
       recurrence_rule: normaliseRecurrenceRule(nextDraft.recurrenceRule),
@@ -5748,6 +6846,9 @@ export default function TimeManagementPage() {
     isPersistingSelectedItemRef.current = false
     setIsAutoSaving(false)
     if (saved) {
+      setPendingUnsavedAction(null)
+      setPendingUnsavedAnchor(null)
+      setIsPendingUnsavedActionSaving(false)
       setSaveSuccessHoldUntilMs(Date.now() + SAVE_SUCCESS_HOLD_MS)
     } else {
       lastSavedDraftSignatureRef.current = null
@@ -5836,24 +6937,95 @@ export default function TimeManagementPage() {
     }
   }, [hasPendingUnsavedChanges])
 
-  const selectItemForEditing = useCallback(async (itemId: string): Promise<boolean> => {
+  useEffect(() => {
+    if (hasPendingUnsavedChanges) return
+    setPendingUnsavedAction(null)
+    setPendingUnsavedAnchor(null)
+    setIsPendingUnsavedActionSaving(false)
+  }, [hasPendingUnsavedChanges])
+
+  const applySelectedItem = useCallback((itemId: string): boolean => {
+    setSelectedItemId(itemId)
+    setMovingItemId(null)
+    setMovingItemSnapshot(null)
+    setSelectionDraft(null)
+    if (isPhoneLayout) {
+      openEditorSurface()
+      return true
+    }
+
+    openLeftPanelSection('editor')
+    return true
+  }, [isPhoneLayout, openEditorSurface, openLeftPanelSection])
+
+  const requestPendingUnsavedAction = useCallback((action: PendingUnsavedAction, anchor?: PendingUnsavedAnchor) => {
+    setPendingUnsavedAction(action)
+    if (anchor) {
+      const popupWidth = 320
+      const popupHeight = 170
+      setPendingUnsavedAnchor({
+        x: Math.max(12, Math.min(window.innerWidth - popupWidth - 12, anchor.x + 12)),
+        y: Math.max(12, Math.min(window.innerHeight - popupHeight - 12, anchor.y + 12)),
+      })
+    } else {
+      setPendingUnsavedAnchor(null)
+    }
+    if (isPhoneLayout) {
+      openEditorSurface()
+      return
+    }
+
+    openLeftPanelSection('editor')
+  }, [isPhoneLayout, openEditorSurface, openLeftPanelSection])
+
+  const handlePendingUnsavedActionConfirm = useCallback(async () => {
+    if (isPendingUnsavedActionSaving) return
+    if (!pendingUnsavedAction) return
+    if (!draft.title.trim()) {
+      showClipboardStatus('Title is required before saving.')
+      return
+    }
+
+    setIsPendingUnsavedActionSaving(true)
+    setIsAutoSaving(true)
+    const saved = await persistSelectedItem(draft)
+    setIsAutoSaving(false)
+    if (!saved) {
+      setIsPendingUnsavedActionSaving(false)
+      return
+    }
+
+    const actionToApply = pendingUnsavedAction
+    setPendingUnsavedAction(null)
+    setPendingUnsavedAnchor(null)
+    setIsPendingUnsavedActionSaving(false)
+
+    if (actionToApply.type === 'switch-item') {
+      applySelectedItem(actionToApply.itemId)
+      return
+    }
+
+    startSelection(actionToApply.dayIndex, actionToApply.minute)
+  }, [applySelectedItem, draft, isPendingUnsavedActionSaving, pendingUnsavedAction, persistSelectedItem, showClipboardStatus, startSelection])
+
+  const selectItemForEditing = useCallback(async (itemId: string, anchor?: PendingUnsavedAnchor): Promise<boolean> => {
     if (isTemplateSelectionMode) {
-      const sourceItem = items.find((item) => item.id === itemId)
+      const sourceItem = interactionItemMap.get(itemId) || items.find((item) => item.id === itemId)
       if (!sourceItem) return false
-      setPendingTemplateSourceId(sourceItem.id)
+      setPendingTemplateSourceId(getTimeItemInteractionId(sourceItem))
       setPendingTemplateQuickName(buildDefaultQuickTemplateName(sourceItem.title))
       setIsTemplateSelectionMode(false)
-      setIsLeftPanelOpen(true)
-      setExpandedSections((prev) => {
-        const next = new Set(prev)
-        next.add('quickObjects')
-        return next
-      })
+      openQuickObjectsSurface()
       showClipboardStatus('Item selected. Save it as a quick template in Quick Objects.')
       return false
     }
 
     if (itemId === selectedItemId) return true
+
+    if (isAutoSaving) {
+      showClipboardStatus('Saving changes...')
+      return false
+    }
 
     if (hasPendingUnsavedChanges) {
       if (!draft.title.trim()) {
@@ -5861,50 +7033,31 @@ export default function TimeManagementPage() {
         return false
       }
 
-      const shouldSave = window.confirm(
-        'You have unsaved changes. Press OK to save before switching items, or Cancel to keep editing this item.'
-      )
-      if (!shouldSave) return false
-
-      setIsAutoSaving(true)
-      const saved = await persistSelectedItem(draft)
-      setIsAutoSaving(false)
-      if (!saved) return false
+      requestPendingUnsavedAction({ type: 'switch-item', itemId }, anchor)
+      return false
     }
 
-    setSelectedItemId(itemId)
-    setMovingItemId(null)
-    setMovingItemSnapshot(null)
-    setSelectionDraft(null)
-    setIsLeftPanelOpen(true)
-    setExpandedSections((prev) => {
-      const next = new Set(prev)
-      next.add('editor')
-      return next
-    })
-    return true
-  }, [draft, hasPendingUnsavedChanges, isTemplateSelectionMode, items, persistSelectedItem, selectedItemId, showClipboardStatus])
+    return applySelectedItem(itemId)
+  }, [applySelectedItem, draft, hasPendingUnsavedChanges, interactionItemMap, isAutoSaving, isTemplateSelectionMode, items, openQuickObjectsSurface, requestPendingUnsavedAction, selectedItemId, showClipboardStatus])
 
-  const startSelectionWithUnsavedGuard = useCallback(async (dayIndex: number, minute: number) => {
+  const startSelectionWithUnsavedGuard = useCallback(async (dayIndex: number, minute: number, anchor?: PendingUnsavedAnchor) => {
+    if (isAutoSaving) {
+      showClipboardStatus('Saving changes...')
+      return
+    }
+
     if (hasPendingUnsavedChanges) {
       if (!draft.title.trim()) {
         showClipboardStatus('Title is required before creating a new selection.')
         return
       }
 
-      const shouldSave = window.confirm(
-        'You have unsaved changes. Press OK to save before creating a new selection, or Cancel to keep editing this item.'
-      )
-      if (!shouldSave) return
-
-      setIsAutoSaving(true)
-      const saved = await persistSelectedItem(draft)
-      setIsAutoSaving(false)
-      if (!saved) return
+      requestPendingUnsavedAction({ type: 'new-selection', dayIndex, minute }, anchor)
+      return
     }
 
     startSelection(dayIndex, minute)
-  }, [draft, hasPendingUnsavedChanges, persistSelectedItem, showClipboardStatus, startSelection])
+  }, [draft, hasPendingUnsavedChanges, isAutoSaving, requestPendingUnsavedAction, showClipboardStatus, startSelection])
 
   const handleDeleteSelected = async () => {
     if (!selectedEvent) return
@@ -5996,6 +7149,101 @@ export default function TimeManagementPage() {
       showClipboardStatus('Could not delete occurrences. Try again.')
     }
   }
+
+  const nudgeSelectionDraftEdge = useCallback((edge: 'start' | 'end', direction: -1 | 1) => {
+    setSelectionDraft((prev) => {
+      if (!prev) return prev
+
+      const stepSlots = Math.max(1, selectionAdjustStepSlots)
+      const stepMinutes = slotMinutes * stepSlots
+      const minDuration = slotMinutes
+      const delta = direction * stepMinutes
+
+      const nextStart = edge === 'start'
+        ? Math.max(0, Math.min(prev.startMinute + delta, prev.endMinute - minDuration))
+        : prev.startMinute
+      const nextEnd = edge === 'end'
+        ? Math.min(MINUTES_IN_DAY, Math.max(prev.endMinute + delta, prev.startMinute + minDuration))
+        : prev.endMinute
+
+      if (nextStart === prev.startMinute && nextEnd === prev.endMinute) {
+        return prev
+      }
+
+      return {
+        ...prev,
+        startMinute: nextStart,
+        endMinute: nextEnd,
+      }
+    })
+
+    setSelectionLastChangedEdge(edge)
+    if (selectionChangePulseTimeoutRef.current) {
+      window.clearTimeout(selectionChangePulseTimeoutRef.current)
+    }
+    selectionChangePulseTimeoutRef.current = window.setTimeout(() => {
+      setSelectionLastChangedEdge(null)
+      selectionChangePulseTimeoutRef.current = null
+    }, 800)
+  }, [selectionAdjustStepSlots, slotMinutes])
+
+  const nudgeSelectedItemEdge = useCallback(async (edge: 'start' | 'end', direction: -1 | 1): Promise<void> => {
+    if (!selectedItem || isSelectedReadOnly) return
+
+    const sourceEventId = selectedItem.sourceEventId || selectedItem.id
+    const currentEvent = events.find((entry) => entry.id === sourceEventId)
+    if (!currentEvent) return
+
+    const stepSlots = Math.max(1, itemAdjustStepSlots)
+    const stepMinutes = slotMinutes * stepSlots
+    const minDuration = slotMinutes
+    const delta = direction * stepMinutes
+
+    const currentStart = selectedItem.startMinute
+    const currentEnd = selectedItem.startMinute + getTimeItemTotalDurationMinutes(selectedItem, slotMinutes)
+
+    const nextStart = edge === 'start'
+      ? Math.max(0, Math.min(currentStart + delta, currentEnd - minDuration))
+      : currentStart
+    const nextEnd = edge === 'end'
+      ? Math.min(MINUTES_IN_DAY, Math.max(currentEnd + delta, currentStart + minDuration))
+      : currentEnd
+
+    if (nextStart === currentStart && nextEnd === currentEnd) return
+
+    const day = weekDays[selectedItem.dayIndex]
+    const startTime = buildEventTimestamp(day, nextStart)
+    const endTime = buildEventTimestamp(day, nextEnd)
+    const previousEvent = currentEvent
+
+    setEvents((prev) =>
+      prev.map((entry) =>
+        entry.id === sourceEventId
+          ? { ...entry, start_time: startTime, end_time: endTime }
+          : entry
+      )
+    )
+
+    setItemLastChangedEdge(edge)
+    if (itemChangePulseTimeoutRef.current) {
+      window.clearTimeout(itemChangePulseTimeoutRef.current)
+    }
+    itemChangePulseTimeoutRef.current = window.setTimeout(() => {
+      setItemLastChangedEdge(null)
+      itemChangePulseTimeoutRef.current = null
+    }, 800)
+
+    try {
+      await apiClient.put(`/api/user-events/${sourceEventId}`, {
+        start_time: startTime,
+        end_time: endTime,
+      })
+    } catch (err) {
+      console.error('Failed to nudge item edge:', err)
+      setEvents((prev) => prev.map((entry) => (entry.id === sourceEventId ? previousEvent : entry)))
+      showClipboardStatus('Could not adjust start/end time. Try again.')
+    }
+  }, [events, isSelectedReadOnly, itemAdjustStepSlots, selectedItem, showClipboardStatus, slotMinutes, weekDays])
 
   const closeCalendarItemContextMenu = useCallback(() => {
     setCalendarItemContextMenu(null)
@@ -6098,7 +7346,7 @@ export default function TimeManagementPage() {
   }, [selectionDraft])
 
   const handleContextSaveAsTemplate = useCallback((itemId: string) => {
-    const item = items.find((entry) => entry.id === itemId)
+    const item = interactionItemMap.get(itemId) || items.find((entry) => entry.id === itemId)
     const sourceEvent = item ? events.find((entry) => entry.id === item.sourceEventId) : null
     if (!sourceEvent) {
       showClipboardStatus('Item not found.')
@@ -6113,6 +7361,7 @@ export default function TimeManagementPage() {
       title,
       notes: sourceEvent.description || '',
       categoryIds: Array.isArray(sourceEvent.category_ids) ? sourceEvent.category_ids : [],
+      autoSaveEnabled: false,
       sourceItemId: sourceEvent.id,
       createdAt: new Date().toISOString(),
     }
@@ -6126,7 +7375,7 @@ export default function TimeManagementPage() {
     })
     showClipboardStatus(`Saved template "${quickName}".`)
     closeCalendarItemContextMenu()
-  }, [closeCalendarItemContextMenu, events, items, showClipboardStatus])
+  }, [closeCalendarItemContextMenu, events, interactionItemMap, items, showClipboardStatus])
 
   const handleContextSaveItem = useCallback(() => {
     closeCalendarItemContextMenu()
@@ -6134,25 +7383,28 @@ export default function TimeManagementPage() {
   }, [closeCalendarItemContextMenu, handleUpdateItem])
 
   const startMoveItem = useCallback((itemId: string): boolean => {
-    const target = items.find((entry) => entry.id === itemId)
+    const target = interactionItemMap.get(itemId) || items.find((entry) => entry.id === itemId)
     if (!target) {
       showClipboardStatus('Item not found.')
       return false
     }
 
     const source = sourceMap.get(target.sourceId)
-    if (source?.sourceType === 'external') {
+    if (isReadOnlySource(source)) {
       showClipboardStatus('Read-only item cannot be moved here.')
       return false
     }
 
-    setMovingItemId(itemId)
+    setMovingItemId(getTimeItemInteractionId(target))
     setMovingItemSnapshot(target)
     setSelectedItemId(null)
     setSelectionDraft({
       dayIndex: target.dayIndex,
       startMinute: target.startMinute,
-      endMinute: Math.min(MINUTES_IN_DAY, target.startMinute + Math.max(slotMinutes, target.durationMinutes)),
+      endMinute: Math.min(
+        MINUTES_IN_DAY,
+        target.startMinute + getTimeItemTotalDurationMinutes(target, slotMinutes)
+      ),
     })
     setIsSelecting(false)
     setDraft({
@@ -6170,7 +7422,7 @@ export default function TimeManagementPage() {
     })
     showClipboardStatus('Move mode active. Select a new date and time, then click Save Item.')
     return true
-  }, [items, showClipboardStatus, slotMinutes, sourceMap])
+  }, [interactionItemMap, items, showClipboardStatus, slotMinutes, sourceMap])
 
   const handleContextMoveItem = useCallback((itemId: string) => {
     startMoveItem(itemId)
@@ -6188,14 +7440,14 @@ export default function TimeManagementPage() {
   }, [closeCalendarItemContextMenu, handleDiscardSelectionDraft])
 
   const handleContextDeleteItem = useCallback(async (itemId: string) => {
-    const targetItem = items.find((entry) => entry.id === itemId)
+    const targetItem = interactionItemMap.get(itemId) || items.find((entry) => entry.id === itemId)
     const target = targetItem ? events.find((entry) => entry.id === targetItem.sourceEventId) : null
     if (!target) {
       closeCalendarItemContextMenu()
       return
     }
     const source = sourceMap.get(target.source_id || activeMainSourceId)
-    if (source?.sourceType === 'external') {
+    if (isReadOnlySource(source)) {
       showClipboardStatus('Read-only item cannot be deleted here.')
       closeCalendarItemContextMenu()
       return
@@ -6219,17 +7471,17 @@ export default function TimeManagementPage() {
       setEvents(previous)
       showClipboardStatus('Could not delete item. Try again.')
     }
-  }, [activeMainSourceId, closeCalendarItemContextMenu, events, items, movingItemId, selectedItemId, showClipboardStatus, sourceMap])
+  }, [activeMainSourceId, closeCalendarItemContextMenu, events, interactionItemMap, items, movingItemId, selectedItemId, showClipboardStatus, sourceMap])
 
   const handleContextDeleteThisOccurrence = useCallback(async (itemId: string) => {
-    const targetItem = items.find((entry) => entry.id === itemId)
+    const targetItem = interactionItemMap.get(itemId) || items.find((entry) => entry.id === itemId)
     const target = targetItem ? events.find((entry) => entry.id === targetItem.sourceEventId) : null
     if (!targetItem || !target) {
       closeCalendarItemContextMenu()
       return
     }
     const source = sourceMap.get(target.source_id || activeMainSourceId)
-    if (source?.sourceType === 'external') {
+    if (isReadOnlySource(source)) {
       showClipboardStatus('Read-only item cannot be deleted here.')
       closeCalendarItemContextMenu()
       return
@@ -6254,17 +7506,17 @@ export default function TimeManagementPage() {
       setEvents(previous)
       showClipboardStatus('Could not delete occurrence. Try again.')
     }
-  }, [activeMainSourceId, closeCalendarItemContextMenu, events, handleContextDeleteItem, items, selectedItemId, showClipboardStatus, sourceMap])
+  }, [activeMainSourceId, closeCalendarItemContextMenu, events, handleContextDeleteItem, interactionItemMap, items, selectedItemId, showClipboardStatus, sourceMap])
 
   const handleContextDeleteThisAndFollowing = useCallback(async (itemId: string) => {
-    const targetItem = items.find((entry) => entry.id === itemId)
+    const targetItem = interactionItemMap.get(itemId) || items.find((entry) => entry.id === itemId)
     const target = targetItem ? events.find((entry) => entry.id === targetItem.sourceEventId) : null
     if (!targetItem || !target) {
       closeCalendarItemContextMenu()
       return
     }
     const source = sourceMap.get(target.source_id || activeMainSourceId)
-    if (source?.sourceType === 'external') {
+    if (isReadOnlySource(source)) {
       showClipboardStatus('Read-only item cannot be deleted here.')
       closeCalendarItemContextMenu()
       return
@@ -6301,14 +7553,15 @@ export default function TimeManagementPage() {
       setEvents(previous)
       showClipboardStatus('Could not delete occurrences. Try again.')
     }
-  }, [activeMainSourceId, closeCalendarItemContextMenu, events, handleContextDeleteItem, items, selectedItemId, showClipboardStatus, sourceMap])
+  }, [activeMainSourceId, closeCalendarItemContextMenu, events, handleContextDeleteItem, interactionItemMap, items, selectedItemId, showClipboardStatus, sourceMap])
 
   const handleContextToggleCategory = useCallback(async (itemId: string, categoryId: string) => {
-    const targetItem = items.find((entry) => entry.id === itemId)
-    const target = targetItem ? events.find((entry) => entry.id === targetItem.sourceEventId) : null
+    const targetItem = interactionItemMap.get(itemId) || items.find((entry) => entry.id === itemId)
+    const sourceEventId = targetItem?.sourceEventId || itemId
+    const target = events.find((entry) => entry.id === sourceEventId)
     if (!target) return
     const source = sourceMap.get(target.source_id || activeMainSourceId)
-    if (source?.sourceType === 'external') {
+    if (isReadOnlySource(source)) {
       showClipboardStatus('Read-only item cannot be edited here.')
       return
     }
@@ -6321,6 +7574,11 @@ export default function TimeManagementPage() {
     if (selectedItemId === itemId) {
       setDraft((prev) => ({ ...prev, categoryIds: nextIds }))
     }
+
+    if (target.id.startsWith('pending-')) {
+      return
+    }
+
     try {
       await apiClient.put(`/api/user-events/${target.id}`, { category_ids: nextIds })
     } catch (err) {
@@ -6328,7 +7586,16 @@ export default function TimeManagementPage() {
       setEvents(previous)
       showClipboardStatus('Could not update categories. Try again.')
     }
-  }, [activeMainSourceId, events, items, selectedItemId, showClipboardStatus, sourceMap])
+  }, [activeMainSourceId, events, interactionItemMap, items, selectedItemId, showClipboardStatus, sourceMap])
+
+  const getContextMenuTargetCategoryIds = useCallback((): string[] => {
+    if (!calendarItemContextMenu) return []
+    const targetItem = interactionItemMap.get(calendarItemContextMenu.itemId)
+      || items.find((entry) => entry.id === calendarItemContextMenu.itemId)
+    const sourceEventId = targetItem?.sourceEventId || calendarItemContextMenu.itemId
+    const targetEvent = events.find((entry) => entry.id === sourceEventId)
+    return Array.isArray(targetEvent?.category_ids) ? targetEvent.category_ids : []
+  }, [calendarItemContextMenu, events, interactionItemMap, items])
 
   // eslint-disable-next-line react-hooks/exhaustive-deps -- stable handler; wrapping in useCallback would cascade through co-located helpers in this large view
   const updateTimeBackground = (periodId: string, updates: Partial<TimeBackgroundPeriod>) => {
@@ -6487,6 +7754,43 @@ export default function TimeManagementPage() {
   }, [isSelectedItemDirty, selectedEvent?.recurrence_rule, selectedItem, selectionDraft])
 
   useEffect(() => {
+    if (!selectedEvent?.id.startsWith('pending-')) return
+
+    const pendingEventId = selectedEvent.id
+    const pendingDescription = notesToEventDescription(draft.notes)
+    const pendingRecurrenceRule = normaliseRecurrenceRule(draft.recurrenceRule)
+
+    setEvents((prev) => {
+      let hasChanges = false
+      const next = prev.map((entry) => {
+        if (entry.id !== pendingEventId) return entry
+
+        const currentCategoryIds = Array.isArray(entry.category_ids) ? entry.category_ids : []
+        const currentRecurrenceRule = normaliseRecurrenceRule(entry.recurrence_rule)
+        const hasTitleChanges = entry.title !== draft.title
+        const hasDescriptionChanges = entry.description !== pendingDescription
+        const hasCategoryChanges = !areStringArraysEqual(currentCategoryIds, draft.categoryIds)
+        const hasRecurrenceChanges = JSON.stringify(currentRecurrenceRule) !== JSON.stringify(pendingRecurrenceRule)
+
+        if (!hasTitleChanges && !hasDescriptionChanges && !hasCategoryChanges && !hasRecurrenceChanges) {
+          return entry
+        }
+
+        hasChanges = true
+        return {
+          ...entry,
+          title: draft.title,
+          description: pendingDescription,
+          category_ids: [...draft.categoryIds],
+          recurrence_rule: pendingRecurrenceRule,
+        }
+      })
+
+      return hasChanges ? next : prev
+    })
+  }, [draft, selectedEvent?.id])
+
+  useEffect(() => {
     setCollapsedBackgroundIds((prev) => {
       const existingIds = new Set(timeBackgrounds.map((period) => period.id))
       const next = new Set(Array.from(prev).filter((id) => existingIds.has(id)))
@@ -6533,6 +7837,18 @@ export default function TimeManagementPage() {
   }, [deletingBackgroundId, timeBackgrounds])
 
   useEffect(() => {
+    if (!deletingTemplateId) {
+      setDeletingTemplatePopoverPosition(null)
+      return
+    }
+    const exists = quickTemplates.some((template) => template.id === deletingTemplateId)
+    if (!exists) {
+      setDeletingTemplateId(null)
+      setDeletingTemplatePopoverPosition(null)
+    }
+  }, [deletingTemplateId, quickTemplates])
+
+  useEffect(() => {
     const handlePointerDownOutsideDeletePopovers = (event: globalThis.MouseEvent) => {
       if (!(event.target instanceof HTMLElement)) return
       const insideDeletePopoverRoot = event.target.closest('[data-delete-popover-root="true"]')
@@ -6540,6 +7856,7 @@ export default function TimeManagementPage() {
         setIsDeleteConfirmOpen(false)
         setDeletingBackgroundId(null)
         setDeletingTemplateId(null)
+        setDeletingTemplatePopoverPosition(null)
       }
 
       const insideMoveScopeRoot = event.target.closest('[data-move-scope-root="true"]')
@@ -6807,7 +8124,7 @@ export default function TimeManagementPage() {
   }
 
   const handleDeleteCategory = async (cat: Category) => {
-    if (!window.confirm(`Delete category "${cat.label}"? It will be removed from any items that use it.`)) return
+    setCategoryDeleteTarget(null)
     try {
       await apiClient.delete(`/api/time-management/categories/${cat.id}`)
       setCategories((prev) => prev.filter((c) => c.id !== cat.id))
@@ -7269,7 +8586,7 @@ export default function TimeManagementPage() {
         isOpen: isLeftPanelOpen,
         expandedSections: Array.from(expandedSections),
         sections: {
-          modes: ['activate mode', 'create mode', 'open settings', 'import mode json', 'export mode json', 'rename mode', 'delete mode'],
+          modes: ['activate mode', 'create mode', 'duplicate mode', 'open settings', 'import mode json', 'export mode json', 'rename mode', 'delete mode'],
           month: ['navigate month overview', 'jump week'],
           sources: ['toggle source visibility', 'update main label/color', 'sync connected calendars'],
           categories: ['create category', 'edit category', 'delete category', 'set category display style'],
@@ -7300,7 +8617,7 @@ export default function TimeManagementPage() {
         activeModeId,
         activeModeName: modes.find((mode) => mode.id === activeModeId)?.name || null,
         list: modes.map((mode) => ({ id: mode.id, name: mode.name })),
-        canCreateMore: modes.length < 3,
+        canCreateMore: canCreateMoreModes,
       },
       sources: syncCalendars.map((source) => ({
         id: source.id,
@@ -7397,6 +8714,7 @@ export default function TimeManagementPage() {
     }
   }, [
     activeModeId,
+    canCreateMoreModes,
     categories,
     expandedSections,
     isHiddenModeEnabled,
@@ -7445,28 +8763,174 @@ export default function TimeManagementPage() {
 
   const hasVisibleItems = visibleItems.length > 0
   const isLoading = isSourcesLoading || isEventsLoading
-  const handleRefreshCurrentWeek = useCallback(() => {
-    void hydrateWeekWindow(currentWeekStartRef.current, { background: false, forceRefresh: true })
+  const selectedSourceCount = useMemo(
+    () => syncCalendars.filter((source) => source.enabled).length,
+    [syncCalendars]
+  )
+  const completedSourceCount = useMemo(
+    () => syncCalendars.filter((source) => source.enabled && sourceLoadStates[source.id] === 'synced').length,
+    [sourceLoadStates, syncCalendars]
+  )
+  const loadingSourceCount = useMemo(
+    () => syncCalendars.filter((source) => source.enabled && sourceLoadStates[source.id] === 'loading').length,
+    [sourceLoadStates, syncCalendars]
+  )
+  const isAllSelectedSourcesSynced = selectedSourceCount > 0 && completedSourceCount === selectedSourceCount
+
+  useEffect(() => {
+    if (aggregateSourceStatusFadeTimerRef.current !== null) {
+      window.clearTimeout(aggregateSourceStatusFadeTimerRef.current)
+      aggregateSourceStatusFadeTimerRef.current = null
+    }
+
+    if (selectedSourceCount === 0) {
+      setIsAggregateSourceStatusVisible(false)
+      return
+    }
+
+    setIsAggregateSourceStatusVisible(true)
+    if (isAllSelectedSourcesSynced) {
+      aggregateSourceStatusFadeTimerRef.current = window.setTimeout(() => {
+        setIsAggregateSourceStatusVisible(false)
+        aggregateSourceStatusFadeTimerRef.current = null
+      }, 2200)
+    }
+  }, [isAllSelectedSourcesSynced, selectedSourceCount])
+
+  const getSourceStatus = useCallback((source: SyncCalendar): SourceLoadState => {
+    if (!source.enabled) return 'disabled'
+    return sourceLoadStates[source.id] || 'loading'
+  }, [sourceLoadStates])
+
+  const getSourceRowClassName = useCallback((source: SyncCalendar): string => {
+    const status = getSourceStatus(source)
+    if (status === 'loading') {
+      return 'border-blue-400/60 bg-blue-500/12 hover:bg-blue-500/16 dark:bg-blue-950/35 dark:hover:bg-blue-900/40'
+    }
+    if (status === 'error') {
+      return 'border-red-400/60 bg-red-500/10 hover:bg-red-500/14 dark:bg-red-950/30 dark:hover:bg-red-900/35'
+    }
+    if (status === 'disabled') {
+      return 'border-border bg-muted/35 hover:bg-muted/55'
+    }
+    return 'border-emerald-400/60 bg-emerald-500/10 hover:bg-emerald-500/14 dark:bg-emerald-950/30 dark:hover:bg-emerald-900/35'
+  }, [getSourceStatus])
+
+  const renderSourceStatusBadge = useCallback((source: SyncCalendar) => {
+    const status = getSourceStatus(source)
+    if (status === 'loading') {
+      return (
+        <span className="inline-flex items-center gap-1 rounded-full border border-blue-400/50 bg-blue-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-blue-700 dark:text-blue-300">
+          <Loader2 className="h-2.5 w-2.5 animate-spin" />
+          Loading
+        </span>
+      )
+    }
+    if (status === 'error') {
+      return (
+        <span className="inline-flex items-center gap-1 rounded-full border border-red-400/60 bg-red-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-red-700 dark:text-red-300">
+          <AlertTriangle className="h-2.5 w-2.5" />
+          Error
+        </span>
+      )
+    }
+    if (status === 'disabled') {
+      return (
+        <span className="inline-flex items-center gap-1 rounded-full border border-border bg-muted/70 px-1.5 py-0.5 text-[10px] font-semibold text-muted-foreground">
+          <Clock3 className="h-2.5 w-2.5" />
+          Disabled
+        </span>
+      )
+    }
+    return (
+      <span
+        className="inline-flex items-center gap-1 rounded-full border border-emerald-400/60 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-700 dark:text-emerald-300"
+        style={{ animation: 'source-sync-complete 700ms ease-out 1' }}
+      >
+        <CheckCircle2 className="h-2.5 w-2.5" />
+        Synced
+      </span>
+    )
+  }, [getSourceStatus])
+
+  const handleRefreshCurrentWeek = useCallback(async () => {
+    const weekStart = currentWeekStartRef.current
+    await hydrateWeekWindow(weekStart, { background: false, forceRefresh: true })
   }, [hydrateWeekWindow])
+
+  const renderCalendarHeaderRow = (position: 'top' | 'bottom') => (
+    <div
+      data-testid={`calendar-header-${position}`}
+      className={`grid bg-card/95 backdrop-blur-sm ${position === 'top' ? 'border-b border-border' : 'sticky bottom-0 z-20 border-t border-border shadow-[0_-1px_0_hsl(var(--border))]'}`}
+      style={{ gridTemplateColumns: weekGridTemplateColumns }}
+    >
+      {tzState.all.map((tz, tzIdx) => {
+        const isPrimary = tzIdx === 0
+        const isUtc = tz === 'UTC'
+        const entry = isUtc ? null : findTimezone(tz)
+        const city = isUtc ? 'UTC' : (entry?.city ?? tz.split('/').pop()?.replace(/_/g, ' ') ?? tz)
+        const abbr = isUtc ? '' : (entry?.abbr ?? '')
+        const ct = isUtc
+          ? `${nowTick.getUTCHours().toString().padStart(2, '0')}:${nowTick.getUTCMinutes().toString().padStart(2, '0')}`
+          : getCurrentTimeInTimezone(tz)
+        return (
+          <div
+            key={`${position}-${tz}`}
+            className={`flex flex-col items-center justify-between border-r border-border px-0.5 py-1.5 ${
+              isPrimary ? 'text-blue-600 dark:text-blue-400' : 'text-muted-foreground'
+            }`}
+          >
+            <span className="text-[9px] font-bold leading-none">{city}</span>
+            {abbr && <span className="text-[9px] opacity-60 leading-none">{abbr}</span>}
+            <span className="font-mono tabular-nums text-[10px] font-semibold leading-none">
+              {ct.split(':')[0]}<span style={{ animation: 'blink-colon 1s step-start infinite' }}>:</span>{ct.split(':')[1]}
+            </span>
+          </div>
+        )
+      })}
+      {weekDays.map((day) => {
+        const isHighlightedDay = highlightedDay ? isSameDay(day, highlightedDay) : false
+        return (
+          <div
+            key={`${position}-${day.toISOString()}`}
+            className={`border-r border-border px-2 py-2 text-center text-xs font-semibold text-foreground last:border-r-0 transition-shadow ${
+              isHighlightedDay ? 'animate-pulse bg-blue-50/80 ring-2 ring-inset ring-blue-500/70 dark:bg-blue-950/30' : ''
+            }`}
+          >
+            <div>{format(day, 'EEE')}</div>
+            <div className="text-[11px] text-muted-foreground">{format(day, 'd MMM')}</div>
+          </div>
+        )
+      })}
+    </div>
+  )
 
   return (
     <div className="flex h-full min-h-0 flex-col bg-background px-2 pb-6 pt-3 md:px-4 md:pt-4">
       <LeftPanelPortal>
+        {isPhoneLayout && isToolsSurfaceVisible && (
+          <button
+            type="button"
+            aria-label="Close mobile side panel"
+            className="fixed inset-0 z-[94] bg-black/55"
+            onClick={closeLeftPanel}
+          />
+        )}
         <aside
           ref={leftPanelAsideRef}
-          className={`sticky top-0 h-screen shrink-0 overflow-hidden border-r border-border bg-card transition-[width] duration-300 ease-out ${
+          className={`${isPhoneLayout ? 'fixed inset-0 z-[95] h-screen w-screen border-0 shadow-2xl' : 'sticky top-0 h-screen shrink-0 border-r border-border'} overflow-hidden bg-card transition-[width,transform,opacity] duration-300 ease-out ${
             isLeftPanelResizing ? 'duration-75' : ''
           }`}
-          style={{ width: isLeftPanelOpen ? `${leftPanelWidthPx}px` : 0 }}
+          style={{ width: isPhoneLayout ? (isToolsSurfaceVisible ? '100vw' : 0) : (isLeftPanelOpen ? `${leftPanelWidthPx}px` : 0) }}
         >
           <div
             className={`flex h-full min-w-0 flex-col transition-all duration-300 ease-out ${
-              isLeftPanelOpen ? 'translate-x-0 opacity-100' : '-translate-x-3 opacity-0'
+              isToolsSurfaceVisible ? 'translate-x-0 opacity-100' : (isPhoneLayout ? 'translate-x-full opacity-0' : '-translate-x-3 opacity-0')
             }`}
-            style={{ width: `${leftPanelWidthPx}px` }}
+            style={{ width: isPhoneLayout ? '100vw' : `${leftPanelWidthPx}px` }}
           >
             <div className="flex items-center justify-between border-b border-border px-4 py-3">
-              <h2 className="text-sm font-semibold text-foreground">Time Management Tools</h2>
+              <h2 className="text-sm font-semibold text-foreground">{showMobileQuickObjectsOverlay ? 'Quick Objects' : 'Time Management Tools'}</h2>
               <button
                 onClick={closeLeftPanel}
                 className="rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
@@ -7537,7 +9001,11 @@ export default function TimeManagementPage() {
                               disabled={isModesLoading}
                               className={`rounded-full border px-3 py-1.5 text-xs font-semibold transition-colors ${
                                 isActive
-                                  ? 'border-indigo-500 bg-indigo-600 text-white shadow-sm'
+                                  ? `border-indigo-500 bg-indigo-600 text-white shadow-sm ${
+                                      highlightedModeId === mode.id
+                                        ? 'animate-[pulse_0.9s_ease-in-out_2] ring-2 ring-indigo-300/70'
+                                        : ''
+                                    }`
                                   : 'border-border bg-background text-foreground hover:bg-muted'
                               }`}
                               aria-pressed={isActive}
@@ -7548,7 +9016,7 @@ export default function TimeManagementPage() {
                         })}
                       </div>
 
-                      {modes.length < 3 && (
+                      {canCreateMoreModes && (
                         <div className="mt-2 flex gap-2">
                           <button
                             type="button"
@@ -7564,7 +9032,7 @@ export default function TimeManagementPage() {
                             disabled={isCreatingMode || isImportingModeJson}
                             className="flex-1 rounded-md border border-border px-2.5 py-1.5 text-xs font-semibold text-foreground hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
                           >
-                            {isImportingModeJson ? 'Importing...' : 'Import Mode'}
+                            {isImportingModeJson ? 'Importing...' : 'Import JSON'}
                           </button>
                         </div>
                       )}
@@ -7594,47 +9062,87 @@ export default function TimeManagementPage() {
                                 Mode name
                               </label>
                               <input
+                                ref={modeNameInputRef}
                                 type="text"
                                 value={modeNameDraft}
                                 onChange={(event) => setModeNameDraft(event.target.value)}
-                                className="w-full rounded-md border border-border bg-background px-2 py-1.5 text-xs"
+                                className={`w-full rounded-md border bg-background px-2 py-1.5 text-xs transition-all ${
+                                  isModeNameInputHighlighted
+                                    ? 'animate-[pulse_0.9s_ease-in-out_2] border-indigo-500 shadow-[0_0_0_3px_rgba(99,102,241,0.25)]'
+                                    : 'border-border'
+                                }`}
                               />
-                              <button
-                                type="button"
-                                onClick={() => { void handleRenameCurrentMode() }}
-                                disabled={isRenamingMode || !modeNameDraft.trim()}
-                                className="mt-2 rounded-md bg-indigo-600 px-2.5 py-1.5 text-xs font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
-                              >
-                                {isRenamingMode ? 'Saving...' : 'Save Name'}
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => { void handleExportCurrentModeJson() }}
-                                className="ml-2 mt-2 rounded-md border border-border px-2.5 py-1.5 text-xs font-semibold text-foreground hover:bg-muted"
-                              >
-                                Export Mode JSON
-                              </button>
+                              <div className="mt-2 grid grid-cols-3 gap-2">
+                                <button
+                                  type="button"
+                                  onClick={handleSaveModeNameClick}
+                                  disabled={isRenamingMode || !hasModeNameValue}
+                                  aria-disabled={!canSaveModeName}
+                                  className={`w-full rounded-md px-2.5 py-1.5 text-xs font-semibold transition-all disabled:cursor-not-allowed disabled:opacity-50 ${
+                                    canSaveModeName
+                                      ? 'bg-indigo-600 text-white hover:bg-indigo-500'
+                                      : `border border-border text-foreground hover:bg-muted ${
+                                          isModeNameSaveNoChangePulse
+                                            ? 'animate-[pulse_0.35s_ease-in-out_1]'
+                                            : ''
+                                        }`
+                                  }`}
+                                >
+                                  {isRenamingMode ? 'Saving...' : 'Save Name'}
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => { void handleExportCurrentModeJson() }}
+                                  className="w-full rounded-md border border-border px-2.5 py-1.5 text-xs font-semibold text-foreground hover:bg-muted"
+                                >
+                                  Show JSON
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={() => { void handleDuplicateMode() }}
+                                  disabled={isDuplicatingMode || isCreatingMode || !canCreateMoreModes || !activeModeId}
+                                  className="w-full rounded-md border border-border px-2.5 py-1.5 text-xs font-semibold text-foreground hover:bg-muted disabled:cursor-not-allowed disabled:opacity-50"
+                                  title={canCreateMoreModes ? 'Duplicate current mode' : `Maximum ${MAX_MODE_COUNT} modes reached`}
+                                >
+                                  {isDuplicatingMode ? 'Duplicating...' : 'Duplicate'}
+                                </button>
+                              </div>
+                              {modeNameSaveFeedback && (
+                                <p className="mt-2 text-[11px] text-muted-foreground">
+                                  {modeNameSaveFeedback}
+                                </p>
+                              )}
                             </div>
 
                             {modes.length > 1 && (
                               <div className="rounded-md border border-red-200 bg-red-50/60 p-2.5 dark:border-red-900 dark:bg-red-950/20">
-                                <p className="text-[11px] font-semibold uppercase tracking-wide text-red-700 dark:text-red-300">
-                                  Delete mode
-                                </p>
-                                <p className="mt-1 text-xs text-muted-foreground">
-                                  Move the calendar data to another mode or delete it completely.
-                                </p>
+                                <button
+                                  type="button"
+                                  onClick={() => {
+                                    setModeDeleteState((prev) => {
+                                      if (prev.open) {
+                                        return { open: false, action: null, transferToModeId: null }
+                                      }
+                                      return { open: true, action: null, transferToModeId: null }
+                                    })
+                                  }}
+                                  className="flex w-full items-center gap-2 text-left"
+                                  title={modeDeleteState.open ? 'Collapse delete mode' : 'Expand delete mode'}
+                                >
+                                  <span className="text-[11px] font-semibold uppercase tracking-wide text-red-700 dark:text-red-300">
+                                    Delete mode
+                                  </span>
+                                  <span className="ml-auto text-red-700/80 dark:text-red-300/80">
+                                    {modeDeleteState.open ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+                                  </span>
+                                </button>
 
-                                {!modeDeleteState.open ? (
-                                  <button
-                                    type="button"
-                                    onClick={() => setModeDeleteState({ open: true, action: null, transferToModeId: null })}
-                                    className="mt-2 rounded-md border border-red-300 px-2.5 py-1.5 text-xs font-semibold text-red-700 hover:bg-red-100 dark:border-red-800 dark:text-red-300 dark:hover:bg-red-950/40"
-                                  >
-                                    Delete Mode
-                                  </button>
-                                ) : (
+                                {modeDeleteState.open && (
                                   <div className="mt-2 space-y-2">
+                                    <p className="text-xs text-muted-foreground">
+                                      Move the calendar data to another mode or delete it completely.
+                                    </p>
+
                                     {modeDeleteState.action !== 'move' ? (
                                       <div className="flex flex-wrap gap-2 pt-1">
                                         <button
@@ -7833,11 +9341,7 @@ export default function TimeManagementPage() {
                             return (
                               <div key={source.id} className="space-y-1.5">
                                 <label
-                                  className={`flex cursor-pointer items-center gap-2 rounded-md border px-2 py-1.5 transition-colors ${
-                                    source.enabled
-                                      ? 'border-blue-300 bg-blue-50/60 dark:bg-blue-950/30'
-                                      : 'border-border hover:bg-muted/50'
-                                  }`}
+                                  className={`flex cursor-pointer items-center gap-2 rounded-md border px-2 py-1.5 transition-colors ${getSourceRowClassName(source)}`}
                                 >
                                   <input
                                     type="checkbox"
@@ -7853,7 +9357,13 @@ export default function TimeManagementPage() {
                                     className="h-3.5 w-3.5 rounded border-border"
                                   />
                                   <span className="h-2.5 w-2.5 rounded-full" style={{ backgroundColor: source.color }} />
-                                  <span className="truncate text-xs font-medium text-foreground">{source.name}</span>
+                                  <span className="min-w-0 flex-1">
+                                    <span className="block truncate text-xs font-medium text-foreground">{source.name}</span>
+                                    {!isMain && (
+                                      <span className="block truncate text-[10px] text-muted-foreground">{source.secondaryLabel || 'Read-only mirror'}</span>
+                                    )}
+                                  </span>
+                                  {renderSourceStatusBadge(source)}
                                   {isMain && (
                                     <button
                                       type="button"
@@ -7935,11 +9445,7 @@ export default function TimeManagementPage() {
                               .map((source) => (
                                 <label
                                   key={source.id}
-                                  className={`flex cursor-pointer items-center gap-2 rounded-md border px-2 py-1.5 transition-colors ${
-                                    source.enabled
-                                      ? 'border-blue-300 bg-blue-50/60 dark:bg-blue-950/30'
-                                      : 'border-border hover:bg-muted/50'
-                                  }`}
+                                  className={`flex cursor-pointer items-center gap-2 rounded-md border px-2 py-1.5 transition-colors ${getSourceRowClassName(source)}`}
                                 >
                                   <input
                                     type="checkbox"
@@ -7961,6 +9467,7 @@ export default function TimeManagementPage() {
                                       <span className="block truncate text-[10px] text-muted-foreground">{source.secondaryLabel}</span>
                                     )}
                                   </span>
+                                  {renderSourceStatusBadge(source)}
                                 </label>
                               ))}
                           </div>
@@ -8172,7 +9679,7 @@ export default function TimeManagementPage() {
                               </button>
                               <button
                                 type="button"
-                                onClick={() => { void handleDeleteCategory(cat) }}
+                                onClick={() => setCategoryDeleteTarget(cat)}
                                 className="rounded p-1 text-muted-foreground hover:bg-red-50 hover:text-red-600 dark:hover:bg-red-950/30"
                                 aria-label={`Delete ${cat.label}`}
                                 title="Delete category"
@@ -8407,7 +9914,7 @@ export default function TimeManagementPage() {
                                         <Trash2 className="h-3.5 w-3.5" />
                                       </button>
                                       {deletingBackgroundId === period.id && (
-                                        <div className="absolute right-0 top-full z-50 mt-2 w-52 max-w-[calc(100vw-1rem)] rounded-md border border-red-200 bg-background p-2 shadow-lg dark:border-red-900">
+                                        <div className="absolute right-0 top-full z-[140] mt-2 w-52 max-w-[calc(100vw-1rem)] rounded-md border border-red-200 bg-background p-2 shadow-lg dark:border-red-900">
                                           <p className="mb-2 text-xs text-foreground">Delete this item?</p>
                                           <div className="flex items-center justify-end gap-2">
                                             <button
@@ -8503,7 +10010,7 @@ export default function TimeManagementPage() {
                     editorSectionRef.current = node
                     sectionEditorRef.current = node
                   }}
-                  className="rounded-lg border border-border bg-background/50 p-3"
+                  className="rounded-lg border border-border bg-background p-3"
                 >
                   <div className="flex items-center gap-2">
                     <button
@@ -8535,13 +10042,180 @@ export default function TimeManagementPage() {
                         <div className="mb-2 mt-2 rounded-md border border-orange-200 bg-orange-50/70 p-2 text-xs text-orange-700 dark:border-orange-800 dark:bg-orange-950/30 dark:text-orange-300">
                           {movingItemId ? 'Move selection:' : 'Selection:'} {format(weekDays[selectionDraft.dayIndex], 'EEE d MMM')} {formatMinuteLabel(selectionDraft.startMinute, tzState.primary, slotMinutes)}-
                           {formatMinuteLabel(selectionDraft.endMinute, tzState.primary, slotMinutes)}
+
+                          <div className="mt-2">
+                              <div
+                                role="button"
+                                tabIndex={0}
+                                onClick={() => {
+                                  setIsSelectionAdjusterExpanded((prev) => !prev)
+                                }}
+                                onKeyDown={(event) => {
+                                  if (event.key !== 'Enter' && event.key !== ' ') return
+                                  event.preventDefault()
+                                  setIsSelectionAdjusterExpanded((prev) => !prev)
+                                }}
+                                className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-md bg-muted/50 px-3 py-2 text-xs font-medium text-foreground transition-colors hover:bg-muted"
+                              >
+                                <span>Adjust selection time</span>
+                                <ChevronDown className={`h-3.5 w-3.5 transition-transform ${isSelectionAdjusterOpen ? 'rotate-180' : ''}`} />
+                              </div>
+
+                              {isSelectionAdjusterOpen && (
+                                <div className="mt-1.5 space-y-1.5 text-[11px]">
+                                  <div className="rounded-md border border-orange-300/70 bg-white/90 px-2 py-1 dark:border-orange-700/70 dark:bg-orange-950/30">
+                                    <span className="mb-1 block font-medium">Step interval</span>
+                                    <div className="grid grid-cols-3 gap-1">
+                                      {[1, 2, 4].map((stepMultiplier) => {
+                                        const isActive = selectionAdjustStepSlots === stepMultiplier
+                                        return (
+                                          <button
+                                            key={stepMultiplier}
+                                            type="button"
+                                            onClick={() => setSelectionAdjustStepSlots(stepMultiplier)}
+                                            className={`rounded-md border px-1.5 py-1 text-[11px] font-semibold transition-colors ${
+                                              isActive
+                                                ? 'border-orange-600 bg-orange-600 text-white'
+                                                : 'border-orange-300 bg-background text-orange-700 hover:bg-orange-100 dark:border-orange-700 dark:text-orange-200 dark:hover:bg-orange-900/40'
+                                            }`}
+                                          >
+                                            {slotMinutes * stepMultiplier}m
+                                          </button>
+                                        )
+                                      })}
+                                    </div>
+                                  </div>
+
+                                  <div className="grid grid-cols-2 gap-1.5">
+                                    <button
+                                      type="button"
+                                      onClick={() => nudgeSelectionDraftEdge('start', -1)}
+                                      className="rounded-md border border-orange-300 bg-white/90 px-2 py-1.5 text-orange-700 hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/40 dark:text-orange-100"
+                                      title={`Move start ${slotMinutes * Math.max(1, selectionAdjustStepSlots)} minutes earlier`}
+                                    >
+                                      Start -{slotMinutes * Math.max(1, selectionAdjustStepSlots)}m
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => nudgeSelectionDraftEdge('start', 1)}
+                                      className="rounded-md border border-orange-300 bg-white/90 px-2 py-1.5 text-orange-700 hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/40 dark:text-orange-100"
+                                      title={`Move start ${slotMinutes * Math.max(1, selectionAdjustStepSlots)} minutes later`}
+                                    >
+                                      Start +{slotMinutes * Math.max(1, selectionAdjustStepSlots)}m
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => nudgeSelectionDraftEdge('end', -1)}
+                                      className="rounded-md border border-orange-300 bg-white/90 px-2 py-1.5 text-orange-700 hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/40 dark:text-orange-100"
+                                      title={`Move end ${slotMinutes * Math.max(1, selectionAdjustStepSlots)} minutes earlier`}
+                                    >
+                                      End -{slotMinutes * Math.max(1, selectionAdjustStepSlots)}m
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => nudgeSelectionDraftEdge('end', 1)}
+                                      className="rounded-md border border-orange-300 bg-white/90 px-2 py-1.5 text-orange-700 hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/40 dark:text-orange-100"
+                                      title={`Move end ${slotMinutes * Math.max(1, selectionAdjustStepSlots)} minutes later`}
+                                    >
+                                      End +{slotMinutes * Math.max(1, selectionAdjustStepSlots)}m
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
                         </div>
                       )}
 
                       {selectedItem && (
-                        <div className="mb-2 mt-2 rounded-md border border-blue-200 bg-blue-50/70 p-2 text-xs text-blue-700 dark:border-blue-800 dark:bg-blue-950/30 dark:text-blue-300">
-                          {format(weekDays[selectedItem.dayIndex], 'EEE d MMM')} {formatMinuteLabel(selectedItem.startMinute, tzState.primary, slotMinutes)}-
-                          {formatMinuteLabel(selectedItem.startMinute + selectedItem.durationMinutes, tzState.primary, slotMinutes)}
+                        <div className="mb-2 mt-2 rounded-md border border-orange-200 bg-orange-50/70 p-2 text-xs text-orange-700 dark:border-orange-800 dark:bg-orange-950/30 dark:text-orange-300">
+                          <span className={itemLastChangedEdge === 'start' ? 'animate-[selection-time-pulse_0.75s_ease-out]' : ''}>{selectedItemStartLabel}</span>
+                          {' - '}
+                          <span className={itemLastChangedEdge === 'end' ? 'animate-[selection-time-pulse_0.75s_ease-out]' : ''}>{selectedItemEndLabel}</span>
+                          {' on '}
+                          {selectedItemDateLabel}
+
+                          {!isSelectedReadOnly && (
+                            <div className="mt-2">
+                              <div
+                                role="button"
+                                tabIndex={0}
+                                onClick={() => {
+                                  setIsItemAdjusterExpanded((prev) => !prev)
+                                }}
+                                onKeyDown={(event) => {
+                                  if (event.key !== 'Enter' && event.key !== ' ') return
+                                  event.preventDefault()
+                                  setIsItemAdjusterExpanded((prev) => !prev)
+                                }}
+                                className="flex w-full cursor-pointer items-center justify-between gap-2 rounded-md bg-muted/50 px-3 py-2 text-xs font-medium text-foreground transition-colors hover:bg-muted"
+                              >
+                                <span>Adjust Time</span>
+                                <ChevronDown className={`h-3.5 w-3.5 transition-transform ${isItemAdjusterOpen ? 'rotate-180' : ''}`} />
+                              </div>
+
+                              {isItemAdjusterOpen && (
+                                <div className="mt-1.5 space-y-1.5 text-[11px]">
+                                  <div className="rounded-md border border-orange-300/70 bg-white/90 px-2 py-1 dark:border-orange-700/70 dark:bg-orange-950/30">
+                                    <span className="mb-1 block font-medium">Step interval</span>
+                                    <div className="grid grid-cols-3 gap-1">
+                                      {[1, 2, 4].map((stepMultiplier) => {
+                                        const isActive = itemAdjustStepSlots === stepMultiplier
+                                        return (
+                                          <button
+                                            key={stepMultiplier}
+                                            type="button"
+                                            onClick={() => setItemAdjustStepSlots(stepMultiplier)}
+                                            className={`rounded-md border px-1.5 py-1 text-[11px] font-semibold transition-colors ${
+                                              isActive
+                                                ? 'border-orange-600 bg-orange-600 text-white'
+                                                : 'border-orange-300 bg-background text-orange-700 hover:bg-orange-100 dark:border-orange-700 dark:text-orange-200 dark:hover:bg-orange-900/40'
+                                            }`}
+                                          >
+                                            {slotMinutes * stepMultiplier}m
+                                          </button>
+                                        )
+                                      })}
+                                    </div>
+                                  </div>
+
+                                  <div className="grid grid-cols-2 gap-1.5">
+                                    <button
+                                      type="button"
+                                      onClick={() => { void nudgeSelectedItemEdge('start', -1) }}
+                                      className="rounded-md border border-orange-300 bg-white/90 px-2 py-1.5 text-orange-700 hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/40 dark:text-orange-100"
+                                      title={`Move start ${slotMinutes * Math.max(1, itemAdjustStepSlots)} minutes earlier`}
+                                    >
+                                      Start -{slotMinutes * Math.max(1, itemAdjustStepSlots)}m
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => { void nudgeSelectedItemEdge('start', 1) }}
+                                      className="rounded-md border border-orange-300 bg-white/90 px-2 py-1.5 text-orange-700 hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/40 dark:text-orange-100"
+                                      title={`Move start ${slotMinutes * Math.max(1, itemAdjustStepSlots)} minutes later`}
+                                    >
+                                      Start +{slotMinutes * Math.max(1, itemAdjustStepSlots)}m
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => { void nudgeSelectedItemEdge('end', -1) }}
+                                      className="rounded-md border border-orange-300 bg-white/90 px-2 py-1.5 text-orange-700 hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/40 dark:text-orange-100"
+                                      title={`Move end ${slotMinutes * Math.max(1, itemAdjustStepSlots)} minutes earlier`}
+                                    >
+                                      End -{slotMinutes * Math.max(1, itemAdjustStepSlots)}m
+                                    </button>
+                                    <button
+                                      type="button"
+                                      onClick={() => { void nudgeSelectedItemEdge('end', 1) }}
+                                      className="rounded-md border border-orange-300 bg-white/90 px-2 py-1.5 text-orange-700 hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/40 dark:text-orange-100"
+                                      title={`Move end ${slotMinutes * Math.max(1, itemAdjustStepSlots)} minutes later`}
+                                    >
+                                      End +{slotMinutes * Math.max(1, itemAdjustStepSlots)}m
+                                    </button>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          )}
                         </div>
                       )}
 
@@ -8551,12 +10225,12 @@ export default function TimeManagementPage() {
                         </div>
                       )}
 
-                      <div className="space-y-2">
+                      <div className={`space-y-2 ${isRecurrenceDirty ? 'rounded-md border border-amber-400/70 bg-amber-50/40 p-1.5 animate-[field-dirty-pulse_1.25s_ease-in-out_infinite] dark:border-amber-700/70 dark:bg-amber-950/25' : ''}`}>
                         <RecurrenceEditor
                           value={draft.recurrenceRule}
                           onChange={(nextRule) => setDraft((prev) => ({ ...prev, recurrenceRule: nextRule }))}
                           expanded={showItemRecurrencePanel}
-                          onToggle={() => setShowItemRecurrencePanel((prev) => !prev)}
+                          onExpandedChange={setShowItemRecurrencePanel}
                           dateSeed={recurrenceEditorDateSeed}
                           readOnly={isSelectedReadOnly}
                           compact
@@ -8574,7 +10248,7 @@ export default function TimeManagementPage() {
                           <div className="flex items-start gap-2 rounded-md border border-amber-300 bg-amber-50/70 px-2.5 py-1.5 text-[11px] text-amber-800 dark:border-amber-800 dark:bg-amber-950/30 dark:text-amber-300">
                             <Lock className="mt-0.5 h-3.5 w-3.5 flex-none" />
                             <span>
-                              Read-only mirror of {selectedSource?.name || 'external calendar'}. Use Export to push a copy to another connected calendar.
+                              Read-only mirror of {selectedSource?.name || 'calendar source'}. Switch mode to edit directly, or copy this item into your active mode.
                             </span>
                           </div>
                         )}
@@ -8586,17 +10260,17 @@ export default function TimeManagementPage() {
                             }`}>
                               {selectedItem?.title || 'Untitled'}
                             </div>
-                            {selectedItem?.notes && (
+                            {selectedReadOnlyDisplayNotes && (
                               <div className={`rounded-md border border-border bg-muted/30 px-2.5 py-2 text-xs text-muted-foreground ${
                                 isHiddenModeEnabled ? 'blur-sm' : ''
                               }`}>
-                                <NotePreview text={selectedItem.notes} />
+                                <NotePreview text={selectedReadOnlyDisplayNotes} />
                               </div>
                             )}
                           </>
                         ) : (
                           <>
-                            <div className="relative">
+                            <div className={`relative ${isTitleDirty ? 'rounded-md animate-[field-dirty-pulse_1.25s_ease-in-out_infinite]' : ''}`}>
                               <input
                                 ref={selectionTitleInputRef}
                                 type="text"
@@ -8613,6 +10287,8 @@ export default function TimeManagementPage() {
                                 className={`w-full rounded-md border bg-background px-2.5 py-2 pr-5 text-sm transition-colors ${
                                   isSelectionTitleTypingMode || isTitleTypingHintActive
                                     ? 'border-blue-500 ring-4 ring-blue-400/30 dark:border-blue-500 dark:ring-blue-500/25'
+                                    : isTitleDirty
+                                      ? 'border-amber-500 ring-2 ring-amber-400/40 dark:border-amber-600 dark:ring-amber-600/35'
                                     : isSelectionTitleRequired
                                       ? 'border-orange-500 bg-orange-50/70 text-orange-950 placeholder:text-orange-500 dark:border-orange-700 dark:bg-orange-950/30 dark:text-orange-100 dark:placeholder:text-orange-300'
                                       : 'border-border'
@@ -8628,7 +10304,7 @@ export default function TimeManagementPage() {
                                 </div>
                               )}
                             </div>
-                            <div className={`${isHiddenModeEnabled ? 'blur-sm' : ''} ${isDescriptionHintActive ? 'rounded-md border border-emerald-400/70 bg-emerald-50/60 p-1.5 dark:border-emerald-700 dark:bg-emerald-950/30' : ''}`}>
+                            <div className={`${isHiddenModeEnabled ? 'blur-sm' : ''} ${isDescriptionHintActive ? 'rounded-md border border-emerald-400/70 bg-emerald-50/60 p-1.5 dark:border-emerald-700 dark:bg-emerald-950/30' : ''} ${isNotesDirty ? 'rounded-md border border-amber-400/70 bg-amber-50/40 p-1.5 animate-[field-dirty-pulse_1.25s_ease-in-out_infinite] dark:border-amber-700/70 dark:bg-amber-950/25' : ''}`}>
                               {isDescriptionHintActive && (
                                 <p className="mb-1 text-[11px] font-semibold text-emerald-700 dark:text-emerald-300">Description -- edit here if needed</p>
                               )}
@@ -8658,7 +10334,7 @@ export default function TimeManagementPage() {
                           </div>
                         </div>
 
-                        <div>
+                        <div className={isCategoryDirty ? 'rounded-md border border-amber-400/70 bg-amber-50/40 p-1.5 animate-[field-dirty-pulse_1.25s_ease-in-out_infinite] dark:border-amber-700/70 dark:bg-amber-950/25' : ''}>
                           <label className="mb-1 block text-xs font-semibold text-muted-foreground">Category Tags</label>
                           {categories.length === 0 ? (
                             <div className="rounded-md border border-dashed border-border px-2.5 py-2 text-[11px] text-muted-foreground">
@@ -8720,6 +10396,16 @@ export default function TimeManagementPage() {
                                   : isSelectedItemDirty
                                   ? 'Unsaved changes pending...'
                                   : `All changes saved${lastSavedLabel ? ` at ${lastSavedLabel}` : ''}.`)}
+                              {isSelectedItemDirty && (
+                                <div className="mt-1 text-[11px] opacity-90">
+                                  Changed: {[
+                                    isTitleDirty ? 'Title' : null,
+                                    isNotesDirty ? 'Notes' : null,
+                                    isCategoryDirty ? 'Categories' : null,
+                                    isRecurrenceDirty ? 'Recurrence' : null,
+                                  ].filter((value): value is string => Boolean(value)).join(', ')}
+                                </div>
+                              )}
                             </div>
                           )}
 
@@ -8787,7 +10473,7 @@ export default function TimeManagementPage() {
                           )}
 
                           {selectedItem && !isSelectedReadOnly && (
-                            <div className="grid grid-cols-4 gap-2">
+                            <div className="grid grid-cols-3 gap-2">
                               <button
                                 type="button"
                                 onClick={handleUpdateItem}
@@ -8796,15 +10482,6 @@ export default function TimeManagementPage() {
                               >
                                 <Save className="h-4 w-4" />
                                 Save
-                              </button>
-                              <button
-                                type="button"
-                                onClick={openFullEditor}
-                                className="flex h-10 w-full items-center justify-center gap-1 rounded-md border border-blue-400/70 bg-blue-600 px-3 py-2 text-sm font-medium text-white shadow-sm hover:bg-blue-500"
-                                title="Open full view for selected item"
-                              >
-                                <Maximize2 className="h-4 w-4" />
-                                Full View
                               </button>
                               <div className="relative w-full" data-delete-popover-root="true">
                                 <button
@@ -9016,7 +10693,7 @@ export default function TimeManagementPage() {
               </div>
             </div>
           </div>
-          {isLeftPanelOpen && (
+          {!isPhoneLayout && isLeftPanelOpen && (
             <button
               type="button"
               aria-label="Resize left panel"
@@ -9035,11 +10712,18 @@ export default function TimeManagementPage() {
         titleValue={draft.title}
         onTitleChange={(nextTitle) => setDraft((prev) => ({ ...prev, title: nextTitle }))}
         titlePlaceholder="Type Title for Time Item"
-        value={draft.notes}
+        value={selectedItem && isSelectedReadOnly ? selectedReadOnlyDisplayNotes : draft.notes}
         onChange={(nextNotes) => setDraft((prev) => ({ ...prev, notes: nextNotes }))}
         onClose={() => {
-          setIsFullEditorOpen(false)
-          setAutoFocusTitleOnEditorOpen(false)
+          const shouldCancelMobileSelection = isPhoneLayout && Boolean(selectionDraft) && !selectedItem
+
+          if (shouldCancelMobileSelection) {
+            handleDiscardSelectionDraft()
+          } else {
+            setIsFullEditorOpen(false)
+            setAutoFocusTitleOnEditorOpen(false)
+            openMobileCalendarSurface()
+          }
         }}
         autoFocusTitle={autoFocusTitleOnEditorOpen}
         onAutoFocusComplete={() => setAutoFocusTitleOnEditorOpen(false)}
@@ -9054,30 +10738,209 @@ export default function TimeManagementPage() {
         saveState={fullEditorSaveState}
         saveMetaLabel={fullEditorSaveMetaLabel}
         saveLabel={selectedItem ? 'Save now' : 'Save item'}
+        closeLabel={isPhoneLayout && selectionDraft && !selectedItem ? 'Cancel' : 'Close'}
+        beforeTitleContent={
+          (selectionDraft && !selectedItem) || (selectedItem && !isSelectedReadOnly) ? (
+            <div className="mb-3 shrink-0 overflow-hidden rounded-lg border border-border bg-card text-xs">
+              <div
+                role="button"
+                tabIndex={0}
+                onClick={() => {
+                  if (selectionDraft && !selectedItem) {
+                    setIsSelectionAdjusterExpanded((prev) => !prev)
+                    return
+                  }
+                  setIsItemAdjusterExpanded((prev) => !prev)
+                }}
+                onKeyDown={(event) => {
+                  if (event.key !== 'Enter' && event.key !== ' ') return
+                  event.preventDefault()
+                  if (selectionDraft && !selectedItem) {
+                    setIsSelectionAdjusterExpanded((prev) => !prev)
+                    return
+                  }
+                  setIsItemAdjusterExpanded((prev) => !prev)
+                }}
+                className="flex w-full cursor-pointer items-center justify-between gap-2 bg-muted/50 px-3 py-2 text-xs font-medium text-foreground transition-colors hover:bg-muted"
+              >
+                <span className="inline-flex items-center gap-1.5">
+                  <Clock3 className="h-3.5 w-3.5 text-muted-foreground" />
+                  {selectionDraft && !selectedItem ? 'Adjust selection time' : 'Adjust Time'}
+                </span>
+                <ChevronDown
+                  className={`h-3.5 w-3.5 text-muted-foreground transition-transform ${isTimeAdjusterExpanded ? 'rotate-180' : ''}`}
+                />
+              </div>
+
+              {isTimeAdjusterExpanded && (
+                <div className="space-y-1.5 p-2.5 text-[11px]">
+                  <div className="rounded-md border border-orange-300/70 bg-white/90 px-2 py-1 dark:border-orange-700/70 dark:bg-orange-950/30">
+                    <span className="mb-1 block font-medium">Step interval</span>
+                    <div className="grid grid-cols-3 gap-1">
+                      {[1, 2, 4].map((stepMultiplier) => {
+                        const isSelectionMode = Boolean(selectionDraft && !selectedItem)
+                        const isActive = isSelectionMode
+                          ? selectionAdjustStepSlots === stepMultiplier
+                          : itemAdjustStepSlots === stepMultiplier
+                        return (
+                          <button
+                            key={stepMultiplier}
+                            type="button"
+                            onClick={() => {
+                              if (isSelectionMode) {
+                                setSelectionAdjustStepSlots(stepMultiplier)
+                                return
+                              }
+                              setItemAdjustStepSlots(stepMultiplier)
+                            }}
+                            className={`rounded-md border px-1.5 py-1 text-[11px] font-semibold transition-colors ${isActive
+                              ? 'border-orange-600 bg-orange-600 text-white'
+                              : 'border-orange-300 bg-background text-orange-700 hover:bg-orange-100 dark:border-orange-700 dark:text-orange-200 dark:hover:bg-orange-900/40'}`}
+                          >
+                            {slotMinutes * stepMultiplier}m
+                          </button>
+                        )
+                      })}
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-2 gap-1.5">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (selectionDraft && !selectedItem) {
+                          nudgeSelectionDraftEdge('start', -1)
+                          return
+                        }
+                        void nudgeSelectedItemEdge('start', -1)
+                      }}
+                      className="rounded-md border border-orange-300 bg-white/90 px-2 py-1.5 text-orange-700 hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/40 dark:text-orange-100"
+                      title={`Move start ${slotMinutes * Math.max(1, selectionDraft && !selectedItem ? selectionAdjustStepSlots : itemAdjustStepSlots)} minutes earlier`}
+                    >
+                      Start -{slotMinutes * Math.max(1, selectionDraft && !selectedItem ? selectionAdjustStepSlots : itemAdjustStepSlots)}m
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (selectionDraft && !selectedItem) {
+                          nudgeSelectionDraftEdge('start', 1)
+                          return
+                        }
+                        void nudgeSelectedItemEdge('start', 1)
+                      }}
+                      className="rounded-md border border-orange-300 bg-white/90 px-2 py-1.5 text-orange-700 hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/40 dark:text-orange-100"
+                      title={`Move start ${slotMinutes * Math.max(1, selectionDraft && !selectedItem ? selectionAdjustStepSlots : itemAdjustStepSlots)} minutes later`}
+                    >
+                      Start +{slotMinutes * Math.max(1, selectionDraft && !selectedItem ? selectionAdjustStepSlots : itemAdjustStepSlots)}m
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (selectionDraft && !selectedItem) {
+                          nudgeSelectionDraftEdge('end', -1)
+                          return
+                        }
+                        void nudgeSelectedItemEdge('end', -1)
+                      }}
+                      className="rounded-md border border-orange-300 bg-white/90 px-2 py-1.5 text-orange-700 hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/40 dark:text-orange-100"
+                      title={`Move end ${slotMinutes * Math.max(1, selectionDraft && !selectedItem ? selectionAdjustStepSlots : itemAdjustStepSlots)} minutes earlier`}
+                    >
+                      End -{slotMinutes * Math.max(1, selectionDraft && !selectedItem ? selectionAdjustStepSlots : itemAdjustStepSlots)}m
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        if (selectionDraft && !selectedItem) {
+                          nudgeSelectionDraftEdge('end', 1)
+                          return
+                        }
+                        void nudgeSelectedItemEdge('end', 1)
+                      }}
+                      className="rounded-md border border-orange-300 bg-white/90 px-2 py-1.5 text-orange-700 hover:bg-orange-100 dark:border-orange-700 dark:bg-orange-900/40 dark:text-orange-100"
+                      title={`Move end ${slotMinutes * Math.max(1, selectionDraft && !selectedItem ? selectionAdjustStepSlots : itemAdjustStepSlots)} minutes later`}
+                    >
+                      End +{slotMinutes * Math.max(1, selectionDraft && !selectedItem ? selectionAdjustStepSlots : itemAdjustStepSlots)}m
+                    </button>
+                  </div>
+                </div>
+              )}
+            </div>
+          ) : null
+        }
       >
         <div className="mb-3">
           <RecurrenceEditor
             value={draft.recurrenceRule}
             onChange={(nextRule) => setDraft((prev) => ({ ...prev, recurrenceRule: nextRule }))}
             expanded={showItemRecurrencePanel}
-            onToggle={() => setShowItemRecurrencePanel((prev) => !prev)}
+            onExpandedChange={setShowItemRecurrencePanel}
             dateSeed={recurrenceEditorDateSeed}
             readOnly={isSelectedReadOnly}
           />
         </div>
       </NoteEditorModal>
 
-      {showQuickTemplatesInMain && (
+      {showMainQuickTemplates && (
         <section
-          className={`mb-3 rounded-lg border border-border bg-card px-3 ${quickTemplatesMainExpanded ? 'py-3' : 'py-1.5'}`}
+          className={`mb-2 rounded-lg border border-border bg-card px-3 ${isPhoneLayout ? 'py-2' : quickTemplatesMainExpanded ? 'py-3' : 'py-1.5'}`}
           onMouseEnter={() => setIsQuickTemplatesToggleHovering(true)}
           onMouseLeave={() => setIsQuickTemplatesToggleHovering(false)}
           onClick={(event) => {
+            if (isPhoneLayout) {
+              return
+            }
             if (event.target === event.currentTarget) {
               setQuickTemplatesMainExpanded((prev) => !prev)
             }
           }}
         >
+          {isPhoneLayout ? (
+            <div className="flex min-w-0 items-center gap-1.5">
+              <span className="shrink-0 text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                Quick Objects
+              </span>
+              <div className="flex min-w-0 flex-1 items-center gap-1 overflow-hidden">
+                {quickTemplates.slice(0, 2).map((template) => (
+                  <button
+                    key={template.id}
+                    type="button"
+                    onClick={() => { void applyQuickTemplate(template) }}
+                    title={template.quickName}
+                    className="min-w-0 rounded-md border border-border px-2 py-1 text-[10px] font-semibold text-foreground hover:bg-muted"
+                    style={{
+                      ...buildCategoryCardStyle(
+                        template.categoryIds,
+                        categoryMap,
+                        prefs.category_color_display_style,
+                        'quick-template'
+                      ),
+                      color: buildCategoryTextColor(template.categoryIds, categoryMap),
+                    }}
+                  >
+                    <span className="block max-w-[5.5rem] truncate">{buildQuickTemplateShortcutLabel(template.quickName)}</span>
+                  </button>
+                ))}
+                {quickTemplates.length > 2 && (
+                  <button
+                    type="button"
+                    onClick={openQuickObjectsSurface}
+                    className="shrink-0 rounded-md border border-border px-2 py-1 text-[10px] font-semibold text-muted-foreground hover:bg-muted hover:text-foreground"
+                    title="Open Quick Objects tools"
+                  >
+                    +{quickTemplates.length - 2}
+                  </button>
+                )}
+              </div>
+              <button
+                type="button"
+                onClick={openQuickObjectsSurface}
+                className="shrink-0 rounded-md border border-border px-2 py-1 text-[10px] font-semibold text-foreground hover:bg-muted"
+                title="Open Quick Objects tools"
+              >
+                Tools
+              </button>
+            </div>
+          ) : (
           <div className={`${quickTemplatesMainExpanded ? 'mb-2' : 'mb-0'} flex items-center justify-between gap-2`}>
             <div
               className={`flex min-w-0 flex-1 items-center rounded-md ${quickTemplatesMainExpanded ? 'gap-2 px-1 py-0.5' : 'gap-1.5 px-1 py-0.5'} cursor-pointer hover:bg-muted/40`}
@@ -9109,7 +10972,7 @@ export default function TimeManagementPage() {
                           event.stopPropagation()
                           void applyQuickTemplate(template)
                         }}
-                        title={`${template.quickName}\n${template.title || 'Untitled item'}${template.notes.trim() ? `\n${template.notes.trim()}` : ''}`}
+                        title={`${template.quickName}\n${template.title || 'Untitled item'}`}
                         className="inline-flex flex-none items-center rounded-md border border-border px-2 py-1 text-[10px] font-semibold transition-colors hover:border-foreground"
                         style={{
                           ...buildCategoryCardStyle(
@@ -9142,12 +11005,7 @@ export default function TimeManagementPage() {
               <button
                 type="button"
                 onClick={() => {
-                  setIsLeftPanelOpen(true)
-                  setExpandedSections((prev) => {
-                    const next = new Set(prev)
-                    next.add('quickObjects')
-                    return next
-                  })
+                  openQuickObjectsSurface()
                 }}
                 className={`rounded-md border border-border text-xs font-semibold text-foreground hover:bg-muted ${quickTemplatesMainExpanded ? 'px-2.5 py-1.5' : 'px-2 py-1'}`}
               >
@@ -9155,24 +11013,30 @@ export default function TimeManagementPage() {
               </button>
             </div>
           </div>
+          )}
 
-          {quickTemplatesMainExpanded && (
+          {!isPhoneLayout && quickTemplatesMainExpanded && (
             quickTemplates.length === 0 ? (
               <div className="rounded-md border border-dashed border-border px-2.5 py-2 text-xs text-muted-foreground">
                 No templates yet. Use Quick Objects in the left panel to create one.
               </div>
             ) : (
-              <div className="grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+              <div className="flex flex-wrap gap-2">
                 {quickTemplates.map((template) => (
                   <article
                     key={template.id}
-                    className="rounded-md border border-border p-2"
-                    style={buildCategoryCardStyle(
-                      template.categoryIds,
-                      categoryMap,
-                      prefs.category_color_display_style,
-                      'quick-template'
-                    )}
+                    className="min-w-0 rounded-md border border-border p-2"
+                    style={{
+                      ...buildCategoryCardStyle(
+                        template.categoryIds,
+                        categoryMap,
+                        prefs.category_color_display_style,
+                        'quick-template'
+                      ),
+                      flex: '1 1 calc((100% - (5 * 0.5rem)) / 6)',
+                      minWidth: 'calc((100% - (5 * 0.5rem)) / 6)',
+                      maxWidth: 'calc((100% - (3 * 0.5rem)) / 4)',
+                    }}
                   >
                     <p
                       className="line-clamp-1 text-[11px] font-semibold"
@@ -9181,15 +11045,6 @@ export default function TimeManagementPage() {
                     >
                       {template.title || 'Untitled item'}
                     </p>
-                    {template.notes.trim() && (
-                      <p
-                        className="mt-1 line-clamp-2 text-[11px]"
-                        style={{ color: buildCategoryTextColor(template.categoryIds, categoryMap) }}
-                        title={template.notes}
-                      >
-                        {template.notes}
-                      </p>
-                    )}
                     {template.categoryIds.length > 0 && (
                       <div className="mt-1.5 flex flex-wrap gap-1">
                         {template.categoryIds
@@ -9214,6 +11069,15 @@ export default function TimeManagementPage() {
                       className="mt-2 w-full rounded-md border border-border bg-background px-2 py-1.5 text-xs font-semibold text-foreground"
                       aria-label="Template quick name"
                     />
+                    <label className="mt-2 inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-[11px] font-semibold text-foreground hover:bg-muted">
+                      <input
+                        type="checkbox"
+                        checked={template.autoSaveEnabled}
+                        onChange={(event) => updateQuickTemplateAutoSave(template.id, event.target.checked)}
+                        className="h-3.5 w-3.5 accent-blue-600"
+                      />
+                      Autosave this template
+                    </label>
                     <div className="mt-2 flex items-center gap-1.5">
                       <button
                         type="button"
@@ -9225,7 +11089,30 @@ export default function TimeManagementPage() {
                       <div className="relative" data-delete-popover-root="true">
                         <button
                           type="button"
-                          onClick={() => setDeletingTemplateId((current) => (current === template.id ? null : template.id))}
+                          onClick={(event) => {
+                            const target = event.currentTarget
+                            setDeletingTemplateId((current) => {
+                              if (current === template.id) {
+                                setDeletingTemplatePopoverPosition(null)
+                                return null
+                              }
+
+                              const rect = target.getBoundingClientRect()
+                              const popoverWidth = 208
+                              const popoverApproxHeight = 120
+                              const margin = 8
+                              const left = Math.max(
+                                margin,
+                                Math.min(rect.right - popoverWidth, window.innerWidth - popoverWidth - margin)
+                              )
+                              const top = Math.max(
+                                margin,
+                                Math.min(rect.bottom + margin, window.innerHeight - popoverApproxHeight - margin)
+                              )
+                              setDeletingTemplatePopoverPosition({ left, top })
+                              return template.id
+                            })
+                          }}
                           className="rounded-md border border-red-300 px-2 py-1.5 text-xs font-semibold text-red-600 hover:bg-red-50"
                           aria-label="Delete template"
                           title="Delete template"
@@ -9233,12 +11120,21 @@ export default function TimeManagementPage() {
                           <Trash2 className="h-3.5 w-3.5" />
                         </button>
                         {deletingTemplateId === template.id && (
-                          <div className="absolute right-0 top-full z-50 mt-2 w-52 max-w-[calc(100vw-1rem)] rounded-md border border-red-200 bg-background p-2 shadow-lg dark:border-red-900">
+                          <div
+                            className="fixed z-[220] w-52 max-w-[calc(100vw-1rem)] rounded-md border border-red-200 bg-background p-2 shadow-lg dark:border-red-900"
+                            style={{
+                              left: deletingTemplatePopoverPosition?.left ?? 8,
+                              top: deletingTemplatePopoverPosition?.top ?? 8,
+                            }}
+                          >
                             <p className="mb-2 text-xs text-foreground">Delete this template?</p>
                             <div className="flex items-center justify-end gap-2">
                               <button
                                 type="button"
-                                onClick={() => setDeletingTemplateId(null)}
+                                onClick={() => {
+                                  setDeletingTemplateId(null)
+                                  setDeletingTemplatePopoverPosition(null)
+                                }}
                                 className="rounded-md border border-border px-2 py-1 text-xs font-medium text-muted-foreground hover:bg-muted hover:text-foreground"
                               >
                                 Cancel
@@ -9264,65 +11160,100 @@ export default function TimeManagementPage() {
       )}
 
       <header
-        className={`mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg border px-3 py-2.5 ${
+        className={`${isPhoneLayout ? 'mb-2 flex flex-nowrap items-center gap-1.5 rounded-lg px-2 py-2' : 'mb-3 flex flex-wrap items-center justify-between gap-2 rounded-lg px-3 py-2.5'} border ${
           isHiddenModeEnabled
             ? 'border-amber-300 bg-amber-50/70 dark:border-amber-800 dark:bg-amber-950/20'
             : 'border-border bg-card'
         }`}
       >
-        <div className="flex items-center gap-2">
+        <div className={`flex items-center ${isPhoneLayout ? 'gap-1.5 shrink-0' : 'gap-2'}`}>
           <button
-            onClick={() => setIsLeftPanelOpen((prev) => !prev)}
-            className="rounded-md border border-border p-2 text-muted-foreground hover:bg-muted hover:text-foreground"
-            title={isLeftPanelOpen ? 'Hide left panel' : 'Show left panel'}
+            onClick={() => {
+              if (isPhoneLayout) {
+                if (isToolsSurfaceVisible) {
+                  closeLeftPanel()
+                } else {
+                  openLeftPanelSection('modes')
+                }
+                return
+              }
+
+              setIsLeftPanelOpen((prev) => !prev)
+            }}
+            className={`rounded-md border border-border text-muted-foreground hover:bg-muted hover:text-foreground ${isPhoneLayout ? 'p-1.5' : 'p-2'}`}
+            title={isPhoneLayout
+              ? (isToolsSurfaceVisible ? 'Close Time Management Tools' : 'Open Time Management Tools')
+              : (isLeftPanelOpen ? 'Hide left panel' : 'Show left panel')}
           >
-            {isLeftPanelOpen ? <PanelLeftClose className="h-4 w-4" /> : <PanelLeftOpen className="h-4 w-4" />}
+            {(isPhoneLayout ? isToolsSurfaceVisible : isLeftPanelOpen)
+              ? <PanelLeftClose className="h-4 w-4" />
+              : <PanelLeftOpen className="h-4 w-4" />}
           </button>
-          <div>
-            <h1 className={`flex items-center gap-2 text-base font-semibold md:text-lg ${isHiddenModeEnabled ? 'text-amber-800 dark:text-amber-200' : 'text-foreground'}`}>
-              <Calendar className={`h-5 w-5 ${isHiddenModeEnabled ? 'text-amber-600 dark:text-amber-300' : 'text-blue-600'}`} />
-              {isHiddenModeEnabled ? 'Content hidden Time Management mode' : 'Time Management'}
-            </h1>
-            {isHiddenModeEnabled && (
-              <button
-                type="button"
-                onClick={() => setIsHiddenModeEnabled(false)}
-                className="mt-0.5 text-[11px] font-medium text-amber-700 underline decoration-amber-500 underline-offset-2 hover:text-amber-800 dark:text-amber-300 dark:hover:text-amber-200"
-              >
-                (disable hidden mode)
-              </button>
-            )}
-          </div>
+          {!isPhoneLayout && (
+            <div>
+              <h1 className={`flex items-center gap-2 text-base font-semibold md:text-lg ${isHiddenModeEnabled ? 'text-amber-800 dark:text-amber-200' : 'text-foreground'}`}>
+                <Calendar className={`h-5 w-5 ${isHiddenModeEnabled ? 'text-amber-600 dark:text-amber-300' : 'text-blue-600'}`} />
+                {isHiddenModeEnabled ? 'Content hidden Time Management mode' : 'Time Management'}
+                {selectedSourceCount > 0 && (
+                  <span
+                    className={`inline-flex items-center gap-1 rounded-full border px-2 py-0.5 text-[11px] font-semibold transition-opacity duration-700 ${
+                      isAggregateSourceStatusVisible ? 'opacity-100' : 'opacity-0'
+                    } ${
+                      isAllSelectedSourcesSynced
+                        ? 'border-emerald-400/60 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300'
+                        : 'border-blue-400/50 bg-blue-500/10 text-blue-700 dark:text-blue-300'
+                    }`}
+                    aria-hidden="true"
+                    title="Selected source loading progress"
+                  >
+                    {loadingSourceCount > 0 ? <Loader2 className="h-3 w-3 animate-spin" /> : <CheckCircle2 className="h-3 w-3" />}
+                    {completedSourceCount}/{selectedSourceCount}
+                  </span>
+                )}
+              </h1>
+              {isHiddenModeEnabled && (
+                <button
+                  type="button"
+                  onClick={() => setIsHiddenModeEnabled(false)}
+                  className="mt-0.5 text-[11px] font-medium text-amber-700 underline decoration-amber-500 underline-offset-2 hover:text-amber-800 dark:text-amber-300 dark:hover:text-amber-200"
+                >
+                  (disable hidden mode)
+                </button>
+              )}
+            </div>
+          )}
         </div>
 
-        <div className="flex flex-wrap items-center gap-1.5">
+        <div className={`flex items-center ${isPhoneLayout ? 'gap-1 shrink-0' : 'flex-wrap gap-1.5'}`}>
           <button
             onClick={() => setCurrentWeekStart((prev) => subWeeks(prev, 1))}
-            className="rounded-md border border-border px-2 py-1.5 text-sm text-muted-foreground hover:bg-muted hover:text-foreground"
+            className={`rounded-md border border-border text-muted-foreground hover:bg-muted hover:text-foreground ${isPhoneLayout ? 'px-1.5 py-1 text-xs' : 'px-2 py-1.5 text-sm'}`}
             title="Previous week"
           >
             <ChevronLeft className="h-4 w-4" />
           </button>
           <button
             onClick={handleToday}
-            className="rounded-md border border-border px-2.5 py-1.5 text-xs font-semibold text-foreground hover:bg-muted"
+            className={`rounded-md border border-border font-semibold text-foreground hover:bg-muted ${isPhoneLayout ? 'px-2 py-1 text-[11px]' : 'px-2.5 py-1.5 text-xs'}`}
           >
             Today
           </button>
           <button
             onClick={() => setCurrentWeekStart((prev) => addWeeks(prev, 1))}
-            className="rounded-md border border-border px-2 py-1.5 text-sm text-muted-foreground hover:bg-muted hover:text-foreground"
+            className={`rounded-md border border-border text-muted-foreground hover:bg-muted hover:text-foreground ${isPhoneLayout ? 'px-1.5 py-1 text-xs' : 'px-2 py-1.5 text-sm'}`}
             title="Next week"
           >
             <ChevronRight className="h-4 w-4" />
           </button>
         </div>
 
-        <div className="flex flex-wrap items-center gap-2">
+        <div className={`flex items-center ${isPhoneLayout ? 'ml-auto gap-1 shrink-0' : 'flex-wrap gap-2'}`}>
+          {!isPhoneLayout && (
           <span className="rounded-md border border-border bg-background px-2 py-1 text-xs font-semibold text-foreground md:text-sm">
             {weekRangeLabel}
           </span>
-          <TimezoneSelector timezones={tzState} compact />
+          )}
+          <TimezoneSelector timezones={tzState} compact={isPhoneLayout} />
         </div>
       </header>
 
@@ -9338,6 +11269,8 @@ export default function TimeManagementPage() {
             )}
           </div>
         )}
+        <style>{`@keyframes blink-colon { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } } @keyframes selection-glow { 0%, 100% { box-shadow: 0 0 0 2px rgba(59,130,246,0.12), 0 0 8px rgba(59,130,246,0.08); } 50% { box-shadow: 0 0 0 4px rgba(59,130,246,0.35), 0 0 18px rgba(59,130,246,0.22); } } @keyframes selection-flow { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } } @keyframes selection-caret { 0%, 45% { opacity: 1; } 55%, 100% { opacity: 0; } } @keyframes selection-time-pulse { 0% { color: inherit; text-shadow: none; } 35% { color: #f97316; text-shadow: 0 0 10px rgba(249,115,22,0.45); } 100% { color: inherit; text-shadow: none; } } @keyframes move-source-ghost { 0%, 100% { opacity: 0.92; transform: scale(1); } 50% { opacity: 0.38; transform: scale(0.985); } } @keyframes drop-target-pulse { 0%, 100% { opacity: 0.96; transform: scale(1); } 50% { opacity: 0.6; transform: scale(0.996); } } @keyframes drop-target-line { 0%, 100% { opacity: 1; } 50% { opacity: 0.62; } } @keyframes source-sync-complete { 0% { transform: scale(0.96); opacity: 0.62; } 45% { transform: scale(1.06); opacity: 1; } 100% { transform: scale(1); opacity: 1; } }`}</style>
+        {renderCalendarHeaderRow('top')}
         <div
           ref={calendarScrollContainerRef}
           data-testid="calendar-scroll-container"
@@ -9354,51 +11287,6 @@ export default function TimeManagementPage() {
         >
           {Array.from({ length: CALENDAR_REPEAT_COUNT }, (_, repeatIndex) => (
             <div key={repeatIndex} aria-hidden={repeatIndex !== CALENDAR_REPEAT_MIDDLE_INDEX}>
-          <div
-            className="sticky top-0 z-10 grid border-b border-border bg-card"
-            style={{ gridTemplateColumns: weekGridTemplateColumns }}
-          >
-            <style>{`@keyframes blink-colon { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } } @keyframes selection-glow { 0%, 100% { box-shadow: 0 0 0 2px rgba(59,130,246,0.12), 0 0 8px rgba(59,130,246,0.08); } 50% { box-shadow: 0 0 0 4px rgba(59,130,246,0.35), 0 0 18px rgba(59,130,246,0.22); } } @keyframes selection-flow { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } } @keyframes selection-caret { 0%, 45% { opacity: 1; } 55%, 100% { opacity: 0; } } @keyframes move-source-ghost { 0%, 100% { opacity: 0.92; transform: scale(1); } 50% { opacity: 0.38; transform: scale(0.985); } } @keyframes drop-target-pulse { 0%, 100% { opacity: 0.96; transform: scale(1); } 50% { opacity: 0.6; transform: scale(0.996); } } @keyframes drop-target-line { 0%, 100% { opacity: 1; } 50% { opacity: 0.62; } }`}</style>
-            {tzState.all.map((tz, tzIdx) => {
-              const isPrimary = tzIdx === 0
-              const isUtc = tz === 'UTC'
-              const entry = isUtc ? null : findTimezone(tz)
-              const city = isUtc ? 'UTC' : (entry?.city ?? tz.split('/').pop()?.replace(/_/g, ' ') ?? tz)
-              const abbr = isUtc ? '' : (entry?.abbr ?? '')
-              const ct = isUtc
-                ? `${nowTick.getUTCHours().toString().padStart(2, '0')}:${nowTick.getUTCMinutes().toString().padStart(2, '0')}`
-                : getCurrentTimeInTimezone(tz)
-              return (
-                <div
-                  key={tz}
-                  className={`flex flex-col items-center justify-between border-r border-border px-0.5 py-1.5 ${
-                    isPrimary ? 'text-blue-600 dark:text-blue-400' : 'text-muted-foreground'
-                  }`}
-                >
-                  <span className="text-[9px] font-bold leading-none">{city}</span>
-                  {abbr && <span className="text-[9px] opacity-60 leading-none">{abbr}</span>}
-                  <span className="font-mono tabular-nums text-[10px] font-semibold leading-none">
-                    {ct.split(':')[0]}<span style={{ animation: 'blink-colon 1s step-start infinite' }}>:</span>{ct.split(':')[1]}
-                  </span>
-                </div>
-              )
-            })}
-            {weekDays.map((day) => {
-              const isHighlightedDay = highlightedDay ? isSameDay(day, highlightedDay) : false
-              return (
-              <div
-                key={day.toISOString()}
-                className={`border-r border-border px-2 py-2 text-center text-xs font-semibold text-foreground last:border-r-0 transition-shadow ${
-                  isHighlightedDay ? 'animate-pulse bg-blue-50/80 ring-2 ring-inset ring-blue-500/70 dark:bg-blue-950/30' : ''
-                }`}
-              >
-                <div>{format(day, 'EEE')}</div>
-                <div className="text-[11px] text-muted-foreground">{format(day, 'd MMM')}</div>
-              </div>
-              )
-            })}
-          </div>
-
           <div
             className="relative grid"
             style={{ gridTemplateColumns: weekGridTemplateColumns }}
@@ -9456,6 +11344,52 @@ export default function TimeManagementPage() {
                 : 0
               const dropPreviewColor = draggingItem ? (sourceMap.get(draggingItem.sourceId)?.color || '#2563eb') : '#2563eb'
 
+              type SegmentContinuity = { hasConnectedTop: boolean; hasConnectedBottom: boolean }
+              const segmentContinuity = new Map<number, SegmentContinuity>()
+              const segmentsByItem = new Map<string, Array<{ index: number; top: number; bottom: number }>>()
+              const segmentOrderByIndex = new Map<number, number>()
+              const firstSegmentMetaByItem = new Map<string, { height: number; hasConnectedBottom: boolean }>()
+
+              layout.eventSegments.forEach((segment, segmentIndex) => {
+                const bucket = segmentsByItem.get(segment.eventId)
+                const entry = { index: segmentIndex, top: segment.top, bottom: segment.top + segment.height }
+                if (bucket) {
+                  bucket.push(entry)
+                  return
+                }
+                segmentsByItem.set(segment.eventId, [entry])
+              })
+
+              for (const entries of segmentsByItem.values()) {
+                entries.sort((a, b) => a.top - b.top)
+                for (let segmentIndex = 0; segmentIndex < entries.length; segmentIndex++) {
+                  const current = entries[segmentIndex]
+                  const previous = segmentIndex > 0 ? entries[segmentIndex - 1] : null
+                  const next = segmentIndex < entries.length - 1 ? entries[segmentIndex + 1] : null
+                  const hasConnectedTop = !!previous && Math.abs(previous.bottom - current.top) < 0.5
+                  const hasConnectedBottom = !!next && Math.abs(current.bottom - next.top) < 0.5
+                  segmentContinuity.set(current.index, { hasConnectedTop, hasConnectedBottom })
+                  segmentOrderByIndex.set(current.index, segmentIndex)
+                  if (segmentIndex === 0) {
+                    const eventId = layout.eventSegments[current.index]?.eventId
+                    if (eventId) {
+                      const segmentItem = itemMap.get(eventId)
+                      const interactionId = segmentItem ? getTimeItemInteractionId(segmentItem) : eventId
+                      firstSegmentMetaByItem.set(eventId, {
+                        height: Math.max(current.bottom - current.top, 0),
+                        hasConnectedBottom,
+                      })
+                      if (interactionId !== eventId) {
+                        firstSegmentMetaByItem.set(interactionId, {
+                          height: Math.max(current.bottom - current.top, 0),
+                          hasConnectedBottom,
+                        })
+                      }
+                    }
+                  }
+                }
+              }
+
               return (
                 <div
                   key={day.toISOString()}
@@ -9505,7 +11439,7 @@ export default function TimeManagementPage() {
                     const eventRecord = targetItem ? events.find((candidate) => candidate.id === targetItem.sourceEventId) : null
                     if (!eventRecord) return
                     const source = sourceMap.get(eventRecord.source_id || MAIN_SOURCE_ID)
-                    if (source?.sourceType === 'external') return
+                    if (isReadOnlySource(source)) return
 
                     const start = new Date(eventRecord.start_time)
                     const end = new Date(eventRecord.end_time)
@@ -9529,8 +11463,39 @@ export default function TimeManagementPage() {
                     if (event.button !== 0) return
                     if (isResizing) return
                     if (isTemplateSelectionMode) return
+                    selectionAnchorDayColumnRef.current = event.currentTarget
                     const minute = minuteFromPointer(event)
-                    void startSelectionWithUnsavedGuard(dayIndex, minute)
+                    void startSelectionWithUnsavedGuard(dayIndex, minute, { x: event.clientX, y: event.clientY })
+                  }}
+                  onPointerDown={(event) => {
+                    if (event.pointerType === 'mouse') return
+                    if (isResizing) return
+                    if (isTemplateSelectionMode) return
+                    event.preventDefault()
+                    event.stopPropagation()
+                    event.currentTarget.setPointerCapture(event.pointerId)
+                    selectionAnchorDayColumnRef.current = event.currentTarget
+                    const minute = minuteFromPointer(event as unknown as MouseEvent<HTMLDivElement>)
+                    void startSelectionWithUnsavedGuard(dayIndex, minute, { x: event.clientX, y: event.clientY })
+                  }}
+                  onPointerMove={(event) => {
+                    if (event.pointerType === 'mouse') return
+                    if (!isSelecting || !selectionDraft || selectionDraft.dayIndex !== dayIndex) return
+                    event.preventDefault()
+                    const minute = minuteFromPointer(event as unknown as MouseEvent<HTMLDivElement>)
+                    updateSelection(dayIndex, minute)
+                  }}
+                  onPointerUp={(event) => {
+                    if (event.pointerType === 'mouse') return
+                    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                      event.currentTarget.releasePointerCapture(event.pointerId)
+                    }
+                  }}
+                  onPointerCancel={(event) => {
+                    if (event.pointerType === 'mouse') return
+                    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                      event.currentTarget.releasePointerCapture(event.pointerId)
+                    }
                   }}
                   onDragOver={(event) => {
                     event.preventDefault()
@@ -9545,11 +11510,12 @@ export default function TimeManagementPage() {
                         slotMinutes,
                         draggingItem.durationMinutes
                       )
+                      const previewStartMinute = wrapMinuteWithinDay(startMinute)
                       setDragDropPreview((previous) => {
                         if (
                           previous &&
                           previous.dayIndex === dayIndex &&
-                          previous.startMinute === startMinute &&
+                          previous.startMinute === previewStartMinute &&
                           previous.durationMinutes === draggingItem.durationMinutes &&
                           previous.itemId === draggingItem.id
                         ) {
@@ -9558,7 +11524,7 @@ export default function TimeManagementPage() {
 
                         return {
                           dayIndex,
-                          startMinute,
+                          startMinute: previewStartMinute,
                           durationMinutes: draggingItem.durationMinutes,
                           itemId: draggingItem.id,
                         }
@@ -9600,7 +11566,12 @@ export default function TimeManagementPage() {
                         animation: 'selection-flow 2.5s ease-in-out infinite',
                         boxShadow: `0 0 0 2px ${hexToRgba(selectionAccentColor, 0.22)}`,
                       }}
-                      onMouseDown={(event) => event.stopPropagation()}
+                      onMouseDown={(event) => {
+                        const target = event.target as HTMLElement | null
+                        if (target?.closest('[data-selection-overlay-action="true"]')) {
+                          event.stopPropagation()
+                        }
+                      }}
                       onContextMenu={(event) => {
                         event.preventDefault()
                         event.stopPropagation()
@@ -9608,7 +11579,7 @@ export default function TimeManagementPage() {
                       }}
                     >
                       <div className="pointer-events-none absolute inset-[3px] rounded border border-dashed" style={{ borderColor: hexToRgba(selectionAccentColor, 0.6) }} />
-                      <div className="absolute left-2 right-2 top-2">
+                      <div className="pointer-events-none absolute left-2 right-2 top-2">
                         <div
                           className="pointer-events-none inline-flex max-w-full select-none items-center gap-1 rounded-md border bg-white/95 px-2 py-1 text-[11px] font-bold shadow-md dark:bg-blue-950/90"
                           style={{ borderColor: selectionAccentColor, color: selectionAccentColor }}
@@ -9620,18 +11591,32 @@ export default function TimeManagementPage() {
                           />
                         </div>
                       </div>
-                      {draft.title.trim() && (
+                      {!isPhoneLayout && (
+                      <div className="absolute right-1.5 -top-3 z-20 flex items-center gap-1" data-selection-overlay-action="true">
                         <button
                           type="button"
-                          onClick={() => { void handleSaveSelection() }}
-                          disabled={!canSaveNewSelectionItem}
-                          className="absolute right-1.5 -top-3 z-20 inline-flex h-5 items-center gap-0.5 rounded bg-blue-600 px-1.5 text-[10px] font-semibold text-white shadow-sm hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
-                          aria-label="Save selected time item"
-                          title="Save (Enter)"
+                          onClick={openFullEditor}
+                          className="inline-flex h-5 items-center gap-0.5 rounded border border-blue-400/80 bg-blue-600 px-1.5 text-[10px] font-semibold text-white shadow-sm hover:bg-blue-500"
+                          aria-label="Open full view for selection"
+                          title="Open full view for selection"
                         >
-                          <Save className="h-2.5 w-2.5" />
-                          Save
+                          <Maximize2 className="h-2.5 w-2.5" />
+                          Full View
                         </button>
+                        {draft.title.trim() && (
+                          <button
+                            type="button"
+                            onClick={() => { void handleSaveSelection() }}
+                            disabled={!canSaveNewSelectionItem}
+                            className="inline-flex h-5 items-center gap-0.5 rounded bg-blue-600 px-1.5 text-[10px] font-semibold text-white shadow-sm hover:bg-blue-700 disabled:cursor-not-allowed disabled:opacity-50"
+                            aria-label="Save selected time item"
+                            title="Save (Enter)"
+                          >
+                            <Save className="h-2.5 w-2.5" />
+                            Save
+                          </button>
+                        )}
+                      </div>
                       )}
                     </div>
                   )}
@@ -9659,16 +11644,17 @@ export default function TimeManagementPage() {
                     </div>
                   )}
 
-                  {layout.eventSegments.map((segment) => {
+                  {layout.eventSegments.map((segment, segmentIndex) => {
                     const item = itemMap.get(segment.eventId)
                     if (!item) return null
 
                     const source = sourceMap.get(item.sourceId)
-                    const isExternal = source?.sourceType === 'external'
-                    const isSelected = selectedItemId === item.id
-                    const isBeingResized = resizeState?.itemId === item.id
-                    const isBeingDragged = draggingItemId === item.id
-                    const isMoveSource = movingItemId === item.id
+                    const interactionId = getTimeItemInteractionId(item)
+                    const isExternal = isReadOnlySource(source)
+                    const isSelected = selectedItemId === interactionId
+                    const isBeingResized = resizeState?.itemId === interactionId
+                    const isBeingDragged = draggingItemId === interactionId
+                    const isMoveSource = movingItemId === interactionId
                     const itemHeight = Math.max(segment.height, 18)
                     const primaryStartLabel = formatMinuteLabel(item.startMinute, tzState.primary, slotMinutes)
                     const primaryEndLabel = formatMinuteLabel(item.startMinute + item.durationMinutes, tzState.primary, slotMinutes)
@@ -9679,6 +11665,43 @@ export default function TimeManagementPage() {
                       prefs.category_color_display_style,
                       'time-item'
                     )
+                    const continuity = segmentContinuity.get(segmentIndex)
+                    const hasConnectedTop = continuity?.hasConnectedTop ?? false
+                    const hasConnectedBottom = continuity?.hasConnectedBottom ?? false
+                    const segmentOrder = segmentOrderByIndex.get(segmentIndex) ?? 0
+                    const firstSegmentMeta = firstSegmentMetaByItem.get(interactionId)
+                    const titleLikelyTwoRows = item.title.trim().length >= 22
+                    const isConnectedChainItem =
+                      Boolean(firstSegmentMeta?.hasConnectedBottom)
+                      || hasConnectedTop
+                      || hasConnectedBottom
+                    const firstSegmentIsSingleQuarterSlot =
+                      (firstSegmentMeta?.height ?? itemHeight) <= SLOT_HEIGHT * 1.15
+                    const shouldMoveTitleToSecondSegment =
+                      isQuarterHourGrid
+                      && titleLikelyTwoRows
+                      && Boolean(firstSegmentMeta?.hasConnectedBottom)
+                      && firstSegmentIsSingleQuarterSlot
+                    const shouldRenderTitle =
+                      !isHiddenModeEnabled
+                      && (
+                        (segment.isFirstSegment && !shouldMoveTitleToSecondSegment)
+                        || (shouldMoveTitleToSecondSegment && segmentOrder === 1 && hasConnectedTop)
+                      )
+                    const effectiveRecurrenceRule =
+                      isSelected && selectedEvent && !isSelectedReadOnly
+                        ? normaliseRecurrenceRule(draft.recurrenceRule)
+                        : item.recurrenceRule
+                    const shouldRenderRecurrenceIcon = effectiveRecurrenceRule?.type !== 'none'
+                    const titleSizeClass = isQuarterHourGrid
+                      ? (
+                        isConnectedChainItem
+                          ? 'text-[12px]'
+                          : titleLikelyTwoRows
+                            ? (itemHeight <= SLOT_HEIGHT * 2 ? 'text-[9px]' : 'text-[10px]')
+                            : 'text-[11px]'
+                      )
+                      : 'text-[11px]'
 
                     return (
                       <div
@@ -9692,7 +11715,7 @@ export default function TimeManagementPage() {
                           event.preventDefault()
                           event.stopPropagation()
                           setCalendarItemContextMenu({
-                            itemId: item.id,
+                            itemId: interactionId,
                             x: event.clientX,
                             y: event.clientY,
                             isReadOnly: isExternal,
@@ -9717,7 +11740,7 @@ export default function TimeManagementPage() {
                           const dragProgress = rect.height > 0 ? y / rect.height : 0
                           dragTopOffsetMinutesRef.current = item.durationMinutes * dragProgress
                           setIsDraggingItem(true)
-                          setDraggingItemId(item.id)
+                          setDraggingItemId(interactionId)
                           dragClientYRef.current = event.clientY
 
                           clearDragPreview()
@@ -9743,7 +11766,7 @@ export default function TimeManagementPage() {
                           const offsetY = Math.max(0, Math.min(rect.height, event.clientY - rect.top))
                           event.dataTransfer.setDragImage(preview, offsetX, offsetY)
 
-                          event.dataTransfer.setData('text/time-item', item.id)
+                          event.dataTransfer.setData('text/time-item', interactionId)
                           event.dataTransfer.effectAllowed = 'move'
                         }}
                         onDrag={(event) => {
@@ -9762,11 +11785,11 @@ export default function TimeManagementPage() {
                         }}
                         onClick={(event) => {
                           event.stopPropagation()
-                          void selectItemForEditing(item.id)
+                          void selectItemForEditing(interactionId, { x: event.clientX, y: event.clientY })
                         }}
                         onDoubleClick={(event) => {
                           event.stopPropagation()
-                          void selectItemForEditing(item.id).then((didSelect) => {
+                          void selectItemForEditing(interactionId, { x: event.clientX, y: event.clientY }).then((didSelect) => {
                             if (didSelect) {
                               openFullEditor()
                             }
@@ -9786,6 +11809,12 @@ export default function TimeManagementPage() {
                           overflow: 'visible',
                           opacity: (isMoveSource || isBeingDragged) ? 0.52 : categoryCardStyle.opacity,
                           animation: (isMoveSource || isBeingDragged) ? 'move-source-ghost 1.6s ease-in-out infinite' : undefined,
+                          borderTopWidth: hasConnectedTop ? 0 : 2,
+                          borderBottomWidth: hasConnectedBottom ? 0 : 2,
+                          borderTopLeftRadius: hasConnectedTop ? 0 : 6,
+                          borderTopRightRadius: hasConnectedTop ? 0 : 6,
+                          borderBottomLeftRadius: hasConnectedBottom ? 0 : 6,
+                          borderBottomRightRadius: hasConnectedBottom ? 0 : 6,
                           boxShadow: isBeingDragged
                             ? '0 0 0 2px rgba(248,250,252,0.92), 0 6px 16px rgba(2,6,23,0.28)'
                             : undefined,
@@ -9799,26 +11828,28 @@ export default function TimeManagementPage() {
                           </div>
                         </div>
 
-                        {item.recurrenceRule && item.recurrenceRule.type !== 'none' && (
+                        {shouldRenderRecurrenceIcon && (
                           <div className="pointer-events-none absolute right-1 top-1 rounded-full bg-background/90 p-0.5 text-blue-600 shadow-sm">
                             <Repeat2 className="h-3 w-3" />
                           </div>
                         )}
-                        {segment.isFirstSegment && !isHiddenModeEnabled && (
+                        {shouldRenderTitle && (
                           <>
-                            <div className="line-clamp-2 overflow-hidden text-[11px] font-semibold leading-tight">{item.title}</div>
+                            <div className={`line-clamp-2 overflow-hidden ${titleSizeClass} font-semibold leading-tight`}>{item.title}</div>
                           </>
                         )}
-                        <div className="pointer-events-none absolute bottom-0.5 right-0.5 text-[10px]">
-                          {isExternal ? (
-                            <Lock className="h-3 w-3 opacity-80" />
-                          ) : (
-                            <GripVertical className="h-3 w-3 opacity-80" />
-                          )}
-                        </div>
+                        {!hasConnectedBottom && (
+                          <div className="pointer-events-none absolute bottom-0.5 right-0.5 text-[10px]">
+                            {isExternal ? (
+                              <Lock className="h-3 w-3 opacity-80" />
+                            ) : (
+                              <GripVertical className="h-3 w-3 opacity-80" />
+                            )}
+                          </div>
+                        )}
 
                         {/* Resize handle -- top (start) edge */}
-                        {!isExternal && segment.isFirstSegment && (
+                        {!isExternal && item.isStartSegment && segment.isFirstSegment && (
                           <div
                             className="time-item-resize-handle time-item-resize-handle-top"
                             data-resize-active={isBeingResized && resizeState?.edge === 'start' ? 'true' : undefined}
@@ -9835,7 +11866,7 @@ export default function TimeManagementPage() {
                         )}
 
                         {/* Resize handle -- bottom (end) edge */}
-                        {!isExternal && (
+                        {!isExternal && item.isEndSegment && !hasConnectedBottom && (
                           <div
                             className="time-item-resize-handle time-item-resize-handle-bottom"
                             data-resize-active={isBeingResized && resizeState?.edge === 'end' ? 'true' : undefined}
@@ -9876,6 +11907,7 @@ export default function TimeManagementPage() {
             })}
 
             <div
+              data-testid="current-time-indicator"
               className="pointer-events-none absolute right-0 z-[15]"
               style={{
                 left: `${timezoneColumnsWidth}px`,
@@ -9898,6 +11930,7 @@ export default function TimeManagementPage() {
           </div>
             </div>
           ))}
+          {isDesktopLayout && renderCalendarHeaderRow('bottom')}
         </div>
       </div>
 
@@ -9996,7 +12029,7 @@ export default function TimeManagementPage() {
               className="h-64 w-full rounded-md border border-border bg-background px-3 py-2 font-mono text-xs text-foreground"
             />
 
-            <div className="mt-4 flex gap-2">
+            <div className="mt-4 flex items-center gap-2">
               <button
                 type="button"
                 onClick={() => {
@@ -10005,25 +12038,29 @@ export default function TimeManagementPage() {
                     try {
                       if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
                         await navigator.clipboard.writeText(modeJsonExportText)
-                        setClipboardStatus('Mode JSON copied.')
+                        showModeJsonCopyFeedback('Copied to clipboard.')
+                      } else {
+                        showModeJsonCopyFeedback('Clipboard not available. Copy manually.')
                       }
                     } catch {
-                      setClipboardStatus('Could not copy Mode JSON.')
+                      showModeJsonCopyFeedback('Could not copy Mode JSON.')
                     }
                   })()
                 }}
                 disabled={!modeJsonExportText}
-                className="rounded-md bg-indigo-600 px-3 py-2 text-sm font-semibold text-white disabled:cursor-not-allowed disabled:opacity-50"
+                className={`rounded-md border-2 px-3 py-2 text-sm font-semibold text-white transition-[border-color,box-shadow,background-color] duration-300 disabled:cursor-not-allowed disabled:opacity-50 ${
+                  modeJsonCopyFeedback === 'Copied to clipboard.'
+                    ? 'animate-[pulse_0.9s_ease-in-out_2] border-emerald-500 bg-emerald-600 shadow-[0_0_0_3px_rgba(16,185,129,0.25)]'
+                    : 'border-indigo-700 bg-indigo-600'
+                }`}
               >
                 Copy JSON
               </button>
-              <button
-                type="button"
-                onClick={() => setIsModeJsonExportOpen(false)}
-                className="rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground hover:bg-muted"
-              >
-                Close
-              </button>
+              {modeJsonCopyFeedback && (
+                <p className="text-xs font-medium text-emerald-700 dark:text-emerald-300">
+                  {modeJsonCopyFeedback}
+                </p>
+              )}
             </div>
           </div>
         </div>
@@ -10128,6 +12165,80 @@ export default function TimeManagementPage() {
         </div>
       )}
 
+      {pendingUnsavedAction && !isPhoneLayout && (
+        <div
+          className="fixed z-[145] w-80 max-w-[calc(100vw-1rem)] rounded-lg border border-amber-300 bg-amber-50/95 p-3 text-xs text-amber-900 shadow-xl backdrop-blur-sm animate-[unsaved-pop-in_180ms_ease-out] dark:border-amber-800 dark:bg-amber-950/90 dark:text-amber-100"
+          style={{
+            left: pendingUnsavedAnchor?.x ?? 24,
+            top: pendingUnsavedAnchor?.y ?? 92,
+          }}
+          role="dialog"
+          aria-live="polite"
+          aria-label="Unsaved changes"
+        >
+          <p className="font-semibold">Unsaved changes detected</p>
+          <p className="mt-1 text-[11px]">
+            {pendingUnsavedAction.type === 'switch-item'
+              ? 'Save this item before switching to another one?'
+              : 'Save this item before creating a new selection?'}
+          </p>
+          <div className="mt-2 flex items-center justify-end gap-2">
+            <button
+              type="button"
+              onClick={() => {
+                setPendingUnsavedAction(null)
+                setPendingUnsavedAnchor(null)
+                setIsPendingUnsavedActionSaving(false)
+              }}
+              className="rounded-md border border-amber-400/80 bg-white/90 px-2 py-1 text-xs font-medium text-amber-900 hover:bg-white dark:border-amber-700/80 dark:bg-amber-950 dark:text-amber-100"
+            >
+              Keep editing
+            </button>
+            <button
+              type="button"
+              onClick={() => { void handlePendingUnsavedActionConfirm() }}
+              disabled={isPendingUnsavedActionSaving}
+              className="rounded-md bg-amber-600 px-2 py-1 text-xs font-semibold text-white hover:bg-amber-700 disabled:cursor-not-allowed disabled:opacity-60"
+            >
+              {isPendingUnsavedActionSaving ? 'Saving...' : 'Save and continue'}
+            </button>
+          </div>
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={Boolean(pendingUnsavedAction && isPhoneLayout)}
+        title="Unsaved changes"
+        message={pendingUnsavedAction
+          ? pendingUnsavedAction.type === 'switch-item'
+            ? 'Save this item before switching to another one?'
+            : 'Save this item before creating a new selection?'
+          : ''}
+        confirmText={isPendingUnsavedActionSaving ? 'Saving...' : 'Save and continue'}
+        cancelText="Keep editing"
+        onCancel={() => {
+          setPendingUnsavedAction(null)
+          setPendingUnsavedAnchor(null)
+          setIsPendingUnsavedActionSaving(false)
+        }}
+        onConfirm={() => { void handlePendingUnsavedActionConfirm() }}
+      />
+
+      <ConfirmDialog
+        open={Boolean(categoryDeleteTarget)}
+        title="Delete category?"
+        message={categoryDeleteTarget
+          ? `Delete category "${categoryDeleteTarget.label}"? It will be removed from any items that use it.`
+          : ''}
+        confirmText="Delete"
+        cancelText="Cancel"
+        onCancel={() => setCategoryDeleteTarget(null)}
+        onConfirm={() => {
+          if (!categoryDeleteTarget) return
+          void handleDeleteCategory(categoryDeleteTarget)
+        }}
+      />
+
       {calendarItemContextMenu && (
         <div
           id="calendar-item-context-menu"
@@ -10215,13 +12326,13 @@ export default function TimeManagementPage() {
               <div
                 className="relative"
                 onMouseEnter={() => setContextMenuCategorySubmenuOpen(true)}
-                onMouseLeave={() => setContextMenuCategorySubmenuOpen(false)}
               >
                 <button
                   type="button"
                   role="menuitem"
                   aria-haspopup="menu"
                   aria-expanded={contextMenuCategorySubmenuOpen}
+                  onClick={() => setContextMenuCategorySubmenuOpen((prev) => !prev)}
                   className="flex w-full items-center gap-2 px-3 py-1.5 text-left hover:bg-muted"
                 >
                   <Tag className="h-3.5 w-3.5 text-blue-600" />
@@ -10248,8 +12359,7 @@ export default function TimeManagementPage() {
                       </div>
                     ) : (
                       (() => {
-                        const target = events.find((entry) => entry.id === calendarItemContextMenu.itemId)
-                        const currentIds = Array.isArray(target?.category_ids) ? target!.category_ids! : []
+                        const currentIds = getContextMenuTargetCategoryIds()
                         return categories.map((cat) => {
                           const selected = currentIds.includes(cat.id)
                           return (

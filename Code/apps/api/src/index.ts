@@ -46,8 +46,8 @@ const PORT = process.env.PORT || 3001
 
 // Trust the first reverse proxy (Railway / Nixpacks / load-balancer).
 // This ensures req.ip reflects the real client IP from X-Forwarded-For
-// rather than the proxy's IP, which is required for express-rate-limit
-// to correctly identify individual users in production.
+// for routes that intentionally inspect the forwarded client address
+// (for example captcha verification and request logging).
 if (process.env.NODE_ENV === 'production') {
   app.set('trust proxy', 1)
 }
@@ -128,12 +128,16 @@ registerRateLimiters({ app, skipLocalhost })
 // All limits above are 4x the "comfortable" threshold. When a client has used
 // more than 75% of the hard limit (i.e. the old limit), we add a warning
 // header so the frontend can show a yellow banner.
-app.use((_req, res, next) => {
+app.use((req, res, next) => {
   const originalEnd = res.end.bind(res) as (...args: unknown[]) => ReturnType<typeof res.end>
   res.end = ((...args: unknown[]) => {
+    const skipWarnHeader =
+      req.path === '/health' ||
+      req.path === '/api/connections/new-count'
+
     const limit = res.getHeader('ratelimit-limit')
     const remaining = res.getHeader('ratelimit-remaining')
-    if (limit != null && remaining != null) {
+    if (!skipWarnHeader && limit != null && remaining != null) {
       const max = Number(limit)
       const left = Number(remaining)
       // Warn when 75% consumed (= only 25% remaining = old limit threshold)

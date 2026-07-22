@@ -431,6 +431,21 @@ function buildEventFingerprint(event: {
   ].join('|')
 }
 
+function eventOverlapsSyncWindow(
+  row: { start_time: string; end_time: string },
+  windowStartMs: number,
+  windowEndMs: number,
+): boolean {
+  const rowStartMs = new Date(row.start_time).getTime()
+  const rowEndMs = new Date(row.end_time).getTime()
+
+  if (!Number.isFinite(rowStartMs) || !Number.isFinite(rowEndMs)) {
+    return false
+  }
+
+  return rowStartMs < windowEndMs && rowEndMs > windowStartMs
+}
+
 async function fetchImportedEventsFromCalendarSource(
   source: {
     id: string
@@ -576,6 +591,8 @@ async function syncImportedSource(
   options?: { autoPublishNew?: boolean },
 ): Promise<{ inserted: number; updated: number; deleted: number; totalFound: number }> {
   const autoPublishNew = !!options?.autoPublishNew
+  const syncWindowStartMs = new Date(timeMin).getTime()
+  const syncWindowEndMs = new Date(timeMax).getTime()
   let incomingEvents: ImportedExternalEvent[] = []
 
   if (sourceType === 'coordination_calendar') {
@@ -759,8 +776,20 @@ async function syncImportedSource(
   }
 
   const incomingIds = new Set(incomingByExternalId.keys())
+  const shouldScopeDeletionToWindow =
+    sourceType !== 'coordination_calendar' &&
+    Number.isFinite(syncWindowStartMs) &&
+    Number.isFinite(syncWindowEndMs)
+
   const staleRowIds = (existingRows || [])
     .filter(row => {
+      if (
+        shouldScopeDeletionToWindow &&
+        !eventOverlapsSyncWindow(row, syncWindowStartMs, syncWindowEndMs)
+      ) {
+        return false
+      }
+
       if (!row.external_event_id) {
         return !matchedLegacyRowIds.has(row.id)
       }

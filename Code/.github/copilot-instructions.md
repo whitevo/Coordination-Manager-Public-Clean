@@ -16,6 +16,7 @@
 
 - [ ] Compile the Project
 	<!-- Install dependencies and verify builds -->
+	<!-- When implementation is complete, run the relevant app tests automatically; do not ask for separate permission before running them. -->
 
 - [ ] Create and Run Task
 	<!-- Create tasks for running dev servers -->
@@ -48,3 +49,13 @@ const [dateStr, timeStr] = safeCell.split('_')
 const [dateStr, timeStr] = safeCell.split('_')
 const [localDate, setLocalDate] = useState(dateStr)
 ```
+
+## Release Loop Trigger Rules
+
+When the user message is exactly or clearly equivalent to "Prepare Public PR":
+- Treat it as an execution request, not a planning request.
+- Immediately run the full release loop command from repository root:
+	- `pnpm release:loop`
+- If any stage fails, apply fixes and restart from stage 1 by rerunning the same command.
+- Do not skip stages unless the user explicitly asks for a skip variant.
+- On success, continue to open-source sync preparation steps and report readiness for PR creation.

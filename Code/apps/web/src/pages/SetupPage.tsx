@@ -990,9 +990,6 @@ function ComponentCard({
 
   const healthTone = healthToTone(health, currentMode, component.required)
   const healthLabel = healthToLabel(health, currentMode)
-  // healthTone/healthLabel currently informational only -- kept here so a
-  // future hover tooltip can reuse them without re-computing.
-  void healthTone; void healthLabel
 
   const displayValues: Record<string, string> = effective
 
@@ -1030,6 +1027,10 @@ function ComponentCard({
   const isMissingRequired =
     component.required === true
     && !isFullyConfigured
+  const isDiscordRuntimeWarnLocal =
+    view === 'local'
+    && (component.id === 'discord-coord' || component.id === 'discord-guardian')
+    && healthTone === 'warn'
 
   return (
     <div
@@ -1037,6 +1038,8 @@ function ComponentCard({
       className={`rounded-lg border bg-card overflow-hidden transition-shadow duration-500 scroll-mt-24 ${
         highlighted
           ? 'border-amber-400 ring-2 ring-amber-400/60 shadow-md shadow-amber-500/20 [animation:pulse_3s_ease-in-out_infinite]'
+          : isDiscordRuntimeWarnLocal
+          ? 'border-amber-500/50 bg-amber-500/10'
           : isMissingRequired
           ? 'border-rose-500/50 bg-rose-500/5'
           : isFullyConfigured
@@ -1059,6 +1062,8 @@ function ComponentCard({
         <Icon className={`h-5 w-5 mt-0.5 shrink-0 ${
           isMissingRequired
             ? 'text-rose-500'
+            : isDiscordRuntimeWarnLocal
+            ? 'text-amber-600 dark:text-amber-400'
             : isFullyConfigured
             ? 'text-emerald-600 dark:text-emerald-400'
             : 'text-muted-foreground'
@@ -1077,6 +1082,14 @@ function ComponentCard({
                 title="This feature is configured but explicitly disabled on this machine via Setup."
               >
                 disabled here
+              </span>
+            )}
+            {view === 'local' && (
+              <span
+                className={`text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded ${tonePillClasses(healthTone)}`}
+                title={healthLabel}
+              >
+                {healthLabel}
               </span>
             )}
           </div>
@@ -1255,6 +1268,10 @@ function healthToTone(
   required?: boolean,
 ): 'good' | 'warn' | 'off' | 'bad' {
   if (!health) return mode === 'off' ? (required ? 'warn' : 'off') : 'good'
+  const detail = (health.detail || '').toLowerCase()
+  if (health.state === 'off' && (detail.includes('disabled') || detail.includes('not launched') || detail.includes('not running'))) {
+    return 'warn'
+  }
   if (health.state === 'live') return 'good'
   if (health.state === 'configured') return 'good'
   if (health.state === 'down') return 'bad'
@@ -1267,7 +1284,15 @@ function healthToLabel(health: ComponentHealth | undefined, mode: ComponentMode)
   if (health.state === 'live') return health.detail ? `live (${health.detail})` : 'live'
   if (health.state === 'configured') return 'configured'
   if (health.state === 'down') return health.detail ? `down: ${health.detail}` : 'down'
+  if (health.state === 'off') return health.detail || 'off'
   return health.state
+}
+
+function tonePillClasses(tone: 'good' | 'warn' | 'off' | 'bad'): string {
+  if (tone === 'good') return 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30'
+  if (tone === 'warn') return 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/35'
+  if (tone === 'bad') return 'bg-rose-500/15 text-rose-700 dark:text-rose-300 border border-rose-500/35'
+  return 'bg-slate-500/15 text-slate-700 dark:text-slate-300 border border-slate-500/30'
 }
 
 // ---------------------------------------------------------------------------
@@ -1432,9 +1457,11 @@ function ViewStatusTiles({
   const apiHealth = health.api
   if (view === 'local') {
     const apiReachable = !error && apiHealth?.state !== 'down'
-    const dbConfigured = health.database?.state === 'configured'
+    const dbHealthy = health.database?.state === 'configured' || health.database?.state === 'live'
+    const docsTone = healthToTone(health.docs, 'selfhost', false)
+    const docsLabel = healthToLabel(health.docs, 'selfhost')
     return (
-      <div className="mb-6 grid gap-3 md:grid-cols-3">
+      <div className="mb-6 grid gap-3 md:grid-cols-2 xl:grid-cols-4">
         <StatusTile
           label="Frontend"
           value="http://localhost:5173"
@@ -1449,9 +1476,15 @@ function ViewStatusTiles({
         />
         <StatusTile
           label="Database"
-          value={values?.api.SUPABASE_URL?.masked || (dbConfigured ? 'configured' : 'not configured')}
-          tone={dbConfigured ? 'good' : 'warn'}
+          value={values?.api.SUPABASE_URL?.masked || (dbHealthy ? 'configured' : 'not configured')}
+          tone={dbHealthy ? 'good' : 'warn'}
           sub="Supabase (PostgreSQL)"
+        />
+        <StatusTile
+          label="Wiki"
+          value={docsLabel}
+          tone={docsTone}
+          sub="Docs frontend (Vite)"
         />
       </div>
     )
