@@ -8,6 +8,8 @@ import type { AiModelId } from '../lib/theme-types'
 import { AI_MODEL_OPTIONS, AI_ROLE_OPTIONS, resolveAiRole } from '../lib/theme-types'
 import SentimentGrid from './SentimentGrid'
 import LearnerHelpIcon from './LearnerHelpIcon'
+import MobilePanelSwitcher from './MobilePanelSwitcher'
+import type { PanelId } from './FloatingPanels'
 
 // ── Types ───────────────────────────────────────────────────────────────────────
 
@@ -35,6 +37,7 @@ interface AiStatus {
 interface AiGuideSidePanelProps {
   isOpen: boolean
   onClose: () => void
+  onPanelChange: (panel: Exclude<PanelId, null>) => void
 }
 
 const SESSION_KEY = 'cm-ai-guide-messages'
@@ -119,7 +122,7 @@ const DEFAULT_SUGGESTIONS = [
 const DEFAULT_PLACEHOLDER = 'Ask me anything...'
 const DEFAULT_DESCRIPTION = 'I can help with app features, coordination philosophy, meeting best practices, and more. Form auto-fill is available on the Distribute Messages page.'
 
-export function AiGuideSidePanel({ isOpen, onClose }: AiGuideSidePanelProps) {
+export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSidePanelProps) {
   const { user, isAuthenticated } = useAuth()
   const { pageContext } = useAiAssistant()
   const location = useLocation()
@@ -398,12 +401,12 @@ export function AiGuideSidePanel({ isOpen, onClose }: AiGuideSidePanelProps) {
       {/* Panel */}
       <aside
         className={`
-          shrink-0 sticky top-0 h-screen overflow-hidden
-          transition-all duration-300 ease-in-out
-          ${isOpen ? 'w-[22rem] sm:w-96' : 'w-0'}
+          fixed inset-y-0 right-0 z-50 w-screen transition-transform duration-300 ease-in-out
+          ${isOpen ? 'translate-x-0 pointer-events-auto sm:w-[22rem] md:w-96' : 'translate-x-full pointer-events-none sm:w-0'}
+          sm:sticky sm:top-0 sm:h-screen sm:shrink-0 sm:overflow-hidden sm:translate-x-0 sm:pointer-events-auto
         `}
       >
-      <div className={`w-[22rem] sm:w-96 min-w-[22rem] sm:min-w-[24rem] h-full flex flex-col bg-card border-l border-border shadow-xl`}>
+      <div className={`ml-auto h-full w-screen flex flex-col bg-card border-l border-border shadow-xl sm:w-[22rem] sm:min-w-[22rem] md:w-96 md:min-w-[24rem]`}>
         {/* Header */}
         <div className="px-4 py-3 border-b border-border flex-shrink-0">
           <div className="flex items-center justify-between">
@@ -473,6 +476,7 @@ export function AiGuideSidePanel({ isOpen, onClose }: AiGuideSidePanelProps) {
             })}
           </div>
         </div>
+        <MobilePanelSwitcher activePanel="ai" onPanelChange={onPanelChange} />
 
         {/* Service unavailable warning */}
         {isAuthenticated && status && !status.available && (

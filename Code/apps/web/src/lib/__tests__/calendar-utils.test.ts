@@ -3,6 +3,7 @@ import {
   isSafeUrl,
   generateICSContent,
   buildOutlookCalendarUrl,
+  resolveMeetingTitle,
 } from '../calendar-utils'
 
 // ---------------------------------------------------------------------------
@@ -208,5 +209,19 @@ describe('buildOutlookCalendarUrl', () => {
     const url = buildOutlookCalendarUrl(event)
     const params = new URL(url).searchParams
     expect(params.get('location')).toBe('https://meet.google.com/xyz')
+  })
+})
+
+describe('resolveMeetingTitle', () => {
+  it('prefers the custom meeting title when present', () => {
+    expect(resolveMeetingTitle({ title: 'Design Review', calendarTitle: 'Weekly Ops' })).toBe('Design Review')
+  })
+
+  it('falls back to the coordination calendar name when title is blank', () => {
+    expect(resolveMeetingTitle({ title: '   ', calendarTitle: 'Weekly Ops' })).toBe('Weekly Ops')
+  })
+
+  it('falls back to the default label when both names are blank', () => {
+    expect(resolveMeetingTitle({ title: '', calendarTitle: '', fallbackTitle: 'Meeting' })).toBe('Meeting')
   })
 })

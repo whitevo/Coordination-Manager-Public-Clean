@@ -22,6 +22,8 @@ All TypeScript/React source code, database migrations/schema, package files,
 
 ## Pre-Open-Source Checklist
 
+- [ ] Run local pre-merge security helper: `pnpm security:premerge`
+  - Uses the local security gate subset and attempts to surface latest branch CodeQL run status
 - [ ] Run full gitleaks history scan: `gitleaks detect --source . --verbose`
   - Rotate any real secrets found before continuing
   - Add confirmed false-positives to `.gitleaks.toml` allowlist
@@ -34,3 +36,13 @@ All TypeScript/React source code, database migrations/schema, package files,
 - [ ] SECURITY.md with responsible disclosure instructions exists
 - [ ] LICENSE file exists
 - [ ] Rotate ALL secrets after open-sourcing
+
+## Workflow Inventory Note
+
+Expected security workflows in this repository include:
+
+- `.github/workflows/ci.yml`
+- `.github/workflows/codeql.yml` (non-blocking by design, maintainer review required)
+- `.github/workflows/dependency-review.yml`
+- `.github/workflows/gitleaks.yml`
+- `.github/workflows/security-drift-weekly.yml`

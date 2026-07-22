@@ -62,7 +62,8 @@ function App() {
         {isSetupAccessible() && (
           <Route path="setup" element={<SetupPage />} />
         )}
-        <Route path="events" element={<EventsPage />} />
+        <Route path="calendars" element={<EventsPage />} />
+        <Route path="events" element={<Navigate to="/calendars" replace />} />
         <Route path="events-calendar" element={<EventsCalendarPage />} />
         <Route path="time-management" element={<TimeManagementPage />} />
         <Route path="calendar" element={<CalendarPage key="create" />} />

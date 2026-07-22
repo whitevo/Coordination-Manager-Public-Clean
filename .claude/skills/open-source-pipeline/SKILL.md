@@ -19,12 +19,30 @@ how to push, and how to keep the two repos diverging safely.
 ## Current Reference Sources
 
 - Public sync exclusions: [references/public-sync-exclusions.md](references/public-sync-exclusions.md)
+- Public sync ledger: [references/public-sync-ledger.md](references/public-sync-ledger.md)
 - Open-source checklist: [.claude/skills/security-hardening/references/open-source-checklist.md](../security-hardening/references/open-source-checklist.md)
 - Security test catalog: [.claude/skills/security-hardening/references/security-test-catalog.md](../security-hardening/references/security-test-catalog.md)
 - Platform settings: [.claude/skills/security-hardening/references/platform-settings.md](../security-hardening/references/platform-settings.md)
 - Gitleaks rationale: [.claude/skills/security-hardening/references/gitleaks-rationale.md](../security-hardening/references/gitleaks-rationale.md)
 
 Use those files as the current source of truth when preparing a first public release.
+
+## Sync Ledger (Required)
+
+Maintain [references/public-sync-ledger.md](references/public-sync-ledger.md) as the anchor
+for each release cycle. This avoids re-reviewing the full repository every time.
+
+Each row records:
+- last private base SHA reviewed for public release planning
+- sync branch used for that cycle
+- private commit used as snapshot source
+- resulting public PR and merge SHA (once merged)
+- net added/removed file counts and notes
+
+Before starting a new public sync:
+- read the latest ledger row
+- use that row's `private_base_sha` as the lower bound for file-diff and exclusion review
+- only audit newly added paths since that SHA
 
 ## When to Use
 
@@ -61,9 +79,11 @@ secret scrubbing in git history (use `security-hardening`), or dependency hygien
    - Confirm clean working tree: `git status`
    - Confirm CI green on latest `main`
    - Run `gitleaks detect` against the working tree (not just history)
+    - Read last entry in [references/public-sync-ledger.md](references/public-sync-ledger.md)
+       and set `LAST_SYNC_PRIVATE_SHA=<private_base_sha>`
    - Review file additions since last sync:
      ```powershell
-     git log --name-only --pretty=format: <last-public-sync-sha>..HEAD | Sort-Object -Unique
+       git log --name-only --pretty=format: <LAST_SYNC_PRIVATE_SHA>..HEAD | Sort-Object -Unique
      ```
    - For each new file, decide: ship publicly OR add to
      [references/public-sync-exclusions.md](references/public-sync-exclusions.md)
@@ -85,18 +105,6 @@ secret scrubbing in git history (use `security-hardening`), or dependency hygien
    # Copy the entire private main on top
    git checkout main -- .
    ```
-
-5. **Remove every excluded path** (authoritative list in references file):
-   ```powershell
-   git rm -rf --ignore-unmatch .vscode tools workspace.code-workspace `
-     _test.js _test_wrap.txt CHANGELOG_*.md `
-     Code/apps/api/_*.cjs Code/apps/api/_*.js `
-     'Code/apps/web/public/M3 - 1 Ada owner metrics' `
-     'Code/apps/web/public/M3 - 2 DRep Metric' `
-     'Code/apps/web/public/M3 - 3 SPO metrics' `
-     'Code/apps/web/public/M3 - 4 CC Metrics'
-   ```
-
 6. **Restore public-only files**:
    ```powershell
    git checkout public/main -- LICENSE CONTRIBUTING.md .github
@@ -125,6 +133,8 @@ secret scrubbing in git history (use `security-hardening`), or dependency hygien
       link semantics changed
     - Record the merged sync SHA in `_sync-report-YYYY-MM-DD.md` and archive locally
     - Re-run `gitleaks detect` on the public repo as a backstop
+      - Append a new row to [references/public-sync-ledger.md](references/public-sync-ledger.md)
+         with the branch, source SHA, PR URL, public merge SHA, and review notes
 
 ## Divergence Rules
 

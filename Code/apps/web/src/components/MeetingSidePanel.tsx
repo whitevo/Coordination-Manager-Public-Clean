@@ -1,4 +1,4 @@
-import { useState, useEffect, useRef } from 'react'
+import { useState, useEffect, useRef, useId } from 'react'
 import { format, parse, addWeeks } from 'date-fns'
 import {
   Calendar, ChevronDown, Repeat2, X, Link as LinkIcon,
@@ -19,6 +19,8 @@ interface MeetingSidePanelProps {
   isOpen: boolean
   cellId: string | null
   widthClassName?: string
+  mobileOverlay?: boolean
+  title: string
   duration: number
   recurrenceRule: RecurrenceRule
   meetingLink: string
@@ -35,6 +37,7 @@ interface MeetingSidePanelProps {
   existingLinks: string[]
   existingDescriptions: string[]
   onSave: (data: {
+    title: string
     duration: number
     recurrenceRule: RecurrenceRule
     meetingLink: string
@@ -48,6 +51,8 @@ export default function MeetingSidePanel({
   isOpen,
   cellId,
   widthClassName = 'w-80 min-w-[20rem]',
+  mobileOverlay = false,
+  title,
   duration,
   recurrenceRule,
   meetingLink,
@@ -67,6 +72,18 @@ export default function MeetingSidePanel({
   onCancel,
   onCellIdChange,
 }: MeetingSidePanelProps) {
+  const fieldIdPrefix = useId().replace(/:/g, '')
+  const dateFieldId = `${fieldIdPrefix}-meeting-date`
+  const timeFieldId = `${fieldIdPrefix}-meeting-time`
+  const titleFieldId = `${fieldIdPrefix}-meeting-title`
+  const durationFieldId = `${fieldIdPrefix}-meeting-duration`
+  const recurrenceIntervalFieldId = `${fieldIdPrefix}-recurrence-interval`
+  const recurrenceUnitFieldId = `${fieldIdPrefix}-recurrence-unit`
+  const linkFieldId = `${fieldIdPrefix}-meeting-link`
+  const detailsFieldId = `${fieldIdPrefix}-meeting-details`
+  const lumaApiKeyFieldId = `${fieldIdPrefix}-luma-api-key`
+
+  const [localTitle, setLocalTitle] = useState(title)
   const [localDuration, setLocalDuration] = useState(duration)
   const [localRecurrenceRule, setLocalRecurrenceRule] = useState<RecurrenceRule>(recurrenceRule)
   const [localLink, setLocalLink] = useState(meetingLink)
@@ -143,15 +160,16 @@ export default function MeetingSidePanel({
 
   // Sync when the external cellId changes (e.g. user selects a different time)
   useEffect(() => {
-    if (!cellId) return
+    if (!cellId || !isOpen) return
+    setLocalTitle(title)
     setLocalDuration(duration)
     setLocalRecurrenceRule(recurrenceRule)
     setLocalLink(meetingLink)
     setMeetLinkGeneratedHere(false)
     setLocalDescription(description)
     setShowRecurrence(recurrenceRule.type !== 'none')
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally re-sync local state only when the selected cell changes
-  }, [cellId])
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally re-sync local state when the selected meeting is opened
+  }, [cellId, isOpen])
 
   // Sync duration when it changes externally (e.g. user drags on grid to extend)
   useEffect(() => {
@@ -231,6 +249,7 @@ export default function MeetingSidePanel({
   const handleSave = () => {
     const roundedDuration = Math.max(timeInterval, Math.round(localDuration / timeInterval) * timeInterval)
     onSave({
+      title: localTitle.trim(),
       duration: roundedDuration,
       recurrenceRule: localRecurrenceRule,
       meetingLink: localLink,
@@ -241,12 +260,14 @@ export default function MeetingSidePanel({
   return (
     <aside
       className={`
-        shrink-0 sticky top-0 h-screen overflow-hidden
-        transition-all duration-300 ease-in-out
-        ${isOpen ? widthClassName : 'w-0'}
+        overflow-hidden transition-all duration-300 ease-in-out
+        ${mobileOverlay
+          ? `fixed inset-y-0 left-0 z-[94] h-screen w-screen transform ${isOpen ? 'translate-x-0 pointer-events-auto' : '-translate-x-full pointer-events-none'}`
+          : `shrink-0 sticky top-0 h-screen ${isOpen ? widthClassName : 'w-0'}`
+        }
       `}
     >
-      <div className={`${widthClassName} h-full flex flex-col bg-card border-r-2 border-primary/40 shadow-xl`}>
+      <div className={`${mobileOverlay ? 'w-screen min-w-full' : widthClassName} h-full flex flex-col bg-card border-r-2 border-primary/40 shadow-xl`}>
       {/* Header */}
       <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-muted/30">
         <h3 className="text-sm font-bold text-foreground flex items-center gap-2">
@@ -269,9 +290,11 @@ export default function MeetingSidePanel({
           {isEditingDateTime ? (
             <div className="space-y-2">
               <div>
-                <label className="block text-[10px] font-medium text-blue-700 dark:text-blue-300 mb-0.5">Date</label>
+                <label htmlFor={dateFieldId} className="block text-[10px] font-medium text-blue-700 dark:text-blue-300 mb-0.5">Date</label>
                 <input
                   ref={dateInputRef}
+                  id={dateFieldId}
+                  name="meetingDate"
                   type="date"
                   value={localDate}
                   onChange={(e) => setLocalDate(e.target.value)}
@@ -279,8 +302,10 @@ export default function MeetingSidePanel({
                 />
               </div>
               <div>
-                <label className="block text-[10px] font-medium text-blue-700 dark:text-blue-300 mb-0.5">Time (UTC)</label>
+                <label htmlFor={timeFieldId} className="block text-[10px] font-medium text-blue-700 dark:text-blue-300 mb-0.5">Time (UTC)</label>
                 <input
+                  id={timeFieldId}
+                  name="meetingTimeUtc"
                   type="time"
                   value={localTime}
                   step={timeInterval * 60}
@@ -355,13 +380,35 @@ export default function MeetingSidePanel({
           )}
         </div>
 
+        {/* ── Custom Meeting Name ───────────────────────────── */}
+        <div>
+          <label htmlFor={titleFieldId} className="block text-xs font-medium text-foreground mb-1">
+            <Calendar className="w-3.5 h-3.5 inline mr-1 text-muted-foreground" />
+            Custom Meeting Name
+          </label>
+          <input
+            id={titleFieldId}
+            name="meetingTitle"
+            type="text"
+            value={localTitle}
+            onChange={(e) => setLocalTitle(e.target.value)}
+            placeholder="Optional -- falls back to the calendar name"
+            className="w-full px-3 py-1.5 text-sm border border-border rounded-lg bg-background text-foreground focus:ring-2 focus:ring-primary focus:border-primary transition-colors"
+          />
+          <p className="mt-0.5 text-[10px] text-muted-foreground">
+            Used on exports and event pages when provided.
+          </p>
+        </div>
+
         {/* ── Duration ────────────────────────────────────────── */}
         <div>
-          <label className="block text-xs font-medium text-foreground mb-1">
+          <label htmlFor={durationFieldId} className="block text-xs font-medium text-foreground mb-1">
             <Clock className="w-3.5 h-3.5 inline mr-1 text-muted-foreground" />
             Duration (minutes)
           </label>
           <input
+            id={durationFieldId}
+            name="meetingDurationMinutes"
             type="number"
             value={localDuration}
             onChange={(e) => setLocalDuration(parseInt(e.target.value) || 0)}
@@ -441,6 +488,9 @@ export default function MeetingSidePanel({
                     <div className="flex items-center gap-1.5">
                       <span className="text-[11px] text-muted-foreground whitespace-nowrap">Every</span>
                       <input
+                        id={recurrenceIntervalFieldId}
+                        name="recurrenceInterval"
+                        aria-label="Recurrence interval"
                         type="number"
                         min={1}
                         max={99}
@@ -449,6 +499,9 @@ export default function MeetingSidePanel({
                         className="w-10 px-1 py-0.5 text-[11px] border border-border rounded bg-background text-foreground text-center"
                       />
                       <select
+                        id={recurrenceUnitFieldId}
+                        name="recurrenceUnit"
+                        aria-label="Recurrence interval unit"
                         value={rule.unit || 'week'}
                         onChange={e => updateRule({ unit: e.target.value as RecurrenceUnit })}
                         className="flex-1 px-1 py-0.5 text-[11px] border border-border rounded bg-background text-foreground"
@@ -511,7 +564,7 @@ export default function MeetingSidePanel({
         {/* ── Meeting Link ────────────────────────────────────── */}
         <div>
           <div className="flex items-center justify-between mb-1">
-            <label className="text-xs font-medium text-foreground flex items-center gap-1">
+            <label htmlFor={linkFieldId} className="text-xs font-medium text-foreground flex items-center gap-1">
               <LinkIcon className="w-3.5 h-3.5 text-muted-foreground" />
               Meeting Link
             </label>
@@ -525,6 +578,8 @@ export default function MeetingSidePanel({
           </div>
           <input
             data-meeting-link-input
+            id={linkFieldId}
+            name="meetingLink"
             type="url"
             value={localLink}
             onChange={(e) => { setLocalLink(e.target.value); setMeetLinkGeneratedHere(false) }}
@@ -624,7 +679,7 @@ export default function MeetingSidePanel({
                       setIsGeneratingZoom(true)
                       setZoomError(null)
                       try {
-                        const zoomTopic = calendarName || 'Meeting'
+                        const zoomTopic = localTitle.trim() || calendarName || 'Meeting'
                         const zoomPayload: Record<string, unknown> = { topic: zoomTopic, agenda: zoomTopic, timezone: 'UTC' }
                         if (cellId) {
                           const [dateStr, timeStr] = cellId.split('_')
@@ -779,6 +834,9 @@ export default function MeetingSidePanel({
                       </p>
                       <div className="flex gap-1.5">
                         <input
+                          id={lumaApiKeyFieldId}
+                          name="lumaApiKey"
+                          aria-label="Luma API key"
                           type="password"
                           value={inlineLumaApiKey}
                           onChange={(e) => setInlineLumaApiKey(e.target.value)}
@@ -871,7 +929,7 @@ export default function MeetingSidePanel({
                             const endIso = new Date(new Date(startIso).getTime() + roundedDur * 60_000).toISOString()
                             const res = await apiClient.post('/api/luma/publish-event', {
                               meetingId: meetingId || undefined,
-                              name: localDescription || 'Meeting',
+                              name: localTitle.trim() || calendarName || 'Meeting',
                               description: localDescription || undefined,
                               startAt: startIso,
                               endAt: endIso,
@@ -906,7 +964,7 @@ export default function MeetingSidePanel({
         {/* ── Details / Description ───────────────────────────── */}
         <div>
           <div className="flex items-center justify-between mb-1">
-            <label className="text-xs font-medium text-foreground flex items-center gap-1">
+            <label htmlFor={detailsFieldId} className="text-xs font-medium text-foreground flex items-center gap-1">
               <FileText className="w-3.5 h-3.5 text-muted-foreground" />
               Details
             </label>
@@ -920,6 +978,8 @@ export default function MeetingSidePanel({
             )}
           </div>
           <textarea
+            id={detailsFieldId}
+            name="meetingDetails"
             value={localDescription}
             onChange={(e) => setLocalDescription(e.target.value)}
             placeholder="Agenda, instructions, notes..."
@@ -976,6 +1036,8 @@ function RecurrenceEndOptions({ rule, updateRule }: {
                 <>
                   On
                   <input
+                    name="recurrenceEndDate"
+                    aria-label="Recurrence end date"
                     type="date"
                     value={rule.endDate || ''}
                     onChange={e => updateRule({ endDate: e.target.value })}
@@ -988,6 +1050,8 @@ function RecurrenceEndOptions({ rule, updateRule }: {
                 <>
                   After
                   <input
+                    name="recurrenceEndCount"
+                    aria-label="Recurrence end count"
                     type="number"
                     min={1}
                     max={999}

@@ -191,12 +191,18 @@ Don't rely solely on code review. Run repeatable automated checks:
 
 | Layer | Tool | Frequency | Purpose |
 |-------|------|-----------|---------|
-| SAST | CodeQL (GitHub) | Every PR + weekly | Static code vulnerability detection |
+| SAST | CodeQL (GitHub, non-blocking by design) | Every PR + weekly | Static code vulnerability detection with maintainer review at PR/deploy time |
 | SCA | Dependabot + `pnpm audit` | Every PR + weekly alerts | Known dependency vulnerabilities |
 | DAST | OWASP ZAP baseline scan | Monthly or pre-release | Dynamic runtime vulnerability scanning |
 | Supply chain | OpenSSF Scorecard | Weekly in CI | Repo security posture drift detection |
 | Secrets | gitleaks + GitHub secret scanning | Every push | Credential leakage prevention |
 | RLS regression | Custom test suite | Every PR with DB changes | Cross-tenant access prevention |
+| Drift visibility | Weekly security drift workflow (`audit-level=moderate` + outdated snapshot) | Weekly | Non-blocking visibility into medium-severity dependency drift |
+
+CodeQL policy note:
+- `continue-on-error: true` is intentional for this repository.
+- Maintainers are expected to review CodeQL results during PR/deployment checks.
+- Weekly drift reporting complements this non-blocking posture.
 
 OWASP ZAP can run as a GitHub Action for automated baseline scans.
 For WebSocket testing when added: use ZAP's WebSocket tab to intercept/replay/fuzz.
@@ -210,6 +216,7 @@ Before security reports or public-sync decisions, run the repo automation gate:
 
 - Command: `pnpm security:check`
 - Fast pre-commit variant: `pnpm security:check:fast`
+- Pre-merge helper (runs local gate subset + fetches latest branch CodeQL run when `gh` CLI is available): `pnpm security:premerge`
 - Script location: `scripts/security-check.ps1`
 
 The gate verifies governance files, CI workflow directory presence, dependency audit,
@@ -278,6 +285,10 @@ Treat all secrets as having a lifecycle (creation, rotation, revocation):
 
 | File | Purpose |
 |------|---------|
+| `.github/workflows/security-drift-weekly.yml` | Weekly medium-severity drift report + artifact capture |
+| `.github/workflows/codeql.yml` | CodeQL configuration with explicit non-blocking policy |
+| `scripts/security-premerge.ps1` | Local pre-merge security helper with CodeQL status lookup |
+| `scripts/weekly-security-drift-summary.mjs` | Weekly drift summary generation for CI job output |
 | `Code/apps/api/src/middleware/validation.ts` | sanitizeString(), sanitizeUUID() |
 | `Code/apps/api/src/middleware/rate-limiter.ts` | Rate limiting configuration |
 | `Code/apps/api/src/middleware/auth.ts` | requireAuth, optionalAuth middleware |

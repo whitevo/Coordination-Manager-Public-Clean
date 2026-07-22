@@ -4,7 +4,9 @@
 [CmdletBinding()]
 param(
 	[switch]$SkipHealthCheck,
-	[int]$StartupDelaySeconds = 8
+	[int]$StartupDelaySeconds = 8,
+	[ValidateSet("full", "localhost")]
+	[string]$Mode = "full"
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,9 +19,19 @@ $serviceRunner = Join-Path $root "run-dev-service.ps1"
 $markerDir = Join-Path $root ".cm-stop-markers"
 $tag = "[CM]"
 $hasWindowsTerminal = $null -ne (Get-Command wt -ErrorAction SilentlyContinue)
-$shellExe = if (Get-Command pwsh -ErrorAction SilentlyContinue) { "pwsh" } else { "powershell" }
+$pwshCommand = Get-Command pwsh -ErrorAction SilentlyContinue
+$powershellCommand = Get-Command powershell -ErrorAction SilentlyContinue
+if ($pwshCommand) {
+	$shellExe = $pwshCommand.Path
+} elseif ($powershellCommand) {
+	$shellExe = $powershellCommand.Path
+} else {
+	throw "Neither 'pwsh' nor 'powershell' is available on PATH."
+}
 $wtWindowName = "cm-dev"
 $wtProfileName = "CM PowerShell"
+# Opt-in only: set CM_USE_WT=1 to use wt tabs.
+$useWindowsTerminal = $hasWindowsTerminal -and $env:CM_USE_WT -eq "1"
 
 $services = @(
 	@{ Name = "web"; Title = "$tag Front End"; Command = "pnpm dev:web" },
@@ -28,6 +40,13 @@ $services = @(
 	@{ Name = "guardian"; Title = "$tag Guardian Bot"; Command = "pnpm dev:guardian" },
 	@{ Name = "docs"; Title = "$tag Wiki"; Command = "pnpm dev:docs" }
 )
+
+if ($Mode -eq "localhost") {
+	$services = @(
+		@{ Name = "web"; Title = "$tag Front End"; Command = "pnpm dev:web" },
+		@{ Name = "api"; Title = "$tag API Server"; Command = "pnpm dev:api" }
+	)
+}
 
 Write-Host "[1/3] Stopping existing dev processes..."
 node "$code\scripts\stop-servers.js"
@@ -49,22 +68,30 @@ $launched = @()
 foreach ($service in $services) {
 	$serviceLogPath = Join-Path $logDir ("{0}.log" -f $service.Name)
 	$runnerArgs = @(
-		"-ExecutionPolicy", "Bypass", "-File", $serviceRunner,
+		"-ExecutionPolicy", "Bypass", "-File", "`"$serviceRunner`"",
 		"-ServiceName", $service.Name,
-		"-Title", $service.Title,
-		"-CodeDir", $code,
-		"-ServiceCommand", $service.Command,
-		"-LogPath", $serviceLogPath
+		"-Title", "`"$($service.Title)`"",
+		"-CodeDir", "`"$code`"",
+		"-ServiceCommand", "`"$($service.Command)`"",
+		"-LogPath", "`"$serviceLogPath`""
 	)
 
-	if ($hasWindowsTerminal) {
-		$safeTitleArg = $service.Title.Replace('"', '""')
-		$safeRunnerArg = $serviceRunner.Replace('"', '""')
-		$safeCodeArg = $code.Replace('"', '""')
-		$safeCommandArg = $service.Command.Replace('"', '""')
-		$safeLogPathArg = $serviceLogPath.Replace('"', '""')
-		$wtArgString = "-w $wtWindowName new-tab -p `"$wtProfileName`" --title `"$safeTitleArg`" --suppressApplicationTitle $shellExe -ExecutionPolicy Bypass -File `"$safeRunnerArg`" -ServiceName `"$($service.Name)`" -Title `"$safeTitleArg`" -CodeDir `"$safeCodeArg`" -ServiceCommand `"$safeCommandArg`" -LogPath `"$safeLogPathArg`""
-		$proc = Start-Process wt -ArgumentList $wtArgString -WorkingDirectory $code -PassThru
+	if ($useWindowsTerminal) {
+		$wtArgs = @("-w", $wtWindowName, "new-tab", "-p", $wtProfileName)
+		$wtArgs += @(
+			"--title", $service.Title,
+			"--suppressApplicationTitle",
+			"--",
+			$shellExe,
+			"-ExecutionPolicy", "Bypass",
+			"-File", $serviceRunner,
+			"-ServiceName", $service.Name,
+			"-Title", $service.Title,
+			"-CodeDir", $code,
+			"-ServiceCommand", $service.Command,
+			"-LogPath", $serviceLogPath
+		)
+		$proc = Start-Process wt -ArgumentList $wtArgs -WorkingDirectory $code -PassThru
 		$launchMode = "windows-terminal-tab"
 	} else {
 		$proc = Start-Process $shellExe -ArgumentList $runnerArgs -WorkingDirectory $code -PassThru
@@ -100,7 +127,7 @@ Write-Host "State saved: $stateFile"
 
 if (-not $SkipHealthCheck) {
 	Write-Host "Running health check..."
-	& "$root\check-health.ps1" -StartupDelaySeconds $StartupDelaySeconds -StateFile $stateFile
+	& "$root\check-health.ps1" -StartupDelaySeconds $StartupDelaySeconds -StateFile $stateFile -Mode $Mode
 	exit $LASTEXITCODE
 }
 

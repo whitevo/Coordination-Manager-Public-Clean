@@ -52,7 +52,8 @@
     ],
     "blockExoticSubdeps": true,
     "overrides": {
-      "shell-quote": ">=1.8.4",
+      "shell-quote": "1.9.0",
+      "axios@>=1.15.2 <1.18.0": "1.18.0",
       "follow-redirects": ">=1.16.0",
       "undici": ">=8.5.0",
       "discord.js>undici": "6.27.0",
@@ -64,9 +65,9 @@
       "qs@>=6.7.0 <=6.14.1": ">=6.14.2",
       "qs@>=6.11.1 <=6.15.1": ">=6.15.2",
       "path-to-regexp@<0.1.13": "0.1.13",
-      "brace-expansion@<2.0.2": "2.0.3",
-      "brace-expansion@^2.0.0": "2.0.3",
-      "brace-expansion@^5.0.0": "5.0.6",
+      "brace-expansion@<2.0.2": "2.1.2",
+      "brace-expansion@^2.0.0": "2.1.2",
+      "brace-expansion@^5.0.0": "5.0.7",
       "caniuse-lite": "1.0.30001793",
       "baseline-browser-mapping": "2.10.33",
       "esbuild@<=0.24.2": ">=0.25.0",
@@ -76,7 +77,7 @@
       "ws@>=7.0.0 <7.5.11": ">=7.5.11",
       "@cardano-ogmios/client>ws": ">=8.21.0",
       "form-data@>=4.0.0 <4.0.6": ">=4.0.6",
-      "js-yaml@<=4.1.1": ">=4.2.0"
+      "js-yaml@<=4.1.1": "4.3.0"
     }
   }
 }

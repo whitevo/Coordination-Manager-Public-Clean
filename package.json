@@ -10,7 +10,10 @@
 		"dev:docs": "pnpm --dir ./Code dev:docs",
 		"dev:stack": "powershell -ExecutionPolicy Bypass -File ./start.ps1",
 		"dev:stack:no-check": "powershell -ExecutionPolicy Bypass -File ./start.ps1 -SkipHealthCheck",
+		"dev:stack:localhost": "powershell -ExecutionPolicy Bypass -File ./start.ps1 -Mode localhost",
+		"dev:stack:localhost:no-check": "powershell -ExecutionPolicy Bypass -File ./start.ps1 -Mode localhost -SkipHealthCheck",
 		"dev:health": "powershell -ExecutionPolicy Bypass -File ./check-health.ps1",
+		"dev:health:localhost": "powershell -ExecutionPolicy Bypass -File ./check-health.ps1 -Mode localhost",
 		"dev:stop": "node ./Code/scripts/stop-servers.js",
 		"build": "pnpm --dir ./Code build",
 		"test": "pnpm --dir ./Code test",
@@ -19,7 +22,12 @@
 		"format": "pnpm --dir ./Code format",
 		"security:check": "powershell -ExecutionPolicy Bypass -File ./scripts/security-check.ps1",
 		"security:check:full-history": "powershell -ExecutionPolicy Bypass -File ./scripts/security-check.ps1 -GitleaksFullHistory",
-		"security:check:fast": "powershell -ExecutionPolicy Bypass -File ./scripts/security-check.ps1 -SkipMonorepoTests -SkipGitleaks"
+		"security:check:fast": "powershell -ExecutionPolicy Bypass -File ./scripts/security-check.ps1 -SkipMonorepoTests -SkipGitleaks",
+		"security:premerge": "powershell -ExecutionPolicy Bypass -File ./scripts/security-premerge.ps1",
+		"release:loop": "powershell -ExecutionPolicy Bypass -File ./scripts/release-open-source-loop.ps1",
+		"release:loop:no-ci": "powershell -ExecutionPolicy Bypass -File ./scripts/release-open-source-loop.ps1 -SkipGitHubActionsCheck",
+		"release:loop:prep": "powershell -ExecutionPolicy Bypass -File ./scripts/release-open-source-loop.ps1 -SkipGitHubActionsCheck -SkipLiveApiCheck",
+		"prepare:public-pr": "powershell -ExecutionPolicy Bypass -File ./scripts/release-open-source-loop.ps1"
 	},
 	"devDependencies": {
 		"tsx": "^4.21.0"

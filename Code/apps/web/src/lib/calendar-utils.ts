@@ -21,6 +21,26 @@ interface CalendarEvent {
   location?: string | null
 }
 
+interface MeetingTitleOptions {
+  title?: string | null
+  calendarTitle?: string | null
+  fallbackTitle?: string
+}
+
+export function resolveMeetingTitle({
+  title,
+  calendarTitle,
+  fallbackTitle = 'Meeting',
+}: MeetingTitleOptions): string {
+  const trimmedTitle = title?.trim()
+  if (trimmedTitle) return trimmedTitle
+
+  const trimmedCalendarTitle = calendarTitle?.trim()
+  if (trimmedCalendarTitle) return trimmedCalendarTitle
+
+  return fallbackTitle
+}
+
 /** Convert ISO date string to iCal DTSTART/DTEND format (UTC) */
 function toICalDate(iso: string): string {
   const d = new Date(iso)

@@ -1,5 +1,7 @@
 import { Router, Response } from 'express'
 import { createHmac, randomBytes } from 'crypto'
+import { lookup } from 'dns/promises'
+import { BlockList } from 'net'
 import { supabaseAdmin } from '../supabaseClient.js'
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth.js'
 import { safeErrorMessage } from '../middleware/validation.js'
@@ -12,12 +14,45 @@ const router: ReturnType<typeof Router> = Router()
 const GOOGLE_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth'
 const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token'
 const GOOGLE_USERINFO_ENDPOINT = 'https://www.googleapis.com/oauth2/v2/userinfo'
+const PRIVATE_ADDRESS_BLOCKLIST = new BlockList()
 
-// Scopes needed for reading & writing calendar events.
-// calendar.events grants read+write on the user's events, so calendar.readonly
-// would be redundant. Keep this list in sync with the OAuth consent screen
-// configured in Google Cloud Console.
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet('0.0.0.0', 8, 'ipv4')
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet('10.0.0.0', 8, 'ipv4')
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet('100.64.0.0', 10, 'ipv4')
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet('127.0.0.0', 8, 'ipv4')
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet('169.254.0.0', 16, 'ipv4')
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet('172.16.0.0', 12, 'ipv4')
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet('192.168.0.0', 16, 'ipv4')
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet('198.18.0.0', 15, 'ipv4')
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet('::', 128, 'ipv6')
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet('::1', 128, 'ipv6')
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet('fc00::', 7, 'ipv6')
+PRIVATE_ADDRESS_BLOCKLIST.addSubnet('fe80::', 10, 'ipv6')
+
+const BLOCKED_HOSTNAME_PATTERNS = [
+  /^localhost$/,
+  /^0\.0\.0\.0$/,
+  /^127\.\d+\.\d+\.\d+$/,
+  /^10\.\d+\.\d+\.\d+$/,
+  /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/,
+  /^192\.168\.\d+\.\d+$/,
+  /^169\.254\.\d+\.\d+$/,
+  /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+$/,
+  /^198\.(1[89])\.\d+\.\d+$/,
+  /^::1$/,
+  /^::$/,
+  /\.local$/,
+  /\.internal$/,
+  /\.svc\.cluster\.local$/,
+]
+
+// Scopes needed for both busy-time reads and event export.
+// calendar.events is sufficient for creating events, but busy sync also calls
+// CalendarList and FreeBusy endpoints, which require a read-capable scope.
+// Keep this list in sync with the OAuth consent screen configured in Google
+// Cloud Console.
 const GOOGLE_CALENDAR_SCOPES = [
+  'https://www.googleapis.com/auth/calendar.readonly',
   'https://www.googleapis.com/auth/calendar.events',
   'https://www.googleapis.com/auth/userinfo.email',
 ].join(' ')
@@ -290,8 +325,70 @@ function normalizePublicCalendarUrl(inputUrl: string): string {
   return parsed.toString()
 }
 
+function normalizeHostname(hostname: string): string {
+  return hostname.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '').split('%')[0]
+}
+
+function isBlockedIpAddress(address: string): boolean {
+  const normalized = normalizeHostname(address)
+  if (!normalized) return true
+
+  if (normalized.startsWith('::ffff:')) {
+    return isBlockedIpAddress(normalized.slice(7))
+  }
+
+  const family = normalized.includes(':') ? 'ipv6' : 'ipv4'
+  return PRIVATE_ADDRESS_BLOCKLIST.check(normalized, family)
+}
+
+async function assertSafePublicCalendarHost(hostname: string): Promise<void> {
+  const normalizedHostname = normalizeHostname(hostname)
+  if (!normalizedHostname) {
+    throw new Error('Invalid calendar host')
+  }
+
+  if (BLOCKED_HOSTNAME_PATTERNS.some((pattern) => pattern.test(normalizedHostname))) {
+    throw new Error('URLs pointing to private or internal addresses are not allowed')
+  }
+
+  if (isBlockedIpAddress(normalizedHostname)) {
+    throw new Error('URLs pointing to private or internal addresses are not allowed')
+  }
+
+  let resolvedAddresses: Array<{ address: string; family: number }>
+  try {
+    resolvedAddresses = await lookup(normalizedHostname, { all: true as const })
+  } catch {
+    throw new Error('Calendar host could not be resolved')
+  }
+
+  if (!Array.isArray(resolvedAddresses) || resolvedAddresses.length === 0) {
+    throw new Error('Calendar host could not be resolved')
+  }
+
+  if (resolvedAddresses.some((entry) => isBlockedIpAddress(entry.address))) {
+    throw new Error('URLs pointing to private or internal addresses are not allowed')
+  }
+}
+
+async function resolveSafePublicCalendarUrl(inputUrl: string): Promise<string> {
+  let normalizedUrl: URL
+  try {
+    normalizedUrl = new URL(normalizePublicCalendarUrl(inputUrl))
+  } catch {
+    throw new Error('Invalid URL format')
+  }
+
+  if (normalizedUrl.protocol !== 'https:') {
+    throw new Error('Only HTTPS URLs are allowed')
+  }
+
+  await assertSafePublicCalendarHost(normalizedUrl.hostname)
+  return normalizedUrl.toString()
+}
+
 async function validatePublicCalendarFeed(publicUrl: string): Promise<PublicCalendarValidationResult> {
-  const normalizedUrl = normalizePublicCalendarUrl(publicUrl)
+  const normalizedUrl = await resolveSafePublicCalendarUrl(publicUrl)
   const response = await fetch(normalizedUrl, {
     signal: AbortSignal.timeout(15_000),
     headers: {
@@ -529,39 +626,6 @@ router.post('/public-url', async (req: AuthenticatedRequest, res: Response) => {
     }
     if (!display_name) {
       return res.status(400).json({ error: 'display_name is required' })
-    }
-
-    // URL validation with SSRF prevention
-    let parsedUrl: URL
-    try {
-      parsedUrl = new URL(public_url)
-    } catch {
-      return res.status(400).json({ error: 'Invalid URL format' })
-    }
-
-    // Only allow HTTPS URLs (prevent fetching from local/internal services)
-    if (parsedUrl.protocol !== 'https:') {
-      return res.status(400).json({ error: 'Only HTTPS URLs are allowed' })
-    }
-
-    // Block private/internal hostnames to prevent SSRF
-    const hostname = parsedUrl.hostname.toLowerCase()
-    const blockedPatterns = [
-      /^localhost$/,
-      /^127\.\d+\.\d+\.\d+$/,
-      /^10\.\d+\.\d+\.\d+$/,
-      /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/,
-      /^192\.168\.\d+\.\d+$/,
-      /^0\.0\.0\.0$/,
-      /^::1$/,
-      /^::$/,
-      /^169\.254\.\d+\.\d+$/,           // link-local
-      /\.local$/,                         // mDNS
-      /\.internal$/,                      // cloud internal
-      /\.svc\.cluster\.local$/,           // Kubernetes
-    ]
-    if (blockedPatterns.some(p => p.test(hostname))) {
-      return res.status(400).json({ error: 'URLs pointing to private or internal addresses are not allowed' })
     }
 
     let validatedFeed: PublicCalendarValidationResult
@@ -986,6 +1050,77 @@ router.post('/busy', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { sourceIds, timeMin, timeMax, includeSummaries } = req.body
 
+    const fetchEventBusyBlocks = async (
+      accessToken: string,
+      calendarItems: Array<{ id: string }>
+    ): Promise<Array<{ start: string; end: string; summary?: string }>> => {
+      const eventBlocks: Array<{ start: string; end: string; summary?: string }> = []
+      const dedupKeys = new Set<string>()
+
+      for (const calendarItem of calendarItems) {
+        const params = new URLSearchParams({
+          timeMin,
+          timeMax,
+          singleEvents: 'true',
+          orderBy: 'startTime',
+          showDeleted: 'false',
+          maxResults: '2500',
+        })
+
+        const eventsRes = await fetch(
+          `${GOOGLE_CALENDAR_API}/calendars/${encodeURIComponent(calendarItem.id)}/events?${params.toString()}`,
+          {
+            headers: {
+              Authorization: `Bearer ${accessToken}`,
+            },
+          }
+        )
+
+        const eventsData = await eventsRes.json() as {
+          items?: Array<{
+            id?: string
+            status?: string
+            transparency?: string
+            summary?: string
+            start?: { dateTime?: string; date?: string }
+            end?: { dateTime?: string; date?: string }
+          }>
+          error?: { message?: string }
+        }
+
+        if (!eventsRes.ok) {
+          throw new Error(eventsData?.error?.message || `Google Calendar API error (${eventsRes.status})`)
+        }
+
+        for (const item of eventsData.items || []) {
+          if (item.status === 'cancelled') continue
+          if (item.transparency === 'transparent') continue
+
+          const startRaw = item.start?.dateTime || item.start?.date
+          const endRaw = item.end?.dateTime || item.end?.date
+          if (!startRaw || !endRaw) continue
+
+          const startMs = new Date(startRaw).getTime()
+          const endMs = new Date(endRaw).getTime()
+          if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) continue
+
+          const startIso = new Date(startMs).toISOString()
+          const endIso = new Date(endMs).toISOString()
+          const dedupKey = `${item.id || ''}::${startIso}::${endIso}`
+          if (dedupKeys.has(dedupKey)) continue
+          dedupKeys.add(dedupKey)
+
+          eventBlocks.push({
+            start: startIso,
+            end: endIso,
+            summary: item.summary || 'Busy',
+          })
+        }
+      }
+
+      return eventBlocks
+    }
+
     if (!sourceIds || !Array.isArray(sourceIds) || sourceIds.length === 0) {
       return res.status(400).json({ error: 'No source IDs provided' })
     }
@@ -1052,6 +1187,7 @@ router.post('/busy', async (req: AuthenticatedRequest, res: Response) => {
         }
 
         // Path 1: FreeBusy for reliable busy intervals.
+        const sourceBusyBlocks: Array<{ start: string; end: string; summary?: string }> = []
         const freeBusyRes = await fetch(`${GOOGLE_CALENDAR_API}/freeBusy`, {
           method: 'POST',
           headers: {
@@ -1072,40 +1208,50 @@ router.post('/busy', async (req: AuthenticatedRequest, res: Response) => {
         }
 
         if (!freeBusyRes.ok) {
-          throw new Error(freeBusyData?.error?.message || `Google Calendar API error (${freeBusyRes.status})`)
+          const freeBusyError = freeBusyData?.error?.message || `Google Calendar API error (${freeBusyRes.status})`
+          const isScopeError = /insufficient authentication scopes|insufficient permissions/i.test(freeBusyError)
+
+          if (isScopeError) {
+            // Backward compatibility: older OAuth grants may only have calendar.events.
+            const eventBlocks = await fetchEventBusyBlocks(accessToken, calendarItems)
+            sourceBusyBlocks.push(...eventBlocks)
+          } else {
+            throw new Error(freeBusyError)
+          }
         }
 
-        const rawBlocks: Array<{ start: number; end: number }> = []
-        if (freeBusyData.calendars) {
-          for (const [_calId, calData] of Object.entries(freeBusyData.calendars)) {
-            if (calData?.busy) {
-              for (const block of calData.busy) {
-                rawBlocks.push({
-                  start: new Date(block.start).getTime(),
-                  end: new Date(block.end).getTime(),
-                })
+        if (sourceBusyBlocks.length === 0) {
+          const rawBlocks: Array<{ start: number; end: number }> = []
+          if (freeBusyData.calendars) {
+            for (const [_calId, calData] of Object.entries(freeBusyData.calendars)) {
+              if (calData?.busy) {
+                for (const block of calData.busy) {
+                  rawBlocks.push({
+                    start: new Date(block.start).getTime(),
+                    end: new Date(block.end).getTime(),
+                  })
+                }
               }
             }
           }
-        }
 
-        const sourceBusyBlocks: Array<{ start: string; end: string; summary?: string }> = []
-        if (rawBlocks.length > 0) {
-          rawBlocks.sort((a, b) => a.start - b.start)
-          const merged: Array<{ start: number; end: number }> = [rawBlocks[0]]
-          for (let i = 1; i < rawBlocks.length; i++) {
-            const last = merged[merged.length - 1]
-            if (rawBlocks[i].start <= last.end) {
-              last.end = Math.max(last.end, rawBlocks[i].end)
-            } else {
-              merged.push(rawBlocks[i])
+          if (rawBlocks.length > 0) {
+            rawBlocks.sort((a, b) => a.start - b.start)
+            const merged: Array<{ start: number; end: number }> = [rawBlocks[0]]
+            for (let i = 1; i < rawBlocks.length; i++) {
+              const last = merged[merged.length - 1]
+              if (rawBlocks[i].start <= last.end) {
+                last.end = Math.max(last.end, rawBlocks[i].end)
+              } else {
+                merged.push(rawBlocks[i])
+              }
             }
-          }
-          for (const block of merged) {
-            sourceBusyBlocks.push({
-              start: new Date(block.start).toISOString(),
-              end: new Date(block.end).toISOString(),
-            })
+            for (const block of merged) {
+              sourceBusyBlocks.push({
+                start: new Date(block.start).toISOString(),
+                end: new Date(block.end).toISOString(),
+              })
+            }
           }
         }
 
@@ -1113,69 +1259,7 @@ router.post('/busy', async (req: AuthenticatedRequest, res: Response) => {
         // If this path returns events, prefer these blocks so UI can show titles.
         if (includeSummaries === true) {
           try {
-            const eventBlocks: Array<{ start: string; end: string; summary?: string }> = []
-            const dedupKeys = new Set<string>()
-
-            for (const calendarItem of calendarItems) {
-              const params = new URLSearchParams({
-                timeMin,
-                timeMax,
-                singleEvents: 'true',
-                orderBy: 'startTime',
-                showDeleted: 'false',
-                maxResults: '2500',
-              })
-
-              const eventsRes = await fetch(
-                `${GOOGLE_CALENDAR_API}/calendars/${encodeURIComponent(calendarItem.id)}/events?${params.toString()}`,
-                {
-                  headers: {
-                    Authorization: `Bearer ${accessToken}`,
-                  },
-                }
-              )
-
-              const eventsData = await eventsRes.json() as {
-                items?: Array<{
-                  id?: string
-                  status?: string
-                  transparency?: string
-                  summary?: string
-                  start?: { dateTime?: string; date?: string }
-                  end?: { dateTime?: string; date?: string }
-                }>
-                error?: { message?: string }
-              }
-
-              if (!eventsRes.ok) {
-                throw new Error(eventsData?.error?.message || `Google Calendar API error (${eventsRes.status})`)
-              }
-
-              for (const item of eventsData.items || []) {
-                if (item.status === 'cancelled') continue
-                if (item.transparency === 'transparent') continue
-
-                const startRaw = item.start?.dateTime || item.start?.date
-                const endRaw = item.end?.dateTime || item.end?.date
-                if (!startRaw || !endRaw) continue
-
-                const startMs = new Date(startRaw).getTime()
-                const endMs = new Date(endRaw).getTime()
-                if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) continue
-
-                const startIso = new Date(startMs).toISOString()
-                const endIso = new Date(endMs).toISOString()
-                const dedupKey = `${item.id || ''}::${startIso}::${endIso}`
-                if (dedupKeys.has(dedupKey)) continue
-                dedupKeys.add(dedupKey)
-
-                eventBlocks.push({
-                  start: startIso,
-                  end: endIso,
-                  summary: item.summary || 'Busy',
-                })
-              }
-            }
+            const eventBlocks = await fetchEventBusyBlocks(accessToken, calendarItems)
 
             if (eventBlocks.length > 0) {
               sourceBusyBlocks.length = 0
@@ -1203,9 +1287,9 @@ router.post('/busy', async (req: AuthenticatedRequest, res: Response) => {
           .eq('id', source.id)
       } catch (err) {
         const errorMsg = (err instanceof Error && err.message) || 'Failed to fetch busy times'
-        const needsReconnect = /re-authorize|refresh token|token.*fail|invalid_grant/i.test(errorMsg)
+        const needsReconnect = /re-authorize|refresh token|token.*fail|invalid_grant|insufficient authentication scopes|insufficient permissions?|permission denied/i.test(errorMsg)
         const userErrorMsg = needsReconnect
-          ? 'Authorization expired — please reconnect this calendar in Settings.'
+          ? 'Calendar authorization is missing required access -- reconnect this calendar in Settings.'
           : `Sync error: ${errorMsg}`
         console.error(`Failed to fetch busy times for source ${source.id}:`, errorMsg)
 
@@ -1227,7 +1311,8 @@ router.post('/busy', async (req: AuthenticatedRequest, res: Response) => {
     // ── Public URL sources: fetch & parse ICS feeds ──
     for (const source of publicUrlSources) {
       try {
-        const icsRes = await fetch(source.public_url, {
+        const safePublicUrl = await resolveSafePublicCalendarUrl(source.public_url)
+        const icsRes = await fetch(safePublicUrl, {
           signal: AbortSignal.timeout(15_000), // 15s timeout to prevent slow-loris DoS
         })
         if (!icsRes.ok) {

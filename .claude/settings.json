@@ -1,7 +1,7 @@
 {
   "permissions": {
     "defaultMode": "ask",
-    "allow": ["Read", "Edit", "MultiEdit", "Grep", "Glob", "LS"],
+    "allow": ["Read", "Edit", "MultiEdit", "Grep", "Glob", "LS", "Run"],
     "deny": []
   }
 }

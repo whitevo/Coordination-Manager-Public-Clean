@@ -4,7 +4,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { act, fireEvent, render, screen } from '@testing-library/react'
 import { MemoryRouter, Routes, Route } from 'react-router-dom'
 import CalendarPage from '../CalendarPage'
-import { apiClient } from '../../lib/api-client'
+import { apiClient, dedupedGet } from '../../lib/api-client'
 
 const mockUseAuth = vi.fn()
 const mockUseLearnerMode = vi.fn()
@@ -19,6 +19,7 @@ vi.mock('../../lib/api-client', () => ({
     put: vi.fn(),
     delete: vi.fn(),
   },
+  dedupedGet: vi.fn(),
 }))
 
 vi.mock('../../contexts/AuthContext', () => ({
@@ -91,10 +92,26 @@ vi.mock('../../lib/timezone-data', () => ({
 
 vi.mock('../../lib/calendar-utils', () => ({
   isSafeUrl: () => true,
+  resolveMeetingTitle: ({ title, calendarTitle }: { title?: string; calendarTitle?: string }) => {
+    const trimmedTitle = (title || '').trim()
+    if (trimmedTitle.length > 0) return trimmedTitle
+    return (calendarTitle || 'Meeting').trim() || 'Meeting'
+  },
 }))
 
-function mockCalendarResponse() {
-  vi.mocked(apiClient.get).mockImplementation(async (url: string) => {
+function mockCalendarResponse(options?: {
+  meetings?: Array<{
+    id: string
+    time_slots: string[]
+    meeting_link?: string
+    description?: string
+    duration_minutes: number
+    title: string
+    recurrence_rule?: null
+  }>
+}) {
+  const meetings = options?.meetings ?? []
+  const handleGet = async (url: string) => {
     if (url === '/api/availability/user/past?exclude_hash=test-hash') {
       return { data: { entries: [] } }
     }
@@ -129,7 +146,7 @@ function mockCalendarResponse() {
     }
 
     if (url === '/api/meetings/test-hash') {
-      return { data: [] }
+      return { data: meetings }
     }
 
     if (url === '/api/calendar-sources') {
@@ -180,7 +197,10 @@ function mockCalendarResponse() {
     }
 
     throw new Error(`Unexpected GET ${url}`)
-  })
+  }
+
+  vi.mocked(apiClient.get).mockImplementation(handleGet)
+  vi.mocked(dedupedGet).mockImplementation(handleGet as typeof dedupedGet)
 
   vi.mocked(apiClient.post).mockImplementation(async (url: string) => {
     throw new Error(`Unexpected POST ${url}`)
@@ -260,7 +280,7 @@ describe('CalendarPage Secret Swarm syncs', () => {
   })
 
   it('hides Secret Swarm when the user has no time items', async () => {
-    vi.mocked(apiClient.get).mockImplementation(async (url: string) => {
+    const noTimeItemsGet = async (url: string) => {
       if (url === '/api/availability/user/past?exclude_hash=test-hash') {
         return { data: { entries: [] } }
       }
@@ -323,7 +343,10 @@ describe('CalendarPage Secret Swarm syncs', () => {
         return { data: { events: [] } }
       }
       throw new Error(`Unexpected GET ${url}`)
-    })
+    }
+
+    vi.mocked(apiClient.get).mockImplementation(noTimeItemsGet)
+    vi.mocked(dedupedGet).mockImplementation(noTimeItemsGet as typeof dedupedGet)
 
     renderCalendarPage()
 
@@ -333,5 +356,103 @@ describe('CalendarPage Secret Swarm syncs', () => {
     expect(screen.getAllByRole('button', { name: 'Calendar Syncs' }).length).toBeGreaterThan(0)
     await openCalendarSyncsPanel()
     expect(screen.queryByText('Secret Swarm')).not.toBeInTheDocument()
+  })
+
+  it('closes an open side panel first when Escape is pressed', async () => {
+    mockCalendarResponse({
+      meetings: [
+        {
+          id: 'meeting-1',
+          time_slots: ['2026-06-10T10:00'],
+          meeting_link: 'https://example.com/meeting-1',
+          description: 'Escape panel precedence meeting',
+          duration_minutes: 60,
+          title: 'Escape precedence',
+          recurrence_rule: null,
+        },
+      ],
+    })
+
+    renderCalendarPage()
+
+    await flushMicrotasks()
+    await flushMicrotasks()
+
+    await openCalendarSyncsPanel()
+    expect(screen.getByText('Google Calendar')).toBeInTheDocument()
+    expect(screen.getByText('Escape panel precedence meeting')).toBeInTheDocument()
+
+    fireEvent.keyDown(window, { key: 'Escape' })
+    await flushMicrotasks()
+
+    expect(screen.queryByText('Google Calendar')).not.toBeInTheDocument()
+    expect(screen.getByText('Escape panel precedence meeting')).toBeInTheDocument()
+  })
+
+  it('toggles Confirmed Meetings when no side panel is open and Escape is pressed', async () => {
+    mockCalendarResponse({
+      meetings: [
+        {
+          id: 'meeting-2',
+          time_slots: ['2026-06-10T10:00'],
+          meeting_link: 'https://example.com/meeting-2',
+          description: 'Escape toggles confirmed meetings',
+          duration_minutes: 60,
+          title: 'Escape toggle',
+          recurrence_rule: null,
+        },
+      ],
+    })
+
+    renderCalendarPage()
+
+    await flushMicrotasks()
+    await flushMicrotasks()
+
+    expect(screen.getByText('Escape toggles confirmed meetings')).toBeInTheDocument()
+
+    fireEvent.keyDown(window, { key: 'Escape' })
+    await flushMicrotasks()
+    expect(screen.queryByText('Escape toggles confirmed meetings')).not.toBeInTheDocument()
+
+    fireEvent.keyDown(window, { key: 'Escape' })
+    await flushMicrotasks()
+    expect(screen.getByText('Escape toggles confirmed meetings')).toBeInTheDocument()
+  })
+
+  it('does not toggle Confirmed Meetings when Escape closes a right sidebar panel', async () => {
+    mockCalendarResponse({
+      meetings: [
+        {
+          id: 'meeting-3',
+          time_slots: ['2026-06-10T10:00'],
+          meeting_link: 'https://example.com/meeting-3',
+          description: 'Escape keeps confirmed meetings open when right panel closes',
+          duration_minutes: 60,
+          title: 'Escape right panel precedence',
+          recurrence_rule: null,
+        },
+      ],
+    })
+
+    const closeRightPanelsListener = (event: Event) => {
+      const customEvent = event as CustomEvent<{ closed?: boolean }>
+      if (customEvent.detail) customEvent.detail.closed = true
+    }
+    window.addEventListener('closeRightSidebarPanels', closeRightPanelsListener)
+
+    renderCalendarPage()
+
+    await flushMicrotasks()
+    await flushMicrotasks()
+
+    expect(screen.getByText('Escape keeps confirmed meetings open when right panel closes')).toBeInTheDocument()
+
+    fireEvent.keyDown(window, { key: 'Escape' })
+    await flushMicrotasks()
+
+    expect(screen.getByText('Escape keeps confirmed meetings open when right panel closes')).toBeInTheDocument()
+
+    window.removeEventListener('closeRightSidebarPanels', closeRightPanelsListener)
   })
 })

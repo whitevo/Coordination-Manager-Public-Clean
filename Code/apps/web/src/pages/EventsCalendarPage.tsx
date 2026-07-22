@@ -4,7 +4,7 @@ import { ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Calendar, ExternalLi
 import { Link } from 'react-router-dom'
 import { apiClient } from '../lib/api-client'
 import { computeDayLayout } from '../lib/calendarOverlapLayout'
-import { downloadICSFile, buildOutlookCalendarUrl, isSafeUrl } from '../lib/calendar-utils'
+import { downloadICSFile, buildOutlookCalendarUrl, isSafeUrl, resolveMeetingTitle } from '../lib/calendar-utils'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from '../components/Toast'
 import TimezoneSelector from '../components/TimezoneSelector'
@@ -18,7 +18,14 @@ function LinkifyText({ text }: { text: string }) {
     String.fromCharCode(Number.parseInt(hex, 16))
   )
   const stripped = decodedText.replace(/<[^>]*>/g, '')
-  const parts = stripped.split(/(https?:\/\/[^\s]+)/g)
+  const markdownLinkRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g
+  const normalized = stripped.replace(markdownLinkRegex, (_match, label: string, url: string) => {
+    const trimmedLabel = label.trim()
+    const trimmedUrl = url.trim()
+    // For markdown like [https://x](https://x), keep a single URL instance.
+    return trimmedLabel === trimmedUrl ? trimmedUrl : `${trimmedLabel} ${trimmedUrl}`
+  })
+  const parts = normalized.split(/(https?:\/\/[^\s]+)/g)
   return (
     <>
       {parts.map((part, i) =>
@@ -55,10 +62,201 @@ type PublicEvent = {
   end_time: string
   is_public: boolean
   source_type: string
+  recurrence_rule?: unknown
   created_at: string
   updated_at?: string
   calendar_title?: string
   calendar_hash?: string
+}
+
+type RecurrenceType = 'none' | 'weekly' | 'biweekly' | 'monthly' | 'custom'
+type RecurrenceUnit = 'day' | 'week' | 'month'
+type RecurrenceEndType = 'never' | 'on' | 'after'
+
+type RecurrenceRule = {
+  type: RecurrenceType
+  interval?: number
+  unit?: RecurrenceUnit
+  weekDays?: number[]
+  endType?: RecurrenceEndType
+  endDate?: string
+  endCount?: number
+  exceptions?: string[]
+}
+
+const DAY_MS = 24 * 60 * 60 * 1000
+const RECURRENCE_MAX_LOOKAHEAD_DAYS = 365 * 20
+
+const isRecurrenceType = (value: unknown): value is RecurrenceRule['type'] =>
+  value === 'none' || value === 'weekly' || value === 'biweekly' || value === 'monthly' || value === 'custom'
+
+const isRecurrenceUnit = (value: unknown): value is NonNullable<RecurrenceRule['unit']> =>
+  value === 'day' || value === 'week' || value === 'month'
+
+const isRecurrenceEndType = (value: unknown): value is NonNullable<RecurrenceRule['endType']> =>
+  value === 'never' || value === 'on' || value === 'after'
+
+const normalizeRecurrenceRule = (value: unknown): RecurrenceRule => {
+  if (!value || typeof value !== 'object') return { type: 'none' }
+
+  const candidate = value as Record<string, unknown>
+  const type = isRecurrenceType(candidate.type) ? candidate.type : 'none'
+  if (type === 'none') return { type: 'none' }
+
+  const intervalValue = typeof candidate.interval === 'number' ? candidate.interval : Number(candidate.interval)
+  const interval = Number.isFinite(intervalValue) && intervalValue > 0 ? Math.min(99, Math.floor(intervalValue)) : 1
+  const unit = isRecurrenceUnit(candidate.unit) ? candidate.unit : 'week'
+  const weekDays = Array.isArray(candidate.weekDays)
+    ? Array.from(new Set(candidate.weekDays.filter((entry): entry is number => Number.isInteger(entry) && entry >= 0 && entry <= 6)))
+    : undefined
+  const endType = isRecurrenceEndType(candidate.endType) ? candidate.endType : 'never'
+  const endDate = typeof candidate.endDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(candidate.endDate) ? candidate.endDate : undefined
+  const endCountValue = typeof candidate.endCount === 'number' ? candidate.endCount : Number(candidate.endCount)
+  const endCount = Number.isFinite(endCountValue) && endCountValue > 0 ? Math.min(500, Math.floor(endCountValue)) : undefined
+  const exceptions = Array.isArray(candidate.exceptions)
+    ? Array.from(new Set(candidate.exceptions.filter((entry): entry is string => typeof entry === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(entry)))).slice(0, 500)
+    : undefined
+
+  return {
+    type,
+    interval,
+    unit,
+    weekDays: weekDays && weekDays.length > 0 ? weekDays : undefined,
+    endType,
+    endDate,
+    endCount,
+    exceptions: exceptions && exceptions.length > 0 ? exceptions : undefined,
+  }
+}
+
+const getUtcDateKey = (date: Date): string => date.toISOString().slice(0, 10)
+
+const getRecurrenceWeekdayIndex = (date: Date): number => {
+  const jsDay = date.getUTCDay()
+  return jsDay === 0 ? 6 : jsDay - 1
+}
+
+const buildRecurrenceOccurrenceStart = (baseStart: Date, day: Date): string => {
+  return new Date(Date.UTC(
+    day.getUTCFullYear(),
+    day.getUTCMonth(),
+    day.getUTCDate(),
+    baseStart.getUTCHours(),
+    baseStart.getUTCMinutes(),
+    0,
+    0,
+  )).toISOString()
+}
+
+const isRecurringOccurrenceDate = (candidate: Date, baseStart: Date, rule: RecurrenceRule): boolean => {
+  const dayDiff = Math.floor((candidate.getTime() - baseStart.getTime()) / DAY_MS)
+  if (dayDiff < 0) return false
+
+  if (rule.type === 'weekly' || rule.type === 'biweekly') {
+    const interval = rule.type === 'biweekly' ? 14 : 7
+    return dayDiff % interval === 0 && getRecurrenceWeekdayIndex(candidate) === getRecurrenceWeekdayIndex(baseStart)
+  }
+
+  if (rule.type === 'monthly') {
+    const monthDiff = (candidate.getUTCFullYear() - baseStart.getUTCFullYear()) * 12 + (candidate.getUTCMonth() - baseStart.getUTCMonth())
+    return candidate.getUTCDate() === baseStart.getUTCDate() && monthDiff % 1 === 0
+  }
+
+  if (rule.type !== 'custom') return false
+
+  const interval = rule.interval || 1
+  const unit = rule.unit || 'week'
+  if (unit === 'day') return dayDiff % interval === 0
+
+  if (unit === 'week') {
+    const allowedWeekDays = rule.weekDays && rule.weekDays.length > 0 ? rule.weekDays : [getRecurrenceWeekdayIndex(baseStart)]
+    const weekDiff = Math.floor(dayDiff / 7)
+    return weekDiff % interval === 0 && allowedWeekDays.includes(getRecurrenceWeekdayIndex(candidate))
+  }
+
+  const monthDiff = (candidate.getUTCFullYear() - baseStart.getUTCFullYear()) * 12 + (candidate.getUTCMonth() - baseStart.getUTCMonth())
+  return candidate.getUTCDate() === baseStart.getUTCDate() && monthDiff % interval === 0
+}
+
+const getRecurringEventStartsInRange = (event: PublicEvent, rangeStart: Date, rangeEnd: Date): string[] => {
+  const recurrenceRule = normalizeRecurrenceRule(event.recurrence_rule)
+  if (recurrenceRule.type === 'none') return []
+
+  const baseStart = new Date(event.start_time)
+  if (Number.isNaN(baseStart.getTime())) return []
+
+  const endDate = recurrenceRule.endType === 'on' && recurrenceRule.endDate ? new Date(`${recurrenceRule.endDate}T00:00:00Z`) : null
+  const exceptionDates = recurrenceRule.exceptions && recurrenceRule.exceptions.length > 0 ? new Set(recurrenceRule.exceptions) : null
+  const matchedStarts: string[] = []
+  let matchedCount = 0
+
+  const baseDay = new Date(Date.UTC(baseStart.getUTCFullYear(), baseStart.getUTCMonth(), baseStart.getUTCDate()))
+  if (rangeEnd.getTime() <= baseDay.getTime()) return []
+
+  const daysUntilRangeEnd = Math.max(0, Math.floor((rangeEnd.getTime() - baseDay.getTime()) / DAY_MS))
+  const maxOffset = Math.min(RECURRENCE_MAX_LOOKAHEAD_DAYS, daysUntilRangeEnd + 7)
+
+  for (let offset = 0; offset <= maxOffset; offset++) {
+    const candidate = addDays(baseStart, offset)
+    const candidateDay = new Date(Date.UTC(candidate.getUTCFullYear(), candidate.getUTCMonth(), candidate.getUTCDate()))
+    if (candidateDay.getTime() < baseDay.getTime()) continue
+    if (endDate && candidateDay.getTime() > Date.UTC(endDate.getUTCFullYear(), endDate.getUTCMonth(), endDate.getUTCDate())) break
+    if (!isRecurringOccurrenceDate(candidate, baseStart, recurrenceRule)) continue
+
+    matchedCount++
+    if (recurrenceRule.endType === 'after' && recurrenceRule.endCount && matchedCount > recurrenceRule.endCount) {
+      break
+    }
+
+    if (exceptionDates && exceptionDates.has(getUtcDateKey(candidate))) {
+      if (candidateDay.getTime() >= rangeEnd.getTime()) break
+      continue
+    }
+
+    if (candidateDay.getTime() >= rangeStart.getTime() && candidateDay.getTime() < rangeEnd.getTime()) {
+      matchedStarts.push(buildRecurrenceOccurrenceStart(baseStart, candidate))
+    }
+
+    if (candidateDay.getTime() >= rangeEnd.getTime()) {
+      break
+    }
+  }
+
+  return matchedStarts
+}
+
+function expandRecurringPublicEvents(events: PublicEvent[], windowStart: Date, windowEnd: Date): PublicEvent[] {
+  const expanded: PublicEvent[] = []
+
+  for (const ev of events) {
+    const rule = normalizeRecurrenceRule(ev.recurrence_rule)
+    const evStart = new Date(ev.start_time)
+    const evEnd = new Date(ev.end_time)
+
+    if (rule.type === 'none') {
+      if (evStart < windowEnd && evEnd > windowStart) {
+        expanded.push(ev)
+      }
+      continue
+    }
+
+    const durationMs = evEnd.getTime() - evStart.getTime()
+    if (!Number.isFinite(durationMs) || durationMs <= 0) continue
+
+    const starts = getRecurringEventStartsInRange(ev, windowStart, windowEnd)
+    for (const occStartIso of starts) {
+      const occStart = new Date(occStartIso)
+      const occEnd = new Date(occStart.getTime() + durationMs)
+      expanded.push({
+        ...ev,
+        id: `${ev.id}__occ__${occStartIso}`,
+        start_time: occStart.toISOString(),
+        end_time: occEnd.toISOString(),
+      })
+    }
+  }
+
+  return expanded
 }
 
 type TimeSession = { start_time: string; end_time: string }
@@ -257,6 +455,21 @@ export default function EventsCalendarPage() {
   const [selectedSyncSourceIds, setSelectedSyncSourceIds] = useState<Set<string>>(new Set())
 
   const calendarGridRef = useRef<HTMLDivElement>(null)
+  const nowLineRef = useRef<HTMLDivElement>(null)
+  const [isPhoneViewport, setIsPhoneViewport] = useState(() =>
+    typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+      ? window.matchMedia('(max-width: 767px)').matches
+      : false
+  )
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || typeof window.matchMedia !== 'function') return
+    const mq = window.matchMedia('(max-width: 767px)')
+    const onChange = (event: MediaQueryListEvent) => setIsPhoneViewport(event.matches)
+    setIsPhoneViewport(mq.matches)
+    mq.addEventListener('change', onChange)
+    return () => mq.removeEventListener('change', onChange)
+  }, [])
 
   // Allow page scrolling when the calendar grid is scrolled to its boundary
   useEffect(() => {
@@ -325,8 +538,15 @@ export default function EventsCalendarPage() {
     return `Shared from ${count} source${count !== 1 ? 's' : ''}`
   }
 
-  // Group duplicate events (same title/link/location/day) into single entries
-  const events = useMemo(() => groupDuplicateEvents(rawEvents), [rawEvents])
+  // Expand recurring events into concrete occurrences in a rolling window, then group duplicates.
+  const expandedEvents = useMemo(() => {
+    const windowStart = subWeeks(currentWeekStart, 8)
+    const windowEnd = addWeeks(currentWeekStart, 80)
+    return expandRecurringPublicEvents(rawEvents, windowStart, windowEnd)
+  }, [rawEvents, currentWeekStart])
+
+  // Group duplicate events (same title/link/location/day) into single entries.
+  const events = useMemo(() => groupDuplicateEvents(expandedEvents), [expandedEvents])
 
   // Fetch public events
   useEffect(() => {
@@ -392,6 +612,32 @@ export default function EventsCalendarPage() {
     }, 30000)
     return () => clearInterval(interval)
   }, [])
+
+  // Center the scrollable grid so the current-time line starts near the middle.
+  useEffect(() => {
+    const now = new Date()
+    const currentHourUTC = now.getUTCHours()
+    if (currentHourUTC < startHour || currentHourUTC >= endHour) {
+      return
+    }
+
+    if (!calendarGridRef.current || !nowLineRef.current) {
+      return
+    }
+
+    let raf1 = 0
+    let raf2 = 0
+    raf1 = window.requestAnimationFrame(() => {
+      raf2 = window.requestAnimationFrame(() => {
+        nowLineRef.current?.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'nearest' })
+      })
+    })
+
+    return () => {
+      if (raf1) window.cancelAnimationFrame(raf1)
+      if (raf2) window.cancelAnimationFrame(raf2)
+    }
+  }, [startHour, endHour, timeInterval])
 
   // Update UTC clock every second for accurate display
   useEffect(() => {
@@ -748,30 +994,13 @@ export default function EventsCalendarPage() {
   /** Whether we're in filtered mode (at least one network selected) */
   const isNetworkFiltered = selectedNetworks.size > 0
 
-  /** Get the network/calendar name for an event */
-  const getEventNetworkName = (ev: GroupedPublicEvent): string => {
-    const netId = eventNetworkMap.get(ev.id)
-    if (netId) {
-      const net = networkMap.get(netId)
-      if (net) return net.name
-    }
-    return ev.calendar_title || ev.title
-  }
-
-  /** Get the network filter id for an event (network_id or cal_<title>) */
-  const getEventNetworkFilterId = (ev: GroupedPublicEvent): string | null => {
-    return getEventNetworkFilterIdFromResolvedData(ev, eventNetworkMap, networkMap)
-  }
-
   /** Get the display label for an event chip */
   const getChipLabel = (ev: GroupedPublicEvent) => {
-    // Unfiltered: show network name; Filtered: show meeting title
-    return isNetworkFiltered ? ev.title : getEventNetworkName(ev)
+    return resolveMeetingTitle({ title: ev.title, calendarTitle: ev.calendar_title })
   }
 
-  /** Right-click a time slot: find overlapping events, scroll to top, and highlight them */
-  const handleSlotContextMenu = useCallback((e: React.MouseEvent, dayIdx: number, utcHour: string) => {
-    e.preventDefault()
+  /** Highlight meetings for a slot. Used by right-click and tap actions. */
+  const highlightSlotMeetings = useCallback((dayIdx: number, utcHour: string) => {
     const day = weekDays[dayIdx]
     const [h, m] = utcHour.split(':').map(Number)
     const slotStartMs = Date.UTC(day.getFullYear(), day.getMonth(), day.getDate(), h, m, 0, 0)
@@ -798,6 +1027,11 @@ export default function EventsCalendarPage() {
     })
   }, [weekDays, eventsInWeek, timeInterval, tzState.primary])
 
+  const handleSlotContextMenu = useCallback((e: React.MouseEvent, dayIdx: number, utcHour: string) => {
+    e.preventDefault()
+    highlightSlotMeetings(dayIdx, utcHour)
+  }, [highlightSlotMeetings])
+
   const formatUTC = (iso: string, fmt: string) => {
     const d = new Date(iso)
     const utc = new Date(d.getTime() + d.getTimezoneOffset() * 60000)
@@ -822,28 +1056,37 @@ export default function EventsCalendarPage() {
       {/* Header */}
       <div className="mb-2 md:mb-4">
         <div className="flex flex-col gap-2">
-          <div className="flex items-center justify-between">
+          <div className={`flex ${isPhoneViewport ? 'flex-col items-start gap-2' : 'items-center justify-between'}`}>
             <div className="flex items-center gap-2">
               <CalendarDays className="w-5 h-5 md:w-6 md:h-6 text-blue-600" />
               <h1 className="text-base md:text-2xl font-bold">Events Calendar</h1>
             </div>
-            {isAdmin && (
+            <div className={`flex items-center gap-2 flex-wrap ${isPhoneViewport ? 'w-full' : 'justify-end'}`}>
               <Link
-                to="/admin/network-relations"
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-sky-100 text-sky-700 hover:bg-sky-200 dark:bg-sky-900/30 dark:text-sky-300 dark:hover:bg-sky-900/50 transition-colors"
+                to={isAuthenticated ? '/coordinate-events' : '/auth/login'}
+                className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors w-full sm:w-auto"
               >
-                <LinkIcon className="w-3.5 h-3.5" />
-                Network Relations
+                <Calendar className="w-3.5 h-3.5" />
+                {isAuthenticated ? 'Your Calendar' : 'Sign in to Coordinate'}
               </Link>
-            )}
+              {isAdmin && (
+                <Link
+                  to="/admin/network-relations"
+                  className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-sky-100 text-sky-700 hover:bg-sky-200 dark:bg-sky-900/30 dark:text-sky-300 dark:hover:bg-sky-900/50 transition-colors w-full sm:w-auto"
+                >
+                  <LinkIcon className="w-3.5 h-3.5" />
+                  Network Relations
+                </Link>
+              )}
+            </div>
           </div>
-          <p className="text-sm text-muted-foreground">
+          <p className={`text-muted-foreground ${isPhoneViewport ? 'text-xs' : 'text-sm'}`}>
             All public events shared by the community. {events.length} event{events.length !== 1 ? 's' : ''} published.
           </p>
-          <div className="flex items-center gap-3 flex-wrap">
+          <div className={`flex gap-3 flex-wrap ${isPhoneViewport ? 'flex-col items-stretch' : 'items-center'}`}>
             <TimezoneSelector timezones={tzState} />
             {/* Search box */}
-            <div className="relative flex-1 min-w-[200px] max-w-sm">
+            <div className={`relative ${isPhoneViewport ? 'w-full' : 'flex-1 min-w-[200px] max-w-sm'}`}>
               <Search className="absolute left-2.5 top-1/2 -translate-y-1/2 w-3.5 h-3.5 text-muted-foreground pointer-events-none" />
               <input
                 type="text"
@@ -901,6 +1144,7 @@ export default function EventsCalendarPage() {
                       <button
                         key={net.id}
                         onClick={() => toggleNetwork(net.id)}
+                        aria-label={net.name}
                         className="flex items-center gap-1.5 w-[140px] px-2 py-1.5 rounded-md text-[11px] font-medium transition-all border"
                         style={{
                           backgroundColor: isSelected ? `${net.color}25` : isSearchMatch ? `${net.color}15` : 'transparent',
@@ -934,6 +1178,7 @@ export default function EventsCalendarPage() {
                           <button
                             key={net.id}
                             onClick={() => toggleNetwork(net.id)}
+                            aria-label={net.name}
                             className="flex items-center gap-1.5 w-[140px] px-2 py-1.5 rounded-md text-[11px] font-medium transition-all border border-dashed"
                             style={{
                               backgroundColor: isSelected ? `${net.color}25` : isSearchMatch ? `${net.color}15` : 'transparent',
@@ -983,7 +1228,13 @@ export default function EventsCalendarPage() {
         </div>
       </div>
 
-      {/* Highlighted Meetings Bar (shown on right-click of a time slot) */}
+      {isPhoneViewport && (
+        <p className="mb-2 px-1 text-[11px] text-muted-foreground">
+          Tip: tap a time slot to see meetings in that window.
+        </p>
+      )}
+
+      {/* Highlighted Meetings Bar (shown after slot tap/right-click) */}
       {highlightedSlotEvents && highlightedSlotEvents.length > 0 && (
         <div
           ref={highlightBarRef}
@@ -1009,6 +1260,7 @@ export default function EventsCalendarPage() {
           <div className="flex flex-wrap gap-2">
             {highlightedSlotEvents.map(ev => {
               const color = getEventColor(ev)
+              const displayTitle = resolveMeetingTitle({ title: ev.title, calendarTitle: ev.calendar_title })
               return (
                 <button
                   key={ev.id}
@@ -1019,7 +1271,7 @@ export default function EventsCalendarPage() {
                   style={{ borderLeft: `4px solid ${color}` }}
                 >
                   <div className="text-left">
-                    <div className="text-xs font-semibold truncate max-w-[200px]" style={{ color }}>{ev.title}</div>
+                    <div className="text-xs font-semibold truncate max-w-[200px]" style={{ color }}>{displayTitle}</div>
                     <div className="text-[10px] text-muted-foreground">
                       {formatUTC(ev.start_time, 'HH:mm')} - {formatUTC(ev.end_time, 'HH:mm')} UTC - {getSourceCountLabel(ev)}
                     </div>
@@ -1166,8 +1418,9 @@ export default function EventsCalendarPage() {
                     return (
                       <div
                         key={slot.dayIdx}
+                        onClick={() => highlightSlotMeetings(slot.dayIdx, time)}
                         onContextMenu={(e) => handleSlotContextMenu(e, slot.dayIdx, time)}
-                        className={`border-r border-border last:border-r-0 cursor-context-menu ${
+                        className={`border-r border-border last:border-r-0 cursor-pointer ${
                           isToday ? 'bg-blue-50/30 dark:bg-blue-950/10' : ''
                         }`}
                       />
@@ -1211,16 +1464,8 @@ export default function EventsCalendarPage() {
                             <button
                               key={`${seg.eventId}-${i}`}
                               onClick={() => {
-                                if (isNetworkFiltered) {
-                                  // Filtered: open event detail modal
-                                  setSelectedEvent(ev)
-                                } else {
-                                  // Unfiltered: auto-select the network filter
-                                  const filterId = getEventNetworkFilterId(ev)
-                                  if (filterId) {
-                                    setSelectedNetworks(new Set([filterId]))
-                                  }
-                                }
+                                // Always open details on primary click so descriptions are accessible.
+                                setSelectedEvent(ev)
                               }}
                               onContextMenu={(e) => {
                                 const evStartHour = new Date(ev.start_time).getUTCHours()
@@ -1244,7 +1489,7 @@ export default function EventsCalendarPage() {
                                 boxShadow: isHovered ? `0 0 8px ${color}40` : 'none',
                                 transform: isHovered ? 'scale(1.02)' : 'scale(1)',
                               }}
-                              title={isNetworkFiltered ? chipLabel : `${chipLabel} -- click to filter`}
+                              title={`${chipLabel} -- click for details`}
                             >
                               {seg.isFirstSegment && (
                                 <>
@@ -1299,6 +1544,7 @@ export default function EventsCalendarPage() {
                 
                 return (
                   <div 
+                    ref={nowLineRef}
                     className="absolute left-0 right-0 pointer-events-none z-[15]"
                     style={{ 
                       top: `${position}px`,
@@ -1357,7 +1603,7 @@ export default function EventsCalendarPage() {
         <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setSelectedEvent(null)}>
           <div className="bg-card text-card-foreground rounded-lg p-5 max-w-md w-full mx-4 my-4 max-h-[90vh] overflow-y-auto shadow-xl border border-border" onClick={e => e.stopPropagation()}>
             <div className="flex items-center justify-between mb-1">
-              <h2 className="text-lg font-bold pr-4">{selectedEvent.title}</h2>
+              <h2 className="text-lg font-bold pr-4">{resolveMeetingTitle({ title: selectedEvent.title, calendarTitle: selectedEvent.calendar_title })}</h2>
               <button onClick={() => setSelectedEvent(null)} className="p-1 rounded hover:bg-muted transition-colors shrink-0">
                 <X className="w-4 h-4" />
               </button>
@@ -1393,7 +1639,7 @@ export default function EventsCalendarPage() {
                 </p>
               )}
 
-              {selectedEvent.description && selectedEvent.description !== selectedEvent.title && (
+              {selectedEvent.description && (
                 <p className="text-muted-foreground text-xs whitespace-pre-wrap break-all border-l-2 border-border pl-3 py-1">
                   <LinkifyText text={selectedEvent.description} />
                 </p>
@@ -1457,7 +1703,7 @@ export default function EventsCalendarPage() {
               <div className="flex items-center gap-2 border-t border-border pt-3 mt-3">
                 <a
                   href={buildOutlookCalendarUrl({
-                    title: selectedEvent.title,
+                    title: resolveMeetingTitle({ title: selectedEvent.title, calendarTitle: selectedEvent.calendar_title }),
                     description: selectedEvent.description,
                     start_time: selectedEvent.start_time,
                     end_time: selectedEvent.end_time,
@@ -1474,7 +1720,7 @@ export default function EventsCalendarPage() {
                 </a>
                 <button
                   onClick={() => downloadICSFile({
-                    title: selectedEvent.title,
+                    title: resolveMeetingTitle({ title: selectedEvent.title, calendarTitle: selectedEvent.calendar_title }),
                     description: selectedEvent.description,
                     start_time: selectedEvent.start_time,
                     end_time: selectedEvent.end_time,
@@ -1490,7 +1736,7 @@ export default function EventsCalendarPage() {
                 {googleOAuthSources.length === 1 ? (
                   <button
                     onClick={() => handleSyncToGoogle({
-                      title: selectedEvent.title, description: selectedEvent.description,
+                      title: resolveMeetingTitle({ title: selectedEvent.title, calendarTitle: selectedEvent.calendar_title }), description: selectedEvent.description,
                       start_time: selectedEvent.start_time, end_time: selectedEvent.end_time,
                       meeting_link: selectedEvent.meeting_link, location: selectedEvent.location,
                     })}
@@ -1504,7 +1750,7 @@ export default function EventsCalendarPage() {
                 ) : googleOAuthSources.length > 1 ? (
                   <button
                     onClick={() => setShowGoogleSyncPicker({
-                      title: selectedEvent.title, description: selectedEvent.description,
+                      title: resolveMeetingTitle({ title: selectedEvent.title, calendarTitle: selectedEvent.calendar_title }), description: selectedEvent.description,
                       start_time: selectedEvent.start_time, end_time: selectedEvent.end_time,
                       meeting_link: selectedEvent.meeting_link, location: selectedEvent.location,
                     })}
@@ -1516,7 +1762,7 @@ export default function EventsCalendarPage() {
                   </button>
                 ) : (
                   <a
-                    href={`https://calendar.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(selectedEvent.title)}&dates=${new Date(selectedEvent.start_time).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '')}/${new Date(selectedEvent.end_time).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '')}${selectedEvent.description ? `&details=${encodeURIComponent(selectedEvent.description)}` : ''}${selectedEvent.location ? `&location=${encodeURIComponent(selectedEvent.location)}` : selectedEvent.meeting_link ? `&location=${encodeURIComponent(selectedEvent.meeting_link)}` : ''}`}
+                    href={`https://calendar.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(resolveMeetingTitle({ title: selectedEvent.title, calendarTitle: selectedEvent.calendar_title }))}&dates=${new Date(selectedEvent.start_time).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '')}/${new Date(selectedEvent.end_time).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '')}${selectedEvent.description ? `&details=${encodeURIComponent(selectedEvent.description)}` : ''}${selectedEvent.location ? `&location=${encodeURIComponent(selectedEvent.location)}` : selectedEvent.meeting_link ? `&location=${encodeURIComponent(selectedEvent.meeting_link)}` : ''}`}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors"

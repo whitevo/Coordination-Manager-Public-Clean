@@ -247,15 +247,7 @@ describe('EventsCalendarPage duplicate event sync selection', () => {
     await renderPage()
     await flushEffects()
 
-    // Unfiltered, the merged chip is labelled by its calendar/network. Clicking it
-    // first applies the network filter; clicking again opens the event detail modal.
-    // The merged chip takes the latest source's label ("Synced Calendar"); the
-    // sidebar filter button is "Synced Calendar 1" (includes a count), so an exact
-    // name match resolves to the calendar chip.
-    await act(async () => {
-      fireEvent.click(screen.getByRole('button', { name: 'Synced Calendar' }))
-    })
-
+    // Event chips now open details directly on first click.
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: /Open Gov WG/ }))
     })

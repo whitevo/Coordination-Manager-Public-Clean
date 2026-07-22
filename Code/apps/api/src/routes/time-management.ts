@@ -47,6 +47,7 @@ interface ModeQuickTemplate {
   title: string
   notes: string
   categoryIds: string[]
+  autoSaveEnabled?: boolean
   sourceItemId: string
   createdAt: string
 }
@@ -213,6 +214,12 @@ function normalizeCategoryIdArray(value: unknown): string[] {
   return Array.from(ids)
 }
 
+function sanitizeTemplateQuickNamePreserveWhitespace(value: unknown): string {
+  if (typeof value !== 'string') return 'Quick template'
+  const sliced = value.slice(0, 80)
+  return sliced.length > 0 ? sliced : 'Quick template'
+}
+
 function normalizeQuickTemplates(value: unknown): ModeQuickTemplate[] {
   if (!Array.isArray(value)) return []
 
@@ -224,10 +231,11 @@ function normalizeQuickTemplates(value: unknown): ModeQuickTemplate[] {
     if (!id) continue
     normalized.push({
       id,
-      quickName: sanitizeString(candidate.quickName, 80) || 'Quick template',
+      quickName: sanitizeTemplateQuickNamePreserveWhitespace(candidate.quickName),
       title: sanitizeString(candidate.title, 200) || 'Untitled item',
       notes: sanitizeString(candidate.notes, 5000) || '',
       categoryIds: normalizeCategoryIdArray(candidate.categoryIds),
+      autoSaveEnabled: candidate.autoSaveEnabled === true,
       sourceItemId: sanitizeString(candidate.sourceItemId, 80) || '',
       createdAt: typeof candidate.createdAt === 'string' && candidate.createdAt.trim() ? candidate.createdAt.trim() : new Date().toISOString(),
     })

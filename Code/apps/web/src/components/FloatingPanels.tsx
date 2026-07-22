@@ -1,5 +1,5 @@
-import { useState } from 'react'
-import { MessageSquare, Sparkles, MessageCircle, ChevronDown, LayoutGrid, LifeBuoy } from 'lucide-react'
+import { useRef, useState } from 'react'
+import { MessageSquare, Sparkles, MessageCircle, ChevronDown, ChevronLeft, LayoutGrid, LifeBuoy } from 'lucide-react'
 
 // ── Types ───────────────────────────────────────────────────────────────────────
 
@@ -37,13 +37,11 @@ const PANEL_COLORS = {
   },
 } as const
 
-// Panel width matches the side panels (22rem / sm:24rem)
-const PANEL_WIDTH_CLASS = 'right-[22.5rem] sm:right-[24.5rem]'
-
 // ── Component ───────────────────────────────────────────────────────────────────
 
 export default function FloatingPanels({ activePanel, onPanelChange }: FloatingPanelsProps) {
   const [fabOpen, setFabOpen] = useState(false)
+  const touchStartXRef = useRef<number | null>(null)
 
   const toggle = (panel: PanelId) => {
     if (activePanel === panel) {
@@ -54,6 +52,39 @@ export default function FloatingPanels({ activePanel, onPanelChange }: FloatingP
   }
 
   const isAnyPanelOpen = activePanel !== null
+
+  const isMobileViewport = () => typeof window !== 'undefined' && window.innerWidth < 640
+
+  const handleEdgeTouchStart = (event: React.TouchEvent<HTMLButtonElement>) => {
+    if (typeof window === 'undefined' || window.innerWidth >= 640) return
+    const touch = event.touches[0]
+    if (window.innerWidth - touch.clientX > 48) return
+    touchStartXRef.current = touch.clientX
+  }
+
+  const handleEdgeTouchEnd = (event: React.TouchEvent<HTMLButtonElement>) => {
+    if (!isMobileViewport()) return
+    if (touchStartXRef.current === null) return
+
+    const touch = event.changedTouches[0]
+    const delta = touchStartXRef.current - touch.clientX
+    touchStartXRef.current = null
+
+    if (delta > 48 && activePanel === null) {
+      onPanelChange('ai')
+      setFabOpen(false)
+    }
+  }
+
+  const handleLauncherClick = () => {
+    if (isMobileViewport()) {
+      onPanelChange('ai')
+      setFabOpen(false)
+      return
+    }
+
+    setFabOpen(prev => !prev)
+  }
 
   // Determine button style based on whether this panel is the active one
   const btnStyle = (panel: 'feedback' | 'ai' | 'chat' | 'support') => {
@@ -67,13 +98,15 @@ export default function FloatingPanels({ activePanel, onPanelChange }: FloatingP
       {/* ── Floating Action Buttons ──────────────────────────────────────── */}
       {/* Container: when a panel is open the buttons slide left to sit beside it */}
       <div
-        className={`fixed bottom-6 z-[55] flex flex-col-reverse items-end gap-2 transition-all duration-300 ease-in-out ${
-          isAnyPanelOpen ? PANEL_WIDTH_CLASS : 'right-6'
+        className={`fixed z-[55] flex flex-col-reverse items-end gap-2 transition-all duration-300 ease-in-out ${
+          isAnyPanelOpen
+            ? 'right-0 top-1/2 -translate-y-1/2 sm:top-auto sm:translate-y-0 sm:bottom-6 sm:right-[24.5rem]'
+            : 'right-0 top-1/2 -translate-y-1/2 sm:top-auto sm:translate-y-0 sm:bottom-6 sm:right-6'
         }`}
       >
         {/* ── Expanded option buttons (visible when fabOpen OR a panel is open) ── */}
         <div
-          className={`flex flex-col-reverse items-end gap-2 transition-all duration-200 ${
+          className={`hidden sm:flex flex-col-reverse items-end gap-2 transition-all duration-200 ${
             fabOpen || isAnyPanelOpen
               ? 'opacity-100 translate-y-0 pointer-events-auto'
               : 'opacity-0 translate-y-4 pointer-events-none'
@@ -82,7 +115,7 @@ export default function FloatingPanels({ activePanel, onPanelChange }: FloatingP
           {/* Feedback */}
           <button
             onClick={() => toggle('feedback')}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-full text-white text-sm font-medium shadow-lg transition-all duration-200 ${btnStyle('feedback')}`}
+            className={`flex items-center gap-2 px-4 py-2.5 rounded-full text-white text-xs sm:text-sm font-medium shadow-lg transition-all duration-200 ${btnStyle('feedback')}`}
             title="Send Feedback"
           >
             <MessageSquare className="h-4 w-4" />
@@ -92,7 +125,7 @@ export default function FloatingPanels({ activePanel, onPanelChange }: FloatingP
           {/* AI Assistant */}
           <button
             onClick={() => toggle('ai')}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-full text-white text-sm font-medium shadow-lg transition-all duration-200 ${btnStyle('ai')}`}
+            className={`flex items-center gap-2 px-4 py-2.5 rounded-full text-white text-xs sm:text-sm font-medium shadow-lg transition-all duration-200 ${btnStyle('ai')}`}
             title="AI Assistant"
           >
             <Sparkles className="h-4 w-4" />
@@ -102,7 +135,7 @@ export default function FloatingPanels({ activePanel, onPanelChange }: FloatingP
           {/* Chat */}
           <button
             onClick={() => toggle('chat')}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-full text-white text-sm font-medium shadow-lg transition-all duration-200 ${btnStyle('chat')}`}
+            className={`flex items-center gap-2 px-4 py-2.5 rounded-full text-white text-xs sm:text-sm font-medium shadow-lg transition-all duration-200 ${btnStyle('chat')}`}
             title="Chat"
           >
             <MessageCircle className="h-4 w-4" />
@@ -112,7 +145,7 @@ export default function FloatingPanels({ activePanel, onPanelChange }: FloatingP
           {/* Support */}
           <button
             onClick={() => toggle('support')}
-            className={`flex items-center gap-2 px-4 py-2.5 rounded-full text-white text-sm font-medium shadow-lg transition-all duration-200 ${btnStyle('support')}`}
+            className={`flex items-center gap-2 px-4 py-2.5 rounded-full text-white text-xs sm:text-sm font-medium shadow-lg transition-all duration-200 ${btnStyle('support')}`}
             title="Support"
           >
             <LifeBuoy className="h-4 w-4" />
@@ -127,13 +160,15 @@ export default function FloatingPanels({ activePanel, onPanelChange }: FloatingP
         {/* collapses back to the circle and also closes the panel.           */}
         {!isAnyPanelOpen && (
           <button
-            onClick={() => setFabOpen(prev => !prev)}
+            onClick={handleLauncherClick}
+            onTouchStart={handleEdgeTouchStart}
+            onTouchEnd={handleEdgeTouchEnd}
             className={`shadow-xl flex items-center justify-center text-white transition-all duration-300 ${
               fabOpen
                 ? 'px-4 py-2.5 rounded-full bg-gray-500 hover:bg-gray-600 dark:bg-gray-600 dark:hover:bg-gray-700 text-sm font-medium gap-2'
-                : 'w-14 h-14 rounded-full bg-gradient-to-br from-purple-500 via-sky-500 to-amber-500'
+                : 'h-14 w-5 rounded-l-2xl rounded-r-none bg-gradient-to-br from-purple-500 via-sky-500 to-amber-500 sm:h-14 sm:w-14 sm:rounded-full'
             }`}
-            title={fabOpen ? 'Hide options' : 'Open panel'}
+            title={fabOpen ? 'Hide options' : 'Open AI panel or swipe left from the edge'}
           >
             {fabOpen ? (
               <>
@@ -141,7 +176,10 @@ export default function FloatingPanels({ activePanel, onPanelChange }: FloatingP
                 <span>Hide</span>
               </>
             ) : (
-              <LayoutGrid className="h-6 w-6" />
+              <>
+                <ChevronLeft className="h-4 w-4 sm:hidden" />
+                <LayoutGrid className="hidden h-6 w-6 sm:block" />
+              </>
             )}
           </button>
         )}
@@ -150,7 +188,7 @@ export default function FloatingPanels({ activePanel, onPanelChange }: FloatingP
         {isAnyPanelOpen && (
           <button
             onClick={() => { onPanelChange(null); setFabOpen(false) }}
-            className="flex items-center gap-1.5 px-3 py-2 rounded-full shadow-lg text-white text-xs font-medium bg-gray-500/70 hover:bg-gray-600 dark:bg-gray-600/70 dark:hover:bg-gray-700 transition-all duration-200"
+            className="hidden sm:flex items-center gap-1.5 px-3 py-2 rounded-full shadow-lg text-white text-xs font-medium bg-gray-500/70 hover:bg-gray-600 dark:bg-gray-600/70 dark:hover:bg-gray-700 transition-all duration-200"
             title="Close panel"
           >
             <ChevronDown className="h-3.5 w-3.5" />

@@ -26,14 +26,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
 
+      - name: Dependency review skipped on public clean repo
+        if: github.repository == 'whitevo/Coordination-Manager-Public-Clean'
+        run: |
+          echo "::warning::Dependency review is skipped on Coordination-Manager-Public-Clean because GitHub Advanced Security is not enabled for this repository."
+          echo "::warning::Enable Dependency Graph + GHAS on the public repository to enforce this gate."
+
       - name: Dependency review
-        if: github.event_name != 'workflow_dispatch'
+        if: github.event_name != 'workflow_dispatch' && github.repository == 'whitevo/Coordination-Manager'
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294
         with:
           fail-on-severity: high
 
       - name: Dependency review (manual)
-        if: github.event_name == 'workflow_dispatch'
+        if: github.event_name == 'workflow_dispatch' && github.repository == 'whitevo/Coordination-Manager'
         id: dependency_review_manual
         continue-on-error: true
         uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294
@@ -43,7 +49,7 @@ jobs:
           head-ref: ${{ inputs.head_ref && inputs.head_ref || github.ref_name }}
 
       - name: Manual dependency review unsupported notice
-        if: github.event_name == 'workflow_dispatch' && steps.dependency_review_manual.outcome == 'failure'
+        if: github.event_name == 'workflow_dispatch' && github.repository == 'whitevo/Coordination-Manager' && steps.dependency_review_manual.outcome == 'failure'
         run: |
           echo "::warning::Dependency review is unsupported for this repository context (typically missing GHAS on private repos)."
           echo "::warning::Pull request-triggered runs remain enforced when repository support is available."

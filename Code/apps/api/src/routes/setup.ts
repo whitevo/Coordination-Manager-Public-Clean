@@ -31,6 +31,9 @@
  */
 
 import { Router, Request, Response, NextFunction } from 'express'
+import { promises as fs } from 'fs'
+import path from 'path'
+import net from 'net'
 import { ValidationError, UnauthorizedError, ApplicationError } from '../middleware/error-handler.js'
 import { sanitizeString } from '../middleware/validation.js'
 import { isSupabaseConfigured } from '../supabaseClient.js'
@@ -63,21 +66,145 @@ import {
 
 const router: Router = Router()
 
-async function probeSupabaseConnection(): Promise<{ ok: boolean; detail: string }> {
-  const url = process.env.SUPABASE_URL?.trim() || ''
-  const key = process.env.SUPABASE_KEY?.trim() || ''
-  if (!isMeaningfulEnvValue('SUPABASE_URL', url) || !isMeaningfulEnvValue('SUPABASE_KEY', key)) {
-    return { ok: false, detail: 'missing or placeholder credentials' }
+function repoRootFromApiCwd(): string {
+  // Expected cwd in dev is Code/apps/api. Move up to repository root.
+  return path.resolve(process.cwd(), '..', '..', '..')
+}
+
+function stateFilePath(): string {
+  return path.join(repoRootFromApiCwd(), '.cm-dev-state.json')
+}
+
+async function getServiceState(name: string): Promise<{ declared: boolean; launcherPid: number | null }> {
+  try {
+    const raw = await fs.readFile(stateFilePath(), 'utf8')
+    const parsed = JSON.parse(raw) as {
+      services?: Array<{ name?: string; launcherPid?: number }>
+    }
+    const svc = parsed.services?.find(s => s?.name === name)
+    if (!svc) return { declared: false, launcherPid: null }
+    const pid = typeof svc.launcherPid === 'number' ? svc.launcherPid : null
+    return { declared: true, launcherPid: pid }
+  } catch {
+    return { declared: false, launcherPid: null }
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function isTcpPortListening(port: number, timeoutMs = 700): Promise<boolean> {
+  return await new Promise(resolve => {
+    const socket = new net.Socket()
+    let done = false
+
+    const finish = (ok: boolean) => {
+      if (done) return
+      done = true
+      socket.destroy()
+      resolve(ok)
+    }
+
+    socket.setTimeout(timeoutMs)
+    socket.once('connect', () => finish(true))
+    socket.once('timeout', () => finish(false))
+    socket.once('error', () => finish(false))
+    socket.connect(port, '127.0.0.1')
+  })
+}
+
+async function probeCoordinationBot(): Promise<{ ok: boolean; detail: string }> {
+  const port = Number(process.env.BOT_API_PORT || '3002')
+  const service = await getServiceState('bot')
+  const portListening = await isTcpPortListening(port)
+
+  if (service.declared && service.launcherPid && isProcessAlive(service.launcherPid) && portListening) {
+    return { ok: true, detail: `running (port ${port})` }
+  }
+  if (portListening) {
+    return { ok: true, detail: `running on port ${port}` }
+  }
+  if (service.declared) {
+    return { ok: false, detail: `not running (expected on port ${port})` }
+  }
+  return { ok: false, detail: 'not launched in current local stack' }
+}
+
+async function probeGuardianBot(): Promise<{ ok: boolean; detail: string }> {
+  const service = await getServiceState('guardian')
+  if (!service.declared) {
+    return { ok: false, detail: 'not launched in current local stack' }
+  }
+  if (!service.launcherPid) {
+    return { ok: false, detail: 'launched but no process id recorded' }
+  }
+  if (isProcessAlive(service.launcherPid)) {
+    return { ok: true, detail: `running (PID ${service.launcherPid})` }
+  }
+  return { ok: false, detail: 'not running (launcher exited)' }
+}
+
+async function probeDocsSite(): Promise<{ ok: boolean; detail: string }> {
+  const service = await getServiceState('docs')
+  const docsCandidates = ['http://localhost:5174', 'http://127.0.0.1:5174']
+
+  let docsReachable = false
+  let reachableUrl = ''
+  for (const docsUrl of docsCandidates) {
+    try {
+      const res = await fetch(docsUrl, { method: 'GET' })
+      if (res.ok) {
+        docsReachable = true
+        reachableUrl = docsUrl
+        break
+      }
+    } catch {
+      // Try next candidate.
+    }
   }
 
-  const endpoint = `${url.replace(/\/$/, '')}/rest/v1/`
+  if (service.declared && service.launcherPid && isProcessAlive(service.launcherPid) && docsReachable) {
+    return { ok: true, detail: `running (${reachableUrl || 'http://localhost:5174'})` }
+  }
+  if (docsReachable) {
+    return { ok: true, detail: `running (${reachableUrl || 'http://localhost:5174'})` }
+  }
+  if (service.declared) {
+    return { ok: false, detail: 'not running (expected at http://localhost:5174)' }
+  }
+  return { ok: false, detail: 'not launched in current local stack' }
+}
+
+async function probeSupabaseConnection(): Promise<{ ok: boolean; detail: string }> {
+  const url = process.env.SUPABASE_URL?.trim() || ''
+  const anonKey = process.env.SUPABASE_KEY?.trim() || ''
+  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim() || ''
+  const key = isMeaningfulEnvValue('SUPABASE_SERVICE_ROLE_KEY', serviceRoleKey)
+    ? serviceRoleKey
+    : anonKey
+
+  if (!isMeaningfulEnvValue('SUPABASE_URL', url)) {
+    return { ok: false, detail: 'missing or placeholder SUPABASE_URL' }
+  }
+  if (!isMeaningfulEnvValue('SUPABASE_KEY', key)) {
+    return { ok: false, detail: 'missing or placeholder Supabase key' }
+  }
+
+  // auth/v1/settings is a lightweight endpoint that validates host + API key
+  // without depending on a specific table or RLS policy.
+  const endpoint = `${url.replace(/\/$/, '')}/auth/v1/settings`
   try {
     const res = await fetch(endpoint, {
       method: 'GET',
       headers: {
         Accept: 'application/json',
         apikey: key,
-        Authorization: `Bearer ${key}`,
       },
     })
     if (res.ok) return { ok: true, detail: `HTTP ${res.status}` }
@@ -107,7 +234,12 @@ router.get('/status', async (_req: Request, res: Response, next: NextFunction) =
   try {
     const localConfig = await readLocalConfig()
     const env = getRequiredEnvStatus()
-    const databaseProbe = await probeSupabaseConnection()
+    const [databaseProbe, coordBotProbe, guardianBotProbe, docsProbe] = await Promise.all([
+      probeSupabaseConnection(),
+      probeCoordinationBot(),
+      probeGuardianBot(),
+      probeDocsSite(),
+    ])
 
     // Derive the effective mode. The wizard may have written one; otherwise
     // we infer from env presence.
@@ -131,6 +263,9 @@ router.get('/status', async (_req: Request, res: Response, next: NextFunction) =
       },
       probes: {
         database: databaseProbe,
+        discordCoordBot: coordBotProbe,
+        discordGuardianBot: guardianBotProbe,
+        docs: docsProbe,
       },
       // Per-feature configured flags. Frontend uses these to render
       // "feature disabled, configure in Setup" banners instead of letting

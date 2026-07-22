@@ -316,7 +316,7 @@ export default function GuestBookingPage() {
   // ------------------------------------------------------------------
   // Cell interaction
   // ------------------------------------------------------------------
-  const handleCellMouseDown = (date: Date, time: string) => {
+  const handleCellPointerDown = (date: Date, time: string) => {
     const cellId = getCellId(date, time)
     setIsDragging(true)
     setDragStart(cellId)
@@ -329,9 +329,8 @@ export default function GuestBookingPage() {
     }
   }
 
-  const handleCellMouseEnter = (date: Date, time: string) => {
+  const applySelectionToCell = (cellId: string) => {
     if (!isDragging || !dragStart) return
-    const cellId = getCellId(date, time)
     const rect = getCellsInRectangle(dragStart, cellId)
     if (isRemoving) {
       setCurrentSelection(prev => { const s = new Set(prev); rect.forEach(c => s.delete(c)); return s })
@@ -340,7 +339,24 @@ export default function GuestBookingPage() {
     }
   }
 
-  const handleMouseUp = () => { setIsDragging(false); setDragStart(null) }
+  const handleCellPointerEnter = (date: Date, time: string) => {
+    const cellId = getCellId(date, time)
+    applySelectionToCell(cellId)
+  }
+
+  const handleGridPointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (!isDragging || !dragStart) return
+    const hovered = document.elementFromPoint(e.clientX, e.clientY)
+    if (!(hovered instanceof HTMLElement)) return
+    const cell = hovered.closest<HTMLElement>('[data-cell-id]')
+    if (!cell) return
+    if (cell.dataset.selectable !== 'true') return
+    const cellId = cell.dataset.cellId
+    if (!cellId) return
+    applySelectionToCell(cellId)
+  }
+
+  const handlePointerEnd = () => { setIsDragging(false); setDragStart(null) }
 
   // ------------------------------------------------------------------
   // Submit availability
@@ -650,7 +666,7 @@ export default function GuestBookingPage() {
       {/* Instruction banner */}
       <div className="px-4 py-3 bg-purple-50 dark:bg-purple-950/30 border-b border-purple-200 dark:border-purple-800/50">
         <p className="text-sm text-center text-purple-700 dark:text-purple-300 font-medium">
-          Drag to select when you're available, then confirm below
+          Drag or tap to select when you're available, then confirm below
         </p>
       </div>
 
@@ -713,8 +729,10 @@ export default function GuestBookingPage() {
             maxHeight: isMobile ? 'calc(100vh - 260px)' : 'calc(100vh - 280px)',
             minHeight: '200px',
           }}
-          onMouseUp={handleMouseUp}
-          onMouseLeave={handleMouseUp}
+          onPointerMove={handleGridPointerMove}
+          onPointerUp={handlePointerEnd}
+          onPointerCancel={handlePointerEnd}
+          onPointerLeave={handlePointerEnd}
         >
           <div style={{ minWidth: isMobile ? undefined : '640px' }}>
             {/* Day headers */}
@@ -767,6 +785,8 @@ export default function GuestBookingPage() {
                   return (
                     <div
                       key={`${day.toISOString()}-${time}`}
+                      data-cell-id={cellId}
+                      data-selectable={isSelectable ? 'true' : 'false'}
                       className={`border-l border-b border-border h-[32px] select-none relative ${
                         isSkipped || !inRange
                           ? 'bg-gray-400/70 dark:bg-[hsla(222,47%,11%,0.7)] cursor-not-allowed'
@@ -777,9 +797,13 @@ export default function GuestBookingPage() {
                           : inRange
                           ? 'bg-green-50/30 dark:bg-green-950/10 cursor-pointer'
                           : ''
-                      }`}
-                      onMouseDown={() => isSelectable && handleCellMouseDown(day, time)}
-                      onMouseEnter={() => isSelectable && handleCellMouseEnter(day, time)}
+                      } touch-none`}
+                      onPointerDown={(e) => {
+                        if (!isSelectable) return
+                        e.preventDefault()
+                        handleCellPointerDown(day, time)
+                      }}
+                      onPointerEnter={() => isSelectable && handleCellPointerEnter(day, time)}
                     />
                   )
                 })}
@@ -797,20 +821,20 @@ export default function GuestBookingPage() {
                 {currentSelection.size} slot{currentSelection.size !== 1 ? 's' : ''} selected
               </span>
             ) : (
-              <span>Drag on the grid to select times</span>
+              <span>Drag or tap on the grid to select times</span>
             )}
           </div>
           <div className="flex-1" />
           <button
             onClick={() => { setStep('name'); setCurrentSelection(new Set()) }}
-            className="px-4 py-2 text-sm text-muted-foreground hover:text-foreground hover:bg-muted rounded-lg transition-colors"
+            className="w-full sm:w-auto px-4 py-2.5 text-sm text-muted-foreground hover:text-foreground hover:bg-muted rounded-lg transition-colors"
           >
             Back
           </button>
           <button
             onClick={handleSubmit}
             disabled={currentSelection.size === 0 || isSaving}
-            className="px-6 py-2.5 bg-green-600 hover:bg-green-700 text-white rounded-xl font-semibold text-sm disabled:opacity-40 disabled:cursor-not-allowed transition-all flex items-center gap-2 shadow-md shadow-green-200 dark:shadow-green-900/30"
+            className="w-full sm:w-auto px-6 py-2.5 bg-green-600 hover:bg-green-700 text-white rounded-xl font-semibold text-sm disabled:opacity-40 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2 shadow-md shadow-green-200 dark:shadow-green-900/30"
           >
             {isSaving ? (
               <>

@@ -1,4 +1,4 @@
-import rateLimit from 'express-rate-limit'
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit'
 import type express from 'express'
 
 type LimiterMethod = 'use' | 'get' | 'post'
@@ -20,6 +20,19 @@ interface RegisterRateLimitersOptions {
   skipLocalhost: (req: express.Request) => boolean
 }
 
+function getSocketAddress(req: express.Request): string | null {
+  const socketAddress = req.socket?.remoteAddress
+  if (typeof socketAddress === 'string' && socketAddress.length > 0) {
+    return socketAddress
+  }
+
+  return null
+}
+
+export function getRateLimitKey(req: express.Request): string {
+  return getSocketAddress(req) ?? ipKeyGenerator(req.ip ?? '')
+}
+
 function applyLimiter(app: express.Express, limiter: ReturnType<typeof rateLimit>, mount: LimiterMount): void {
   if (mount.method === 'use') app.use(mount.path, limiter)
   if (mount.method === 'get') app.get(mount.path, limiter)
@@ -34,6 +47,7 @@ function createLimiter(
     windowMs: definition.windowMs,
     max: definition.max,
     skip: skipLocalhost,
+    keyGenerator: getRateLimitKey,
     standardHeaders: true,
     legacyHeaders: false,
     message: definition.message,
@@ -47,9 +61,37 @@ export function registerRateLimiters({ app, skipLocalhost }: RegisterRateLimiter
       max: 1200,
       message: { error: 'Too many requests, please try again later.' },
     },
-    skipLocalhost
+    (req) => skipLocalhost(req) || req.path === '/health'
   )
   app.use(globalLimiter)
+
+  const healthCheckLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    // 3 visible tabs polling every 30s ~= 90 requests per 15 minutes.
+    // Keep a small safety margin for retries and clock skew.
+    max: 110,
+    skip: skipLocalhost,
+    keyGenerator: getRateLimitKey,
+    standardHeaders: true,
+    legacyHeaders: false,
+    handler: (req, res) => {
+      const rateLimitState = (req as express.Request & {
+        rateLimit?: { limit?: number; current?: number }
+      }).rateLimit
+      const limit = typeof rateLimitState?.limit === 'number' ? rateLimitState.limit : 110
+      const used = typeof rateLimitState?.current === 'number' ? rateLimitState.current : limit
+
+      // Health checks poll every 30 seconds => about 30 requests per tab per 15-minute window.
+      const estimatedActiveTabs = Math.max(1, Math.ceil(used / 30))
+
+      res.status(429).json({
+        error: 'Health check rate limit reached.',
+        message: `Your session hit the health-check limit (${used}/${limit} requests in 15 minutes). This is typically caused by about ${estimatedActiveTabs} active tabs polling concurrently.`,
+        statusCode: 429,
+      })
+    },
+  })
+  app.use('/health', healthCheckLimiter)
 
   const authActions: Array<{ path: string; label: string }> = [
     { path: '/api/auth/guest', label: 'login' },

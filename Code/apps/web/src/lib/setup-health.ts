@@ -31,7 +31,6 @@ export type HealthMap = Partial<Record<string, ComponentHealth>>
 const FEATURE_BY_ID: Partial<Record<string, FeatureFlag>> = {
   jwt: 'jwt',
   google: 'google',
-  discord: 'discord',
   smtp: 'smtp',
   captcha: 'captcha',
   ai: 'ai',
@@ -92,6 +91,42 @@ export function useComponentHealth(status: SetupStatus | null): {
       next[id] = on
         ? { state: 'configured', detail: 'env present', checkedAt: Date.now() }
         : { state: 'off' }
+    }
+
+    const coordDisabled = Boolean(status?.disabled?.['discord-coord'])
+    const guardianDisabled = Boolean(status?.disabled?.['discord-guardian'])
+    const coordProbe = status?.probes?.discordCoordBot
+    const guardianProbe = status?.probes?.discordGuardianBot
+    const docsProbe = status?.probes?.docs
+
+    if (coordDisabled) {
+      next['discord-coord'] = { state: 'off', detail: 'disabled on this machine', checkedAt: Date.now() }
+    } else if (coordProbe?.ok) {
+      next['discord-coord'] = { state: 'live', detail: coordProbe.detail, checkedAt: Date.now() }
+    } else if (coordProbe && !coordProbe.ok) {
+      next['discord-coord'] = { state: 'off', detail: coordProbe.detail, checkedAt: Date.now() }
+    } else {
+      next['discord-coord'] = status?.features?.discord
+        ? { state: 'configured', detail: 'env present', checkedAt: Date.now() }
+        : { state: 'off' }
+    }
+
+    if (guardianDisabled) {
+      next['discord-guardian'] = { state: 'off', detail: 'disabled on this machine', checkedAt: Date.now() }
+    } else if (guardianProbe?.ok) {
+      next['discord-guardian'] = { state: 'live', detail: guardianProbe.detail, checkedAt: Date.now() }
+    } else if (guardianProbe && !guardianProbe.ok) {
+      next['discord-guardian'] = { state: 'off', detail: guardianProbe.detail, checkedAt: Date.now() }
+    } else {
+      next['discord-guardian'] = { state: 'configured', detail: 'set in guardian .env', checkedAt: Date.now() }
+    }
+
+    if (docsProbe?.ok) {
+      next.docs = { state: 'live', detail: docsProbe.detail, checkedAt: Date.now() }
+    } else if (docsProbe && !docsProbe.ok) {
+      next.docs = { state: 'off', detail: docsProbe.detail, checkedAt: Date.now() }
+    } else {
+      next.docs = { state: 'off', detail: 'no docs probe data', checkedAt: Date.now() }
     }
 
     setHealth(next)
