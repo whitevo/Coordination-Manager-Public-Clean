@@ -55,6 +55,8 @@ jobs:
 
       - name: Perform CodeQL analysis
         uses: github/codeql-action/analyze@411bbbe57033eedfc1a82d68c01345aa96c737d7
+        # By design this is non-blocking for this repository.
+        # Expectation: maintainers must review CodeQL output during PR/deployment checks
         continue-on-error: true
 
       - name: Info - Code scanning requires GitHub Advanced Security

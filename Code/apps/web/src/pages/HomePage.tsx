@@ -160,20 +160,20 @@ export default function HomePage() {
       <FlowyBackdrop />
 
       {/* ── Hero ─────────────────────────────────────────── */}
-      <section className="relative min-h-[70vh] flex items-center justify-center overflow-hidden">
+      <section className="relative min-h-[58vh] sm:min-h-[70vh] flex items-center justify-center overflow-hidden">
         <div className="relative z-10 text-center px-4 max-w-3xl mx-auto">
           <h1 className="text-4xl sm:text-5xl font-bold tracking-tight mb-4 animate-fade-in-up">
             How would you like to coordinate?
           </h1>
-          <p className="text-xl text-muted-foreground mb-12 animate-fade-in-up [animation-delay:200ms]">
+          <p className="text-lg sm:text-xl text-muted-foreground mb-8 sm:mb-12 animate-fade-in-up [animation-delay:200ms]">
             Engage. Schedule. Synchronize.
           </p>
 
           {/* Primary CTAs — two entry points */}
-          <div className="flex flex-col sm:flex-row items-center justify-center gap-4 animate-fade-in-up [animation-delay:400ms]">
+          <div className="flex w-full max-w-sm mx-auto sm:max-w-none flex-col sm:flex-row items-stretch sm:items-center justify-center gap-3 sm:gap-4 animate-fade-in-up [animation-delay:400ms]">
             <Link
               to="/events-calendar"
-              className="px-7 py-3 border border-border rounded-lg hover:bg-muted transition-colors font-medium"
+              className="w-full sm:w-auto px-7 py-3 rounded-xl border border-border bg-card/95 shadow-sm hover:bg-card hover:border-primary/30 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 transition-all font-medium text-center"
             >
               Join Conversations
             </Link>
@@ -182,7 +182,7 @@ export default function HomePage() {
 
             <Link
               to="/calendar"
-              className="px-7 py-3 border border-border rounded-lg hover:bg-muted transition-colors font-medium"
+              className="w-full sm:w-auto px-7 py-3 rounded-xl border border-border bg-card/95 shadow-sm hover:bg-card hover:border-primary/30 hover:shadow-md focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 transition-all font-medium text-center"
             >
               Coordinate the Next Meeting
             </Link>
@@ -195,12 +195,12 @@ export default function HomePage() {
         <RevealSection>
           <h2 className="text-3xl font-semibold text-center mb-12">Explore</h2>
         </RevealSection>
-        <div className="grid grid-cols-2 sm:grid-cols-3 gap-4">
+        <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4 auto-rows-fr">
           {/* Agentic Tools — opens AI Chat side panel */}
           <RevealSection delay={0}>
             <button
               onClick={() => window.dispatchEvent(new CustomEvent('openAiPanel'))}
-              className="group flex flex-col items-center gap-3 p-6 rounded-xl border border-border bg-card hover:border-primary/40 hover:shadow-md transition-all w-full"
+              className="group flex h-full w-full flex-col items-center justify-between gap-3 rounded-xl border border-border bg-card p-6 text-center hover:border-primary/40 hover:shadow-md transition-all"
             >
               <Bot size={28} className="text-primary transition-transform group-hover:scale-110" />
               <span className="font-medium">Agentic Tools</span>
@@ -210,7 +210,7 @@ export default function HomePage() {
 
           {/* Distribution — inline auth options for non-auth users */}
           <RevealSection delay={80}>
-            <div className="rounded-xl border border-border bg-card hover:border-primary/40 hover:shadow-md transition-all overflow-hidden">
+            <div className="h-full rounded-xl border border-border bg-card hover:border-primary/40 hover:shadow-md transition-all overflow-hidden">
               <button
                 onClick={() => {
                   if (isAuthenticated) {
@@ -219,7 +219,7 @@ export default function HomePage() {
                     setDistExpanded(prev => !prev)
                   }
                 }}
-                className="group flex flex-col items-center gap-3 p-6 w-full"
+                className="group flex w-full flex-col items-center justify-between gap-3 p-6 text-center"
               >
                 <Send size={28} className="text-primary transition-transform group-hover:scale-110" />
                 <span className="font-medium">Distribution</span>
@@ -291,8 +291,8 @@ export default function HomePage() {
           {/* Availability */}
           <RevealSection delay={160}>
             <Link
-              to="/events"
-              className="group flex flex-col items-center gap-3 p-6 rounded-xl border border-border bg-card hover:border-primary/40 hover:shadow-md transition-all"
+              to="/calendars"
+              className="group flex h-full flex-col items-center justify-between gap-3 rounded-xl border border-border bg-card p-6 text-center hover:border-primary/40 hover:shadow-md transition-all"
             >
               <HeartHandshake size={28} className="text-primary transition-transform group-hover:scale-110" />
               <span className="font-medium">Availability</span>
@@ -304,7 +304,7 @@ export default function HomePage() {
           <RevealSection delay={240}>
             <Link
               to="/events-calendar"
-              className="group flex flex-col items-center gap-3 p-6 rounded-xl border border-border bg-card hover:border-primary/40 hover:shadow-md transition-all"
+              className="group flex h-full flex-col items-center justify-between gap-3 rounded-xl border border-border bg-card p-6 text-center hover:border-primary/40 hover:shadow-md transition-all"
             >
               <Globe size={28} className="text-primary transition-transform group-hover:scale-110" />
               <span className="font-medium">Public Events</span>
@@ -318,7 +318,7 @@ export default function HomePage() {
               href={import.meta.env.DEV ? 'http://localhost:5174/docs/overview' : '/docs/overview'}
               target="_blank"
               rel="noopener noreferrer"
-              className="group flex flex-col items-center gap-3 p-6 rounded-xl border border-border bg-card hover:border-primary/40 hover:shadow-md transition-all"
+              className="group flex h-full flex-col items-center justify-between gap-3 rounded-xl border border-border bg-card p-6 text-center hover:border-primary/40 hover:shadow-md transition-all"
             >
               <Code size={28} className="text-primary transition-transform group-hover:scale-110" />
               <span className="font-medium">API Integration</span>
@@ -330,7 +330,7 @@ export default function HomePage() {
           <RevealSection delay={400}>
             <button
               onClick={() => window.dispatchEvent(new CustomEvent('openFeedbackPanel'))}
-              className="group flex flex-col items-center gap-3 p-6 rounded-xl border border-border bg-card hover:border-primary/40 hover:shadow-md transition-all w-full"
+              className="group flex h-full w-full flex-col items-center justify-between gap-3 rounded-xl border border-border bg-card p-6 text-center hover:border-primary/40 hover:shadow-md transition-all"
             >
               <MessageSquare size={28} className="text-primary transition-transform group-hover:scale-110" />
               <span className="font-medium">Feedback</span>
@@ -343,10 +343,10 @@ export default function HomePage() {
       {/* ── Public Coordination Calendars ────────────────── */}
       <section className="max-w-5xl mx-auto px-4 py-20">
         <RevealSection>
-          <div className="flex items-center justify-between mb-8">
+          <div className="mb-8 flex flex-col items-start gap-2 sm:flex-row sm:items-center sm:justify-between">
             <h2 className="text-3xl font-semibold">Coordination Calendars</h2>
             <Link
-              to="/events"
+              to="/calendars"
               className="text-sm text-muted-foreground hover:text-foreground transition-colors flex items-center gap-1"
             >
               View all <ArrowRight size={14} />
@@ -377,19 +377,19 @@ export default function HomePage() {
                 <RevealSection key={cal.id} delay={i * 100}>
                   <Link
                     to={`/calendar/${cal.hash}`}
-                    className="group rounded-xl border border-border bg-card p-5 hover:border-primary/30 hover:shadow-sm transition-all block"
+                    className="group block h-full rounded-xl border border-border bg-card p-5 hover:border-primary/30 hover:shadow-sm transition-all"
                   >
                     <div className="flex items-start gap-3">
                       <div className="flex-shrink-0 w-10 h-10 rounded-lg bg-primary/10 flex items-center justify-center text-primary">
                         <Calendar size={20} />
                       </div>
                       <div className="min-w-0 flex-1">
-                        <h3 className="font-medium truncate">{cal.title}</h3>
+                        <h3 className="font-medium break-words leading-tight">{cal.title}</h3>
                         {dateRange && (
                           <p className="text-xs text-muted-foreground mt-1">{dateRange}</p>
                         )}
                         {cal.creator_display_name && (
-                          <p className="text-xs text-muted-foreground mt-1 truncate">by {cal.creator_display_name}</p>
+                          <p className="text-xs text-muted-foreground mt-1 break-words">by {cal.creator_display_name}</p>
                         )}
                       </div>
                     </div>
@@ -404,7 +404,7 @@ export default function HomePage() {
       {/* ── Upcoming Events ──────────────────────────────── */}
       <section className="max-w-5xl mx-auto px-4 py-20">
         <RevealSection>
-          <div className="flex items-center justify-between mb-8">
+          <div className="mb-8 flex flex-col items-start gap-2 sm:flex-row sm:items-center sm:justify-between">
             <h2 className="text-3xl font-semibold">Upcoming Events</h2>
             <Link
               to="/events-calendar"
@@ -437,7 +437,7 @@ export default function HomePage() {
                 <RevealSection key={ev.id} delay={i * 100}>
                   <Link
                     to="/events-calendar"
-                    className="group rounded-xl border border-border bg-card p-5 hover:border-primary/30 hover:shadow-sm transition-all block"
+                    className="group block h-full rounded-xl border border-border bg-card p-5 hover:border-primary/30 hover:shadow-sm transition-all"
                   >
                     <div className="flex items-start gap-3">
                       <div className="flex-shrink-0 w-12 h-12 rounded-lg bg-primary/10 flex flex-col items-center justify-center text-primary">
@@ -445,16 +445,16 @@ export default function HomePage() {
                         <span className="text-lg font-bold leading-none">{new Intl.DateTimeFormat('en-US', { timeZone: tz, day: 'numeric' }).format(start)}</span>
                       </div>
                       <div className="min-w-0 flex-1">
-                        <h3 className="font-medium truncate">{ev.title}</h3>
+                        <h3 className="font-medium break-words leading-tight">{ev.title}</h3>
                         <p className="text-xs text-muted-foreground mt-1">
                           {formatTimeOnlyInTimezone(start, tz)}
                           {' -- '}
                           {formatTimeOnlyInTimezone(end, tz)}
                         </p>
                         {ev.calendar_title && (
-                          <span className="inline-flex items-center gap-1 text-[10px] font-medium text-primary bg-primary/10 px-2 py-0.5 rounded-full mt-2 max-w-full">
+                          <span className="mt-2 inline-flex max-w-full items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary">
                             <Calendar size={10} className="flex-shrink-0" />
-                            <span className="truncate">{ev.calendar_title}</span>
+                            <span className="break-words leading-tight">{ev.calendar_title}</span>
                           </span>
                         )}
                       </div>
@@ -470,7 +470,7 @@ export default function HomePage() {
       {/* ── Principles (compact) ───────────────────────── */}
       <section className="max-w-5xl mx-auto px-4 py-20">
         <RevealSection>
-          <div className="grid sm:grid-cols-3 gap-8 text-center">
+          <div className="grid gap-6 text-center sm:grid-cols-3 sm:gap-8">
             {[
               { title: 'Equivalence', text: 'Every participant deserves a seat at the table.' },
               { title: 'Privacy by Design', text: 'Your data is protected first — openness is a choice, not a default.' },

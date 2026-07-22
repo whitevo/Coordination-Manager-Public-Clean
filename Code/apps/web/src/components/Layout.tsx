@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import { Outlet, Link, useLocation, useNavigate } from 'react-router-dom'
-import { Calendar, User, LogOut, ChevronDown, Compass, AlertTriangle, Moon, Sun, Megaphone, MessageSquare, Menu, X, Sparkles, Bell, Shield, Wrench, CalendarDays, CalendarClock, Users, Wallet, UserPlus, WifiOff, Eye, LifeBuoy, Video, Loader2, ExternalLink, Info, SlidersHorizontal } from 'lucide-react'
+import { Calendar, CalendarPlus, Home, User, LogOut, ChevronDown, Compass, AlertTriangle, Moon, Sun, Megaphone, MessageSquare, Menu, X, Sparkles, Bell, Shield, Wrench, CalendarDays, CalendarClock, Users, Wallet, UserPlus, WifiOff, Eye, LifeBuoy, Video, Loader2, ExternalLink, Info, SlidersHorizontal } from 'lucide-react'
 import { detectWallets } from '../lib/cardano-wallet'
 import type { WalletInfo } from '../lib/cardano-types'
 import { generateManagedWallet } from '../lib/managed-wallet'
@@ -23,11 +23,13 @@ import type { PanelId } from './FloatingPanels'
 
 export default function Layout() {
   const location = useLocation()
+  const fromCalendarView = location.pathname.startsWith('/calendar/')
   const shouldRenderMainBottomSpacer = location.pathname !== '/time-management'
   const shouldLockViewportScroll = location.pathname === '/time-management'
   const navigate = useNavigate()
   const [showUserMenu, setShowUserMenu] = useState(false)
   const [showMobileMenu, setShowMobileMenu] = useState(false)
+  const [showMobileAccountMenu, setShowMobileAccountMenu] = useState(false)
   const [showToolsMenu, setShowToolsMenu] = useState(false)
   const [showSignInMenu, setShowSignInMenu] = useState(false)
   // Cardano wallet picker state
@@ -47,15 +49,19 @@ export default function Layout() {
 
   const handleCardanoWalletClick = useCallback(() => {
     setCreateWalletError(null)
-    // Small delay so extension wallets have time to inject into window.cardano
-    setTimeout(() => {
+    const updateWalletPicker = () => {
       const wallets = detectWallets()
       const installed = wallets.filter((w) => w.installed)
       setCardanoPickerWallets(installed)
       setCardanoPickerMode(installed.length > 0 ? 'wallets' : 'no-wallets')
       setShowSignInMenu(false)
       setShowMobileMenu(false)
-    }, 300)
+    }
+
+    // Retry a few times in case extensions inject after click.
+    ;[0, 350, 1000, 2200].forEach((delay) => {
+      setTimeout(updateWalletPicker, delay)
+    })
   }, [])
 
   const _handleCreateManagedWallet = useCallback(async () => {
@@ -127,6 +133,7 @@ export default function Layout() {
   }, [isAdmin])
 
   const [activePanel, setActivePanel] = useState<PanelId>(null)
+  const leftEdgeTouchStartRef = useRef<number | null>(null)
 
   // ─── Zoom integration check (for Traveler quick link) ─────
   const [travelerHasZoom, setTravelerHasZoom] = useState(false)
@@ -145,6 +152,9 @@ export default function Layout() {
   const startHealthCheck = useCallback(() => {
     if (healthInterval.current) clearInterval(healthInterval.current)
     const check = async () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+        return
+      }
       try {
         await dedupedGet('/health', { timeout: 8000 })
         apiFailCount.current = 0
@@ -157,11 +167,25 @@ export default function Layout() {
     }
     check()
     healthInterval.current = setInterval(check, 30_000) // check every 30s
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void check()
+      }
+    }
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+
+    return () => {
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
   }, [])
 
   useEffect(() => {
-    startHealthCheck()
-    return () => { if (healthInterval.current) clearInterval(healthInterval.current) }
+    const cleanup = startHealthCheck()
+    return () => {
+      if (healthInterval.current) clearInterval(healthInterval.current)
+      cleanup?.()
+    }
   }, [startHealthCheck])
 
   // ─── Rate-limit soft warning ───────────────────────────────
@@ -203,6 +227,9 @@ export default function Layout() {
   useEffect(() => {
     if (!isAuthenticated || isTraveler) { setNewFriendCount(0); return }
     const check = () => {
+      if (typeof document !== 'undefined' && document.visibilityState !== 'visible') {
+        return
+      }
       const since = localStorage.getItem('lastFriendSeenAt') || new Date(0).toISOString()
       apiClient.get('/api/connections/new-count', { params: { since } })
         .then(res => setNewFriendCount(res.data.count || 0))
@@ -210,7 +237,18 @@ export default function Layout() {
     }
     check()
     const interval = setInterval(check, 60_000) // check every minute
-    return () => clearInterval(interval)
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        check()
+      }
+    }
+
+    document.addEventListener('visibilitychange', handleVisibilityChange)
+    return () => {
+      clearInterval(interval)
+      document.removeEventListener('visibilitychange', handleVisibilityChange)
+    }
   }, [isAuthenticated, isTraveler])
   const aiPanelOpen = activePanel === 'ai'
   const _setAiPanelOpen = (open: boolean | ((prev: boolean) => boolean)) => {
@@ -238,6 +276,49 @@ export default function Layout() {
     return () => window.removeEventListener('openFeedbackPanel', handler)
   }, [])
 
+  useEffect(() => {
+    const isEditableTarget = (target: EventTarget | null): boolean => {
+      const node = target instanceof Node ? target : null
+      const element = node instanceof HTMLElement ? node : node?.parentElement
+      if (!(element instanceof HTMLElement)) return false
+      const tagName = element.tagName.toLowerCase()
+      if (tagName === 'input' || tagName === 'textarea' || tagName === 'select') return true
+      return element.isContentEditable
+    }
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape') return
+      if (event.defaultPrevented) return
+      if (event.ctrlKey || event.metaKey || event.altKey) return
+      if (activePanel === null) return
+      if (isEditableTarget(event.target)) return
+
+      event.preventDefault()
+      setActivePanel(null)
+    }
+
+    // Capture-phase ensures global right-panel close runs before page-level
+    // Escape handlers, so panel-closing is always the first action.
+    window.addEventListener('keydown', handleEscape, true)
+    return () => window.removeEventListener('keydown', handleEscape, true)
+  }, [activePanel])
+
+  // Allow page-level Esc handlers to close global right-side panels first.
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const customEvent = event as CustomEvent<{ closed?: boolean }>
+      if (activePanel === null) {
+        if (customEvent.detail) customEvent.detail.closed = false
+        return
+      }
+      if (customEvent.detail) customEvent.detail.closed = true
+      setActivePanel(null)
+    }
+
+    window.addEventListener('closeRightSidebarPanels', handler)
+    return () => window.removeEventListener('closeRightSidebarPanels', handler)
+  }, [activePanel])
+
   const isActive = (path: string) => location.pathname === path
 
   // Close dropdowns when clicking outside
@@ -260,6 +341,7 @@ export default function Layout() {
   const handleLogout = async () => {
     setShowUserMenu(false)
     setShowMobileMenu(false)
+    setShowMobileAccountMenu(false)
     try {
       await logout()
     } catch {
@@ -296,6 +378,27 @@ export default function Layout() {
   return (
     <AiAssistantProvider>
     <div className={`flex min-h-screen bg-background text-foreground ${shouldLockViewportScroll ? 'overflow-hidden' : ''}`}>
+      <div
+        className="fixed inset-y-0 left-0 z-20 w-3 md:hidden"
+        aria-hidden
+        onTouchStart={(event) => {
+          if (showMobileMenu || showMobileAccountMenu) return
+          const touch = event.touches[0]
+          if (touch.clientX > 24) return
+          leftEdgeTouchStartRef.current = touch.clientX
+        }}
+        onTouchEnd={(event) => {
+          if (leftEdgeTouchStartRef.current === null) return
+          const touch = event.changedTouches[0]
+          const delta = touch.clientX - leftEdgeTouchStartRef.current
+          leftEdgeTouchStartRef.current = null
+          if (delta > 48) {
+            setShowMobileAccountMenu(false)
+            setShowMobileMenu(true)
+          }
+        }}
+      />
+
       {/* LEFT PANEL SLOT -- Portal target for page-level left panels */}
       <LeftPanelSlot />
 
@@ -346,50 +449,122 @@ export default function Layout() {
       <nav className="border-b border-border bg-background">
         <div className="w-full px-4 sm:px-6 lg:px-8">
           <div className="flex items-center justify-between h-14 md:h-16">
-            <div className="flex items-center gap-4 md:gap-8">
-              <Link to="/" className="flex items-center gap-2">
+            <div className="flex items-center gap-4 md:gap-6 xl:gap-8 min-w-0">
+              <Link to="/" className="hidden md:flex items-center gap-2" aria-label="Coordination Manager home" title="Coordination Manager">
                 <Calendar className="h-5 w-5 md:h-6 md:w-6" />
-                <span className="font-semibold text-base md:text-lg">Coordination Manager</span>
+                <span className="hidden xl:inline font-semibold text-base md:text-lg">Coordination Manager</span>
               </Link>
+
+              <div className="flex items-center gap-1 md:hidden">
+                <button
+                  onClick={() => {
+                    setShowMobileAccountMenu(false)
+                    setShowMobileMenu((prev) => !prev)
+                  }}
+                  className="p-2 rounded-lg text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground transition-colors"
+                  aria-label={showMobileMenu ? 'Close navigation menu' : 'Open navigation menu'}
+                >
+                  {showMobileMenu ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+                </button>
+
+                <div className="flex items-center gap-0.5 rounded-full border border-border bg-card/80 px-1 py-1">
+                  <Link
+                    to="/"
+                    className={`rounded-full p-2 transition-colors ${
+                      isActive('/') ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
+                    }`}
+                    aria-label="Home"
+                  >
+                    <Home className="h-4 w-4" />
+                  </Link>
+                  <Link
+                    to="/events-calendar"
+                    className={`rounded-full p-2 transition-colors ${
+                      isActive('/events-calendar') ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
+                    }`}
+                    aria-label="Events"
+                  >
+                    <CalendarDays className="h-4 w-4" />
+                  </Link>
+                  <Link
+                    to="/calendars"
+                    state={fromCalendarView ? { fromCalendarView: true } : undefined}
+                    className={`rounded-full p-2 transition-colors ${
+                      isActive('/calendars') ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
+                    }`}
+                    aria-label="Coordination calendars"
+                  >
+                    <Calendar className="h-4 w-4" />
+                  </Link>
+                  <Link
+                    to="/calendar"
+                    className={`rounded-full p-2 transition-colors ${
+                      isActive('/calendar') ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
+                    }`}
+                    aria-label="Create calendar"
+                  >
+                    <CalendarPlus className="h-4 w-4" />
+                  </Link>
+                  <Link
+                    to="/time-management"
+                    className={`rounded-full p-2 transition-colors ${
+                      isActive('/time-management') ? 'bg-accent text-accent-foreground' : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
+                    }`}
+                    aria-label="Time management"
+                  >
+                    <CalendarClock className="h-4 w-4" />
+                  </Link>
+                </div>
+              </div>
               
               {/* Desktop nav links - left side */}
               <div className="hidden md:flex items-center gap-1">
                 <Link
                   to="/"
-                  className={`px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+                  className={`px-2 xl:px-3 py-2 rounded-md text-sm font-medium transition-colors ${
                     isActive('/') 
                       ? 'bg-accent text-accent-foreground' 
                       : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
                   }`}
-                >
-                  Home
-                </Link>
-
-                <Link
-                  to="/events-calendar"
-                  className={`px-3 py-2 rounded-md text-sm font-medium transition-colors ${
-                    isActive('/events-calendar')
-                      ? 'bg-accent text-accent-foreground'
-                      : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
-                  }`}
+                  aria-label="Home"
+                  title="Home"
                 >
                   <span className="flex items-center gap-1.5">
-                    <CalendarDays className="w-4 h-4" />
-                    Events
+                    <Home className="w-4 h-4" />
+                    <span className="hidden xl:inline">Home</span>
                   </span>
                 </Link>
 
                 <Link
-                  to="/events"
-                  className={`px-3 py-2 rounded-md text-sm font-medium transition-colors ${
-                    isActive('/events')
+                  to="/events-calendar"
+                  className={`px-2 xl:px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+                    isActive('/events-calendar')
                       ? 'bg-accent text-accent-foreground'
                       : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
                   }`}
+                  aria-label="Events"
+                  title="Events"
+                >
+                  <span className="flex items-center gap-1.5">
+                    <CalendarDays className="w-4 h-4" />
+                    <span className="hidden xl:inline">Events</span>
+                  </span>
+                </Link>
+
+                <Link
+                  to="/calendars"
+                  state={fromCalendarView ? { fromCalendarView: true } : undefined}
+                  className={`px-2 xl:px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+                    isActive('/calendars')
+                      ? 'bg-accent text-accent-foreground'
+                      : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
+                  }`}
+                  aria-label="Coordination Calendars"
+                  title="Coordination Calendars"
                 >
                   <span className="flex items-center gap-1.5">
                     <Calendar className="w-4 h-4" />
-                    Coordination Calendars
+                    <span className="hidden xl:inline">Coordination Calendars</span>
                   </span>
                 </Link>
               </div>
@@ -405,7 +580,7 @@ export default function Layout() {
                 {isSetupAccessible() && (
                   <Link
                     to="/setup"
-                    className={`relative flex items-center gap-1 px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+                    className={`relative flex items-center gap-1 px-2 xl:px-3 py-2 rounded-md text-sm font-medium transition-colors ${
                       isActive('/setup')
                         ? 'bg-accent text-accent-foreground'
                         : setupNeeded
@@ -419,9 +594,10 @@ export default function Layout() {
                           ? `Mode: ${setupStatus.mode}`
                           : 'Setup'
                     }
+                    aria-label="Setup"
                   >
                     <SlidersHorizontal className="h-3.5 w-3.5" />
-                    Setup
+                    <span className="hidden xl:inline">Setup</span>
                   </Link>
                 )}
 
@@ -433,15 +609,17 @@ export default function Layout() {
                   onMouseLeave={() => { toolsHoverTimeout.current = setTimeout(() => setShowToolsMenu(false), 150) }}
                 >
                   <button
-                    className={`flex items-center gap-1 px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+                    className={`flex items-center gap-1 px-2 xl:px-3 py-2 rounded-md text-sm font-medium transition-colors ${
                       isActive('/calendar') || isActive('/time-management') || isActive('/distribute') || isActive('/coordinate-events') || isActive('/guardian') || isActive('/admin/users') || isActive('/admin/oversight')
                         ? 'bg-accent text-accent-foreground'
                         : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
                     }`}
+                    aria-label="Tools"
+                    title="Tools"
                   >
                     <Wrench className="h-3.5 w-3.5" />
-                    Tools
-                    <ChevronDown className="h-3.5 w-3.5" />
+                    <span className="hidden xl:inline">Tools</span>
+                    <ChevronDown className="hidden xl:inline h-3.5 w-3.5" />
                   </button>
                   {showToolsMenu && (
                     <div className="absolute right-0 mt-1 w-72 bg-popover text-popover-foreground rounded-lg shadow-lg border border-border py-1 z-50">
@@ -450,7 +628,7 @@ export default function Layout() {
                         onClick={() => setShowToolsMenu(false)}
                         className="flex items-center gap-2.5 px-4 py-2.5 text-sm hover:bg-accent/50 transition-colors"
                       >
-                        <Calendar className="h-4 w-4" />
+                        <CalendarPlus className="h-4 w-4" />
                         Create Coordination Calendar
                       </Link>
                       <Link
@@ -525,30 +703,34 @@ export default function Layout() {
                 {isAuthenticated && (
                   <Link
                     to="/feedback"
-                    className={`px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+                    className={`px-2 xl:px-3 py-2 rounded-md text-sm font-medium transition-colors ${
                       isActive('/feedback') 
                         ? 'bg-accent text-accent-foreground' 
                         : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
                     }`}
+                    aria-label="Feedback"
+                    title="Feedback"
                   >
                     <span className="flex items-center gap-1.5">
                       <MessageSquare className="w-4 h-4" />
-                      Feedback
+                      <span className="hidden xl:inline">Feedback</span>
                     </span>
                   </Link>
                 )}
 
                 <Link
                   to="/support"
-                  className={`px-3 py-2 rounded-md text-sm font-medium transition-colors ${
+                  className={`px-2 xl:px-3 py-2 rounded-md text-sm font-medium transition-colors ${
                     isActive('/support') 
                       ? 'bg-accent text-accent-foreground' 
                       : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
                   }`}
+                  aria-label="Support"
+                  title="Support"
                 >
                   <span className="flex items-center gap-1.5">
                     <LifeBuoy className="w-4 h-4" />
-                    Support
+                    <span className="hidden xl:inline">Support</span>
                   </span>
                 </Link>
               </div>
@@ -604,11 +786,11 @@ export default function Layout() {
                         (user?.displayName || user?.email || '?').charAt(0).toUpperCase()
                       ) : null}
                     </div>
-                    <span className="text-sm font-medium hidden sm:block">
+                    <span className="text-sm font-medium hidden xl:block">
                       {user?.displayName || user?.travelerName || 'User'}
                     </span>
                     {isTraveler && (
-                      <span className="text-xs bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-200 px-1.5 py-0.5 rounded-full hidden sm:inline">
+                      <span className="text-xs bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-200 px-1.5 py-0.5 rounded-full hidden xl:inline">
                         Traveler
                       </span>
                     )}
@@ -811,18 +993,21 @@ export default function Layout() {
               )}
               </div>
 
-              {/* Mobile hamburger button */}
               <button
-                onClick={() => setShowMobileMenu(!showMobileMenu)}
+                onClick={() => {
+                  setShowMobileMenu(false)
+                  setShowMobileAccountMenu((prev) => !prev)
+                }}
                 className="md:hidden p-2 rounded-lg text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground transition-colors"
+                aria-label={showMobileAccountMenu ? 'Close account menu' : 'Open account menu'}
               >
-                {showMobileMenu ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
+                {showMobileAccountMenu ? <X className="h-5 w-5" /> : <Menu className="h-5 w-5" />}
               </button>
             </div>
           </div>
         </div>
 
-        {/* Mobile dropdown menu */}
+        {/* Mobile tools/pages menu */}
         {showMobileMenu && (
           <>
             <div className="fixed inset-0 z-30 bg-black/20" onClick={() => setShowMobileMenu(false)} />
@@ -854,10 +1039,11 @@ export default function Layout() {
                   </span>
                 </Link>
                 <Link
-                  to="/events"
+                  to="/calendars"
+                  state={fromCalendarView ? { fromCalendarView: true } : undefined}
                   onClick={() => setShowMobileMenu(false)}
                   className={`px-3 py-2.5 rounded-md text-sm font-medium transition-colors ${
-                    isActive('/events') 
+                    isActive('/calendars') 
                       ? 'bg-accent text-accent-foreground' 
                       : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
                   }`}
@@ -876,7 +1062,10 @@ export default function Layout() {
                       : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
                   }`}
                 >
-                  Create Coordination Calendar
+                  <span className="flex items-center gap-1.5">
+                    <CalendarPlus className="w-4 h-4" />
+                    Create Coordination Calendar
+                  </span>
                 </Link>
                 <Link
                   to="/time-management"
@@ -975,22 +1164,20 @@ export default function Layout() {
                     </span>
                   </Link>
                 )}
-                {isAuthenticated && (
-                  <Link
-                    to="/feedback"
-                    onClick={() => setShowMobileMenu(false)}
-                    className={`px-3 py-2.5 rounded-md text-sm font-medium transition-colors ${
-                      isActive('/feedback') 
-                        ? 'bg-accent text-accent-foreground' 
-                        : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
-                    }`}
-                  >
-                    <span className="flex items-center gap-1.5">
-                      <MessageSquare className="w-4 h-4" />
-                      Feedback
-                    </span>
-                  </Link>
-                )}
+                <Link
+                  to="/feedback"
+                  onClick={() => setShowMobileMenu(false)}
+                  className={`px-3 py-2.5 rounded-md text-sm font-medium transition-colors ${
+                    isActive('/feedback') 
+                      ? 'bg-accent text-accent-foreground' 
+                      : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
+                  }`}
+                >
+                  <span className="flex items-center gap-1.5">
+                    <MessageSquare className="w-4 h-4" />
+                    Feedback
+                  </span>
+                </Link>
                 <Link
                   to="/support"
                   onClick={() => setShowMobileMenu(false)}
@@ -1005,176 +1192,152 @@ export default function Layout() {
                     Support
                   </span>
                 </Link>
-                
-                {/* Mobile user section */}
-                <div className="border-t border-border mt-1 pt-2">
-                  {/* Mobile friend request alert */}
-                  {newFriendCount > 0 && (
-                    <Link
-                      to="/user-management"
-                      onClick={() => {
-                        setShowMobileMenu(false)
-                        localStorage.setItem('lastFriendSeenAt', new Date().toISOString())
-                        setNewFriendCount(0)
-                      }}
-                      className="flex items-center gap-2 mx-3 mb-2 px-3 py-2.5 text-sm font-semibold rounded-lg text-white
-                        bg-gradient-to-r from-red-500 to-rose-500
-                        shadow-[0_0_12px_rgba(239,68,68,0.5)] animate-pulse"
-                    >
-                      <UserPlus className="w-4 h-4" />
-                      New friend request{newFriendCount > 1 ? 's' : ''}
-                    </Link>
-                  )}
-                  {authLoading ? (
-                    <div className="flex items-center gap-2 px-3 py-2.5 text-sm text-muted-foreground">
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                      Signing in...
-                    </div>
-                  ) : isAuthenticated ? (
-                    <div className="flex flex-col gap-1">
-                      <div className="px-3 py-2 text-sm font-medium text-foreground flex items-center gap-2">
-                        <div className={`w-6 h-6 rounded-full flex items-center justify-center text-white text-xs font-medium overflow-hidden ${
-                          isTraveler 
-                            ? 'bg-gradient-to-br from-amber-500 to-orange-500'
-                            : 'bg-gradient-to-br from-blue-500 to-purple-500'
-                        }`}>
-                          {user?.avatarUrl ? (
-                            <img src={user.avatarUrl} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }} />
-                          ) : null}
-                          {!user?.avatarUrl && isTraveler ? (
-                            <Compass className="w-3 h-3" />
-                          ) : !user?.avatarUrl ? (
-                            (user?.displayName || user?.email || '?').charAt(0).toUpperCase()
-                          ) : null}
-                        </div>
-                        {user?.displayName || user?.travelerName || 'User'}
-                        {isTraveler && (
-                          <span className="text-xs bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-200 px-1.5 py-0.5 rounded-full">
-                            Traveler
-                          </span>
-                        )}
+              </div>
+            </div>
+          </>
+        )}
+
+        {/* Mobile account/auth menu */}
+        {showMobileAccountMenu && (
+          <>
+            <div className="fixed inset-0 z-30 bg-black/20" onClick={() => setShowMobileAccountMenu(false)} />
+            <div className="md:hidden absolute left-0 right-0 z-40 bg-background border-b border-border shadow-lg">
+              <div className="container mx-auto px-4 sm:px-6 lg:px-8 py-3 flex flex-col gap-1">
+                {newFriendCount > 0 && (
+                  <Link
+                    to="/user-management"
+                    onClick={() => {
+                      setShowMobileAccountMenu(false)
+                      localStorage.setItem('lastFriendSeenAt', new Date().toISOString())
+                      setNewFriendCount(0)
+                    }}
+                    className="flex items-center gap-2 mb-2 px-3 py-2.5 text-sm font-semibold rounded-lg text-white bg-gradient-to-r from-red-500 to-rose-500 shadow-[0_0_12px_rgba(239,68,68,0.5)] animate-pulse"
+                  >
+                    <UserPlus className="w-4 h-4" />
+                    New friend request{newFriendCount > 1 ? 's' : ''}
+                  </Link>
+                )}
+                {authLoading ? (
+                  <div className="flex items-center gap-2 px-3 py-2.5 text-sm text-muted-foreground">
+                    <Loader2 className="h-4 w-4 animate-spin" />
+                    Signing in...
+                  </div>
+                ) : isAuthenticated ? (
+                  <div className="flex flex-col gap-1">
+                    <div className="px-3 py-2 text-sm font-medium text-foreground flex items-center gap-2">
+                      <div className={`w-6 h-6 rounded-full flex items-center justify-center text-white text-xs font-medium overflow-hidden ${
+                        isTraveler ? 'bg-gradient-to-br from-amber-500 to-orange-500' : 'bg-gradient-to-br from-blue-500 to-purple-500'
+                      }`}>
+                        {user?.avatarUrl ? (
+                          <img src={user.avatarUrl} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }} />
+                        ) : null}
+                        {!user?.avatarUrl && isTraveler ? (
+                          <Compass className="w-3 h-3" />
+                        ) : !user?.avatarUrl ? (
+                          (user?.displayName || user?.email || '?').charAt(0).toUpperCase()
+                        ) : null}
                       </div>
-                      {!isTraveler && (
-                        <>
-                          <Link
-                            to="/settings?tab=profile"
-                            onClick={() => setShowMobileMenu(false)}
-                            className="flex items-center gap-3 px-3 py-2.5 text-sm text-muted-foreground hover:bg-accent/50 rounded-md transition-colors"
-                          >
-                            <User className="h-4 w-4" />
-                            Profile
-                          </Link>
-                          <Link
-                            to="/user-management"
-                            onClick={() => setShowMobileMenu(false)}
-                            className="flex items-center gap-3 px-3 py-2.5 text-sm text-muted-foreground hover:bg-accent/50 rounded-md transition-colors"
-                          >
-                            <Users className="h-4 w-4" />
-                            Friend List
-                          </Link>
-                          <Link
-                            to="/settings?tab=notifications"
-                            onClick={() => setShowMobileMenu(false)}
-                            className="flex items-center gap-3 px-3 py-2.5 text-sm text-muted-foreground hover:bg-accent/50 rounded-md transition-colors"
-                          >
-                            <Bell className="h-4 w-4" />
-                            Notifications
-                          </Link>
-                          <Link
-                            to="/settings?tab=calendar"
-                            onClick={() => setShowMobileMenu(false)}
-                            className="flex items-center gap-3 px-3 py-2.5 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950 rounded-md transition-colors"
-                          >
-                            <Calendar className="h-4 w-4" />
-                            Calendar
-                          </Link>
-                          <Link
-                            to="/settings?tab=privacy"
-                            onClick={() => setShowMobileMenu(false)}
-                            className="flex items-center gap-3 px-3 py-2.5 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950 rounded-md transition-colors"
-                          >
-                            <Shield className="h-4 w-4" />
-                            Privacy
-                          </Link>
-                        </>
-                      )}
+                      {user?.displayName || user?.travelerName || 'User'}
                       {isTraveler && (
-                        <button
-                          onClick={() => {
-                            setShowMobileMenu(false)
-                            if (user?.id) sessionStorage.setItem('previousTravelerId', user.id)
-                            sessionStorage.setItem('authReturnTo', window.location.pathname)
-                            navigate('/auth/login?upgrade=true')
-                          }}
-                          className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-950 rounded-md transition-colors"
-                        >
-                          <User className="h-4 w-4" />
-                          Create Account
-                        </button>
+                        <span className="text-xs bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-200 px-1.5 py-0.5 rounded-full">
+                          Traveler
+                        </span>
                       )}
-                      <button
-                        onClick={handleLogout}
-                        className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950 rounded-md transition-colors"
-                      >
-                        <LogOut className="h-4 w-4" />
-                        Sign out
-                      </button>
                     </div>
-                  ) : (
-                    <div className="flex flex-col gap-2">
+                    {!isTraveler && (
+                      <>
+                        <Link to="/settings?tab=profile" onClick={() => setShowMobileAccountMenu(false)} className="flex items-center gap-3 px-3 py-2.5 text-sm text-muted-foreground hover:bg-accent/50 rounded-md transition-colors">
+                          <User className="h-4 w-4" />
+                          Profile
+                        </Link>
+                        <Link to="/user-management" onClick={() => setShowMobileAccountMenu(false)} className="flex items-center gap-3 px-3 py-2.5 text-sm text-muted-foreground hover:bg-accent/50 rounded-md transition-colors">
+                          <Users className="h-4 w-4" />
+                          Friend List
+                        </Link>
+                        <Link to="/settings?tab=notifications" onClick={() => setShowMobileAccountMenu(false)} className="flex items-center gap-3 px-3 py-2.5 text-sm text-muted-foreground hover:bg-accent/50 rounded-md transition-colors">
+                          <Bell className="h-4 w-4" />
+                          Notifications
+                        </Link>
+                        <Link to="/settings?tab=calendar" onClick={() => setShowMobileAccountMenu(false)} className="flex items-center gap-3 px-3 py-2.5 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950 rounded-md transition-colors">
+                          <Calendar className="h-4 w-4" />
+                          Calendar
+                        </Link>
+                        <Link to="/settings?tab=privacy" onClick={() => setShowMobileAccountMenu(false)} className="flex items-center gap-3 px-3 py-2.5 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950 rounded-md transition-colors">
+                          <Shield className="h-4 w-4" />
+                          Privacy
+                        </Link>
+                      </>
+                    )}
+                    {isTraveler && (
+                      <button
+                        onClick={() => {
+                          setShowMobileAccountMenu(false)
+                          if (user?.id) sessionStorage.setItem('previousTravelerId', user.id)
+                          sessionStorage.setItem('authReturnTo', window.location.pathname)
+                          navigate('/auth/login?upgrade=true')
+                        }}
+                        className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-blue-600 dark:text-blue-400 hover:bg-blue-50 dark:hover:bg-blue-950 rounded-md transition-colors"
+                      >
+                        <User className="h-4 w-4" />
+                        Create Account
+                      </button>
+                    )}
+                    <button onClick={handleLogout} className="w-full flex items-center gap-3 px-3 py-2.5 text-sm text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950 rounded-md transition-colors">
+                      <LogOut className="h-4 w-4" />
+                      Sign out
+                    </button>
+                  </div>
+                ) : (
+                  <div className="flex flex-col gap-2">
+                    <button
+                      onClick={async () => {
+                        setShowMobileAccountMenu(false)
+                        sessionStorage.setItem('authReturnTo', location.pathname)
+                        try { await login() } catch (err) {
+                          if (err instanceof Error && err.name === 'AbortError') return
+                        }
+                      }}
+                      className="flex items-center gap-3 px-3 py-2.5 text-sm hover:bg-accent/50 rounded-md transition-colors"
+                    >
+                      <svg className="w-4 h-4" viewBox="0 0 24 24">
+                        <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
+                        <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
+                        <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" />
+                        <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
+                      </svg>
+                      Google Account
+                    </button>
+                    <button onClick={handleCardanoWalletClick} className="flex items-center gap-3 px-3 py-2.5 text-sm hover:bg-accent/50 rounded-md transition-colors w-full">
+                      <Wallet className="h-4 w-4 text-blue-600 dark:text-blue-400" />
+                      Cardano Wallet
+                    </button>
+                    {captchaMode ? (
+                      <Link
+                        to="/auth/login"
+                        state={{ from: { pathname: location.pathname } }}
+                        onClick={() => setShowMobileAccountMenu(false)}
+                        className="flex items-center gap-3 px-3 py-2.5 text-sm hover:bg-accent/50 rounded-md transition-colors"
+                      >
+                        <Compass className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+                        Travel Account
+                      </Link>
+                    ) : (
                       <button
                         onClick={async () => {
-                          setShowMobileMenu(false)
-                          sessionStorage.setItem('authReturnTo', location.pathname)
-                          try { await login() } catch (err) {
-                            if (err instanceof Error && err.name === 'AbortError') return
-                          }
+                          setShowMobileAccountMenu(false)
+                          try {
+                            await loginAsTraveler()
+                            navigate(location.pathname)
+                          } catch { /* ignore traveler login failure */ }
                         }}
                         className="flex items-center gap-3 px-3 py-2.5 text-sm hover:bg-accent/50 rounded-md transition-colors"
                       >
-                        <svg className="w-4 h-4" viewBox="0 0 24 24">
-                          <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
-                          <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
-                          <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z" />
-                          <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" />
-                        </svg>
-                        Google Account
+                        <Compass className="h-4 w-4 text-amber-600 dark:text-amber-400" />
+                        Travel Account
                       </button>
-                      <button
-                        onClick={handleCardanoWalletClick}
-                        className="flex items-center gap-3 px-3 py-2.5 text-sm hover:bg-accent/50 rounded-md transition-colors w-full"
-                      >
-                        <Wallet className="h-4 w-4 text-blue-600 dark:text-blue-400" />
-                        Cardano Wallet
-                      </button>
-                      {captchaMode ? (
-                        <Link
-                          to="/auth/login"
-                          state={{ from: { pathname: location.pathname } }}
-                          onClick={() => setShowMobileMenu(false)}
-                          className="flex items-center gap-3 px-3 py-2.5 text-sm hover:bg-accent/50 rounded-md transition-colors"
-                        >
-                          <Compass className="h-4 w-4 text-amber-600 dark:text-amber-400" />
-                          Travel Account
-                        </Link>
-                      ) : (
-                        <button
-                          onClick={async () => {
-                            setShowMobileMenu(false)
-                            try {
-                              await loginAsTraveler()
-                              navigate(location.pathname)
-                            } catch { /* ignore traveler login failure */ }
-                          }}
-                          className="flex items-center gap-3 px-3 py-2.5 text-sm hover:bg-accent/50 rounded-md transition-colors"
-                        >
-                          <Compass className="h-4 w-4 text-amber-600 dark:text-amber-400" />
-                          Travel Account
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </div>
+                    )}
+                  </div>
+                )}
               </div>
             </div>
           </>
@@ -1197,7 +1360,7 @@ export default function Layout() {
           ? 'flex-1 min-h-0 overflow-hidden'
           : ''
         : 'container mx-auto px-4 py-8'}>
-        <Outlet />
+        <Outlet key={location.pathname} />
         {shouldRenderMainBottomSpacer && <div className="h-[30vh]" />}
       </main>
       </div>
@@ -1206,10 +1369,10 @@ export default function Layout() {
       <RightPanelSlot />
 
       {/* Push side panels — flex siblings that shrink main content */}
-      <AiGuideSidePanel isOpen={aiPanelOpen} onClose={() => setActivePanel(null)} />
-      <FeedbackSidePanel isOpen={activePanel === 'feedback'} onClose={() => setActivePanel(null)} />
-      <ChatSidePanel isOpen={activePanel === 'chat'} onClose={() => setActivePanel(null)} />
-      <SupportSidePanel isOpen={activePanel === 'support'} onClose={() => setActivePanel(null)} />
+      <AiGuideSidePanel isOpen={aiPanelOpen} onClose={() => setActivePanel(null)} onPanelChange={setActivePanel} />
+      <FeedbackSidePanel isOpen={activePanel === 'feedback'} onClose={() => setActivePanel(null)} onPanelChange={setActivePanel} />
+      <ChatSidePanel isOpen={activePanel === 'chat'} onClose={() => setActivePanel(null)} onPanelChange={setActivePanel} />
+      <SupportSidePanel isOpen={activePanel === 'support'} onClose={() => setActivePanel(null)} onPanelChange={setActivePanel} />
 
       {/* Floating action buttons (fixed overlay) */}
       <FloatingPanels activePanel={activePanel} onPanelChange={setActivePanel} />
@@ -1250,19 +1413,38 @@ export default function Layout() {
                 <div className="flex items-start gap-2 p-3 rounded-lg bg-muted border border-border">
                   <Info className="w-4 h-4 text-muted-foreground mt-0.5 flex-shrink-0" />
                   <p className="text-sm text-muted-foreground">
-                    No Cardano wallet extensions detected. Install Lace, Eternl, or use GameChanger (no extension needed).
+                    No Cardano wallet extensions detected. Install a supported wallet extension and try again.
                   </p>
                 </div>
-                <a
-                  href="https://wallet.gamechanger.finance/"
-                  target="_blank"
-                  rel="noopener noreferrer"
-                  onClick={() => setCardanoPickerMode(null)}
-                  className="w-full flex items-center justify-center gap-2 px-4 py-2.5 border border-border rounded-lg text-sm font-medium hover:bg-accent/50 transition-colors"
-                >
-                  <ExternalLink className="w-4 h-4" />
-                  Open GameChanger Wallet
-                </a>
+                <div className="grid grid-cols-1 gap-2">
+                  <a
+                    href="https://lace.io"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 border border-border rounded-lg text-sm font-medium hover:bg-accent/50 transition-colors"
+                  >
+                    <ExternalLink className="w-4 h-4" />
+                    Install Lace
+                  </a>
+                  <a
+                    href="https://eternl.io"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 border border-border rounded-lg text-sm font-medium hover:bg-accent/50 transition-colors"
+                  >
+                    <ExternalLink className="w-4 h-4" />
+                    Install Eternl
+                  </a>
+                  <a
+                    href="https://typhonwallet.io"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="w-full flex items-center justify-center gap-2 px-4 py-2.5 border border-border rounded-lg text-sm font-medium hover:bg-accent/50 transition-colors"
+                  >
+                    <ExternalLink className="w-4 h-4" />
+                    Install Typhon
+                  </a>
+                </div>
               </div>
             ) : (
               <div className="space-y-2">

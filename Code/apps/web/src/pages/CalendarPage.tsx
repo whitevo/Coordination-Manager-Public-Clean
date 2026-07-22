@@ -2,7 +2,7 @@ import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useParams, useNavigate, Link } from 'react-router-dom'
 import { format, startOfWeek, addDays, addWeeks, subWeeks, isWithinInterval, isSameDay, parse, isValid, getDay, differenceInDays, addMonths } from 'date-fns'
 import { ChevronLeft, ChevronRight, Calendar, Link as LinkIcon, FileText, Check, User, Users, Trash2, X, AlertTriangle, Settings, ExternalLink, Smartphone, Sparkles, Loader2, ChevronDown, ChevronUp, Repeat2, Star, CalendarPlus, Plus, ShieldAlert, Lightbulb, UserPlus, CalendarClock } from 'lucide-react'
-import { apiClient } from '../lib/api-client'
+import { apiClient, dedupedGet } from '../lib/api-client'
 import { useAuth } from '../contexts/AuthContext'
 import DualThumbSlider from '../components/DualThumbSlider'
 import LearnerHelpIcon from '../components/LearnerHelpIcon'
@@ -10,7 +10,7 @@ import { useLearnerMode } from '../contexts/LearnerModeContext'
 import { useAiAssistant } from '../contexts/AiAssistantContext'
 import { LeftPanelPortal, RightPanelPortal } from '../contexts/LayoutContext'
 import MeetingSidePanel from '../components/MeetingSidePanel'
-import { isSafeUrl } from '../lib/calendar-utils'
+import { isSafeUrl, resolveMeetingTitle } from '../lib/calendar-utils'
 import { useToast } from '../components/Toast'
 import ImportAvailabilityModal from '../components/ImportAvailabilityModal'
 import TimezoneSelector from '../components/TimezoneSelector'
@@ -167,6 +167,35 @@ type TimeManagementEventRecord = {
   end_time: string
   category_ids?: string[]
   recurrence_rule?: unknown
+}
+
+type MeetingFormData = {
+  title: string
+  meetingLink: string
+  description: string
+  duration: number
+  recurrenceRule: RecurrenceRule
+}
+
+function createEmptyMeetingFormData(): MeetingFormData {
+  return {
+    title: '',
+    meetingLink: '',
+    description: '',
+    duration: 60,
+    recurrenceRule: { type: 'none' },
+  }
+}
+
+function getMeetingEditorTitle(
+  meeting: { title?: string; description?: string },
+  calendarName: string,
+): string {
+  const trimmedTitle = meeting.title?.trim() || ''
+  if (!trimmedTitle) return ''
+  if (meeting.description?.trim() === trimmedTitle) return ''
+  if (calendarName.trim() === trimmedTitle) return ''
+  return trimmedTitle
 }
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -483,17 +512,7 @@ export default function CalendarPage() {
   }>>([])
   const [pendingMeetingCellId, setPendingMeetingCellId] = useState<string | null>(null)
   const [editingMeetingIndex, setEditingMeetingIndex] = useState<number | null>(null)
-  const [meetingFormData, setMeetingFormData] = useState<{
-    meetingLink: string
-    description: string
-    duration: number
-    recurrenceRule: RecurrenceRule
-  }>({
-    meetingLink: '',
-    description: '',
-    duration: 60,
-    recurrenceRule: { type: 'none' }
-  })
+  const [meetingFormData, setMeetingFormData] = useState<MeetingFormData>(createEmptyMeetingFormData())
   const [_showRecurrencePanel, setShowRecurrencePanel] = useState(false)
   const [showConfirmedMeetings, setShowConfirmedMeetings] = useState(true)
   // Track order in which dynamic panels were opened (latest = rightmost)
@@ -522,6 +541,18 @@ export default function CalendarPage() {
 
   // Meeting side panel visibility
   const [showMeetingSidePanel, setShowMeetingSidePanel] = useState(false)
+
+  const closeMobileLeftPanels = () => {
+    setShowLeftSidebar(false)
+    setExpandedSidebarSections(new Set())
+    setShowMeetingSidePanel(false)
+    setPendingMeetingCellId(null)
+    setEditingMeetingIndex(null)
+    setMeetingFormData(createEmptyMeetingFormData())
+    setIsCreatingMeeting(false)
+    setMeetingCreationSelection(new Set())
+    setLeftPanelOrder(prev => prev.filter(p => p !== 'meetingForm'))
+  }
   
   // Meeting creation mode state
   const [isCreatingMeeting, setIsCreatingMeeting] = useState(false)
@@ -546,6 +577,8 @@ export default function CalendarPage() {
   const [timeManagementCategories, setTimeManagementCategories] = useState<TimeManagementCategory[]>([])
   const [timeManagementEvents, setTimeManagementEvents] = useState<TimeManagementEventRecord[]>([])
   const timeManagementRefreshTimerRef = useRef<number | null>(null)
+  const timeManagementFetchInFlightRef = useRef<Promise<void> | null>(null)
+  const timeManagementRateLimitedUntilRef = useRef(0)
   
   // Google Calendar busy times state
   const [busyBlocks, setBusyBlocks] = useState<BusyBlock[]>([])
@@ -681,6 +714,75 @@ export default function CalendarPage() {
   const [hasPastAvailability, setHasPastAvailability] = useState(false)
   const actionControlsRowRef = useRef<HTMLDivElement | null>(null)
   const [actionRowCompactStep, setActionRowCompactStep] = useState(0)
+
+  useEffect(() => {
+    const isEditableTarget = (target: EventTarget | null): boolean => {
+      const node = target instanceof Node ? target : null
+      const element = node instanceof HTMLElement ? node : node?.parentElement
+      if (!(element instanceof HTMLElement)) return false
+      const tagName = element.tagName.toLowerCase()
+      if (tagName === 'input' || tagName === 'textarea' || tagName === 'select') return true
+      return element.isContentEditable
+    }
+
+    const handleEscape = (event: KeyboardEvent): void => {
+      if (event.key !== 'Escape') return
+      if (event.defaultPrevented) return
+      if (event.ctrlKey || event.metaKey || event.altKey) return
+      if (isEditableTarget(event.target)) return
+
+      let closedAnySidePanel = false
+
+      const closeRightPanelEvent = new CustomEvent<{ closed?: boolean }>('closeRightSidebarPanels', {
+        detail: { closed: false },
+      })
+      window.dispatchEvent(closeRightPanelEvent)
+      if (closeRightPanelEvent.detail.closed) {
+        closedAnySidePanel = true
+      }
+
+      if (showImportModal) {
+        setShowImportModal(false)
+        setImportPreviewSelection(new Set())
+        closedAnySidePanel = true
+      }
+
+      if (showLeftSidebar || expandedSidebarSections.size > 0) {
+        setShowLeftSidebar(false)
+        setExpandedSidebarSections(new Set())
+        closedAnySidePanel = true
+      }
+
+      if (showMeetingSidePanel || pendingMeetingCellId || editingMeetingIndex !== null || isCreatingMeeting || meetingCreationSelection.size > 0) {
+        setShowMeetingSidePanel(false)
+        setPendingMeetingCellId(null)
+        setEditingMeetingIndex(null)
+        setMeetingFormData(createEmptyMeetingFormData())
+        setIsCreatingMeeting(false)
+        setMeetingCreationSelection(new Set())
+        setLeftPanelOrder(prev => prev.filter(p => p !== 'meetingForm'))
+        closedAnySidePanel = true
+      }
+
+      event.preventDefault()
+      if (closedAnySidePanel) return
+      setShowConfirmedMeetings(prev => !prev)
+    }
+
+    window.addEventListener('keydown', handleEscape)
+    return () => {
+      window.removeEventListener('keydown', handleEscape)
+    }
+  }, [
+    editingMeetingIndex,
+    expandedSidebarSections,
+    isCreatingMeeting,
+    meetingCreationSelection,
+    pendingMeetingCellId,
+    showImportModal,
+    showLeftSidebar,
+    showMeetingSidePanel,
+  ])
 
   // Hour slider preview state (progressive stepping to avoid reflow feedback loop)
   const [previewStartHour, setPreviewStartHour] = useState<number | null>(null)
@@ -890,6 +992,7 @@ export default function CalendarPage() {
   }
 
   const calendarGridRef = useRef<HTMLDivElement>(null)
+  const nowLineRef = useRef<HTMLDivElement>(null)
 
   // Allow page scrolling when the calendar grid is scrolled to its boundary
   useEffect(() => {
@@ -1266,6 +1369,32 @@ export default function CalendarPage() {
     return () => clearInterval(interval)
   }, [])
 
+  // Center the scrollable grid so the current-time line starts near the middle.
+  useEffect(() => {
+    const now = new Date()
+    const currentHourUTC = now.getUTCHours()
+    if (currentHourUTC < startHour || currentHourUTC >= endHour) {
+      return
+    }
+
+    if (!calendarGridRef.current || !nowLineRef.current) {
+      return
+    }
+
+    let raf1 = 0
+    let raf2 = 0
+    raf1 = window.requestAnimationFrame(() => {
+      raf2 = window.requestAnimationFrame(() => {
+        nowLineRef.current?.scrollIntoView({ behavior: 'auto', block: 'center', inline: 'nearest' })
+      })
+    })
+
+    return () => {
+      if (raf1) window.cancelAnimationFrame(raf1)
+      if (raf2) window.cancelAnimationFrame(raf2)
+    }
+  }, [startHour, endHour, timeInterval])
+
   // Update UTC clock every second for accurate display
   useEffect(() => {
     const interval = setInterval(() => {
@@ -1541,7 +1670,7 @@ export default function CalendarPage() {
       
       setShowDeleteConfirm(false)
       // Navigate back to events page after deletion
-      navigate('/events')
+      navigate('/calendars')
     } catch (error) {
       console.error('Error deleting calendar:', error)
       alert((error as { response?: { data?: { error?: string } } }).response?.data?.error || 'Failed to delete calendar')
@@ -1664,58 +1793,93 @@ export default function CalendarPage() {
       return
     }
 
-    try {
-      const [modesRes, categoriesRes, eventsRes] = await Promise.all([
-        apiClient.get('/api/time-management/modes'),
-        apiClient.get('/api/time-management/categories'),
-        apiClient.get('/api/user-events'),
-      ])
-
-      const modes = Array.isArray(modesRes.data?.modes) ? modesRes.data.modes : []
-      setTimeManagementModes(
-        modes
-          .filter((mode: { id?: unknown; name?: unknown; main_color?: unknown; slot_minutes?: unknown }) => {
-            return typeof mode.id === 'string' && typeof mode.name === 'string'
-          })
-          .map((mode: { id: string; name: string; main_color?: string; slot_minutes?: number }) => ({
-            id: mode.id,
-            name: mode.name,
-            main_color: typeof mode.main_color === 'string' && mode.main_color.trim().length > 0 ? mode.main_color : '#2563eb',
-            slot_minutes: mode.slot_minutes === 15 || mode.slot_minutes === 30 || mode.slot_minutes === 60 ? mode.slot_minutes : 30,
-          }))
-      )
-
-      const categories = Array.isArray(categoriesRes.data?.categories) ? categoriesRes.data.categories : []
-      setTimeManagementCategories(
-        categories
-          .filter((category: { id?: unknown; label?: unknown; color?: unknown; font_color?: unknown }) => {
-            return (
-              typeof category.id === 'string'
-              && typeof category.label === 'string'
-              && typeof category.color === 'string'
-              && typeof category.font_color === 'string'
-            )
-          })
-          .map((category: { id: string; label: string; color: string; font_color: string }) => ({
-            id: category.id,
-            label: category.label,
-            color: category.color,
-            font_color: category.font_color,
-          }))
-      )
-
-      const events = Array.isArray(eventsRes.data?.events) ? eventsRes.data.events : []
-      setTimeManagementEvents(
-        events.filter((event: { source_type?: unknown; source_id?: unknown }) => {
-          return event.source_type === 'manual' && typeof event.source_id === 'string'
-        })
-      )
-    } catch (err) {
-      console.error('Failed to fetch time-management sources:', err)
-      setTimeManagementModes([])
-      setTimeManagementCategories([])
-      setTimeManagementEvents([])
+    if (timeManagementFetchInFlightRef.current) {
+      return timeManagementFetchInFlightRef.current
     }
+
+    if (Date.now() < timeManagementRateLimitedUntilRef.current) {
+      return
+    }
+
+    const request = (async () => {
+      const isRateLimitedError = (error: unknown): boolean => {
+        if (!(error instanceof Error)) return false
+
+        const maybeRateLimitError = error as Error & {
+          isRateLimitError?: boolean
+          response?: { status?: number }
+        }
+
+        if (maybeRateLimitError.isRateLimitError === true) return true
+        if (maybeRateLimitError.response?.status === 429) return true
+        return error.message.toLowerCase().includes('too many time-management requests')
+      }
+
+      try {
+        const [modesRes, categoriesRes, eventsRes] = await Promise.all([
+          dedupedGet('/api/time-management/modes'),
+          dedupedGet('/api/time-management/categories'),
+          dedupedGet('/api/user-events'),
+        ])
+
+        const modesPayload = modesRes.data as { modes?: unknown } | undefined
+        const modes = Array.isArray(modesPayload?.modes) ? modesPayload.modes : []
+        setTimeManagementModes(
+          modes
+            .filter((mode: { id?: unknown; name?: unknown; main_color?: unknown; slot_minutes?: unknown }) => {
+              return typeof mode.id === 'string' && typeof mode.name === 'string'
+            })
+            .map((mode: { id: string; name: string; main_color?: string; slot_minutes?: number }) => ({
+              id: mode.id,
+              name: mode.name,
+              main_color: typeof mode.main_color === 'string' && mode.main_color.trim().length > 0 ? mode.main_color : '#2563eb',
+              slot_minutes: mode.slot_minutes === 15 || mode.slot_minutes === 30 || mode.slot_minutes === 60 ? mode.slot_minutes : 30,
+            }))
+        )
+
+        const categoriesPayload = categoriesRes.data as { categories?: unknown } | undefined
+        const categories = Array.isArray(categoriesPayload?.categories) ? categoriesPayload.categories : []
+        setTimeManagementCategories(
+          categories
+            .filter((category: { id?: unknown; label?: unknown; color?: unknown; font_color?: unknown }) => {
+              return (
+                typeof category.id === 'string'
+                && typeof category.label === 'string'
+                && typeof category.color === 'string'
+                && typeof category.font_color === 'string'
+              )
+            })
+            .map((category: { id: string; label: string; color: string; font_color: string }) => ({
+              id: category.id,
+              label: category.label,
+              color: category.color,
+              font_color: category.font_color,
+            }))
+        )
+
+        const eventsPayload = eventsRes.data as { events?: unknown } | undefined
+        const events = Array.isArray(eventsPayload?.events) ? eventsPayload.events : []
+        setTimeManagementEvents(
+          events.filter((event: { source_type?: unknown; source_id?: unknown }) => {
+            return event.source_type === 'manual' && typeof event.source_id === 'string'
+          })
+        )
+      } catch (err) {
+        if (isRateLimitedError(err)) {
+          // Avoid immediate re-bursts from focus/visibility/storage listeners.
+          timeManagementRateLimitedUntilRef.current = Date.now() + 30_000
+        }
+
+        console.error('Failed to fetch time-management sources:', err)
+        setTimeManagementModes([])
+        setTimeManagementCategories([])
+        setTimeManagementEvents([])
+      }
+    })()
+
+    timeManagementFetchInFlightRef.current = request
+    await request
+    timeManagementFetchInFlightRef.current = null
   }, [isAuthenticated])
 
   useEffect(() => {
@@ -2145,7 +2309,7 @@ export default function CalendarPage() {
           calendarHash: roomHash,
           canEditCalendar: hasEditPermission || isCreator,
           existingMeetings: confirmedMeetings.map(m => ({
-            title: m.title || m.description || eventName || 'Meeting',
+            title: resolveMeetingTitle({ title: m.title, calendarTitle: eventName || calendarTitle || 'Meeting' }),
             cellId: m.cellId,
             duration: m.duration,
           })),
@@ -2279,7 +2443,7 @@ export default function CalendarPage() {
                   meetingLink: meetingToExport.meetingLink,
                   description: meetingToExport.description,
                   duration: meetingToExport.duration,
-                  title: meetingToExport.title || eventName || 'Meeting',
+                  title: resolveMeetingTitle({ title: meetingToExport.title, calendarTitle: eventName || calendarTitle || 'Meeting' }),
                   recurrenceRule: meetingToExport.recurrenceRule || null,
                 }],
                 targetSourceIds,
@@ -2374,7 +2538,7 @@ export default function CalendarPage() {
       setAiSending(false)
     }
     }, [roomHash, customStartDate, customEndDate, skippedDays, timeInterval, startHour, endHour,
-      currentSelection, combinedBusyBlocks, username, user, calendarVisibility, selectedTimezone, eventName, hideDateNumbers,
+      currentSelection, combinedBusyBlocks, username, user, calendarVisibility, selectedTimezone, eventName, calendarTitle, hideDateNumbers,
       hasExportTargets, checkedExportableSources, confirmedMeetings,
       generateTimeSlots, hasEditPermission, isCreator, tzState, activeGoogleSourceIds,
       activeSecretSwarmModeIds, modeColors, timeManagementEvents])
@@ -3318,6 +3482,7 @@ export default function CalendarPage() {
     setEditingMeetingIndex(meetingIndex)
     setPendingMeetingCellId(targetCellId)
     setMeetingFormData({
+      title: getMeetingEditorTitle(meeting, eventName || calendarTitle || ''),
       meetingLink: meeting.meetingLink,
       description: meeting.description,
       duration: meeting.duration,
@@ -3447,7 +3612,7 @@ export default function CalendarPage() {
         setPendingMeetingCellId(firstSuggestion.cellId)
         setShowMeetingSidePanel(true)
         setIsCreatingMeeting(true)
-        setMeetingFormData({ meetingLink: '', description: '', duration: 60, recurrenceRule: { type: 'none' } })
+        setMeetingFormData(createEmptyMeetingFormData())
         setShowRecurrencePanel(false)
         const [hours, minutes] = timeStr.split(':').map(Number)
         const startMinutes = hours * 60 + minutes
@@ -4120,10 +4285,10 @@ export default function CalendarPage() {
             This Coordination Calendar does not exist or you do not have permission to view it.
           </p>
           <button
-            onClick={() => navigate('/events')}
+            onClick={() => navigate('/calendars')}
             className="px-6 py-2 bg-primary text-primary-foreground rounded-md hover:bg-primary/90 font-medium"
           >
-            Go to Events Page
+            Go to Coordination Calendars
           </button>
         </div>
       </div>
@@ -4134,13 +4299,24 @@ export default function CalendarPage() {
     <div className="flex flex-col min-h-screen p-2 md:p-6">
       {/* Left panels -- rendered via portal into Layout root flex */}
       <LeftPanelPortal>
+      {isMobile && (showLeftSidebar || (showMeetingSidePanel && !!pendingMeetingCellId)) && (
+        <button
+          type="button"
+          aria-label="Close tools panel"
+          className="fixed inset-0 z-[92] bg-black/55"
+          onClick={closeMobileLeftPanels}
+        />
+      )}
+
       {/* Meeting Side Panel (left, push) -- order driven by leftPanelOrder */}
       {isCreator && (
         <div style={{ order: leftPanelOrder.indexOf('meetingForm') }}>
         <MeetingSidePanel
           isOpen={showMeetingSidePanel && !!pendingMeetingCellId}
           cellId={pendingMeetingCellId}
-          widthClassName={showLeftSidebar ? toolsSidebarInnerWidthClass : 'w-80 min-w-[20rem]'}
+          widthClassName={isMobile ? 'w-screen min-w-full' : (showLeftSidebar ? toolsSidebarInnerWidthClass : 'w-80 min-w-[20rem]')}
+          mobileOverlay={isMobile}
+          title={meetingFormData.title}
           duration={meetingFormData.duration}
           recurrenceRule={meetingFormData.recurrenceRule}
           meetingLink={meetingFormData.meetingLink}
@@ -4161,13 +4337,14 @@ export default function CalendarPage() {
           existingLinks={[...new Set(confirmedMeetings.filter((_, i) => i !== editingMeetingIndex).map(m => m.meetingLink).filter(Boolean))]}
           existingDescriptions={[...new Set(confirmedMeetings.filter((_, i) => i !== editingMeetingIndex).map(m => m.description).filter(Boolean))]}
           onCellIdChange={(newCellId) => setPendingMeetingCellId(newCellId)}
-          onSave={async ({ duration, recurrenceRule, meetingLink, description }) => {
+          onSave={async ({ title, duration, recurrenceRule, meetingLink, description }) => {
             const roundedDuration = Math.max(timeInterval, Math.round(duration / timeInterval) * timeInterval)
             const [dateStr, timeStr] = pendingMeetingCellId!.split('_')
             const startTime = new Date(`${dateStr}T${timeStr}:00Z`)
             const endTime = new Date(startTime.getTime() + roundedDuration * 60 * 1000)
             const timeSlots = [`${dateStr}T${timeStr}`]
             const recRule = recurrenceRule?.type !== 'none' ? recurrenceRule : null
+            const resolvedTitle = title.trim() || eventName.trim() || calendarTitle.trim() || 'Meeting'
 
             if (editingMeetingIndex !== null) {
               const existingMeeting = confirmedMeetings[editingMeetingIndex]
@@ -4177,14 +4354,14 @@ export default function CalendarPage() {
                 meetingLink,
                 description,
                 duration: roundedDuration,
-                title: description || existingMeeting?.title || 'Meeting',
+                title: resolvedTitle,
                 timeSlots: timeSlots.map(s => s.replace('T', '_')),
                 recurrenceRule: recRule
               }
               if (existingMeeting?.id && roomHash) {
                 try {
                   await apiClient.put(`/api/meetings/${existingMeeting.id}`, {
-                    title: meetingData.title,
+                    title: resolvedTitle,
                     description,
                     start_time: startTime.toISOString(),
                     end_time: endTime.toISOString(),
@@ -4207,6 +4384,7 @@ export default function CalendarPage() {
               setEditingMeetingIndex(null)
             } else {
               const meetingData = {
+                title: resolvedTitle,
                 cellId: pendingMeetingCellId!,
                 meetingLink,
                 description,
@@ -4217,7 +4395,7 @@ export default function CalendarPage() {
                 try {
                   const response = await apiClient.post('/api/meetings', {
                     calendar_hash: roomHash,
-                    title: description || 'Meeting',
+                    title: resolvedTitle,
                     description,
                     start_time: startTime.toISOString(),
                     end_time: endTime.toISOString(),
@@ -4230,7 +4408,6 @@ export default function CalendarPage() {
                   setConfirmedMeetings(prev => [...prev, {
                     ...meetingData,
                     id: response.data?.id,
-                    title: description || 'Meeting',
                     timeSlots: timeSlots.map(s => s.replace('T', '_')),
                     recurrenceRule: recRule
                   }])
@@ -4253,7 +4430,7 @@ export default function CalendarPage() {
             }
             setShowMeetingSidePanel(false)
             setPendingMeetingCellId(null)
-            setMeetingFormData({ meetingLink: '', description: '', duration: 60, recurrenceRule: { type: 'none' } })
+            setMeetingFormData(createEmptyMeetingFormData())
             setIsCreatingMeeting(false)
             setMeetingCreationSelection(new Set())
             setLeftPanelOrder(prev => prev.filter(p => p !== 'meetingForm'))
@@ -4263,7 +4440,7 @@ export default function CalendarPage() {
             setShowMeetingSidePanel(false)
             setPendingMeetingCellId(null)
             setEditingMeetingIndex(null)
-            setMeetingFormData({ meetingLink: '', description: '', duration: 60, recurrenceRule: { type: 'none' } })
+            setMeetingFormData(createEmptyMeetingFormData())
             setIsCreatingMeeting(false)
             setMeetingCreationSelection(new Set())
             setLeftPanelOrder(prev => prev.filter(p => p !== 'meetingForm'))
@@ -4278,12 +4455,14 @@ export default function CalendarPage() {
         <aside
           style={{ order: leftPanelOrder.indexOf('tools') }}
           className={`
-            shrink-0 sticky top-0 h-screen overflow-hidden
-            transition-all duration-300 ease-in-out
-            ${showLeftSidebar ? toolsSidebarWidthClass : 'w-0'}
+            overflow-hidden transition-all duration-300 ease-in-out
+            ${isMobile
+              ? `fixed inset-y-0 left-0 z-[93] h-screen w-screen transform ${showLeftSidebar ? 'translate-x-0 pointer-events-auto' : '-translate-x-full pointer-events-none'}`
+              : `shrink-0 sticky top-0 h-screen ${showLeftSidebar ? toolsSidebarWidthClass : 'w-0'}`
+            }
           `}
         >
-          <div className={`${toolsSidebarInnerWidthClass} h-full flex flex-col bg-card border-r-2 border-border shadow-xl`}>
+          <div className={`${isMobile ? 'w-screen min-w-full' : toolsSidebarInnerWidthClass} h-full flex flex-col bg-card border-r-2 border-border shadow-xl`}>
           {/* Sidebar Header */}
           <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-muted/30">
             <h3 className="text-sm font-bold text-foreground">Tools</h3>
@@ -4473,6 +4652,7 @@ export default function CalendarPage() {
                                   >
                                     <input
                                       type="checkbox"
+                                      name="calendarSourceSelection"
                                       checked={isChecked}
                                       onChange={(e) => {
                                         setCheckedSourceIds(prev => {
@@ -4557,6 +4737,7 @@ export default function CalendarPage() {
                                 >
                                   <input
                                     type="checkbox"
+                                    name="secretSwarmModeSelection"
                                     checked={isChecked}
                                     onChange={(e) => {
                                       setCheckedSourceIds(prev => {
@@ -4968,7 +5149,7 @@ export default function CalendarPage() {
               <h1 className="text-base md:text-2xl font-bold shrink-0">
                 {!roomHash ? 'Prepare Coordination Calendar' : 'Coordination Calendar'}
               </h1>
-              {/* Follow / Unfollow button  — only for existing calendars when logged in */}
+              {/* Subscribe / Unsubscribe button  -- only for existing calendars when logged in */}
               {roomHash && isAuthenticated && (
                 <button
                   onClick={handleToggleFollow}
@@ -5117,6 +5298,7 @@ export default function CalendarPage() {
                 </label>
                 <input
                   type="text"
+                  name="eventName"
                   value={eventName}
                   onChange={(e) => setEventName(e.target.value)}
                   placeholder="Enter event name..."
@@ -5212,7 +5394,7 @@ export default function CalendarPage() {
                 <button
                   onClick={handleCreateCalendar}
                   disabled={!eventName.trim() || !customStartDate || !customEndDate}
-                  className="px-6 py-2 bg-green-600 text-white rounded-md hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium"
+                  className="w-full sm:w-auto px-6 py-2.5 bg-green-600 text-white rounded-md hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium"
                 >
                   Create Coordination Calendar
                 </button>
@@ -5271,6 +5453,7 @@ export default function CalendarPage() {
                       <div className="flex flex-col sm:flex-row gap-2">
                         <input
                           type="url"
+                          name="socialTwitterUrl"
                           value={socialLinks.twitter}
                           onChange={e => setSocialLinks(prev => ({ ...prev, twitter: e.target.value }))}
                           placeholder="X / Twitter URL"
@@ -5278,6 +5461,7 @@ export default function CalendarPage() {
                         />
                         <input
                           type="url"
+                          name="socialDiscordUrl"
                           value={socialLinks.discord}
                           onChange={e => setSocialLinks(prev => ({ ...prev, discord: e.target.value }))}
                           placeholder="Discord URL"
@@ -5285,6 +5469,7 @@ export default function CalendarPage() {
                         />
                         <input
                           type="url"
+                          name="socialYoutubeUrl"
                           value={socialLinks.youtube}
                           onChange={e => setSocialLinks(prev => ({ ...prev, youtube: e.target.value }))}
                           placeholder="YouTube URL"
@@ -5304,6 +5489,7 @@ export default function CalendarPage() {
                           <div key={index} className="flex items-center gap-2">
                             <input
                               type="text"
+                              name={`communityResourceName-${index}`}
                               value={resource.name}
                               onChange={e => {
                                 const updated = [...communityResources]
@@ -5315,6 +5501,7 @@ export default function CalendarPage() {
                             />
                             <input
                               type="url"
+                              name={`communityResourceUrl-${index}`}
                               value={resource.url}
                               onChange={e => {
                                 const updated = [...communityResources]
@@ -5353,6 +5540,7 @@ export default function CalendarPage() {
                       </p>
                       <input
                         type="url"
+                        name="onboardingUrl"
                         value={onboardingUrl}
                         onChange={e => setOnboardingUrl(e.target.value)}
                         placeholder="https://your-onboarding-or-resource-link.com"
@@ -5376,7 +5564,7 @@ export default function CalendarPage() {
           {roomHash && (savedSelections.size > 0 || isCreator) && (
             <div className="space-y-3">
               {/* Button Row */}
-              <div className="flex flex-wrap gap-2">
+              <div className="grid grid-cols-2 gap-2 sm:flex sm:flex-wrap">
                 {/* Participants */}
                 {savedSelections.size > 0 && (
                   <button
@@ -5390,7 +5578,7 @@ export default function CalendarPage() {
                         setLeftPanelOrder(prev => prev.includes('tools') ? prev : [...prev, 'tools'])
                       }
                     }}
-                    className={`px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors ${
+                    className={`w-full sm:w-auto px-4 py-2 rounded-lg text-sm font-medium flex items-center justify-center gap-2 transition-colors ${
                       showParticipantsPanel
                         ? 'bg-orange-100 text-orange-800 border border-orange-400 dark:bg-orange-900/40 dark:text-orange-300 dark:border-orange-600'
                         : 'bg-card border border-border text-foreground hover:bg-muted'
@@ -5414,7 +5602,7 @@ export default function CalendarPage() {
                         setLeftPanelOrder(prev => prev.includes('tools') ? prev : [...prev, 'tools'])
                       }
                     }}
-                    className={`px-4 py-2 rounded-lg text-sm font-medium flex items-center gap-2 transition-colors ${
+                    className={`w-full sm:w-auto px-4 py-2 rounded-lg text-sm font-medium flex items-center justify-center gap-2 transition-colors ${
                       showCalendarSyncsPanel
                         ? 'bg-blue-100 text-blue-800 border border-blue-400 dark:bg-blue-900/40 dark:text-blue-300 dark:border-blue-600'
                         : 'bg-card border border-border text-foreground hover:bg-muted'
@@ -5429,7 +5617,7 @@ export default function CalendarPage() {
                 {hasEditPermission && !isEditingSettings && (
                   <button
                     onClick={() => handleEditSettings()}
-                    className="px-4 py-2 bg-card border border-border text-foreground rounded-lg hover:bg-muted text-sm font-medium flex items-center gap-2 transition-colors"
+                    className="w-full sm:w-auto px-4 py-2 bg-card border border-border text-foreground rounded-lg hover:bg-muted text-sm font-medium flex items-center justify-center gap-2 transition-colors"
                   >
                     <Settings className="w-4 h-4" />
                     Settings
@@ -5448,7 +5636,7 @@ export default function CalendarPage() {
                       setLeftPanelOrder(prev => prev.includes('tools') ? prev : [...prev, 'tools'])
                     }
                   }}
-                  className={`group relative px-4 py-2 rounded-lg text-sm font-semibold flex items-center gap-2 text-white shadow-md transition-all duration-300 hover:opacity-90 ${
+                  className={`group relative w-full sm:w-auto px-4 py-2 rounded-lg text-sm font-semibold flex items-center justify-center gap-2 text-white shadow-md transition-all duration-300 hover:opacity-90 ${
                     showActionsPanel ? 'ring-2 ring-purple-300 dark:ring-purple-700 scale-[1.02]' : ''
                   }`}
                   style={{
@@ -5458,7 +5646,7 @@ export default function CalendarPage() {
                   }}
                 >
                   <Sparkles className="w-4 h-4" />
-                  <span>Take Action</span>
+                  <span>{isMobile ? 'Action' : 'Take Action'}</span>
                   <span className="text-[10px] font-normal text-purple-100/90 hidden sm:inline">invite and meetings</span>
                 </button>
               </div>
@@ -5522,7 +5710,7 @@ export default function CalendarPage() {
                                       setPendingMeetingCellId(meeting.cellId)
                                       setShowMeetingSidePanel(true)
                                       setIsCreatingMeeting(true)
-                                      setMeetingFormData({ meetingLink: '', description: '', duration: 60, recurrenceRule: { type: 'none' } })
+                                      setMeetingFormData(createEmptyMeetingFormData())
                                       setShowRecurrencePanel(false)
                                       const [dateStr, timeStr] = meeting.cellId.split('_')
                                       const [hours, minutes] = timeStr.split(':').map(Number)
@@ -5596,7 +5784,7 @@ export default function CalendarPage() {
                             meetingLink: m.meetingLink,
                             description: m.description,
                             duration: m.duration,
-                            title: eventName || 'Meeting',
+                            title: resolveMeetingTitle({ title: m.title, calendarTitle: eventName || calendarTitle || 'Meeting' }),
                             recurrenceRule: m.recurrenceRule || null
                           })),
                           targetSourceIds,
@@ -5639,6 +5827,20 @@ export default function CalendarPage() {
                   const isPastInActiveWeek = meeting.isPastInActiveWeek
                   const _isUpcomingFutureWeek = meeting.isUpcomingFutureWeek
                   const isEditingThis = editingMeetingIndex === originalIndex && showMeetingSidePanel
+                  const trimmedCalendarName = (eventName || calendarTitle || 'Meeting').trim()
+                  const trimmedMeetingTitle = meeting.title?.trim() || ''
+                  const trimmedMeetingDescription = meeting.description?.trim() || ''
+                  const hasCustomMeetingName =
+                    trimmedMeetingTitle.length > 0
+                    && trimmedMeetingTitle !== trimmedCalendarName
+                    && trimmedMeetingTitle !== trimmedMeetingDescription
+                  const meetingDisplayTitle = resolveMeetingTitle({
+                    title: meeting.title,
+                    calendarTitle: eventName || calendarTitle || 'Meeting',
+                  })
+                  const shouldShowDescription =
+                    trimmedMeetingDescription.length > 0
+                    && trimmedMeetingDescription !== meetingDisplayTitle.trim()
                   return (
                     <div 
                       key={originalIndex}
@@ -5650,7 +5852,7 @@ export default function CalendarPage() {
                             setShowMeetingSidePanel(false)
                             setPendingMeetingCellId(null)
                             setEditingMeetingIndex(null)
-                            setMeetingFormData({ meetingLink: '', description: '', duration: 60, recurrenceRule: { type: 'none' } })
+                            setMeetingFormData(createEmptyMeetingFormData())
                             setIsCreatingMeeting(false)
                             setMeetingCreationSelection(new Set())
                             setLeftPanelOrder(prev => prev.filter(p => p !== 'meetingForm'))
@@ -5659,6 +5861,7 @@ export default function CalendarPage() {
                           setEditingMeetingIndex(originalIndex)
                           setPendingMeetingCellId(meeting.cellId)
                           setMeetingFormData({
+                            title: getMeetingEditorTitle(meeting, eventName || calendarTitle || ''),
                             meetingLink: meeting.meetingLink,
                             description: meeting.description,
                             duration: meeting.duration,
@@ -5682,7 +5885,7 @@ export default function CalendarPage() {
                       }}
                       className={`p-3 border-2 rounded-lg flex-shrink-0 relative cursor-pointer transition-all duration-200 hover:shadow-lg hover:scale-[1.02] flex flex-col ${
                         isEditingThis
-                          ? 'editing-meeting-card bg-blue-50 dark:bg-blue-950/40'
+                          ? 'editing-meeting-card bg-blue-50 dark:bg-blue-900/25'
                           : isPast
                             ? 'bg-amber-50 border-amber-200 dark:border-amber-900/70 opacity-75 hover:opacity-100 hover:border-amber-400'
                             : isSelected
@@ -5760,8 +5963,8 @@ export default function CalendarPage() {
                               className="mt-1 w-4 h-4 rounded border-border text-primary focus:ring-primary"
                             />
                           )}
-                          <div className="flex-1">
-                            <div className="flex items-center gap-2">
+                          <div className="min-w-0 flex-1">
+                            <div className="flex items-start gap-2 min-w-0">
                               <span className={`text-white text-[10px] font-bold px-1.5 py-0.5 rounded ${
                                 isPastInActiveWeek
                                   ? 'bg-amber-800 dark:bg-amber-700'
@@ -5769,13 +5972,30 @@ export default function CalendarPage() {
                               }`}>
                                 {sortedIndex + 1}
                               </span>
-                              <span className={`text-xs font-medium ${
-                                isPastInActiveWeek
-                                  ? 'text-amber-900 dark:text-amber-500'
-                                  : 'text-amber-700'
-                              }`}>Meeting</span>
+                              {!hasCustomMeetingName && (
+                                <span className={`shrink-0 text-xs font-medium ${
+                                  isPastInActiveWeek
+                                    ? 'text-foreground/80'
+                                    : 'text-foreground/70'
+                                }`}>Meeting</span>
+                              )}
+                              <span
+                                className={`min-w-0 flex-1 overflow-hidden text-sm font-extrabold leading-tight ${
+                                  isEditingThis ? 'text-blue-50' : 'text-slate-900'
+                                }`}
+                                title={meetingDisplayTitle}
+                                style={{
+                                  display: '-webkit-box',
+                                  WebkitLineClamp: 2,
+                                  WebkitBoxOrient: 'vertical',
+                                  overflowWrap: 'break-word',
+                                  wordBreak: 'break-word',
+                                }}
+                              >
+                                {meetingDisplayTitle}
+                              </span>
                               {isPast && (
-                                <span className="text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-amber-600 dark:bg-amber-700 text-white">
+                                <span className="shrink-0 text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-amber-600 dark:bg-amber-700 text-white">
                                   Past
                                 </span>
                               )}
@@ -5816,7 +6036,7 @@ export default function CalendarPage() {
                             </a>
                           </div>
                         )}
-                        {meeting.description && (
+                        {shouldShowDescription && (
                           <div className={hasExportTargets ? 'pl-6 min-w-0' : 'min-w-0'}>
                             <div className="text-xs text-amber-700 flex items-start gap-1 min-w-0 leading-snug">
                               <FileText className="w-3 h-3 mt-0.5 shrink-0" />
@@ -5824,11 +6044,10 @@ export default function CalendarPage() {
                                 className="min-w-0 overflow-hidden"
                                 style={{
                                   display: '-webkit-box',
-                                  WebkitLineClamp: 2,
+                                  WebkitLineClamp: 1,
                                   WebkitBoxOrient: 'vertical',
-                                  hyphens: 'auto',
-                                  overflowWrap: 'anywhere',
-                                  wordBreak: 'normal',
+                                  overflowWrap: 'break-word',
+                                  wordBreak: 'break-word',
                                 }}
                               >
                                 {meeting.description}
@@ -5904,6 +6123,7 @@ export default function CalendarPage() {
                   </label>
                   <input
                     type="text"
+                    name="participantName"
                     value={username}
                     onChange={(e) => {
                       setUsername(e.target.value)
@@ -5913,7 +6133,7 @@ export default function CalendarPage() {
                     className="px-3 py-2 border border-border rounded-md text-sm bg-background text-foreground focus:ring-2 focus:ring-primary focus:border-primary"
                   />
                 </div>
-                <div className="flex flex-wrap items-center gap-2 flex-1 min-w-0">
+                <div className="flex flex-col sm:flex-row sm:flex-wrap items-start sm:items-center gap-2 flex-1 min-w-0">
                   {/* Contextual guidance messages */}
                   {!username.trim() && currentSelection.size === 0 && (
                     <p className="text-sm text-muted-foreground italic">
@@ -5927,11 +6147,11 @@ export default function CalendarPage() {
                   )}
                   {/* ADD or REMOVE Selected Availability - only shown when there is a selection */}
                   {currentSelection.size > 0 && (
-                    <>
+                    <div className="flex w-full sm:w-auto flex-wrap items-center gap-2">
                       <button
                         onClick={handleAddAvailability}
                         disabled={!username.trim()}
-                        className="px-3 md:px-4 py-2 bg-purple-600 text-white rounded-md hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium text-sm"
+                        className="w-full sm:w-auto px-3 md:px-4 py-2.5 bg-purple-600 text-white rounded-md hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium text-sm"
                       >
                         Add
                       </button>
@@ -5939,12 +6159,12 @@ export default function CalendarPage() {
                       <button
                         onClick={handleClearSelectedAvailability}
                         disabled={!username.trim()}
-                        className="px-3 md:px-4 py-2 bg-red-600 text-white rounded-md hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium text-sm"
+                        className="w-full sm:w-auto px-3 md:px-4 py-2.5 bg-red-600 text-white rounded-md hover:bg-red-700 disabled:opacity-50 disabled:cursor-not-allowed font-medium text-sm"
                       >
                         Remove
                       </button>
                       <span className="text-sm text-foreground font-medium">Selected Availability</span>
-                    </>
+                    </div>
                   )}
                   {/* AI Assistant, Create Meeting Time & Import button - right aligned */}
                   {isAuthenticated && (
@@ -5957,7 +6177,7 @@ export default function CalendarPage() {
                               setIsCreatingMeeting(true)
                               setMeetingCreationSelection(new Set(currentSelection))
                               setPendingMeetingCellId(singleDayRange.startCellId)
-                              setMeetingFormData({ meetingLink: '', description: '', duration: singleDayRange.durationMinutes, recurrenceRule: { type: 'none' } })
+                              setMeetingFormData({ ...createEmptyMeetingFormData(), duration: singleDayRange.durationMinutes })
                               setShowMeetingSidePanel(true)
                               setShowRecurrencePanel(false)
                               setLeftPanelOrder(prev => prev.includes('meetingForm') ? prev : [...prev, 'meetingForm'])
@@ -5969,7 +6189,7 @@ export default function CalendarPage() {
                               setIsCreatingMeeting(true)
                               setMeetingCreationSelection(new Set(currentSelection))
                               setPendingMeetingCellId(earliestCell)
-                              setMeetingFormData({ meetingLink: '', description: '', duration: inferredDuration, recurrenceRule: { type: 'none' } })
+                              setMeetingFormData({ ...createEmptyMeetingFormData(), duration: inferredDuration })
                               setShowMeetingSidePanel(true)
                               setShowRecurrencePanel(false)
                               setShowLeftSidebar(true)
@@ -6061,6 +6281,7 @@ export default function CalendarPage() {
                   <label className="text-sm text-muted-foreground">From:</label>
                   <input
                     type="date"
+                    name="availabilityStartDate"
                     value={customStartDate}
                     onChange={(e) => handleCustomDateChange('start', e.target.value)}
                     min={format(MIN_DATE, 'yyyy-MM-dd')}
@@ -6092,6 +6313,7 @@ export default function CalendarPage() {
                   <label className="text-sm text-muted-foreground">To:</label>
                   <input
                     type="date"
+                    name="availabilityEndDate"
                     value={customEndDate}
                     onChange={(e) => handleCustomDateChange('end', e.target.value)}
                     min={format(MIN_DATE, 'yyyy-MM-dd')}
@@ -6232,6 +6454,7 @@ export default function CalendarPage() {
                 <div className="flex items-center gap-2 mb-3">
                   <label className="text-xs font-medium text-foreground">Interval:</label>
                   <select
+                    name="mobileTimeInterval"
                     value={timeInterval}
                     onChange={(e) => setTimeInterval(Number(e.target.value) as TimeInterval)}
                     className="px-2 py-1 border border-border rounded text-xs bg-background text-foreground"
@@ -6276,6 +6499,7 @@ export default function CalendarPage() {
                   Time Interval
                 </label>
                 <select
+                  name="desktopTimeInterval"
                   value={timeInterval}
                   onChange={(e) => setTimeInterval(Number(e.target.value) as TimeInterval)}
                   className="w-full px-3 py-2 border border-border rounded-md text-sm bg-background text-foreground"
@@ -6715,6 +6939,7 @@ export default function CalendarPage() {
               
               return (
                 <div 
+                  ref={nowLineRef}
                   className="absolute left-0 right-0 pointer-events-none z-[15]"
                   style={{ 
                     top: `${position}px`,

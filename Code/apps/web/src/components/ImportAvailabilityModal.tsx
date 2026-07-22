@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef } from 'react'
 import { X, Loader2, Calendar, Clock } from 'lucide-react'
 import { apiClient } from '../lib/api-client'
 
@@ -81,6 +81,7 @@ export default function ImportAvailabilityModal({
   const [entries, setEntries] = useState<PastAvailabilityEntry[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState('')
+  const wasOpenRef = useRef(open)
 
   useEffect(() => {
     if (!open) return
@@ -106,9 +107,12 @@ export default function ImportAvailabilityModal({
   }, [open, currentCalendarHash])
 
   useEffect(() => {
-    if (!open) {
+    // Clear preview once when the modal transitions from open -> closed.
+    // Avoid calling onPreview on every render while closed.
+    if (wasOpenRef.current && !open) {
       onPreview?.(null)
     }
+    wasOpenRef.current = open
   }, [open, onPreview])
 
   const parseTimeParts = (timeStr: string): { hours: number; minutes: number } | null => {

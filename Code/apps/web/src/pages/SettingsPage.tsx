@@ -2092,36 +2092,50 @@ export default function SettingsPage() {
         </p>
 
         <div className="space-y-3">
-          <div className={`flex items-center justify-between p-4 bg-card rounded-lg border-2 transition-colors ${notifChannelEmail ? 'border-blue-400 dark:border-blue-500' : 'border-rose-300 dark:border-rose-500/60'}`}>
-            <div className="flex items-center gap-3">
+          <div className={`flex flex-col gap-3 p-4 bg-card rounded-lg border-2 transition-colors sm:flex-row sm:items-center sm:justify-between ${notifChannelEmail ? 'border-blue-400 dark:border-blue-500' : 'border-rose-300 dark:border-rose-500/60'}`}>
+            <div className="flex items-center gap-3 min-w-0">
               <Mail className="w-5 h-5 text-muted-foreground" />
-              <div>
+              <div className="min-w-0">
                 <p className="font-medium">Email notifications</p>
                 <p className="text-sm text-muted-foreground">Receive announcements and updates via email</p>
               </div>
             </div>
-            <button
-              onClick={() => { const next = !notifChannelEmail; setNotifChannelEmail(next); saveNotifPrefsNow({ channelEmail: next }) }}
-              className={`relative w-12 h-6 rounded-full transition-colors ${notifChannelEmail ? 'bg-blue-500' : 'bg-rose-300 dark:bg-rose-500/60'}`}
-            >
-              <span className={`absolute top-1 w-4 h-4 rounded-full transition-all shadow-[0_1px_3px_rgba(0,0,0,0.3)] ${notifChannelEmail ? 'left-7 bg-white' : 'left-1 bg-white dark:bg-gray-200'}`} />
-            </button>
+            <div className="flex items-center gap-2 self-start sm:self-auto">
+              <span className={`text-xs font-medium ${notifChannelEmail ? 'text-blue-600 dark:text-blue-400' : 'text-rose-500 dark:text-rose-400'}`}>
+                {notifChannelEmail ? 'On' : 'Off'}
+              </span>
+              <button
+                onClick={() => { const next = !notifChannelEmail; setNotifChannelEmail(next); saveNotifPrefsNow({ channelEmail: next }) }}
+                aria-label="Toggle email notifications"
+                aria-pressed={notifChannelEmail}
+                className={`relative w-12 h-6 rounded-full transition-colors ${notifChannelEmail ? 'bg-blue-500' : 'bg-rose-300 dark:bg-rose-500/60'}`}
+              >
+                <span className={`absolute top-1 w-4 h-4 rounded-full transition-all shadow-[0_1px_3px_rgba(0,0,0,0.3)] ${notifChannelEmail ? 'left-7 bg-white' : 'left-1 bg-white dark:bg-gray-200'}`} />
+              </button>
+            </div>
           </div>
 
-          <div className={`flex items-center justify-between p-4 bg-card rounded-lg border-2 transition-colors ${notifChannelDiscord ? 'border-blue-400 dark:border-blue-500' : 'border-rose-300 dark:border-rose-500/60'}`}>
-            <div className="flex items-center gap-3">
+          <div className={`flex flex-col gap-3 p-4 bg-card rounded-lg border-2 transition-colors sm:flex-row sm:items-center sm:justify-between ${notifChannelDiscord ? 'border-blue-400 dark:border-blue-500' : 'border-rose-300 dark:border-rose-500/60'}`}>
+            <div className="flex items-center gap-3 min-w-0">
               <MessageSquare className="w-5 h-5 text-muted-foreground" />
-              <div>
+              <div className="min-w-0">
                 <p className="font-medium">Discord notifications</p>
                 <p className="text-sm text-muted-foreground">Receive DMs via Discord bot</p>
               </div>
             </div>
-            <button
-              onClick={() => { const next = !notifChannelDiscord; setNotifChannelDiscord(next); saveNotifPrefsNow({ channelDiscord: next }) }}
-              className={`relative w-12 h-6 rounded-full transition-colors ${notifChannelDiscord ? 'bg-blue-500' : 'bg-rose-300 dark:bg-rose-500/60'}`}
-            >
-              <span className={`absolute top-1 w-4 h-4 rounded-full transition-all shadow-[0_1px_3px_rgba(0,0,0,0.3)] ${notifChannelDiscord ? 'left-7 bg-white' : 'left-1 bg-white dark:bg-gray-200'}`} />
-            </button>
+            <div className="flex items-center gap-2 self-start sm:self-auto">
+              <span className={`text-xs font-medium ${notifChannelDiscord ? 'text-blue-600 dark:text-blue-400' : 'text-rose-500 dark:text-rose-400'}`}>
+                {notifChannelDiscord ? 'On' : 'Off'}
+              </span>
+              <button
+                onClick={() => { const next = !notifChannelDiscord; setNotifChannelDiscord(next); saveNotifPrefsNow({ channelDiscord: next }) }}
+                aria-label="Toggle discord notifications"
+                aria-pressed={notifChannelDiscord}
+                className={`relative w-12 h-6 rounded-full transition-colors ${notifChannelDiscord ? 'bg-blue-500' : 'bg-rose-300 dark:bg-rose-500/60'}`}
+              >
+                <span className={`absolute top-1 w-4 h-4 rounded-full transition-all shadow-[0_1px_3px_rgba(0,0,0,0.3)] ${notifChannelDiscord ? 'left-7 bg-white' : 'left-1 bg-white dark:bg-gray-200'}`} />
+              </button>
+            </div>
           </div>
         </div>
 
@@ -3035,7 +3049,7 @@ export default function SettingsPage() {
                   <span>The Luma API requires a <strong>Luma Plus</strong> (paid) subscription. The API settings page will not appear for free accounts.</span>
                 </p>
               </div>
-              <div className="flex gap-2">
+              <div className="flex flex-col gap-2 sm:flex-row">
                 <input
                   type="password"
                   value={lumaApiKey}
@@ -3059,7 +3073,7 @@ export default function SettingsPage() {
                       setLumaConnecting(false)
                     }
                   }}
-                  className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-gradient-to-r from-orange-500 to-pink-500 hover:from-orange-600 hover:to-pink-600 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="flex w-full sm:w-auto items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-gradient-to-r from-orange-500 to-pink-500 hover:from-orange-600 hover:to-pink-600 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {lumaConnecting ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
@@ -3207,7 +3221,7 @@ export default function SettingsPage() {
                     : 'border-border bg-muted/30 hover:bg-muted/50 hover:border-border'
                 }`}
               >
-                <div className="flex items-start justify-between">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
                   <div className="flex items-start gap-3">
                     <div className={`mt-0.5 w-5 h-5 rounded-full border-2 flex items-center justify-center flex-shrink-0 ${
                       !isAvailable ? 'border-muted-foreground/20' : isSelected ? 'border-primary' : 'border-muted-foreground/40'
@@ -3217,7 +3231,7 @@ export default function SettingsPage() {
                       )}
                     </div>
                     <div>
-                      <div className="flex items-center gap-2">
+                      <div className="flex flex-wrap items-center gap-2">
                         <span className="font-medium">{model.label}</span>
                         <span className="text-xs text-muted-foreground bg-muted px-2 py-0.5 rounded-full">
                           {model.provider}
@@ -3244,7 +3258,7 @@ export default function SettingsPage() {
                       </p>
                     </div>
                   </div>
-                  <span className="text-sm font-mono text-muted-foreground whitespace-nowrap ml-4">
+                  <span className="text-sm font-mono text-muted-foreground whitespace-nowrap self-start sm:self-auto sm:ml-4">
                     {model.costPerPrompt}/prompt
                   </span>
                 </div>
@@ -3592,7 +3606,7 @@ export default function SettingsPage() {
 
           {/* Warning when email notifications are disabled */}
           {!notifChannelEmail && (
-            <div className="mb-4 flex items-center justify-between p-3 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-lg">
+            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between p-3 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-lg">
               <div className="flex items-center gap-2">
                 <AlertCircle className="w-4 h-4 flex-shrink-0 text-amber-600 dark:text-amber-400" />
                 <p className="text-xs text-amber-700 dark:text-amber-400">
@@ -3618,18 +3632,22 @@ export default function SettingsPage() {
           ) : verifiedEmails.length > 0 ? (
             <div className="space-y-2 mb-4">
               {verifiedEmails.map(ve => (
-                <div key={ve.id} className="flex items-center justify-between p-3 border border-border rounded-lg bg-muted/30">
-                  <div className="flex items-center gap-2">
-                    <Mail className="w-4 h-4 text-muted-foreground" />
-                    <span className="text-sm font-medium">{ve.email}</span>
-                    {ve.is_primary && (
-                      <span className="px-1.5 py-0.5 bg-green-100 dark:bg-green-950/40 text-green-700 dark:text-green-400 text-[10px] font-medium rounded">Primary</span>
-                    )}
-                    <span className="px-1.5 py-0.5 bg-blue-100 dark:bg-blue-950/40 text-blue-700 dark:text-blue-400 text-[10px] font-medium rounded">
-                      {ve.verification_method === 'google_oauth' ? 'Google' : 'Code'}
-                    </span>
+                <div key={ve.id} className="flex flex-col gap-3 p-3 border border-border rounded-lg bg-muted/30 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="flex min-w-0 items-start gap-2">
+                    <Mail className="w-4 h-4 text-muted-foreground mt-0.5" />
+                    <div className="min-w-0">
+                      <p className="text-sm font-medium break-all">{ve.email}</p>
+                      <div className="mt-1 flex flex-wrap items-center gap-1.5">
+                        {ve.is_primary && (
+                          <span className="px-1.5 py-0.5 bg-green-100 dark:bg-green-950/40 text-green-700 dark:text-green-400 text-[10px] font-medium rounded">Primary</span>
+                        )}
+                        <span className="px-1.5 py-0.5 bg-blue-100 dark:bg-blue-950/40 text-blue-700 dark:text-blue-400 text-[10px] font-medium rounded">
+                          {ve.verification_method === 'google_oauth' ? 'Google' : 'Code'}
+                        </span>
+                      </div>
+                    </div>
                   </div>
-                  <div className="flex items-center gap-1.5">
+                  <div className="flex items-center justify-start gap-3 sm:justify-end sm:gap-1.5">
                     {!ve.is_primary && (
                       <button
                         onClick={() => handleSetPrimaryEmail(ve.id)}
@@ -3660,10 +3678,10 @@ export default function SettingsPage() {
           {/* Verify Google email (one-click) */}
           {!isCardano && user?.email && !verifiedEmails.some(ve => ve.email === user.email?.toLowerCase()) && (
             <div className="mb-4 p-3 border border-border rounded-lg bg-card">
-              <div className="flex items-center justify-between">
-                <div className="flex items-center gap-2">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                <div className="flex items-center gap-2 min-w-0">
                   <ShieldCheck className="w-4 h-4 text-green-500" />
-                  <span className="text-sm">Verify your Google email: <strong>{user.email}</strong></span>
+                  <span className="text-sm break-all">Verify your Google email: <strong>{user.email}</strong></span>
                 </div>
                 <button
                   onClick={handleVerifyGoogleEmail}
@@ -3679,7 +3697,7 @@ export default function SettingsPage() {
           <div className="p-3 border border-border rounded-lg bg-card">
             <h5 className="text-xs font-semibold mb-2">Add another email address</h5>
             {verifyStep === 'idle' || verifyStep === 'sending' ? (
-              <div className="flex gap-2">
+              <div className="flex flex-col gap-2 sm:flex-row">
                 <input
                   type="email"
                   value={verifyEmailInput}
@@ -3691,7 +3709,7 @@ export default function SettingsPage() {
                 <button
                   onClick={handleSendVerificationCode}
                   disabled={!verifyEmailInput.trim() || verifyStep === 'sending'}
-                  className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition-colors disabled:opacity-50"
+                  className="flex items-center justify-center gap-1.5 px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition-colors disabled:opacity-50"
                 >
                   {verifyStep === 'sending' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Mail className="w-3.5 h-3.5" />}
                   Send Code
@@ -3702,20 +3720,20 @@ export default function SettingsPage() {
                 <p className="text-xs text-muted-foreground">
                   A 6-digit code was sent to <strong>{verifyPendingEmail}</strong>. Enter it below.
                 </p>
-                <div className="flex gap-2">
+                <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
                   <input
                     type="text"
                     value={verifyCodeInput}
                     onChange={e => setVerifyCodeInput(e.target.value.replace(/\D/g, '').slice(0, 6))}
                     placeholder="123456"
                     maxLength={6}
-                    className="w-32 px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground text-center tracking-widest font-mono focus:ring-2 focus:ring-ring outline-none"
+                    className="w-full sm:w-32 px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground text-center tracking-widest font-mono focus:ring-2 focus:ring-ring outline-none"
                     disabled={verifyStep === 'verifying'}
                   />
                   <button
                     onClick={handleVerifyCode}
                     disabled={verifyCodeInput.length !== 6 || verifyStep === 'verifying'}
-                    className="flex items-center gap-1.5 px-3 py-2 bg-green-600 hover:bg-green-700 text-white text-xs font-medium rounded-lg transition-colors disabled:opacity-50"
+                    className="flex items-center justify-center gap-1.5 px-3 py-2 bg-green-600 hover:bg-green-700 text-white text-xs font-medium rounded-lg transition-colors disabled:opacity-50"
                   >
                     {verifyStep === 'verifying' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckIcon className="w-3.5 h-3.5" />}
                     Verify
@@ -3784,7 +3802,7 @@ export default function SettingsPage() {
           /* ── Linked wallet display ── */
           <div className="space-y-4">
             <div className="p-4 bg-green-50 dark:bg-green-950 border border-green-200 dark:border-green-800 rounded-lg">
-              <div className="flex items-center justify-between gap-3">
+              <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex items-center gap-3 min-w-0">
                   <Wallet className="h-5 w-5 text-green-600 dark:text-green-400 flex-shrink-0" />
                   <div className="min-w-0">
@@ -3802,7 +3820,7 @@ export default function SettingsPage() {
                     )}
                   </div>
                 </div>
-                <div className="flex items-center gap-2 flex-shrink-0">
+                <div className="flex items-center gap-2 self-start sm:self-auto flex-shrink-0">
                   <button
                     onClick={copyWalletAddress}
                     className="p-2 rounded-lg hover:bg-green-100 dark:hover:bg-green-900 transition-colors"
@@ -4276,8 +4294,8 @@ export default function SettingsPage() {
             ? 'border-rose-300 dark:border-rose-700 bg-rose-50/30 dark:bg-rose-950/20'
             : 'border-blue-400 dark:border-blue-500 bg-blue-50/30 dark:bg-blue-950/20'
         }`}>
-          <div className="flex items-center justify-between">
-            <div className="flex items-center gap-3">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-start gap-3">
               <div className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors duration-300 ${
                 privacyPrivateEnabled ? 'bg-rose-400 text-white' : 'bg-blue-500 text-white'
               }`}>
@@ -4324,7 +4342,7 @@ export default function SettingsPage() {
                     pEmail: false, pPrefs: false, pConn: false,
                   })
                 }}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-rose-500 text-white hover:bg-rose-600 transition-colors flex-shrink-0"
+                className="flex w-full sm:w-auto items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-rose-500 text-white hover:bg-rose-600 transition-colors flex-shrink-0"
               >
                 <ShieldBan className="w-3.5 h-3.5" />
                 Reset to Hidden
@@ -4361,12 +4379,12 @@ export default function SettingsPage() {
         <style>{`@keyframes fadeSlideIn { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }`}</style>
 
         {/* ── Feature Matrix ── */}
-        <div className="overflow-x-auto rounded-lg border border-border mb-4">
-          <table className="w-full text-sm">
+        <div className="overflow-x-hidden rounded-lg border border-border mb-4">
+          <table className="w-full table-fixed text-xs sm:text-sm">
             <thead>
               <tr className="bg-muted/50">
                 <th
-                  className={`text-left p-3 font-medium border-b cursor-pointer transition-colors hover:bg-blue-50/50 dark:hover:bg-blue-950/30 ${
+                  className={`text-left p-2 sm:p-3 font-medium border-b cursor-pointer transition-colors hover:bg-blue-50/50 dark:hover:bg-blue-950/30 ${
                     visibilityGuideKey === 'feature'
                       ? 'border-blue-400 dark:border-blue-500 bg-blue-100/60 dark:bg-blue-950/30'
                       : 'border-border'
@@ -4374,7 +4392,7 @@ export default function SettingsPage() {
                   onClick={() => setVisibilityGuideKey(visibilityGuideKey === 'feature' ? 'default' : 'feature')}
                 >Profile Data Feature</th>
                 <th
-                  className={`text-center p-3 font-medium border-b border-l cursor-pointer transition-colors hover:bg-blue-50/50 dark:hover:bg-blue-950/30 ${
+                  className={`text-center p-2 sm:p-3 font-medium border-b border-l cursor-pointer transition-colors hover:bg-blue-50/50 dark:hover:bg-blue-950/30 ${
                     visibilityGuideKey === 'followers'
                       ? 'border-blue-400 dark:border-blue-500 bg-blue-100/60 dark:bg-blue-950/30'
                       : 'border-border'
@@ -4383,11 +4401,12 @@ export default function SettingsPage() {
                 >
                   <div className="flex items-center justify-center gap-1.5">
                     <Calendar className="w-3.5 h-3.5" />
-                    <span>Followed Calendars</span>
+                    <span className="hidden sm:inline">Followed Calendars</span>
+                    <span className="sm:hidden">Calendars</span>
                   </div>
                 </th>
                 <th
-                  className={`text-center p-3 font-medium border-b border-l cursor-pointer transition-colors hover:bg-blue-50/50 dark:hover:bg-blue-950/30 ${
+                  className={`text-center p-2 sm:p-3 font-medium border-b border-l cursor-pointer transition-colors hover:bg-blue-50/50 dark:hover:bg-blue-950/30 ${
                     visibilityGuideKey === 'contacts'
                       ? 'border-blue-400 dark:border-blue-500 bg-blue-100/60 dark:bg-blue-950/30'
                       : 'border-border'
@@ -4424,11 +4443,11 @@ export default function SettingsPage() {
                 return (
                   <tr key={row.label} className={`${i < 2 ? 'border-b border-border' : ''} ${rowHue} transition-colors duration-300`}>
                     <td
-                      className={`p-3 font-medium transition-colors duration-300 cursor-pointer hover:underline ${rowLabelColor}`}
+                      className={`p-2 sm:p-3 font-medium leading-tight transition-colors duration-300 cursor-pointer hover:underline break-words ${rowLabelColor}`}
                       onClick={() => setVisibilityGuideKey(visibilityGuideKey === row.guideKey ? 'default' : row.guideKey)}
                     >{row.label}</td>
                     <td
-                      className={`p-3 text-center border-l cursor-pointer transition-all duration-200 group/cell ${
+                      className={`p-2 sm:p-3 text-center border-l cursor-pointer transition-all duration-200 group/cell ${
                         fActive
                           ? 'border-blue-400 dark:border-blue-500 bg-blue-100/50 dark:bg-blue-900/30'
                           : visibilityGuideKey === 'followers'
@@ -4449,9 +4468,9 @@ export default function SettingsPage() {
                     >
                       <div className="flex items-center justify-center">
                         {fActive
-                          ? <CheckCircle2 className="w-5 h-5 text-green-500" />
+                          ? <CheckCircle2 className="w-4 h-4 sm:w-5 sm:h-5 text-green-500" />
                           : <>
-                              <X className="w-5 h-5 text-rose-400 group-hover/cell:hidden" />
+                              <X className="w-4 h-4 sm:w-5 sm:h-5 text-rose-400 group-hover/cell:hidden" />
                               <span className="hidden group-hover/cell:inline-flex items-center gap-0.5 text-xs font-medium text-amber-600 dark:text-amber-400">
                                 <X className="w-3.5 h-3.5 text-rose-400" />
                                 <span>&rarr;</span>
@@ -4463,14 +4482,14 @@ export default function SettingsPage() {
                     </td>
                     {row.disableContacts ? (
                       <td
-                        className="p-3 text-center border-l border-border bg-muted/30"
+                        className="p-2 sm:p-3 text-center border-l border-border bg-muted/30"
                         title="Already connected -- no request needed"
                       >
                         <span className="text-xs text-muted-foreground">N/A</span>
                       </td>
                     ) : (
                       <td
-                        className={`p-3 text-center border-l cursor-pointer transition-all duration-200 group/cell2 ${
+                        className={`p-2 sm:p-3 text-center border-l cursor-pointer transition-all duration-200 group/cell2 ${
                           cActive
                             ? 'border-blue-400 dark:border-blue-500 bg-blue-100/50 dark:bg-blue-900/30'
                             : visibilityGuideKey === 'contacts'
@@ -4489,9 +4508,9 @@ export default function SettingsPage() {
                       >
                         <div className="flex items-center justify-center">
                           {cActive
-                            ? <CheckCircle2 className="w-5 h-5 text-green-500" />
+                            ? <CheckCircle2 className="w-4 h-4 sm:w-5 sm:h-5 text-green-500" />
                             : <>
-                                <X className="w-5 h-5 text-rose-400 group-hover/cell2:hidden" />
+                                <X className="w-4 h-4 sm:w-5 sm:h-5 text-rose-400 group-hover/cell2:hidden" />
                                 <span className="hidden group-hover/cell2:inline-flex items-center gap-0.5 text-xs font-medium text-amber-600 dark:text-amber-400">
                                   <X className="w-3.5 h-3.5 text-rose-400" />
                                   <span>&rarr;</span>
@@ -4562,7 +4581,7 @@ export default function SettingsPage() {
                 <p className="text-xs text-green-600 dark:text-green-400">
                   This code is shown only once. Copy it and share it with the people you want to connect with.
                 </p>
-                <div className="flex items-center gap-2 bg-card rounded-lg p-2 border border-border">
+                <div className="flex flex-col sm:flex-row sm:items-center gap-2 bg-card rounded-lg p-2 border border-border">
                   <code className="flex-1 text-xs font-mono break-all select-all">{`${window.location.origin}/join/invite/${settingsInviteCode}`}</code>
                   <button
                     onClick={async () => {
@@ -4570,7 +4589,7 @@ export default function SettingsPage() {
                       setSettingsInviteCopied(true)
                       setTimeout(() => setSettingsInviteCopied(false), 2000)
                     }}
-                    className="p-1.5 rounded hover:bg-muted transition-colors shrink-0"
+                    className="p-1.5 rounded hover:bg-muted transition-colors self-end sm:self-auto shrink-0"
                   >
                     {settingsInviteCopied ? <CheckIcon className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
                   </button>
@@ -4789,9 +4808,39 @@ export default function SettingsPage() {
           </div>
         </div>
         
-        <div className="flex gap-6">
+        <div className="flex flex-col gap-4 lg:flex-row lg:gap-6">
+          {/* Mobile Categories */}
+          <nav className="lg:hidden">
+            <div className="bg-card text-card-foreground rounded-xl shadow-sm border border-border p-2">
+              <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
+                {tabs.map(tab => {
+                  const Icon = tab.icon
+                  const isPrivate = tab.id === 'calendar' || tab.id === 'privacy'
+                  return (
+                    <button
+                      key={tab.id}
+                      onClick={() => handleTabChange(tab.id)}
+                      className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm text-center min-w-0 transition-colors ${
+                        activeTab === tab.id
+                          ? isPrivate
+                            ? 'bg-rose-50 dark:bg-rose-950/40 text-rose-600 dark:text-rose-300 border border-rose-200 dark:border-rose-800'
+                            : 'bg-primary/10 text-primary'
+                          : isPrivate
+                            ? 'text-rose-500 dark:text-rose-400 hover:bg-rose-50/50 dark:hover:bg-rose-950/30 border border-transparent'
+                            : 'text-muted-foreground hover:bg-muted'
+                      }`}
+                    >
+                      <Icon className="h-4 w-4" />
+                      <span className="font-medium truncate">{tab.label}</span>
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          </nav>
+
           {/* Left Sidebar — Categories */}
-          <nav className="w-52 flex-shrink-0">
+          <nav className="hidden w-52 flex-shrink-0 lg:block">
             <div className="sticky top-8 bg-card text-card-foreground rounded-xl shadow-sm border border-border p-2">
               {tabs.map(tab => {
                 const Icon = tab.icon
@@ -4820,7 +4869,7 @@ export default function SettingsPage() {
           
           {/* Content */}
           <div className="flex-1 min-w-0" ref={contentRef}>
-            <div className="bg-card text-card-foreground rounded-xl shadow-sm border border-border p-6">
+            <div className="bg-card text-card-foreground rounded-xl shadow-sm border border-border p-4 sm:p-6">
               {activeTab === 'profile' && renderProfileTab()}
               {activeTab === 'notifications' && renderNotificationsTab()}
               {activeTab === 'calendar' && renderCalendarTab()}

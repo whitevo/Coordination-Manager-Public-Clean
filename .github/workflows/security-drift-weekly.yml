@@ -1,0 +1,60 @@
+name: Security Drift Weekly
+
+on:
+  schedule:
+    - cron: '17 4 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-drift-weekly-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  medium-drift-report:
+    name: Weekly medium drift report
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: Code
+    env:
+      LAST_SECURITY_HARDENING_DATE: '2026-07-03'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320
+        with:
+          version: 10.28.0
+
+      - name: Setup Node
+        uses: actions/setup-node@a0853c24544627f65ddf259abe73b1d18a591444
+        with:
+          node-version: 24
+          cache: pnpm
+          cache-dependency-path: |
+            Code/pnpm-lock.yaml
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Medium dependency audit (non-blocking)
+        run: pnpm audit --audit-level=moderate --json > audit-moderate.json || true
+
+      - name: Package drift snapshot (non-blocking)
+        run: pnpm outdated -r --format json > outdated.json || true
+
+      - name: Build weekly report summary
+        run: node ../scripts/weekly-security-drift-summary.mjs
+
+      - name: Upload weekly security artifacts
+        uses: actions/upload-artifact@65462800fd760344b1a7b4382951275a0abb4808
+        with:
+          name: security-drift-weekly
+          path: |
+            Code/audit-moderate.json
+            Code/outdated.json

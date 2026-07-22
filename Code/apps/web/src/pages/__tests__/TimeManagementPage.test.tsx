@@ -3,11 +3,12 @@ import type { ReactNode } from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
-import TimeManagementPage, {
+import TimeManagementPage from '../TimeManagementPage'
+import {
   buildDiffuseTimeBackgroundFill,
   inferRequestedTimezoneForAiResponse,
   isExplicitPrimaryTimezoneChangeRequest,
-} from '../TimeManagementPage'
+} from '../time-management-page-helpers'
 
 const mockDedupedGet = vi.fn()
 const mockUseAuth = vi.fn()
@@ -151,6 +152,13 @@ function installDefaultApiMocks(): void {
   })
 }
 
+function setWindowInnerWidth(width: number): void {
+  Object.defineProperty(window, 'innerWidth', {
+    configurable: true,
+    value: width,
+  })
+}
+
 describe('TimeManagementPage', () => {
   beforeEach(() => {
     vi.clearAllMocks()
@@ -166,6 +174,7 @@ describe('TimeManagementPage', () => {
       isTraveler: false,
     })
     mockApiPost.mockResolvedValue({ data: { inserted: 0, updated: 0, deleted: 0, syncedSources: 0 } })
+    mockApiPut.mockResolvedValue({ data: {} })
     installDefaultApiMocks()
   })
 
@@ -187,6 +196,52 @@ describe('TimeManagementPage', () => {
     })
   })
 
+  it('restores a saved wider left panel width after the viewport expands again', async () => {
+    setWindowInnerWidth(1400)
+    localStorage.setItem(
+      'time-management-v1',
+      JSON.stringify({
+        syncCalendars: [],
+        slotMinutes: 30,
+        timeBackgrounds: [],
+        collapsedBackgroundIds: [],
+        quickTemplates: [],
+        showQuickTemplatesInMain: false,
+        quickTemplatesMainExpanded: true,
+        isLeftPanelOpen: true,
+        leftPanelWidthPx: 500,
+        expandedSections: [],
+      })
+    )
+
+    render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    const panelHeading = await screen.findByRole('heading', { name: 'Time Management Tools' })
+    const aside = panelHeading.closest('aside') as HTMLElement
+
+    await waitFor(() => {
+      expect(aside.style.width).toBe('500px')
+    })
+
+    setWindowInnerWidth(900)
+    fireEvent(window, new Event('resize'))
+
+    await waitFor(() => {
+      expect(aside.style.width).toBe('450px')
+    })
+
+    setWindowInnerWidth(1400)
+    fireEvent(window, new Event('resize'))
+
+    await waitFor(() => {
+      expect(aside.style.width).toBe('500px')
+    })
+  })
+
   it('shows empty-state messaging when no meetings are returned', async () => {
     render(
       <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
@@ -195,6 +250,76 @@ describe('TimeManagementPage', () => {
     )
 
     expect(await screen.findByText('No meetings found on the selected calendars.')).toBeInTheDocument()
+  })
+
+  it('renders duplicated calendar headers on desktop and only the primary header on tablet', async () => {
+    setWindowInnerWidth(1280)
+
+    const { unmount } = render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    await screen.findByRole('heading', { name: 'Time Management' })
+    expect(screen.getByTestId('calendar-header-top')).toBeInTheDocument()
+    expect(screen.getByTestId('calendar-header-bottom')).toBeInTheDocument()
+
+    unmount()
+
+    setWindowInnerWidth(900)
+
+    render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    await screen.findByRole('heading', { name: 'Time Management' })
+    expect(screen.getByTestId('calendar-header-top')).toBeInTheDocument()
+    expect(screen.queryByTestId('calendar-header-bottom')).not.toBeInTheDocument()
+  })
+
+  it('centers the current-time indicator near the middle of the calendar viewport on load', async () => {
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get() {
+        const element = this as HTMLElement
+        if (element.dataset?.testid === 'calendar-scroll-container') {
+          return 600
+        }
+        return 0
+      },
+    })
+
+    Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
+      configurable: true,
+      get() {
+        const element = this as HTMLElement
+        if (element.parentElement?.dataset?.testid === 'calendar-scroll-container') {
+          return 1300
+        }
+        return 0
+      },
+    })
+
+    render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    const container = await screen.findByTestId('calendar-scroll-container')
+    const indicators = await screen.findAllByTestId('current-time-indicator')
+    const indicator = indicators[Math.floor(indicators.length / 2)]
+    const indicatorTop = Number.parseFloat(indicator.style.top || '0')
+    const expectedTop = 1300 + indicatorTop - 300
+
+    await waitFor(() => {
+      expect(indicatorTop).toBeGreaterThanOrEqual(0)
+      expect(container.scrollTop).toBeCloseTo(expectedTop, 3)
+    })
+
   })
 
   it('syncs enabled connected calendars for the visible week and refreshes events', async () => {
@@ -274,6 +399,360 @@ describe('TimeManagementPage', () => {
     })
 
     expect(mockDedupedGet.mock.calls.filter((call) => call[0] === '/api/user-events').length).toBeGreaterThanOrEqual(2)
+  })
+
+  it('keeps calendar scroll position stable when toggling connected OAuth/public calendars', async () => {
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get() {
+        const element = this as HTMLElement
+        if (element.dataset?.testid === 'calendar-scroll-container') {
+          return 620
+        }
+        return 0
+      },
+    })
+
+    Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
+      configurable: true,
+      get() {
+        const element = this as HTMLElement
+        if (element.parentElement?.dataset?.testid === 'calendar-scroll-container') {
+          return 1320
+        }
+        return 0
+      },
+    })
+
+    mockDedupedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/calendar-sources') {
+        return {
+          data: {
+            sources: [
+              {
+                id: 'google-oauth-1',
+                source_type: 'google_oauth',
+                google_email: 'oauth@example.com',
+                public_url: null,
+                display_name: 'Google OAuth Source',
+                color: '#34d399',
+                is_active: true,
+              },
+              {
+                id: 'google-public-1',
+                source_type: 'google_public_url',
+                google_email: null,
+                public_url: 'https://calendar.google.com/public/basic.ics',
+                display_name: 'Google Public Source',
+                color: '#22d3ee',
+                is_active: true,
+              },
+            ],
+          },
+        }
+      }
+      if (url === '/api/time-management/modes') {
+        return {
+          data: {
+            activeModeId: 'mode-main',
+            modes: [
+              {
+                id: 'mode-main',
+                name: 'Main',
+                main_color: '#2563eb',
+                slot_minutes: 30,
+                sync_calendars: [],
+                time_backgrounds: [],
+                collapsed_background_ids: [],
+                quick_templates: [],
+                show_quick_templates_in_main: false,
+              },
+            ],
+          },
+        }
+      }
+      if (url === '/api/time-management/categories') {
+        return { data: { categories: [] } }
+      }
+      if (url === '/api/user-events') {
+        return { data: { events: [] } }
+      }
+      return { data: {} }
+    })
+
+    render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    await screen.findByRole('heading', { name: 'Time Management' })
+    const calendarContainer = await screen.findByTestId('calendar-scroll-container')
+
+    const sourcesToggle = screen.getByTitle('Expand calendar sources')
+    fireEvent.click(sourcesToggle)
+    await screen.findByTitle('Collapse calendar sources')
+
+    await waitFor(() => {
+      expect(calendarContainer.scrollTop).toBeGreaterThan(0)
+    })
+
+    calendarContainer.scrollTop = 777
+    const initialSyncCalls = mockApiPost.mock.calls.filter((call) => call[0] === '/api/user-events/sync-imports').length
+
+    const oauthLabel = await screen.findByText('Google OAuth Source')
+    const oauthCheckbox = oauthLabel.closest('label')?.querySelector<HTMLInputElement>('input[type="checkbox"]')
+    if (!oauthCheckbox) {
+      throw new Error('Expected OAuth source checkbox to be present')
+    }
+
+    fireEvent.click(oauthCheckbox)
+
+    await waitFor(() => {
+      const nextCalls = mockApiPost.mock.calls.filter((call) => call[0] === '/api/user-events/sync-imports').length
+      expect(nextCalls).toBeGreaterThan(initialSyncCalls)
+    })
+
+    expect(calendarContainer.scrollTop).toBe(777)
+
+    const publicLabel = await screen.findByText('Google Public Source')
+    const publicCheckbox = publicLabel.closest('label')?.querySelector<HTMLInputElement>('input[type="checkbox"]')
+    if (!publicCheckbox) {
+      throw new Error('Expected public source checkbox to be present')
+    }
+
+    fireEvent.click(publicCheckbox)
+    await waitFor(() => {
+      expect(calendarContainer.scrollTop).toBe(777)
+    })
+  })
+
+  it('renders cross-midnight events as segments across adjacent day columns', async () => {
+    const weekStart = new Date()
+    weekStart.setHours(0, 0, 0, 0)
+    weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7))
+
+    const start = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + 1, 23, 30, 0)).toISOString()
+    const end = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + 2, 0, 30, 0)).toISOString()
+
+    mockDedupedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/calendar-sources') {
+        return { data: { sources: [] } }
+      }
+      if (url === '/api/time-management/modes') {
+        return {
+          data: {
+            activeModeId: 'mode-main',
+            modes: [
+              {
+                id: 'mode-main',
+                name: 'Main',
+                main_color: '#2563eb',
+                slot_minutes: 30,
+                sync_calendars: [],
+                time_backgrounds: [],
+                collapsed_background_ids: [],
+                quick_templates: [],
+                show_quick_templates_in_main: false,
+              },
+            ],
+          },
+        }
+      }
+      if (url === '/api/time-management/categories') {
+        return { data: { categories: [] } }
+      }
+      if (url === '/api/user-events') {
+        return {
+          data: {
+            events: [
+              {
+                id: 'night-shift-1',
+                title: 'Night Shift',
+                description: null,
+                meeting_link: null,
+                location: null,
+                start_time: start,
+                end_time: end,
+                source_type: 'manual',
+                source_id: 'coord-main',
+                category_ids: [],
+                recurrence_rule: { type: 'none' },
+              },
+            ],
+          },
+        }
+      }
+      return { data: {} }
+    })
+
+    mockComputeDayLayout.mockImplementation((dayEvents: Array<{ id: string }>) => ({
+      eventSegments: dayEvents.map((event, eventIndex) => ({
+        eventId: event.id,
+        eventIndex,
+        top: 80,
+        height: 36,
+        leftPercent: 0,
+        widthPercent: 100,
+        isFirstSegment: true,
+      })),
+      overflowSegments: [],
+    }))
+
+    render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    await screen.findByRole('heading', { name: 'Time Management' })
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Night Shift').length).toBeGreaterThanOrEqual(2)
+    })
+
+    expect(document.querySelectorAll('.time-item-resize-handle-top').length).toBe(3)
+    expect(document.querySelectorAll('.time-item-resize-handle-bottom').length).toBe(3)
+
+    fireEvent.click(screen.getAllByText('Night Shift')[1])
+
+    await waitFor(() => {
+      expect(document.querySelectorAll('.ring-2.ring-blue-400').length).toBeGreaterThan(1)
+    })
+  })
+
+  it('preserves full duration when dragging a split cross-midnight segment', async () => {
+    const weekStart = new Date()
+    weekStart.setHours(0, 0, 0, 0)
+    weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7))
+
+    const eventStart = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + 1, 23, 30, 0)).toISOString()
+    const eventEnd = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + 2, 1, 0, 0)).toISOString()
+
+    mockDedupedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/calendar-sources') {
+        return { data: { sources: [] } }
+      }
+      if (url === '/api/time-management/modes') {
+        return {
+          data: {
+            activeModeId: 'mode-main',
+            modes: [
+              {
+                id: 'mode-main',
+                name: 'Main',
+                main_color: '#2563eb',
+                slot_minutes: 30,
+                sync_calendars: [],
+                time_backgrounds: [],
+                collapsed_background_ids: [],
+                quick_templates: [],
+                show_quick_templates_in_main: false,
+              },
+            ],
+          },
+        }
+      }
+      if (url === '/api/time-management/categories') {
+        return { data: { categories: [] } }
+      }
+      if (url === '/api/user-events') {
+        return {
+          data: {
+            events: [
+              {
+                id: 'event-split-drag',
+                title: 'Split Drag',
+                description: null,
+                meeting_link: null,
+                location: null,
+                start_time: eventStart,
+                end_time: eventEnd,
+                source_type: 'manual',
+                source_id: 'coord-main',
+                category_ids: [],
+                recurrence_rule: { type: 'none' },
+              },
+            ],
+          },
+        }
+      }
+      return { data: {} }
+    })
+
+    mockComputeDayLayout.mockImplementation((dayEvents: Array<{ id: string }>) => ({
+      eventSegments: dayEvents.map((event, eventIndex) => ({
+        eventId: event.id,
+        eventIndex,
+        top: 80,
+        height: 52,
+        leftPercent: 0,
+        widthPercent: 100,
+        isFirstSegment: true,
+      })),
+      overflowSegments: [],
+    }))
+
+    mockApiPut.mockResolvedValue({ data: {} })
+
+    render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    await screen.findByRole('heading', { name: 'Time Management' })
+
+    await screen.findAllByTitle(/00:00-01:00/)
+    const dayColumns = Array.from(document.querySelectorAll<HTMLDivElement>('div[style*="background-image"]'))
+    const dropDayColumn = dayColumns[0]
+    if (!dropDayColumn) {
+      throw new Error('Expected at least one day column')
+    }
+
+    Object.defineProperty(dropDayColumn, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({
+        x: 0,
+        y: 0,
+        top: 0,
+        left: 0,
+        right: 100,
+        bottom: 600,
+        width: 100,
+        height: 600,
+        toJSON: () => ({}),
+      }),
+    })
+
+    const dataStore = new Map<string, string>([['text/time-item', 'event-split-drag']])
+    const dataTransfer = {
+      setData: (type: string, value: string) => {
+        dataStore.set(type, value)
+      },
+      getData: (type: string) => dataStore.get(type) || '',
+      setDragImage: () => {},
+      effectAllowed: 'move',
+      dropEffect: 'move',
+    }
+
+    fireEvent.drop(dropDayColumn, { clientX: 24, clientY: 300, dataTransfer })
+
+    await waitFor(() => {
+      expect(mockApiPut).toHaveBeenCalledWith('/api/user-events/event-split-drag', expect.objectContaining({
+        start_time: expect.any(String),
+        end_time: expect.any(String),
+      }))
+    })
+
+    const moveCall = mockApiPut.mock.calls.find((call) => call[0] === '/api/user-events/event-split-drag')
+    if (!moveCall) {
+      throw new Error('Expected move API call for split drag item')
+    }
+    const payload = moveCall[1] as { start_time: string; end_time: string }
+    const movedDurationMinutes = Math.round((Date.parse(payload.end_time) - Date.parse(payload.start_time)) / 60_000)
+
+    expect(movedDurationMinutes).toBe(90)
   })
 
   it('keeps neighboring week data cached when navigating back and forth', async () => {
@@ -607,6 +1086,251 @@ describe('TimeManagementPage', () => {
         start_time: eventStart,
         end_time: new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 1, 30, 0)).toISOString(),
       })
+    })
+  })
+
+  it('allows resizing a start edge beyond 00:00 UTC and saves to previous day on release', async () => {
+    const weekStart = new Date()
+    weekStart.setHours(0, 0, 0, 0)
+    weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7))
+
+    const eventStart = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 0, 30, 0)).toISOString()
+    const eventEnd = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 0, 45, 0)).toISOString()
+    const expectedResizedStart = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() - 1, 23, 30, 0)).toISOString()
+
+    mockDedupedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/calendar-sources') {
+        return { data: { sources: [] } }
+      }
+      if (url === '/api/time-management/modes') {
+        return {
+          data: {
+            activeModeId: 'mode-main',
+            modes: [
+              {
+                id: 'mode-main',
+                name: 'Main',
+                main_color: '#2563eb',
+                slot_minutes: 15,
+                sync_calendars: [],
+                time_backgrounds: [],
+                collapsed_background_ids: [],
+                quick_templates: [],
+                show_quick_templates_in_main: false,
+              },
+            ],
+          },
+        }
+      }
+      if (url === '/api/time-management/categories') {
+        return { data: { categories: [] } }
+      }
+      if (url === '/api/user-events') {
+        return {
+          data: {
+            events: [
+              {
+                id: 'event-midnight-edge',
+                title: 'Edge drag item',
+                description: null,
+                meeting_link: null,
+                location: null,
+                start_time: eventStart,
+                end_time: eventEnd,
+                source_type: 'manual',
+                source_id: 'coord-main',
+                category_ids: [],
+                recurrence_rule: { type: 'none' },
+              },
+            ],
+          },
+        }
+      }
+      return { data: {} }
+    })
+
+    mockComputeDayLayout.mockReturnValue({
+      eventSegments: [
+        {
+          eventId: 'event-midnight-edge',
+          eventIndex: 0,
+          top: 100,
+          height: 26,
+          leftPercent: 0,
+          widthPercent: 100,
+          isFirstSegment: true,
+        },
+      ],
+      overflowSegments: [],
+    })
+
+    mockApiPut.mockResolvedValue({ data: {} })
+
+    render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    await screen.findByRole('heading', { name: 'Time Management' })
+    await screen.findAllByText('Edge drag item')
+
+    const dayColumns = Array.from(document.querySelectorAll<HTMLDivElement>('div[style*="background-image"]'))
+    expect(dayColumns.length).toBeGreaterThanOrEqual(7)
+
+    const dayColumn = dayColumns[0]
+    if (!dayColumn) {
+      throw new Error('Expected at least one day column')
+    }
+
+    Object.defineProperty(dayColumn, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({
+        x: 0,
+        y: 0,
+        top: 0,
+        left: 0,
+        right: 100,
+        bottom: 2496,
+        width: 100,
+        height: 2496,
+        toJSON: () => ({}),
+      }),
+    })
+
+    fireEvent.mouseDown(dayColumn, { button: 0, clientX: 20, clientY: 100 })
+    fireEvent.mouseMove(window, { clientX: 20, clientY: -52 })
+    fireEvent.mouseUp(window)
+
+    await waitFor(() => {
+      expect(mockApiPut).toHaveBeenCalledWith('/api/user-events/event-midnight-edge', {
+        start_time: expectedResizedStart,
+        end_time: eventEnd,
+      })
+    })
+  })
+
+  it('allows new selection to extend beyond 00:00 UTC and saves as a cross-day item', async () => {
+    const weekStart = new Date()
+    weekStart.setHours(0, 0, 0, 0)
+    weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7))
+
+    const expectedStart = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 23, 30, 0)).toISOString()
+    const expectedEnd = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + 1, 1, 0, 0)).toISOString()
+
+    mockDedupedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/calendar-sources') {
+        return { data: { sources: [] } }
+      }
+      if (url === '/api/time-management/modes') {
+        return {
+          data: {
+            activeModeId: 'mode-main',
+            modes: [
+              {
+                id: 'mode-main',
+                name: 'Main',
+                main_color: '#2563eb',
+                slot_minutes: 30,
+                sync_calendars: [],
+                time_backgrounds: [],
+                collapsed_background_ids: [],
+                quick_templates: [],
+                show_quick_templates_in_main: false,
+              },
+            ],
+          },
+        }
+      }
+      if (url === '/api/time-management/categories') {
+        return { data: { categories: [] } }
+      }
+      if (url === '/api/user-events') {
+        return { data: { events: [] } }
+      }
+      return { data: {} }
+    })
+
+    mockApiPost.mockImplementation(async (url: string, payload?: unknown) => {
+      if (url === '/api/user-events') {
+        const posted = payload as {
+          title: string
+          description?: string | null
+          start_time: string
+          end_time: string
+          category_ids?: string[]
+          source_id?: string
+          recurrence_rule?: { type: string }
+        }
+        return {
+          data: {
+            event: {
+              id: 'created-cross-day',
+              title: posted.title,
+              description: posted.description ?? null,
+              meeting_link: null,
+              location: null,
+              start_time: posted.start_time,
+              end_time: posted.end_time,
+              source_type: 'manual',
+              source_id: posted.source_id ?? 'coord-main',
+              category_ids: posted.category_ids ?? [],
+              recurrence_rule: posted.recurrence_rule ?? { type: 'none' },
+            },
+          },
+        }
+      }
+
+      if (url === '/api/user-events/sync-imports') {
+        return { data: { inserted: 0, updated: 0, deleted: 0, syncedSources: 0 } }
+      }
+
+      return { data: {} }
+    })
+
+    render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    await screen.findByRole('heading', { name: 'Time Management' })
+
+    const dayColumns = Array.from(document.querySelectorAll<HTMLDivElement>('div[style*="background-image"]'))
+    expect(dayColumns.length).toBeGreaterThanOrEqual(7)
+
+    const dayColumn = dayColumns[0]
+    if (!dayColumn) {
+      throw new Error('Expected at least one day column')
+    }
+
+    Object.defineProperty(dayColumn, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({
+        x: 0,
+        y: 0,
+        top: 0,
+        left: 0,
+        right: 100,
+        bottom: 600,
+        width: 100,
+        height: 600,
+        toJSON: () => ({}),
+      }),
+    })
+
+    fireEvent.mouseDown(dayColumn, { button: 0, clientX: 20, clientY: 590 })
+    fireEvent.mouseMove(dayColumn, { clientX: 20, clientY: 620 })
+    fireEvent.mouseUp(window)
+
+    fireEvent.keyDown(window, { key: 'N' })
+    fireEvent.keyDown(window, { key: 'Enter' })
+
+    await waitFor(() => {
+      expect(mockApiPost).toHaveBeenCalledWith('/api/user-events', expect.objectContaining({
+        start_time: expectedStart,
+        end_time: expectedEnd,
+      }))
     })
   })
 
@@ -1072,6 +1796,166 @@ describe('TimeManagementPage', () => {
         expect.objectContaining({ id: 'google-1', enabled: true }),
       ])
     )
+  })
+
+  it('refreshes categories when switching modes', async () => {
+    let activeModeId = 'mode-main'
+
+    mockDedupedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/calendar-sources') {
+        return { data: { sources: [] } }
+      }
+      if (url === '/api/time-management/modes') {
+        return {
+          data: {
+            activeModeId,
+            modes: [
+              {
+                id: 'mode-main',
+                name: 'Main',
+                main_color: '#2563eb',
+                slot_minutes: 30,
+                sync_calendars: [],
+                time_backgrounds: [],
+                collapsed_background_ids: [],
+                quick_templates: [],
+                show_quick_templates_in_main: false,
+              },
+              {
+                id: 'mode-focus',
+                name: 'Focus',
+                main_color: '#0891b2',
+                slot_minutes: 15,
+                sync_calendars: [],
+                time_backgrounds: [],
+                collapsed_background_ids: [],
+                quick_templates: [],
+                show_quick_templates_in_main: false,
+              },
+            ],
+          },
+        }
+      }
+      if (url === '/api/time-management/categories') {
+        return {
+          data: {
+            categories: activeModeId === 'mode-main'
+              ? [{ id: 'cat-main', label: 'Main category', color: '#2563eb', font_color: '#ffffff', sort_order: 0 }]
+              : [{ id: 'cat-focus', label: 'Focus category', color: '#0891b2', font_color: '#ffffff', sort_order: 0 }],
+          },
+        }
+      }
+      if (url === '/api/user-events') {
+        return { data: { events: [] } }
+      }
+      return { data: {} }
+    })
+
+    mockApiPost.mockImplementation(async (url: string) => {
+      if (url === '/api/time-management/modes/mode-focus/activate') {
+        activeModeId = 'mode-focus'
+        return { data: { activeModeId } }
+      }
+      return { data: { inserted: 0, updated: 0, deleted: 0, syncedSources: 0 } }
+    })
+
+    render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    await screen.findByRole('heading', { name: 'Time Management' })
+
+    fireEvent.click(screen.getByTitle('Expand categories'))
+    expect(await screen.findByText('Main category')).toBeInTheDocument()
+
+    const categoryFetchCountBeforeSwitch = mockDedupedGet.mock.calls.filter(
+      (call) => call[0] === '/api/time-management/categories'
+    ).length
+
+    fireEvent.click(screen.getByTitle('Expand calendar modes'))
+    fireEvent.click(screen.getByRole('button', { name: 'Focus' }))
+
+    await waitFor(() => {
+      expect(mockApiPost).toHaveBeenCalledWith('/api/time-management/modes/mode-focus/activate')
+    })
+
+    await waitFor(() => {
+      const categoryFetchCountAfterSwitch = mockDedupedGet.mock.calls.filter(
+        (call) => call[0] === '/api/time-management/categories'
+      ).length
+      expect(categoryFetchCountAfterSwitch).toBeGreaterThan(categoryFetchCountBeforeSwitch)
+    })
+
+    expect(await screen.findByText('Focus category')).toBeInTheDocument()
+    expect(screen.queryByText('Main category')).not.toBeInTheDocument()
+  })
+
+  it('uses in-app delete confirmation for category deletion', async () => {
+    const browserConfirmSpy = vi.spyOn(window, 'confirm')
+    mockApiDelete.mockResolvedValue({ data: { message: 'Category deleted' } })
+
+    mockDedupedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/calendar-sources') {
+        return { data: { sources: [] } }
+      }
+      if (url === '/api/time-management/modes') {
+        return {
+          data: {
+            activeModeId: 'mode-main',
+            modes: [
+              {
+                id: 'mode-main',
+                name: 'Main',
+                main_color: '#2563eb',
+                slot_minutes: 30,
+                sync_calendars: [],
+                time_backgrounds: [],
+                collapsed_background_ids: [],
+                quick_templates: [],
+                show_quick_templates_in_main: false,
+              },
+            ],
+          },
+        }
+      }
+      if (url === '/api/time-management/categories') {
+        return {
+          data: {
+            categories: [{ id: 'cat-work', label: 'Work', color: '#2563eb', font_color: '#ffffff', sort_order: 0 }],
+          },
+        }
+      }
+      if (url === '/api/user-events') {
+        return { data: { events: [] } }
+      }
+      return { data: {} }
+    })
+
+    render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    await screen.findByRole('heading', { name: 'Time Management' })
+    fireEvent.click(screen.getByTitle('Expand categories'))
+    expect(await screen.findByText('Work')).toBeInTheDocument()
+
+    fireEvent.click(screen.getByRole('button', { name: 'Delete Work' }))
+
+    expect(await screen.findByText('Delete category?')).toBeInTheDocument()
+    expect(screen.getByText('Delete category "Work"? It will be removed from any items that use it.')).toBeInTheDocument()
+    expect(browserConfirmSpy).not.toHaveBeenCalled()
+
+    fireEvent.click(screen.getByRole('button', { name: /^Delete$/ }))
+
+    await waitFor(() => {
+      expect(mockApiDelete).toHaveBeenCalledWith('/api/time-management/categories/cat-work')
+    })
+
+    browserConfirmSpy.mockRestore()
   })
 
   it('uses the active mode slot width when persisted local width differs', async () => {

@@ -28,6 +28,18 @@ export interface SetupStatus {
       ok: boolean
       detail: string
     }
+    discordCoordBot?: {
+      ok: boolean
+      detail: string
+    }
+    discordGuardianBot?: {
+      ok: boolean
+      detail: string
+    }
+    docs?: {
+      ok: boolean
+      detail: string
+    }
   }
   /** Per-feature configured flags. False means the matching env keys are missing. */
   features?: Partial<Record<FeatureFlag, boolean>>

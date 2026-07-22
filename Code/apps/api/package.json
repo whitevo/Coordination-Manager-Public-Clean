@@ -30,17 +30,18 @@
     "nodemailer": "^9.0.1"
   },
   "devDependencies": {
+    "@eslint/js": "^9.0.0",
     "@types/cors": "^2.8.17",
     "@types/express": "^4.17.21",
     "@types/morgan": "^1.9.9",
     "@types/node": "^20.11.5",
     "@types/nodemailer": "^7.0.11",
-    "@eslint/js": "^9.0.0",
+    "@types/supertest": "^7.2.1",
     "eslint": "^9.0.0",
-    "typescript-eslint": "^8.0.0",
     "supertest": "^7.1.3",
     "tsx": "^4.7.0",
     "typescript": "^5.3.3",
+    "typescript-eslint": "^8.0.0",
     "vitest": "^4.1.0"
   }
 }

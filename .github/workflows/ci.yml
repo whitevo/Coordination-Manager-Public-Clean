@@ -49,5 +49,5 @@ jobs:
       - name: Test
         run: pnpm test
 
-      - name: Audit high and critical
-        run: pnpm audit --audit-level=high
+      - name: Audit high and critical (OSV)
+        run: pwsh -NoProfile -File ../scripts/security-check.ps1 -SkipMonorepoTests -SkipGitleaks

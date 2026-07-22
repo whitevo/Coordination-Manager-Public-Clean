@@ -6,8 +6,11 @@ param(
     [int]$StartupDelaySeconds = 8,
     [int]$MaxWaitSeconds = 45,
     [int]$PollIntervalSeconds = 3,
+    [int]$ObservationSeconds = 6,
     [int]$LogTailLines = 120,
-    [string]$StateFile = (Join-Path $(if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }) ".cm-dev-state.json")
+    [string]$StateFile = (Join-Path $(if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }) ".cm-dev-state.json"),
+    [ValidateSet("full", "localhost")]
+    [string]$Mode = "full"
 )
 
 $ErrorActionPreference = "Stop"
@@ -17,14 +20,21 @@ $defaultLogDir = Join-Path $rootDir ".cm-dev-logs"
 $consoleErrorPatterns = @(
     '(?i)\\bunhandled rejection\\b',
     '(?i)\\buncaught exception\\b',
+    '(?i)\\bexception\\b',
     '(?i)\\bfatal\\b',
-    '(?i)\\berror\\b'
+    '(?i)\\bvalidationerror\\b',
+    '(?i)\\bfail(?:ed|ure)?\\b',
+    '(?i)\\berror\\b',
+    '(?i)\\bwarn(?:ing)?\\b'
 )
 
 $consoleIgnorePatterns = @(
     '(?i)\\b0\\s+errors?\\b',
     '(?i)\\bno\\s+errors?\\b',
-    '(?i)\\bwithout\\s+errors?\\b'
+    '(?i)\\bwithout\\s+errors?\\b',
+    '(?i)\\b0\\s+warnings?\\b',
+    '(?i)\\bno\\s+warnings?\\b',
+    '(?i)\\bwithout\\s+warnings?\\b'
 )
 
 function Get-ServiceLogMap {
@@ -172,6 +182,7 @@ function Test-GuardianProcess {
 Start-Sleep -Seconds $StartupDelaySeconds
 
 $deadline = (Get-Date).AddSeconds($MaxWaitSeconds)
+$stableSince = $null
 $serviceLogMap = Get-ServiceLogMap -StateFilePath $StateFile -FallbackLogDir $defaultLogDir
 $serviceChecks = @(
     [pscustomobject]@{ id = "web"; service = "Web"; endpoint = "http://localhost:5173"; tester = { Test-Http -Url "http://localhost:5173" } },
@@ -181,16 +192,19 @@ $serviceChecks = @(
     [pscustomobject]@{ id = "docs"; service = "Docs"; endpoint = "http://localhost:5174"; tester = { Test-Http -Url "http://localhost:5174" } }
 )
 
+if ($Mode -eq "localhost") {
+    $serviceChecks = @(
+        [pscustomobject]@{ id = "web"; service = "Web"; endpoint = "http://localhost:5173"; tester = { Test-Http -Url "http://localhost:5173" } },
+        [pscustomobject]@{ id = "api"; service = "API"; endpoint = "http://localhost:3001/health"; tester = { Test-Http -Url "http://localhost:3001/health" } }
+    )
+}
+
 $latestResults = @{}
 
 while ((Get-Date) -lt $deadline) {
     $allPassNow = $true
 
     foreach ($serviceCheck in $serviceChecks) {
-        if ($latestResults.ContainsKey($serviceCheck.service) -and $latestResults[$serviceCheck.service].ok) {
-            continue
-        }
-
         $transportResult = & $serviceCheck.tester
         $logPath = $serviceLogMap[$serviceCheck.id]
         $consoleResult = Test-ServiceConsoleLog -ServiceName $serviceCheck.service -LogPath $logPath -TailLines $LogTailLines -Patterns $consoleErrorPatterns -IgnorePatterns $consoleIgnorePatterns
@@ -211,7 +225,16 @@ while ((Get-Date) -lt $deadline) {
     }
 
     if ($allPassNow) {
-        break
+        if (-not $stableSince) {
+            $stableSince = Get-Date
+        }
+
+        $stableDuration = ((Get-Date) - $stableSince).TotalSeconds
+        if ($stableDuration -ge $ObservationSeconds) {
+            break
+        }
+    } else {
+        $stableSince = $null
     }
 
     Start-Sleep -Seconds $PollIntervalSeconds

@@ -996,6 +996,26 @@
   50%       { opacity: 1;    transform: scaleX(1.08); }
 }
 
+@keyframes field-dirty-pulse {
+  0%, 100% {
+    box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.12);
+  }
+  50% {
+    box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.28);
+  }
+}
+
+@keyframes unsaved-pop-in {
+  0% {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
 .time-item-resize-handle {
   border-radius: 9999px;
   background: rgba(255, 255, 255, 0.35);

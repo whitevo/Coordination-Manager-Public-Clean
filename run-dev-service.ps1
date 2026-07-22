@@ -20,6 +20,31 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+function Resolve-ExecutablePath {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string[]]$CandidateNames,
+
+        [string[]]$CandidatePaths = @()
+    )
+
+    foreach ($name in $CandidateNames) {
+        $cmd = Get-Command $name -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source) {
+            return [string]$cmd.Source
+        }
+    }
+
+    foreach ($path in $CandidatePaths) {
+        if ($path -and (Test-Path $path)) {
+            return [string]$path
+        }
+    }
+
+    return $null
+}
+
 $markerDir = Join-Path $PSScriptRoot ".cm-stop-markers"
 $markerPath = Join-Path $markerDir "$ServiceName.requested"
 if (-not $LogPath) {
@@ -56,7 +81,51 @@ $transcriptStarted = $false
 try {
     Start-Transcript -Path $LogPath -Force | Out-Null
     $transcriptStarted = $true
-    Invoke-Expression $ServiceCommand
+
+    # Some spawned shells miss user-level PATH entries (where pnpm usually lives).
+    $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    if ($userPath -or $machinePath) {
+        $env:Path = @($userPath, $machinePath) -join ';'
+    }
+
+    $resolvedServiceCommand = $ServiceCommand.Trim()
+    if ($resolvedServiceCommand.Length -ge 2 -and $resolvedServiceCommand.StartsWith('"') -and $resolvedServiceCommand.EndsWith('"')) {
+        $resolvedServiceCommand = $resolvedServiceCommand.Substring(1, $resolvedServiceCommand.Length - 2)
+    }
+
+    if ($resolvedServiceCommand -match '^\s*pnpm(\s|$)') {
+        $pnpmPath = Resolve-ExecutablePath -CandidateNames @('pnpm', 'pnpm.cmd') -CandidatePaths @(
+            (Join-Path $env:APPDATA 'npm\pnpm.cmd'),
+            (Join-Path $env:ProgramFiles 'nodejs\pnpm.cmd')
+        )
+
+        if ($pnpmPath) {
+            $safePnpmPath = $pnpmPath.Replace('"', '""')
+            $resolvedServiceCommand = $resolvedServiceCommand -replace '^\s*pnpm\b', "`"$safePnpmPath`""
+        } else {
+            $corepackPath = Resolve-ExecutablePath -CandidateNames @('corepack', 'corepack.cmd') -CandidatePaths @(
+                (Join-Path $env:ProgramFiles 'nodejs\corepack.cmd')
+            )
+
+            if ($corepackPath) {
+                $safeCorepackPath = $corepackPath.Replace('"', '""')
+                $resolvedServiceCommand = $resolvedServiceCommand -replace '^\s*pnpm\b', "`"$safeCorepackPath`" pnpm"
+            }
+        }
+    }
+
+    # Execute via cmd /c which properly handles command parsing with colons
+    # Use pnpm.cmd directly if it exists (cmd.exe can execute .cmd files but not .ps1)
+    $cmdCommand = $resolvedServiceCommand
+    
+    # If resolved path ends in .ps1, replace with .cmd equivalent for cmd.exe compatibility
+    if ($cmdCommand -match '\.ps1"') {
+        $cmdCommand = $cmdCommand -replace '\.ps1"', '.cmd"'
+    }
+    
+    Write-Host "Executing: $cmdCommand"
+    cmd.exe /C $cmdCommand
 } finally {
     if ($transcriptStarted) {
         Stop-Transcript | Out-Null

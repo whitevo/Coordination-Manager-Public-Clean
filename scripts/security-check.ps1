@@ -19,6 +19,9 @@ $gitleaksCheckpointPath = if ([System.IO.Path]::IsPathRooted($GitleaksCheckpoint
 else {
   Join-Path $root $GitleaksCheckpointFile
 }
+$osvQueryBatchUrl = 'https://api.osv.dev/v1/querybatch'
+$osvVulnUrlBase = 'https://api.osv.dev/v1/vulns/'
+$osvBatchSize = 200
 
 $failed = @()
 
@@ -44,6 +47,214 @@ function Require-Command {
   if (-not (Get-Command $CommandName -ErrorAction SilentlyContinue)) {
     throw "Missing required command: $CommandName"
   }
+}
+
+function Get-NodeJsonPackageInventory {
+  $packagesJsonPath = Join-Path ([System.IO.Path]::GetTempPath()) ("cm-pnpm-list-" + [guid]::NewGuid().ToString() + '.json')
+  $extractScriptPath = Join-Path ([System.IO.Path]::GetTempPath()) ("cm-pnpm-list-extract-" + [guid]::NewGuid().ToString() + '.cjs')
+  $utf8NoBom = [System.Text.UTF8Encoding]::new($false)
+
+  try {
+    $pnpmListOutput = (& pnpm --reporter silent list -r --depth Infinity --json) | Out-String
+    if ($LASTEXITCODE -ne 0) {
+      throw "pnpm list failed with exit code $LASTEXITCODE"
+    }
+
+    [System.IO.File]::WriteAllText($packagesJsonPath, $pnpmListOutput.Trim(), $utf8NoBom)
+
+    $extractScriptContent = @'
+const fs = require('fs')
+
+const inputPath = process.argv[2]
+const input = JSON.parse(fs.readFileSync(inputPath, 'utf8'))
+const packages = []
+const seen = new Set()
+
+function registerPackage(name, version) {
+  if (typeof name !== 'string' || typeof version !== 'string') return
+  const key = `${name}@${version}`
+  if (seen.has(key)) return
+  seen.add(key)
+  packages.push({ name, version })
+}
+
+function visitDependencyMap(map) {
+  if (!map || typeof map !== 'object') return
+
+  for (const [dependencyName, dependencyNode] of Object.entries(map)) {
+    if (dependencyNode && typeof dependencyNode === 'object' && typeof dependencyNode.version === 'string') {
+      registerPackage(dependencyName, dependencyNode.version)
+    }
+    visit(dependencyNode)
+  }
+}
+
+function visit(node) {
+  if (!node) return
+
+  if (Array.isArray(node)) {
+    for (const entry of node) visit(entry)
+    return
+  }
+
+  if (typeof node !== 'object') return
+
+  if (typeof node.name === 'string' && typeof node.version === 'string') {
+    registerPackage(node.name, node.version)
+  }
+
+  for (const key of ['dependencies', 'devDependencies', 'optionalDependencies', 'peerDependencies', 'unsavedDependencies']) {
+    if (node[key] && typeof node[key] === 'object') {
+      visitDependencyMap(node[key])
+    }
+  }
+}
+
+visit(input)
+process.stdout.write(JSON.stringify(packages))
+'@
+
+    [System.IO.File]::WriteAllText($extractScriptPath, $extractScriptContent, $utf8NoBom)
+
+    $inventoryJson = & node $extractScriptPath $packagesJsonPath
+    if ($LASTEXITCODE -ne 0) {
+      throw "node inventory extraction failed with exit code $LASTEXITCODE"
+    }
+
+    return $inventoryJson | ConvertFrom-Json
+  }
+  finally {
+    if (Test-Path $packagesJsonPath) {
+      Remove-Item $packagesJsonPath -Force -ErrorAction SilentlyContinue
+    }
+    if (Test-Path $extractScriptPath) {
+      Remove-Item $extractScriptPath -Force -ErrorAction SilentlyContinue
+    }
+  }
+}
+
+function Get-OsvSeverity {
+  param([Parameter(Mandatory = $true)] $Vulnerability)
+
+  $databaseSeverity = $Vulnerability.database_specific.severity
+  if ($databaseSeverity) {
+    return $databaseSeverity.ToString().ToUpperInvariant()
+  }
+
+  $severityEntries = @()
+  if ($null -ne $Vulnerability.severity) {
+    $severityEntries = @($Vulnerability.severity)
+  }
+
+  foreach ($entry in $severityEntries) {
+    $score = $entry.score
+    if (-not $score) {
+      continue
+    }
+
+    if ($score -match '^(?<numeric>\d+(?:\.\d+)?)$') {
+      $numericScore = [double]$Matches.numeric
+      if ($numericScore -ge 9.0) { return 'CRITICAL' }
+      if ($numericScore -ge 7.0) { return 'HIGH' }
+      if ($numericScore -ge 4.0) { return 'MEDIUM' }
+      return 'LOW'
+    }
+  }
+
+  return 'UNKNOWN'
+}
+
+function Invoke-OsvHighCriticalAudit {
+  $inventory = Get-NodeJsonPackageInventory
+  if (-not $inventory -or $inventory.Count -eq 0) {
+    throw 'No package inventory could be collected from pnpm list'
+  }
+
+  Write-Host "Collected $($inventory.Count) unique packages from pnpm workspace"
+
+  $findings = New-Object System.Collections.Generic.List[object]
+  for ($offset = 0; $offset -lt $inventory.Count; $offset += $osvBatchSize) {
+    $upperBound = [Math]::Min($offset + $osvBatchSize - 1, $inventory.Count - 1)
+    $chunk = @($inventory[$offset..$upperBound])
+    $queries = @()
+
+    foreach ($pkg in $chunk) {
+      if (-not $pkg.name -or -not $pkg.version) {
+        continue
+      }
+
+      $queries += @{
+        package = @{
+          ecosystem = 'npm'
+          name = [string]$pkg.name
+        }
+        version = [string]$pkg.version
+      }
+    }
+
+    if ($queries.Count -eq 0) {
+      continue
+    }
+
+    $body = @{ queries = $queries } | ConvertTo-Json -Depth 8 -Compress
+    $response = Invoke-RestMethod -Method Post -Uri $osvQueryBatchUrl -ContentType 'application/json' -Body $body
+
+    for ($index = 0; $index -lt $queries.Count; $index++) {
+      $result = $response.results[$index]
+      if (-not $result -or -not $result.vulns) {
+        continue
+      }
+
+      foreach ($vuln in $result.vulns) {
+        $findings.Add([pscustomobject]@{
+          packageName = $queries[$index].package.name
+          packageVersion = $queries[$index].version
+          vulnId = $vuln.id
+        })
+      }
+    }
+  }
+
+  if ($findings.Count -eq 0) {
+    Write-Host 'OSV audit returned no matched advisories.'
+    return
+  }
+
+  $detailCache = @{}
+  $highOrCritical = New-Object System.Collections.Generic.List[object]
+  foreach ($finding in $findings) {
+    if (-not $detailCache.ContainsKey($finding.vulnId)) {
+      $detailCache[$finding.vulnId] = Invoke-RestMethod -Method Get -Uri ($osvVulnUrlBase + $finding.vulnId)
+    }
+
+    $detail = $detailCache[$finding.vulnId]
+    $severity = Get-OsvSeverity -Vulnerability $detail
+    if ($severity -ne 'HIGH' -and $severity -ne 'CRITICAL') {
+      continue
+    }
+
+    $highOrCritical.Add([pscustomobject]@{
+      packageName = $finding.packageName
+      packageVersion = $finding.packageVersion
+      vulnerabilityId = $finding.vulnId
+      severity = $severity
+      summary = $detail.summary
+    })
+  }
+
+  if ($highOrCritical.Count -eq 0) {
+    Write-Host 'OSV audit found no high or critical advisories.'
+    return
+  }
+
+  Write-Host 'OSV audit found high or critical advisories:' -ForegroundColor Yellow
+  $highOrCritical |
+    Sort-Object severity, packageName, vulnerabilityId -Unique |
+    ForEach-Object {
+      Write-Host ("- [{0}] {1}@{2} -> {3} ({4})" -f $_.severity, $_.packageName, $_.packageVersion, $_.vulnerabilityId, $_.summary)
+    }
+
+  throw "OSV audit found $($highOrCritical.Count) high/critical advisory matches"
 }
 
 function Get-GitCommitHash {
@@ -183,9 +394,10 @@ function Get-GitleaksScanPlan {
 Write-Host 'Coordination Manager security process check' -ForegroundColor Yellow
 Write-Host "Repo root: $root"
 
-Run-Step -Name 'Verify required commands (git, pnpm)' -Action {
+Run-Step -Name 'Verify required commands (git, pnpm, node)' -Action {
   Require-Command -CommandName 'git'
   Require-Command -CommandName 'pnpm'
+  Require-Command -CommandName 'node'
 }
 
 Run-Step -Name 'Verify governance files (SECURITY, LICENSE, CONTRIBUTING)' -Action {
@@ -208,10 +420,7 @@ if (-not $SkipAudit) {
   Run-Step -Name 'Run dependency audit (high+critical)' -Action {
     Push-Location $codeDir
     try {
-      & pnpm audit --audit-level=high
-      if ($LASTEXITCODE -ne 0) {
-        throw "pnpm audit failed with exit code $LASTEXITCODE"
-      }
+      Invoke-OsvHighCriticalAudit
     }
     finally {
       Pop-Location

@@ -98,6 +98,9 @@ async function flushPage() {
 }
 
 describe('CoordinateEventsPage network filters', () => {
+  const mainEventTitle = 'Secret Swarm planning session'
+  const teamEventTitle = 'Team sync event'
+
   beforeEach(() => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-06-10T12:00:00Z'))
@@ -180,8 +183,8 @@ describe('CoordinateEventsPage network filters', () => {
 
     await flushPage()
 
-    expect(screen.queryByTitle('Secret Swarm')).not.toBeInTheDocument()
-    expect(screen.getByTitle('Team Calendar')).toBeInTheDocument()
+    expect(screen.queryByTitle(mainEventTitle)).not.toBeInTheDocument()
+    expect(screen.getByTitle(teamEventTitle)).toBeInTheDocument()
     expect(screen.getByTitle('Volatire Swarm as data controller')).toHaveTextContent('Secret Swarm')
 
     expect(screen.getByText('Calendar mode')).toBeInTheDocument()
@@ -192,35 +195,35 @@ describe('CoordinateEventsPage network filters', () => {
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Secret Swarm filter Hide' }))
     })
-    expect(screen.getByTitle('Secret Swarm')).toBeInTheDocument()
+    expect(screen.getByTitle(mainEventTitle)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Secret Swarm filter All' })).toBeInTheDocument()
 
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Team Calendar filter All' }))
     })
-    expect(screen.getByTitle('Secret Swarm')).toBeInTheDocument()
+    expect(screen.getByTitle(mainEventTitle)).toBeInTheDocument()
     expect(screen.getByTitle('Team sync event')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Team Calendar filter Pin' })).toBeInTheDocument()
 
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Team Calendar filter Pin' }))
     })
-    expect(screen.queryByTitle('Secret Swarm')).not.toBeInTheDocument()
+    expect(screen.queryByTitle(mainEventTitle)).not.toBeInTheDocument()
     expect(screen.getByTitle('Team sync event')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Team Calendar filter Only' })).toBeInTheDocument()
 
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Team Calendar filter Only' }))
     })
-    expect(screen.getByTitle('Secret Swarm')).toBeInTheDocument()
-    expect(screen.queryByTitle('Team Calendar')).not.toBeInTheDocument()
+    expect(screen.getByTitle(mainEventTitle)).toBeInTheDocument()
+    expect(screen.queryByTitle(teamEventTitle)).not.toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Team Calendar filter Hide' })).toBeInTheDocument()
 
     await act(async () => {
       fireEvent.click(screen.getByRole('button', { name: 'Team Calendar filter Hide' }))
     })
-    expect(screen.getByTitle('Secret Swarm')).toBeInTheDocument()
-    expect(screen.getByTitle('Team Calendar')).toBeInTheDocument()
+    expect(screen.getByTitle(mainEventTitle)).toBeInTheDocument()
+    expect(screen.getByTitle(teamEventTitle)).toBeInTheDocument()
     expect(screen.getByRole('button', { name: 'Team Calendar filter All' })).toBeInTheDocument()
   })
 

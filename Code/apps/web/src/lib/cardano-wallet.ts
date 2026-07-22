@@ -16,12 +16,33 @@ import type { Session } from '@supabase/supabase-js'
 
 // ── Known wallets ─────────────────────────────────────────────────────
 
-const KNOWN_WALLETS: { id: CardanoWalletId; name: string }[] = [
-  { id: 'eternl', name: 'Eternl' },
-  { id: 'lace', name: 'Lace' },
-  { id: 'typhonwallet', name: 'Typhon' },
-  { id: 'yoroi', name: 'Yoroi' },
+interface KnownWallet {
+  id: CardanoWalletId
+  name: string
+  keys: string[]
+}
+
+const KNOWN_WALLETS: KnownWallet[] = [
+  { id: 'eternl', name: 'Eternl', keys: ['eternl'] },
+  { id: 'lace', name: 'Lace', keys: ['lace'] },
+  // Typhon versions may expose either `typhonwallet` or `typhoncip30`.
+  { id: 'typhonwallet', name: 'Typhon', keys: ['typhonwallet', 'typhoncip30'] },
+  { id: 'yoroi', name: 'Yoroi', keys: ['yoroi'] },
 ]
+
+function resolveWalletEntry(walletId: CardanoWalletId) {
+  const descriptor = KNOWN_WALLETS.find((wallet) => wallet.id === walletId)
+  if (!descriptor || !window.cardano) return null
+
+  for (const key of descriptor.keys) {
+    const entry = window.cardano[key]
+    if (entry) {
+      return entry
+    }
+  }
+
+  return null
+}
 
 // ── Wallet detection ──────────────────────────────────────────────────
 
@@ -35,9 +56,13 @@ export function detectWallets(): WalletInfo[] {
   }
 
   return KNOWN_WALLETS.map((w) => {
-    const entry = window.cardano?.[w.id]
+    const entry = w.keys
+      .map((key) => window.cardano?.[key])
+      .find((candidate) => !!candidate)
+
     return {
-      ...w,
+      id: w.id,
+      name: w.name,
       installed: !!entry,
       icon: entry?.icon,
     }
@@ -64,7 +89,7 @@ export async function connectWallet(walletId: CardanoWalletId): Promise<CardanoW
     throw new Error('No Cardano wallet detected. Please install a wallet extension.')
   }
 
-  const walletEntry = window.cardano[walletId]
+  const walletEntry = resolveWalletEntry(walletId)
   if (!walletEntry) {
     throw new Error(`${walletId} wallet is not installed. Please install it and try again.`)
   }

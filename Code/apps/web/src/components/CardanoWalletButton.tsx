@@ -19,14 +19,30 @@ export default function CardanoWalletButton({ onSuccess, onError, getCaptchaToke
   const [isConnecting, setIsConnecting] = useState(false)
   const [connectingWallet, setConnectingWallet] = useState<string | null>(null)
 
-  // Detect available wallets on mount
-  useEffect(() => {
-    // Small delay to let wallet extensions inject into window.cardano
-    const timer = setTimeout(() => {
-      setWallets(detectWallets())
-    }, 500)
-    return () => clearTimeout(timer)
+  const refreshWallets = useCallback(() => {
+    setWallets(detectWallets())
   }, [])
+
+  // Detect available wallets on mount and after extension context changes.
+  useEffect(() => {
+    const delays = [350, 1000, 2200]
+    const timers = delays.map((delay) => setTimeout(refreshWallets, delay))
+
+    const handleVisibility = () => {
+      if (document.visibilityState === 'visible') {
+        refreshWallets()
+      }
+    }
+
+    window.addEventListener('focus', refreshWallets)
+    document.addEventListener('visibilitychange', handleVisibility)
+
+    return () => {
+      timers.forEach((timer) => clearTimeout(timer))
+      window.removeEventListener('focus', refreshWallets)
+      document.removeEventListener('visibilitychange', handleVisibility)
+    }
+  }, [refreshWallets])
 
   const installedWallets = wallets.filter((w) => w.installed)
   const hasWallets = installedWallets.length > 0
@@ -62,7 +78,7 @@ export default function CardanoWalletButton({ onSuccess, onError, getCaptchaToke
           href="https://lace.io"
           target="_blank"
           rel="noopener noreferrer"
-          className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900 transition-colors"
+          className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-blue-50/70 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-xl hover:bg-blue-100/80 dark:hover:bg-blue-900/60 transition-colors"
         >
           <Wallet className="w-5 h-5 text-blue-600 dark:text-blue-400" />
           <span className="font-medium text-blue-800 dark:text-blue-200">
@@ -95,7 +111,7 @@ export default function CardanoWalletButton({ onSuccess, onError, getCaptchaToke
         <button
           onClick={() => handleWalletConnect(wallet.id)}
           disabled={isConnecting}
-          className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-blue-50/70 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-xl hover:bg-blue-100/80 dark:hover:bg-blue-900/60 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {wallet.icon ? (
             <img src={wallet.icon} alt={wallet.name} className="w-5 h-5 rounded" />
@@ -123,7 +139,7 @@ export default function CardanoWalletButton({ onSuccess, onError, getCaptchaToke
       <button
         onClick={() => setIsOpen(!isOpen)}
         disabled={isConnecting}
-        className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-blue-50/70 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-xl hover:bg-blue-100/80 dark:hover:bg-blue-900/60 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
       >
         <Wallet className="w-5 h-5 text-blue-600 dark:text-blue-400" />
         <span className="font-medium text-blue-800 dark:text-blue-200">
@@ -143,7 +159,7 @@ export default function CardanoWalletButton({ onSuccess, onError, getCaptchaToke
 
       {/* Dropdown list of wallets */}
       {isOpen && (
-        <div className="absolute top-full left-0 right-0 mt-1 bg-card border border-border rounded-lg shadow-lg z-50 overflow-hidden">
+        <div className="absolute top-full left-0 right-0 mt-1 bg-card border border-border rounded-xl shadow-lg z-50 overflow-hidden">
           {installedWallets.map((wallet) => (
             <button
               key={wallet.id}

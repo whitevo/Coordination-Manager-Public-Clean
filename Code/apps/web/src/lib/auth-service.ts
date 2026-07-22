@@ -40,11 +40,30 @@ function isEmbeddedAuthBrowser(): boolean {
     return false
   }
 
-  const userAgent = navigator.userAgent || ''
-  const isElectronShell = userAgent.includes('Electron')
   const isFramed = window.self !== window.top
 
-  return isElectronShell || isFramed
+  return isFramed
+}
+
+function clearOAuthReturnState(): void {
+  try {
+    sessionStorage.removeItem('authReturnTo')
+  } catch {
+    // ignore storage errors
+  }
+}
+
+export async function clearStaleAuthState(): Promise<void> {
+  clearOAuthReturnState()
+
+  try {
+    const { error } = await supabase.auth.signOut({ scope: 'local' })
+    if (error) {
+      console.error('Failed to clear stale auth state:', error)
+    }
+  } catch (error) {
+    console.error('Failed to clear stale auth state:', error)
+  }
 }
 
 export interface AuthUser {
@@ -86,6 +105,7 @@ export async function signInWithGoogle(): Promise<void> {
 
   if (error) {
     console.error('Google sign-in error:', error)
+    await clearStaleAuthState()
     throw error
   }
 }

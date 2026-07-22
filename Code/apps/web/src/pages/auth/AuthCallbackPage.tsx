@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Calendar } from 'lucide-react'
 import { supabase } from '../../lib/supabase'
+import { clearStaleAuthState } from '../../lib/auth-service'
 
 /**
  * OAuth callback page.
@@ -13,15 +14,24 @@ export default function AuthCallbackPage() {
   const [error, setError] = useState<string | null>(null)
 
   useEffect(() => {
+    let mounted = true
+
+    const failWithCleanup = async (message: string) => {
+      await clearStaleAuthState()
+      if (mounted) {
+        setError(message)
+      }
+    }
+
     // Check URL for error params (e.g., user cancelled)
     const params = new URLSearchParams(window.location.search)
     const hashParams = new URLSearchParams(window.location.hash.substring(1))
-    
+
     const errorParam = params.get('error') || hashParams.get('error')
     const errorDescription = params.get('error_description') || hashParams.get('error_description')
 
     if (errorParam) {
-      setError(errorDescription || errorParam)
+      void failWithCleanup(errorDescription || errorParam)
       return
     }
 
@@ -34,7 +44,7 @@ export default function AuthCallbackPage() {
         const { data: { session }, error: sessionError } = await supabase.auth.getSession()
 
         if (sessionError) {
-          setError(sessionError.message)
+          await failWithCleanup(sessionError.message)
           return
         }
 
@@ -64,13 +74,16 @@ export default function AuthCallbackPage() {
         }, 8000)
       } catch (err) {
         console.error('Auth callback error:', err)
-        setError('Failed to complete authentication')
+        await failWithCleanup('Failed to complete authentication')
       }
     }
 
     // Small delay to let Supabase client process the URL hash
     const timer = setTimeout(checkSession, 500)
-    return () => clearTimeout(timer)
+    return () => {
+      mounted = false
+      clearTimeout(timer)
+    }
   }, [navigate])
 
   if (error) {
