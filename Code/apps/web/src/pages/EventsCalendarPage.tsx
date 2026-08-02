@@ -10,6 +10,7 @@ import { useToast } from '../components/Toast'
 import TimezoneSelector from '../components/TimezoneSelector'
 import { useTimezones } from '../lib/use-timezones'
 import { findTimezone, convertUtcTimeToTimezone, convertUtcTimeToTimezoneOnDate, getCurrentTimeInTimezone, detectDstTransitions, type DstTransition } from '../lib/timezone-data'
+import { subscribePublicEventsSync } from '../lib/public-events-sync'
 
 /** Strip HTML tags from text and render URLs as clickable links with copy buttons */
 function LinkifyText({ text }: { text: string }) {
@@ -402,6 +403,22 @@ function getEventNetworkFilterIdFromResolvedData(
   return null
 }
 
+const FALLBACK_COLOR_PALETTE = ['#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6', '#EC4899', '#06B6D4', '#84CC16', '#F97316', '#14B8A6']
+
+/**
+ * Deterministic color for an unresolved group key. Uses a stable hash of the
+ * key so a network keeps the same color regardless of which week is visible
+ * or the order events happen to load in.
+ */
+function getFallbackColorForKey(key: string): string {
+  if (!key) return FALLBACK_COLOR_PALETTE[0]
+  let hash = 0
+  for (let i = 0; i < key.length; i++) {
+    hash = (hash * 31 + key.charCodeAt(i)) >>> 0
+  }
+  return FALLBACK_COLOR_PALETTE[hash % FALLBACK_COLOR_PALETTE.length]
+}
+
 // ─── Component ──────────────────────────────────────────────
 
 export default function EventsCalendarPage() {
@@ -548,29 +565,63 @@ export default function EventsCalendarPage() {
   // Group duplicate events (same title/link/location/day) into single entries.
   const events = useMemo(() => groupDuplicateEvents(expandedEvents), [expandedEvents])
 
-  // Fetch public events
-  useEffect(() => {
+  const fetchPublicEvents = useCallback(async (opts?: { silent?: boolean }) => {
     // Ensure timestamps are treated as UTC (meetings table uses plain TIMESTAMP)
     const ensureUTC = (ts: string) =>
       ts && !ts.endsWith('Z') && !ts.includes('+') ? ts + 'Z' : ts
 
-    const fetchPublicEvents = async () => {
-      try {
-        const res = await apiClient.get('/api/user-events/public')
-        const normalized = (res.data.events || []).map((ev: PublicEvent) => ({
-          ...ev,
-          start_time: ensureUTC(ev.start_time),
-          end_time: ensureUTC(ev.end_time),
-        }))
-        setRawEvents(normalized)
-      } catch (err) {
-        console.error('Failed to fetch public events:', err)
-      } finally {
+    if (!opts?.silent) {
+      setLoading(true)
+    }
+
+    try {
+      const res = await apiClient.get('/api/user-events/public')
+      const normalized = (res.data.events || []).map((ev: PublicEvent) => ({
+        ...ev,
+        start_time: ensureUTC(ev.start_time),
+        end_time: ensureUTC(ev.end_time),
+      }))
+      setRawEvents(normalized)
+    } catch (err) {
+      console.error('Failed to fetch public events:', err)
+    } finally {
+      if (!opts?.silent) {
         setLoading(false)
       }
     }
-    fetchPublicEvents()
   }, [])
+
+  // Fetch public events on initial mount.
+  useEffect(() => {
+    void fetchPublicEvents()
+  }, [fetchPublicEvents])
+
+  // Refresh when other pages announce a successful sync.
+  useEffect(() => {
+    return subscribePublicEventsSync(() => {
+      void fetchPublicEvents({ silent: true })
+    })
+  }, [fetchPublicEvents])
+
+  // Refresh on focus/visibility so stale tabs recover quickly.
+  useEffect(() => {
+    const onFocus = () => {
+      void fetchPublicEvents({ silent: true })
+    }
+
+    const onVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        void fetchPublicEvents({ silent: true })
+      }
+    }
+
+    window.addEventListener('focus', onFocus)
+    document.addEventListener('visibilitychange', onVisibilityChange)
+    return () => {
+      window.removeEventListener('focus', onFocus)
+      document.removeEventListener('visibilitychange', onVisibilityChange)
+    }
+  }, [fetchPublicEvents])
 
   // Fetch network relations (networks, mappings, rules)
   useEffect(() => {
@@ -802,13 +853,9 @@ export default function EventsCalendarPage() {
     })
   }, [eventsInWeek, timeInterval, startHour, endHour, weekDays])
 
-  // Assign colors: use network color if resolved, otherwise hash to fallback palette
+  // Assign colors: use network color if resolved, otherwise deterministic fallback
   const eventColors = useMemo(() => {
-    const fallbackPalette = ['#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6', '#EC4899', '#06B6D4', '#84CC16', '#F97316', '#14B8A6']
     const map = new Map<string, string>()
-    // Track fallback index for events without a network
-    const calTitleColors = new Map<string, string>()
-    let fallbackIdx = 0
 
     for (const ev of events) {
       const netId = eventNetworkMap.get(ev.id)
@@ -819,13 +866,10 @@ export default function EventsCalendarPage() {
           continue
         }
       }
-      // Fallback: same calendar_title gets same color, else hash by title
+      // Fallback: same calendar_title gets same color via stable hash so it
+      // never shifts when the visible week (and event window) changes.
       const groupKey = ev.calendar_title || ev.title
-      if (!calTitleColors.has(groupKey)) {
-        calTitleColors.set(groupKey, fallbackPalette[fallbackIdx % fallbackPalette.length])
-        fallbackIdx++
-      }
-      map.set(ev.id, calTitleColors.get(groupKey)!)
+      map.set(ev.id, getFallbackColorForKey(groupKey))
     }
     return map
   }, [events, eventNetworkMap, networkMap])
@@ -839,8 +883,6 @@ export default function EventsCalendarPage() {
     // Build network list: resolved networks + unresolved calendar_titles
     const netStats = new Map<string, { count: number; hasUpcoming: boolean; isInVisibleWeek: boolean }>()
     const unresolvedTitles = new Map<string, { name: string; count: number; color: string; hasUpcoming: boolean; isInVisibleWeek: boolean }>()
-    const fallbackPalette = ['#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6', '#EC4899', '#06B6D4', '#84CC16', '#F97316', '#14B8A6']
-    let fallbackIdx = 0
 
     for (const ev of events) {
       const hasUpcoming = new Date(ev.end_time).getTime() >= now
@@ -862,11 +904,10 @@ export default function EventsCalendarPage() {
           unresolvedTitles.set(name, {
             name,
             count: 0,
-            color: fallbackPalette[fallbackIdx % fallbackPalette.length],
+            color: getFallbackColorForKey(name),
             hasUpcoming: false,
             isInVisibleWeek: false,
           })
-          fallbackIdx++
         }
         const existing = unresolvedTitles.get(name)!
         existing.count += 1
@@ -1207,11 +1248,25 @@ export default function EventsCalendarPage() {
 
       {/* Week Navigation */}
       <div className="flex items-center mb-2 px-1">
+        <style>{`@keyframes week-range-flash {
+  0% { opacity: 0; transform: translateY(6px) scale(0.96); color: rgb(37 99 235); background-color: rgba(59,130,246,0.28); box-shadow: 0 0 0 4px rgba(59,130,246,0.18); }
+  25% { opacity: 1; transform: translateY(0) scale(1.06); color: rgb(37 99 235); background-color: rgba(59,130,246,0.28); }
+  60% { transform: scale(1); color: rgb(37 99 235); background-color: rgba(59,130,246,0.16); }
+  100% { color: inherit; background-color: rgba(59,130,246,0); box-shadow: 0 0 0 0 rgba(59,130,246,0); transform: scale(1); }
+}
+@keyframes week-row-sweep {
+  0% { background-color: rgba(59,130,246,0.22); }
+  40% { background-color: rgba(59,130,246,0.14); }
+  100% { background-color: transparent; }
+}`}</style>
         <button aria-label="Previous week" onClick={goToPrevWeek} className="p-1.5 rounded-md hover:bg-accent/50 transition-colors">
           <ChevronLeft className="w-5 h-5" />
         </button>
         <div className="flex-1 text-center">
-          <span className="text-sm font-semibold">
+          <span
+            key={currentWeekStart.getTime()}
+            className="inline-block text-sm font-semibold rounded-md px-2.5 py-1 animate-[week-range-flash_1200ms_ease-out_2]"
+          >
             {format(currentWeekStart, 'MMM d')} &ndash; {format(addDays(currentWeekStart, 6), 'MMM d, yyyy')}
           </span>
         </div>
@@ -1302,7 +1357,8 @@ export default function EventsCalendarPage() {
           <div className="min-w-[700px] flex flex-1 min-h-0 flex-col">
             {/* Day headers */}
             <div
-              className="sticky z-10 grid bg-background border-b border-border"
+              key={currentWeekStart.getTime()}
+              className="sticky z-10 grid bg-background border-b border-border animate-[week-row-sweep_1050ms_ease-out_2]"
               style={{
                 top: networks.length > 0 ? `${networksStickyHeight}px` : 0,
                 gridTemplateColumns: `${tzState.additional.length > 0 ? `repeat(${tzState.additional.length}, 62px) ` : ''}60px ${daySlots.map((s) => (s.type === 'dst' ? '62px' : '1fr')).join(' ')}`,
@@ -1496,7 +1552,7 @@ export default function EventsCalendarPage() {
                                   <span className="block truncate font-medium pt-0.5 max-w-full">{chipLabel}</span>
                                   {isNetworkFiltered && (
                                     <div className="text-[9px] opacity-70 truncate max-w-full">
-                                      {formatUTC(ev.start_time, 'HH:mm')} \u2013 {formatUTC(ev.end_time, 'HH:mm')} - {getSourceCountLabel(ev)}
+                                      {formatUTC(ev.start_time, 'HH:mm')} &ndash; {formatUTC(ev.end_time, 'HH:mm')} - {getSourceCountLabel(ev)}
                                     </div>
                                   )}
                                 </>

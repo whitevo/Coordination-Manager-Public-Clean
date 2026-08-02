@@ -1,7 +1,7 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { Link } from 'react-router-dom'
 import { format, startOfWeek, addDays, addWeeks, subWeeks, addMonths, isSameDay, parse } from 'date-fns'
-import { ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Calendar, Plus, Trash2, X, Download, Eye, EyeOff, Check, ExternalLink, Loader2, Search, Bell, BellOff, Network, CalendarPlus, Copy, RefreshCw, PanelLeftClose, PanelLeftOpen, Repeat2 } from 'lucide-react'
+import { ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Calendar, Plus, Trash2, X, Download, Eye, EyeOff, Check, ExternalLink, Loader2, Search, Bell, BellOff, Network, CalendarPlus, Copy, RefreshCw, PanelLeftClose, PanelLeftOpen, Repeat2, AlertTriangle } from 'lucide-react'
 import { apiClient } from '../lib/api-client'
 import { useAuth } from '../contexts/AuthContext'
 import { computeDayLayout } from '../lib/calendarOverlapLayout'
@@ -149,6 +149,12 @@ type SourceSyncMeta = {
   lastSyncedAt?: string
   updatedAt?: string
   lastSyncError?: string
+}
+
+type SyncErrorDiagnosis = {
+  category: string
+  likelyCause: string
+  suggestedAction: string
 }
 
 type NetworkFilterMode = 'pinned' | 'focus' | 'hidden'
@@ -395,6 +401,84 @@ const serializeNetworkFilterModes = (modes: Record<string, NetworkFilterMode>): 
   return serialized
 }
 
+const diagnoseSyncError = (rawMessage: string): SyncErrorDiagnosis => {
+  const normalized = rawMessage.toLowerCase()
+
+  if (
+    normalized.includes('invalid_grant') ||
+    normalized.includes('refresh token') ||
+    normalized.includes('token expired') ||
+    normalized.includes('reauth')
+  ) {
+    return {
+      category: 'Authentication expired',
+      likelyCause: 'The source connection token expired or was revoked.',
+      suggestedAction: 'Reconnect the source in Settings, then run Sync now.',
+    }
+  }
+
+  if (
+    normalized.includes('403') ||
+    normalized.includes('forbidden') ||
+    normalized.includes('permission') ||
+    normalized.includes('not authorized') ||
+    normalized.includes('access denied')
+  ) {
+    return {
+      category: 'Permissions conflict',
+      likelyCause: 'The linked account cannot read this calendar or event.',
+      suggestedAction: 'Verify sharing permissions and account access, then sync again.',
+    }
+  }
+
+  if (
+    normalized.includes('timeout') ||
+    normalized.includes('timed out') ||
+    normalized.includes('deadline exceeded') ||
+    normalized.includes('econnreset') ||
+    normalized.includes('socket hang up') ||
+    normalized.includes('network')
+  ) {
+    return {
+      category: 'Timeout or network issue',
+      likelyCause: 'The source was temporarily unreachable during sync.',
+      suggestedAction: 'Retry sync in a few minutes. If persistent, check provider status.',
+    }
+  }
+
+  if (
+    normalized.includes('429') ||
+    normalized.includes('rate limit') ||
+    normalized.includes('quota exceeded') ||
+    normalized.includes('too many requests')
+  ) {
+    return {
+      category: 'Rate limit',
+      likelyCause: 'The provider throttled sync requests.',
+      suggestedAction: 'Wait and retry. Reduce sync frequency if this repeats.',
+    }
+  }
+
+  if (
+    normalized.includes('404') ||
+    normalized.includes('not found') ||
+    normalized.includes('deleted') ||
+    normalized.includes('gone')
+  ) {
+    return {
+      category: 'Missing event or calendar',
+      likelyCause: 'An imported event or source no longer exists.',
+      suggestedAction: 'Refresh subscriptions or re-import this source.',
+    }
+  }
+
+  return {
+    category: 'Unknown sync failure',
+    likelyCause: 'The source sync failed with an uncategorized provider error.',
+    suggestedAction: 'Open Settings to inspect the source and retry sync.',
+  }
+}
+
 // ─── Component ──────────────────────────────────────────────
 
 export default function CoordinateEventsPage() {
@@ -422,6 +506,7 @@ export default function CoordinateEventsPage() {
 
   // Calendar sources state
   const [calendarSources, setCalendarSources] = useState<CalendarSource[]>([])
+  const [calendarSourcesHydrated, setCalendarSourcesHydrated] = useState(false)
   const [sourcesLoading, setSourcesLoading] = useState(false)
 
   // Import modal state
@@ -457,6 +542,9 @@ export default function CoordinateEventsPage() {
   })
   const [sourceSyncMeta, setSourceSyncMeta] = useState<Record<string, SourceSyncMeta>>({})
   const [syncPrefsHydrated, setSyncPrefsHydrated] = useState(false)
+  const [syncErrorDetailsPinned, setSyncErrorDetailsPinned] = useState(false)
+  const [syncErrorDetailsHovered, setSyncErrorDetailsHovered] = useState(false)
+  const syncErrorDetailsRef = useRef<HTMLDivElement>(null)
 
   // Create event modal state
   const [showCreateModal, setShowCreateModal] = useState(false)
@@ -605,6 +693,7 @@ export default function CoordinateEventsPage() {
     try {
       const res = await apiClient.get('/api/calendar-sources')
       setCalendarSources(res.data.sources || [])
+      setCalendarSourcesHydrated(true)
     } catch (err) {
       console.error('Failed to fetch calendar sources:', err)
     } finally {
@@ -733,7 +822,13 @@ export default function CoordinateEventsPage() {
   }, [networkFilterModes])
 
   useEffect(() => {
-    if (!isAuthenticated || !syncPrefsHydrated) return
+    // Do not run the destructive save until BOTH sync prefs and calendar
+    // sources have hydrated. The server treats this PUT as the complete active
+    // set and deletes any pref not included. calendarSources loads async and
+    // starts empty, so firing before it hydrates would build an empty payload
+    // and silently delete every saved pref -- which made the Calendar mode
+    // revert to "Off" on every page refresh.
+    if (!isAuthenticated || !syncPrefsHydrated || !calendarSourcesHydrated) return
 
     const payloadPrefs = Object.entries(sourceSyncPrefs)
       .map(([key, pref]) => {
@@ -776,7 +871,7 @@ export default function CoordinateEventsPage() {
     }, 500)
 
     return () => window.clearTimeout(timer)
-  }, [isAuthenticated, syncPrefsHydrated, sourceSyncPrefs, sourceAutoPublishPrefs, calendarSources])
+  }, [isAuthenticated, syncPrefsHydrated, calendarSourcesHydrated, sourceSyncPrefs, sourceAutoPublishPrefs, calendarSources])
 
   const sourceSyncConfigs = useMemo(() => {
     const configs: Array<{
@@ -1853,6 +1948,88 @@ export default function CoordinateEventsPage() {
     return Object.values(sourceSyncMeta).filter(meta => !!meta.lastSyncError).length
   }, [sourceSyncMeta])
 
+  const syncErrorDetails = useMemo(() => {
+    const sourceNameByPrefKey = new Map<string, { sourceLabel: string; sourceTypeLabel: string }>()
+
+    for (const src of calendarSources) {
+      const kind = src.source_type === 'google_oauth' ? 'Google account' : 'Public calendar URL'
+      sourceNameByPrefKey.set(`calendar_source:${src.id}`, {
+        sourceLabel: src.display_name || src.google_email || src.id,
+        sourceTypeLabel: kind,
+      })
+    }
+
+    for (const sub of subscriptions) {
+      if (!sub.calendars?.hash) continue
+      sourceNameByPrefKey.set(`coordination_calendar:${sub.calendars.hash}`, {
+        sourceLabel: sub.calendars.title || sub.calendars.hash,
+        sourceTypeLabel: 'Coordination calendar',
+      })
+    }
+
+    for (const cal of coordCalendars) {
+      sourceNameByPrefKey.set(`coordination_calendar:${cal.hash}`, {
+        sourceLabel: cal.title || cal.hash,
+        sourceTypeLabel: 'Coordination calendar',
+      })
+    }
+
+    return Object.entries(sourceSyncMeta)
+      .filter(([, meta]) => typeof meta.lastSyncError === 'string' && meta.lastSyncError.trim().length > 0)
+      .map(([prefKey, meta]) => {
+        const fallbackSourceId = prefKey.includes(':') ? prefKey.split(':')[1] : prefKey
+        const sourceInfo = sourceNameByPrefKey.get(prefKey)
+        const rawMessage = (meta.lastSyncError || '').trim()
+        const diagnosis = diagnoseSyncError(rawMessage)
+
+        return {
+          prefKey,
+          sourceLabel: sourceInfo?.sourceLabel || fallbackSourceId || 'Unknown source',
+          sourceTypeLabel: sourceInfo?.sourceTypeLabel || 'Imported source',
+          rawMessage,
+          diagnosis,
+          updatedAt: meta.updatedAt,
+        }
+      })
+      .sort((a, b) => {
+        const aTs = a.updatedAt ? new Date(a.updatedAt).getTime() : 0
+        const bTs = b.updatedAt ? new Date(b.updatedAt).getTime() : 0
+        return bTs - aTs
+      })
+  }, [sourceSyncMeta, calendarSources, subscriptions, coordCalendars])
+
+  const isSyncErrorDetailsOpen = syncErrorDetailsPinned || (!isPhoneViewport && syncErrorDetailsHovered)
+
+  useEffect(() => {
+    if (syncErrorDetails.length > 0) return
+    setSyncErrorDetailsPinned(false)
+    setSyncErrorDetailsHovered(false)
+  }, [syncErrorDetails.length])
+
+  useEffect(() => {
+    if (!syncErrorDetailsPinned) return
+
+    const handleClickOutside = (event: MouseEvent) => {
+      if (!syncErrorDetailsRef.current?.contains(event.target as Node)) {
+        setSyncErrorDetailsPinned(false)
+      }
+    }
+
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        setSyncErrorDetailsPinned(false)
+      }
+    }
+
+    window.addEventListener('mousedown', handleClickOutside)
+    window.addEventListener('keydown', handleEscape)
+
+    return () => {
+      window.removeEventListener('mousedown', handleClickOutside)
+      window.removeEventListener('keydown', handleEscape)
+    }
+  }, [syncErrorDetailsPinned])
+
   const importPrimaryLabel = useMemo(() => {
     if (importType === 'coordination_calendar') {
       return importSyncMode === 'once' ? 'Import Meetings (once)' : 'Import Meetings'
@@ -2376,9 +2553,47 @@ export default function CoordinateEventsPage() {
                 <span className="opacity-80">Last sync {format(new Date(lastAutoSyncAt), 'HH:mm')}</span>
               )}
               {serverSyncErrorCount > 0 && (
-                <span className="text-amber-600 dark:text-amber-400">
-                  {serverSyncErrorCount} source{serverSyncErrorCount !== 1 ? 's' : ''} with sync errors
-                </span>
+                <div
+                  ref={syncErrorDetailsRef}
+                  className="relative"
+                  onMouseEnter={() => setSyncErrorDetailsHovered(true)}
+                  onMouseLeave={() => setSyncErrorDetailsHovered(false)}
+                >
+                  <button
+                    type="button"
+                    onClick={() => setSyncErrorDetailsPinned(prev => !prev)}
+                    className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-300 hover:text-amber-800 dark:hover:text-amber-200"
+                    title="Click to inspect sync errors"
+                    aria-expanded={isSyncErrorDetailsOpen}
+                    aria-label="Show sync error details"
+                  >
+                    <AlertTriangle className="w-3.5 h-3.5" />
+                    <span>
+                      {syncErrorDetails.length} source{syncErrorDetails.length !== 1 ? 's' : ''} with sync errors
+                    </span>
+                  </button>
+
+                  {isSyncErrorDetailsOpen && (
+                    <div className="absolute z-40 mt-2 right-0 w-[22rem] max-w-[90vw] rounded-lg border border-amber-300/70 dark:border-amber-800 bg-amber-50 dark:bg-slate-900 text-amber-900 dark:text-amber-100 shadow-xl p-3">
+                      <p className="text-xs font-semibold mb-2">Sync error details</p>
+                      <div className="space-y-2 max-h-72 overflow-y-auto">
+                        {syncErrorDetails.map(detail => (
+                          <div key={detail.prefKey} className="rounded border border-amber-200/70 dark:border-amber-800/70 bg-white/60 dark:bg-slate-950/70 p-2">
+                            <p className="text-xs font-medium break-words">{detail.sourceLabel}</p>
+                            <p className="text-[11px] opacity-90">{detail.sourceTypeLabel}</p>
+                            <p className="text-[11px] mt-1"><strong>Likely issue:</strong> {detail.diagnosis.category}</p>
+                            <p className="text-[11px]"><strong>Possible cause:</strong> {detail.diagnosis.likelyCause}</p>
+                            <p className="text-[11px]"><strong>Suggested action:</strong> {detail.diagnosis.suggestedAction}</p>
+                            <p className="text-[11px] mt-1 break-words"><strong>Error:</strong> {detail.rawMessage}</p>
+                            {detail.updatedAt && (
+                              <p className="text-[10px] mt-1 opacity-80">Last attempt: {format(new Date(detail.updatedAt), 'MMM d, yyyy HH:mm')}</p>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
               )}
             </div>
           ) : (
@@ -2409,9 +2624,47 @@ export default function CoordinateEventsPage() {
                 </span>
               )}
               {serverSyncErrorCount > 0 && (
-                <span className="text-xs text-amber-600 dark:text-amber-400">
-                  {serverSyncErrorCount} source{serverSyncErrorCount !== 1 ? 's' : ''} with sync errors
-                </span>
+                <div
+                  ref={syncErrorDetailsRef}
+                  className="relative"
+                  onMouseEnter={() => setSyncErrorDetailsHovered(true)}
+                  onMouseLeave={() => setSyncErrorDetailsHovered(false)}
+                >
+                  <button
+                    type="button"
+                    onClick={() => setSyncErrorDetailsPinned(prev => !prev)}
+                    className="inline-flex items-center gap-1 text-xs text-amber-700 dark:text-amber-300 hover:text-amber-800 dark:hover:text-amber-200"
+                    title="Click to inspect sync errors"
+                    aria-expanded={isSyncErrorDetailsOpen}
+                    aria-label="Show sync error details"
+                  >
+                    <AlertTriangle className="w-3.5 h-3.5" />
+                    <span>
+                      {syncErrorDetails.length} source{syncErrorDetails.length !== 1 ? 's' : ''} with sync errors
+                    </span>
+                  </button>
+
+                  {isSyncErrorDetailsOpen && (
+                    <div className="absolute z-40 mt-2 right-0 w-[28rem] max-w-[92vw] rounded-lg border border-amber-300/70 dark:border-amber-800 bg-amber-50 dark:bg-slate-900 text-amber-900 dark:text-amber-100 shadow-xl p-3">
+                      <p className="text-xs font-semibold mb-2">Sync error details</p>
+                      <div className="space-y-2 max-h-80 overflow-y-auto">
+                        {syncErrorDetails.map(detail => (
+                          <div key={detail.prefKey} className="rounded border border-amber-200/70 dark:border-amber-800/70 bg-white/60 dark:bg-slate-950/70 p-2">
+                            <p className="text-xs font-medium break-words">{detail.sourceLabel}</p>
+                            <p className="text-[11px] opacity-90">{detail.sourceTypeLabel}</p>
+                            <p className="text-[11px] mt-1"><strong>Likely issue:</strong> {detail.diagnosis.category}</p>
+                            <p className="text-[11px]"><strong>Possible cause:</strong> {detail.diagnosis.likelyCause}</p>
+                            <p className="text-[11px]"><strong>Suggested action:</strong> {detail.diagnosis.suggestedAction}</p>
+                            <p className="text-[11px] mt-1 break-words"><strong>Error:</strong> {detail.rawMessage}</p>
+                            {detail.updatedAt && (
+                              <p className="text-[10px] mt-1 opacity-80">Last attempt: {format(new Date(detail.updatedAt), 'MMM d, yyyy HH:mm')}</p>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
               )}
             </div>
           )}

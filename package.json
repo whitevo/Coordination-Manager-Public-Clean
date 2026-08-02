@@ -17,6 +17,7 @@
 		"dev:stop": "node ./Code/scripts/stop-servers.js",
 		"build": "pnpm --dir ./Code build",
 		"test": "pnpm --dir ./Code test",
+		"test:web:copilot": "powershell -ExecutionPolicy Bypass -File ./scripts/test-web-copilot.ps1",
 		"lint": "pnpm --dir ./Code lint",
 		"typecheck": "pnpm --dir ./Code typecheck",
 		"format": "pnpm --dir ./Code format",

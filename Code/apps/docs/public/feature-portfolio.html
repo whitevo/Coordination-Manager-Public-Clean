@@ -1,0 +1,192 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Coordination Manager Feature Portfolio</title>
+  <style>
+    :root {
+      --bg: #0b1222;
+      --panel: #111b31;
+      --line: #22304d;
+      --text: #dbe6ff;
+      --muted: #9fb1d8;
+      --accent: #7aa2ff;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", Tahoma, Geneva, Verdana, sans-serif;
+      background: radial-gradient(1200px 700px at 80% -10%, #1a2850 0%, var(--bg) 55%);
+      color: var(--text);
+    }
+    .wrap {
+      max-width: 1200px;
+      margin: 0 auto;
+      padding: 32px 20px 48px;
+    }
+    h1 {
+      margin: 0 0 8px;
+      font-size: 2rem;
+    }
+    p {
+      margin: 0;
+      color: var(--muted);
+      line-height: 1.5;
+    }
+    .note {
+      margin-top: 14px;
+      padding: 12px 14px;
+      border: 1px solid var(--line);
+      background: #0f172d;
+      border-radius: 10px;
+      color: #c6d5f9;
+      font-size: 0.95rem;
+    }
+    .grid {
+      margin-top: 24px;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
+    }
+    figure {
+      margin: 0;
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    img {
+      display: block;
+      width: 100%;
+      height: auto;
+      background: #0a1020;
+    }
+    figcaption {
+      padding: 10px 12px 14px;
+      border-top: 1px solid var(--line);
+    }
+    .title {
+      font-size: 0.95rem;
+      font-weight: 700;
+      margin-bottom: 4px;
+    }
+    .meta {
+      font-size: 0.8rem;
+      color: var(--muted);
+    }
+    .meta a {
+      color: var(--accent);
+      text-decoration: none;
+    }
+    .meta a:hover { text-decoration: underline; }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <h1>Feature Screenshots Portfolio</h1>
+    <p>Captured from local product routes to build a visual portfolio for feature pages.</p>
+    <div class="note">
+      Protected routes currently redirect to login in this capture set. To capture authenticated pages, log in first and re-run the capture pass.
+    </div>
+
+    <section class="grid">
+      <figure>
+        <img src="images/feature-portfolio/01-home.png" alt="Home page" />
+        <figcaption>
+          <div class="title">Home</div>
+          <div class="meta">Route: <a href="http://localhost:5173/">/</a></div>
+        </figcaption>
+      </figure>
+
+      <figure>
+        <img src="images/feature-portfolio/02-calendars.png" alt="Calendars page" />
+        <figcaption>
+          <div class="title">Calendars</div>
+          <div class="meta">Route: <a href="http://localhost:5173/calendars">/calendars</a></div>
+        </figcaption>
+      </figure>
+
+      <figure>
+        <img src="images/feature-portfolio/03-events-calendar.png" alt="Events calendar page" />
+        <figcaption>
+          <div class="title">Events Calendar</div>
+          <div class="meta">Route: <a href="http://localhost:5173/events-calendar">/events-calendar</a></div>
+        </figcaption>
+      </figure>
+
+      <figure>
+        <img src="images/feature-portfolio/04-time-management.png" alt="Time management page" />
+        <figcaption>
+          <div class="title">Time Management</div>
+          <div class="meta">Route: <a href="http://localhost:5173/time-management">/time-management</a></div>
+        </figcaption>
+      </figure>
+
+      <figure>
+        <img src="images/feature-portfolio/05-calendar-create.png" alt="Calendar create page" />
+        <figcaption>
+          <div class="title">Calendar (Create/View)</div>
+          <div class="meta">Route: <a href="http://localhost:5173/calendar">/calendar</a></div>
+        </figcaption>
+      </figure>
+
+      <figure>
+        <img src="images/feature-portfolio/06-support.png" alt="Support page" />
+        <figcaption>
+          <div class="title">Support</div>
+          <div class="meta">Route: <a href="http://localhost:5173/support">/support</a></div>
+        </figcaption>
+      </figure>
+
+      <figure>
+        <img src="images/feature-portfolio/07-zoom-review.png" alt="Zoom review page" />
+        <figcaption>
+          <div class="title">Zoom Review</div>
+          <div class="meta">Route: <a href="http://localhost:5173/zoom-review">/zoom-review</a></div>
+        </figcaption>
+      </figure>
+
+      <figure>
+        <img src="images/feature-portfolio/08-coordinate-events.png" alt="Coordinate events route capture" />
+        <figcaption>
+          <div class="title">Coordinate Events (Auth Redirect)</div>
+          <div class="meta">Route requested: /coordinate-events | Captured: /auth/login</div>
+        </figcaption>
+      </figure>
+
+      <figure>
+        <img src="images/feature-portfolio/09-distribute.png" alt="Distribute route capture" />
+        <figcaption>
+          <div class="title">Distribute (Auth Redirect)</div>
+          <div class="meta">Route requested: /distribute | Captured: /auth/login</div>
+        </figcaption>
+      </figure>
+
+      <figure>
+        <img src="images/feature-portfolio/10-feedback.png" alt="Feedback route capture" />
+        <figcaption>
+          <div class="title">Feedback (Auth Redirect)</div>
+          <div class="meta">Route requested: /feedback | Captured: /auth/login</div>
+        </figcaption>
+      </figure>
+
+      <figure>
+        <img src="images/feature-portfolio/11-ai-chat.png" alt="AI chat route capture" />
+        <figcaption>
+          <div class="title">AI Chat (Auth Redirect)</div>
+          <div class="meta">Route requested: /ai-chat | Captured: /auth/login</div>
+        </figcaption>
+      </figure>
+
+      <figure>
+        <img src="images/feature-portfolio/12-settings.png" alt="Settings route capture" />
+        <figcaption>
+          <div class="title">Settings (Auth Redirect)</div>
+          <div class="meta">Route requested: /settings | Captured: /auth/login</div>
+        </figcaption>
+      </figure>
+    </section>
+  </main>
+</body>
+</html>

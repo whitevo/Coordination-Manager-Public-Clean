@@ -223,12 +223,32 @@ interface PendingUnsavedAnchor {
 
 interface ResizeState {
   itemId: string
+  sourceEventId: string
   dayIndex: number
   edge: 'start' | 'end'
   dayColumnElement: HTMLDivElement
   originalEvent: UserEventRecord
+  originalOccurrenceStartTime: string
+  originalOccurrenceEndTime: string
+  isRecurringEvent: boolean
   originalStartMinute: number
   originalEndMinute: number
+}
+
+interface PendingRecurringResizeSeriesPrompt {
+  sourceEventId: string
+  createdOccurrenceEventId: string
+  originalSeriesEvent: UserEventRecord
+  originalOccurrenceStartTime: string
+  originalOccurrenceEndTime: string
+  finalOccurrenceStartTime: string
+  finalOccurrenceEndTime: string
+}
+
+interface RecurringResizePreviewState {
+  dayIndex: number
+  startMinute: number
+  durationMinutes: number
 }
 
 interface DragDropPreviewState {
@@ -1565,6 +1585,37 @@ function normaliseCreatedManualEvent(
   }
 }
 
+function isPendingEventId(eventId: string): boolean {
+  return eventId.startsWith('pending-')
+}
+
+function mergeFetchedEventsWithLocalState(params: {
+  fetchedEvents: UserEventRecord[]
+  localEvents: UserEventRecord[]
+  preserveEventIds: Set<string>
+}): UserEventRecord[] {
+  const { fetchedEvents, localEvents, preserveEventIds } = params
+  if (localEvents.length === 0) return fetchedEvents
+
+  const localById = new Map(localEvents.map((event) => [event.id, event]))
+  const fetchedIds = new Set(fetchedEvents.map((event) => event.id))
+  const merged = fetchedEvents.map((event) => {
+    if (!preserveEventIds.has(event.id)) {
+      return event
+    }
+
+    return localById.get(event.id) || event
+  })
+
+  for (const localEvent of localEvents) {
+    if (fetchedIds.has(localEvent.id)) continue
+    if (!isPendingEventId(localEvent.id) && !preserveEventIds.has(localEvent.id)) continue
+    merged.push(localEvent)
+  }
+
+  return merged
+}
+
 function isSafeNoteUrl(value: string): boolean {
   return isSafeUrl(value)
 }
@@ -2596,8 +2647,8 @@ function MarkdownComposer({
         </div>
       )}
 
-      <div className={compact ? '' : 'min-h-0 flex-1'}>
-        <EditorContent editor={editor} />
+      <div className={compact ? '' : 'flex min-h-0 flex-1 flex-col'}>
+        <EditorContent editor={editor} className={compact ? '' : 'flex min-h-0 flex-1 flex-col'} />
       </div>
     </div>
   )
@@ -3078,12 +3129,15 @@ export default function TimeManagementPage() {
   const [itemAdjustStepSlots, setItemAdjustStepSlots] = useState(1)
   const [selectionLastChangedEdge, setSelectionLastChangedEdge] = useState<'start' | 'end' | null>(null)
   const [itemLastChangedEdge, setItemLastChangedEdge] = useState<'start' | 'end' | null>(null)
+  const [hoveredInteractionItemId, setHoveredInteractionItemId] = useState<string | null>(null)
   const [isHiddenModeEnabled, setIsHiddenModeEnabled] = useState(false)
   const [isSelecting, setIsSelecting] = useState(false)
   const [isDraggingItem, setIsDraggingItem] = useState(false)
   const [draggingItemId, setDraggingItemId] = useState<string | null>(null)
   const [dragDropPreview, setDragDropPreview] = useState<DragDropPreviewState | null>(null)
   const [resizeState, setResizeState] = useState<ResizeState | null>(null)
+  const [pendingRecurringResizeSeriesPrompt, setPendingRecurringResizeSeriesPrompt] = useState<PendingRecurringResizeSeriesPrompt | null>(null)
+  const [recurringResizePreview, setRecurringResizePreview] = useState<RecurringResizePreviewState | null>(null)
   const [selectedItemId, setSelectedItemId] = useState<string | null>(null)
   const [showItemRecurrencePanel, setShowItemRecurrencePanel] = useState(false)
   const [movingItemId, setMovingItemId] = useState<string | null>(null)
@@ -3188,6 +3242,7 @@ export default function TimeManagementPage() {
   const draftRef = useRef<ItemDraft | null>(null)
   const syncChannelRef = useRef<BroadcastChannel | null>(null)
   const hasBroadcastedInitialSyncRef = useRef(false)
+  const suppressOptimisticEventBroadcastRef = useRef(false)
   const enabledExternalSourceIdsRef = useRef<string[]>([])
   const aggregateSourceStatusFadeTimerRef = useRef<number | null>(null)
 
@@ -3370,9 +3425,22 @@ export default function TimeManagementPage() {
   const selectionTitleInputRef = useRef<HTMLInputElement | null>(null)
   const isCreatingItemRef = useRef(false)
   const eventsRef = useRef<UserEventRecord[]>([])
+  // Holds the most recent resize geometry, updated synchronously on every
+  // pointer move. The commit handler reads this instead of eventsRef so it is
+  // never blocked by React's deferred state/ref flush on mouse release.
+  const resizeLatestTimesRef = useRef<{ startTime: string; endTime: string } | null>(null)
   const dragClientYRef = useRef<number | null>(null)
   const dragPreviewRef = useRef<HTMLDivElement | null>(null)
   const currentWeekStartRef = useRef(currentWeekStart)
+  const selectedEventIdRef = useRef<string | null>(null)
+  const isAutoSavingRef = useRef(false)
+  // Event ids with an in-flight mutation (e.g. drag-drop reschedule) whose
+  // optimistic state must survive silent refetches. Without this, a background
+  // refresh triggered by window focus/visibility (returning from idle) or a
+  // cross-tab sync ping can land before the PUT commits server-side, merge in
+  // stale server data, and snap the item back to its pre-move position. This is
+  // invisible on localhost because the PUT commits before any refetch runs.
+  const pendingMutationEventIdsRef = useRef(new Set<string>())
   const weekWindowCacheRef = useRef(new Map<string, WeekWindowCacheEntry>())
   const weekWindowRequestsRef = useRef(new Map<string, Promise<UserEventRecord[]>>())
   const crossTabRefreshTimerRef = useRef<number | null>(null)
@@ -3422,6 +3490,10 @@ export default function TimeManagementPage() {
 
     if (!hasBroadcastedInitialSyncRef.current) {
       hasBroadcastedInitialSyncRef.current = true
+      return
+    }
+
+    if (suppressOptimisticEventBroadcastRef.current) {
       return
     }
 
@@ -3974,14 +4046,34 @@ export default function TimeManagementPage() {
     try {
       const res = await dedupedGet<{ events: UserEventRecord[] }>('/api/user-events')
       const fetchedEvents = Array.isArray(res.data?.events) ? res.data.events : []
-      setEvents(fetchedEvents)
+      const selectedEventId = selectedEventIdRef.current
+      const preserveEventIds = new Set<string>()
+      if (selectedEventId) {
+        const selectedEventMissingFromFetch = !fetchedEvents.some((event) => event.id === selectedEventId)
+        if (selectedEventMissingFromFetch || isAutoSavingRef.current) {
+          preserveEventIds.add(selectedEventId)
+        }
+      }
+      // Preserve any event with an in-flight mutation so a silent refetch does
+      // not overwrite its optimistic state with stale server data.
+      for (const pendingId of pendingMutationEventIdsRef.current) {
+        preserveEventIds.add(pendingId)
+      }
+
+      const mergedEvents = mergeFetchedEventsWithLocalState({
+        fetchedEvents,
+        localEvents: eventsRef.current,
+        preserveEventIds,
+      })
+
+      setEvents(mergedEvents)
       const cacheWeekStart = options?.weekStart ?? currentWeekStartRef.current
       const cacheKey = getWeekWindowKey(cacheWeekStart, enabledExternalSourceIdsRef.current)
       weekWindowCacheRef.current.set(cacheKey, {
-        events: fetchedEvents,
+        events: mergedEvents,
         updatedAt: Date.now(),
       })
-      return fetchedEvents
+      return mergedEvents
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : 'Failed to load meetings.'
       setEventsError(message)
@@ -4602,6 +4694,14 @@ export default function TimeManagementPage() {
     },
     [events, selectedItem]
   )
+
+  useEffect(() => {
+    selectedEventIdRef.current = selectedEvent?.id ?? null
+  }, [selectedEvent?.id])
+
+  useEffect(() => {
+    isAutoSavingRef.current = isAutoSaving
+  }, [isAutoSaving])
 
   const movingItemIsRecurring = useMemo(() => {
     if (!movingItemId) return false
@@ -5500,6 +5600,51 @@ export default function TimeManagementPage() {
     [dayResizeSegments, selectedItemId]
   )
 
+  const beginEdgeResize = useCallback((params: {
+    itemId: string
+    dayIndex: number
+    edge: 'start' | 'end'
+    dayColumnElement: HTMLDivElement
+  }): boolean => {
+    const { dayColumnElement, dayIndex, edge, itemId } = params
+    const targetItem = items.find((candidate) => candidate.id === itemId)
+    if (!targetItem) return false
+    const eventRecord = targetItem ? events.find((candidate) => candidate.id === targetItem.sourceEventId) : null
+    if (!eventRecord) return false
+
+    const source = sourceMap.get(eventRecord.source_id || MAIN_SOURCE_ID)
+    if (isReadOnlySource(source)) return false
+
+    const start = new Date(eventRecord.start_time)
+    const end = new Date(eventRecord.end_time)
+    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return false
+
+    const occurrenceStartMs = new Date(targetItem.occurrenceStartTime).getTime()
+    if (Number.isNaN(occurrenceStartMs)) return false
+    const occurrenceDurationMinutes = getTimeItemTotalDurationMinutes(targetItem, slotMinutes)
+    const occurrenceEndMs = occurrenceStartMs + occurrenceDurationMinutes * 60_000
+    const recurrenceRule = normaliseRecurrenceRule(eventRecord.recurrence_rule)
+
+    suppressOptimisticEventBroadcastRef.current = true
+    resizeLatestTimesRef.current = null
+    setSelectionDraft(null)
+    setSelectedItemId(itemId)
+    setResizeState({
+      itemId,
+      sourceEventId: eventRecord.id,
+      dayIndex,
+      edge,
+      dayColumnElement,
+      originalEvent: eventRecord,
+      originalOccurrenceStartTime: new Date(occurrenceStartMs).toISOString(),
+      originalOccurrenceEndTime: new Date(occurrenceEndMs).toISOString(),
+      isRecurringEvent: recurrenceRule.type !== 'none',
+      originalStartMinute: start.getUTCHours() * 60 + start.getUTCMinutes(),
+      originalEndMinute: end.getUTCHours() * 60 + end.getUTCMinutes(),
+    })
+    return true
+  }, [events, items, slotMinutes, sourceMap])
+
   const categoryMap = useMemo(() => {
     const map = new Map<string, Category>()
     for (const cat of categories) {
@@ -5855,20 +6000,32 @@ export default function TimeManagementPage() {
   useEffect(() => {
     if (!resizeState) return
 
-    const handleMouseMove = (event: globalThis.MouseEvent) => {
+    let hasCommitted = false
+
+    const updateResizeFromClientY = (clientY: number) => {
       const dayColumn = resizeState.dayColumnElement
       if (!dayColumn) return
 
       const rect = dayColumn.getBoundingClientRect()
-      const pointerMinuteRaw = (event.clientY - rect.top) / rect.height * MINUTES_IN_DAY
-      const pointerMinute = snapMinuteUnbounded(pointerMinuteRaw, slotMinutes)
+      if (!Number.isFinite(clientY) || rect.height <= 0) return
+
+      const pointerMinuteRaw = (clientY - rect.top) / rect.height * MINUTES_IN_DAY
+      const boundedPointerMinuteRaw = Math.max(-MINUTES_IN_DAY, Math.min(MINUTES_IN_DAY * 2, pointerMinuteRaw))
+      const pointerMinute = snapMinuteUnbounded(boundedPointerMinuteRaw, slotMinutes)
 
       const day = weekDays[resizeState.dayIndex]
+      if (!day || Number.isNaN(day.getTime())) return
+
       const baseDayStartMs = Date.UTC(day.getFullYear(), day.getMonth(), day.getDate(), 0, 0, 0)
       const pointerTimeMs = baseDayStartMs + pointerMinute * 60_000
+      if (!Number.isFinite(pointerTimeMs)) return
 
-      const originalStartMs = new Date(resizeState.originalEvent.start_time).getTime()
-      const originalEndMs = new Date(resizeState.originalEvent.end_time).getTime()
+      const originalStartMs = resizeState.isRecurringEvent
+        ? new Date(resizeState.originalOccurrenceStartTime).getTime()
+        : new Date(resizeState.originalEvent.start_time).getTime()
+      const originalEndMs = resizeState.isRecurringEvent
+        ? new Date(resizeState.originalOccurrenceEndTime).getTime()
+        : new Date(resizeState.originalEvent.end_time).getTime()
       const minDurationMs = slotMinutes * 60_000
 
       const nextStartMs = resizeState.edge === 'start'
@@ -5881,50 +6038,214 @@ export default function TimeManagementPage() {
       const startTime = new Date(nextStartMs).toISOString()
       const endTime = new Date(nextEndMs).toISOString()
 
-      setEvents((prev) =>
-        prev.map((candidate) =>
-          candidate.id === (items.find((entry) => entry.id === resizeState.itemId)?.sourceEventId || resizeState.itemId)
-            ? { ...candidate, start_time: startTime, end_time: endTime }
-            : candidate
+      // Record the latest geometry synchronously so the commit handler always
+      // has the final size, even if the last state flush has not landed yet.
+      resizeLatestTimesRef.current = { startTime, endTime }
+
+      if (resizeState.isRecurringEvent) {
+        const previewStartMinuteRaw = Math.round((nextStartMs - baseDayStartMs) / 60_000)
+        const normalizedPreview = normaliseDroppedMinuteToWeekDay(resizeState.dayIndex, previewStartMinuteRaw)
+        const previewDurationMinutes = Math.max(slotMinutes, Math.round((nextEndMs - nextStartMs) / 60_000))
+
+        if (normalizedPreview) {
+          setRecurringResizePreview({
+            dayIndex: normalizedPreview.dayIndex,
+            startMinute: normalizedPreview.startMinute,
+            durationMinutes: previewDurationMinutes,
+          })
+        } else {
+          setRecurringResizePreview(null)
+        }
+      } else {
+        setRecurringResizePreview(null)
+      }
+
+      if (!resizeState.isRecurringEvent) {
+        const sourceEventId = resizeState.sourceEventId
+        setEvents((prev) =>
+          prev.map((candidate) =>
+            candidate.id === sourceEventId
+              ? { ...candidate, start_time: startTime, end_time: endTime }
+              : candidate
+          )
         )
-      )
+      }
     }
 
-    const handleMouseUp = () => {
-      const itemId = resizeState.itemId
-      const resizeItem = items.find((entry) => entry.id === itemId)
-      const sourceEventId = resizeItem?.sourceEventId || itemId
-      const finalEvent = eventsRef.current.find((event) => event.id === sourceEventId)
-      const previousEvent = resizeState.originalEvent
-      setResizeState(null)
+    const handlePointerMove = (event: globalThis.PointerEvent) => {
+      updateResizeFromClientY(event.clientY)
+    }
 
-      if (!finalEvent) return
-      if (finalEvent.start_time === previousEvent.start_time && finalEvent.end_time === previousEvent.end_time) {
+    const handleMouseMove = (event: globalThis.MouseEvent) => {
+      updateResizeFromClientY(event.clientY)
+    }
+
+    const handleResizeCommit = () => {
+      if (hasCommitted) return
+      hasCommitted = true
+
+      const sourceEventId = resizeState.sourceEventId
+      const previousEvent = resizeState.originalEvent
+      const latestTimes = resizeLatestTimesRef.current
+      resizeLatestTimesRef.current = null
+      setResizeState(null)
+      setRecurringResizePreview(null)
+
+      // Prefer the synchronously tracked geometry; fall back to the latest
+      // event snapshot only when the pointer never moved.
+      const fallbackEvent = eventsRef.current.find((event) => event.id === sourceEventId)
+      const finalStartTime = latestTimes?.startTime ?? fallbackEvent?.start_time
+      const finalEndTime = latestTimes?.endTime ?? fallbackEvent?.end_time
+
+      if (!finalStartTime || !finalEndTime) {
+        suppressOptimisticEventBroadcastRef.current = false
         return
       }
 
-      apiClient
-        .put(`/api/user-events/${sourceEventId}`, {
-          start_time: finalEvent.start_time,
-          end_time: finalEvent.end_time,
+      const originalResizeStart = resizeState.isRecurringEvent
+        ? resizeState.originalOccurrenceStartTime
+        : previousEvent.start_time
+      const originalResizeEnd = resizeState.isRecurringEvent
+        ? resizeState.originalOccurrenceEndTime
+        : previousEvent.end_time
+
+      if (finalStartTime === originalResizeStart && finalEndTime === originalResizeEnd) {
+        suppressOptimisticEventBroadcastRef.current = false
+        return
+      }
+
+      if (resizeState.isRecurringEvent) {
+        const recurrenceRule = normaliseRecurrenceRule(previousEvent.recurrence_rule)
+        if (recurrenceRule.type === 'none') {
+          suppressOptimisticEventBroadcastRef.current = false
+          return
+        }
+
+        const occurrenceKey = getUtcDateKey(new Date(resizeState.originalOccurrenceStartTime))
+        const nextExceptions = Array.from(new Set([...(recurrenceRule.exceptions || []), occurrenceKey]))
+        const updatedRule: RecurrenceRule = { ...recurrenceRule, exceptions: nextExceptions }
+        const pendingId = `pending-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`
+        const fallbackSourceId = previousEvent.source_id || activeModeId || MAIN_SOURCE_ID
+        const pendingEvent: UserEventRecord = {
+          id: pendingId,
+          title: previousEvent.title,
+          description: previousEvent.description,
+          meeting_link: previousEvent.meeting_link,
+          location: previousEvent.location,
+          start_time: finalStartTime,
+          end_time: finalEndTime,
+          is_public: previousEvent.is_public,
+          source_type: 'manual',
+          source_id: fallbackSourceId,
+          category_ids: Array.isArray(previousEvent.category_ids) ? previousEvent.category_ids : [],
+          recurrence_rule: { type: 'none' },
+        }
+
+        setEvents((prev) => [
+          ...prev.map((candidate) =>
+            candidate.id === sourceEventId
+              ? { ...candidate, recurrence_rule: updatedRule }
+              : candidate
+          ),
+          pendingEvent,
+        ])
+        setSelectedItemId(pendingId)
+
+        void (async () => {
+          try {
+            await apiClient.put(`/api/user-events/${sourceEventId}`, { recurrence_rule: updatedRule })
+            const { data } = await apiClient.post<{ event: UserEventRecord }>('/api/user-events', {
+              title: previousEvent.title,
+              description: previousEvent.description,
+              meeting_link: previousEvent.meeting_link,
+              location: previousEvent.location,
+              start_time: finalStartTime,
+              end_time: finalEndTime,
+              is_public: previousEvent.is_public,
+              category_ids: Array.isArray(previousEvent.category_ids) ? previousEvent.category_ids : [],
+              source_id: fallbackSourceId,
+              recurrence_rule: { type: 'none' },
+            })
+            const created = data?.event
+            if (created) {
+              const normalizedCreated = normaliseCreatedManualEvent(created, {
+                fallbackSourceId,
+                fallbackCategoryIds: Array.isArray(previousEvent.category_ids) ? previousEvent.category_ids : [],
+                fallbackRecurrenceRule: { type: 'none' },
+              })
+              setEvents((prev) => prev.map((candidate) => (candidate.id === pendingId ? normalizedCreated : candidate)))
+              setSelectedItemId(normalizedCreated.id)
+              setPendingRecurringResizeSeriesPrompt({
+                sourceEventId,
+                createdOccurrenceEventId: normalizedCreated.id,
+                originalSeriesEvent: previousEvent,
+                originalOccurrenceStartTime: resizeState.originalOccurrenceStartTime,
+                originalOccurrenceEndTime: resizeState.originalOccurrenceEndTime,
+                finalOccurrenceStartTime: finalStartTime,
+                finalOccurrenceEndTime: finalEndTime,
+              })
+            }
+            setClipboardStatus('This occurrence was resized.')
+            notifyTimeManagementDataChanged('recurring-item-resized-occurrence')
+          } catch (err) {
+            console.error('Failed to resize recurring occurrence:', err)
+            setEvents((prev) => prev.map((candidate) => (candidate.id === sourceEventId ? previousEvent : candidate)).filter((candidate) => candidate.id !== pendingId))
+            setSelectedItemId(sourceEventId)
+            setClipboardStatus('Could not resize recurring occurrence. Try again.')
+          } finally {
+            suppressOptimisticEventBroadcastRef.current = false
+          }
+        })()
+        return
+      }
+
+      // Ensure the committed geometry is reflected locally before the network
+      // round-trip so the item never snaps back to its pre-drag size.
+      setEvents((prev) =>
+        prev.map((candidate) =>
+          candidate.id === sourceEventId
+            ? { ...candidate, start_time: finalStartTime, end_time: finalEndTime }
+            : candidate
+        )
+      )
+
+      void apiClient
+        .put<{ event?: UserEventRecord }>(`/api/user-events/${sourceEventId}`, {
+          start_time: finalStartTime,
+          end_time: finalEndTime,
+        })
+        .then((res) => {
+          const updatedEvent = res.data?.event
+          if (updatedEvent) {
+            setEvents((prev) => prev.map((candidate) => (candidate.id === sourceEventId ? updatedEvent : candidate)))
+          }
+          notifyTimeManagementDataChanged('event-resized')
         })
         .catch((err) => {
           console.error('Failed to resize item:', err)
           setEvents((prev) => prev.map((candidate) => (candidate.id === sourceEventId ? previousEvent : candidate)))
         })
+        .finally(() => {
+          suppressOptimisticEventBroadcastRef.current = false
+        })
     }
 
+    window.addEventListener('pointermove', handlePointerMove)
+    window.addEventListener('pointerup', handleResizeCommit)
+    window.addEventListener('pointercancel', handleResizeCommit)
     window.addEventListener('mousemove', handleMouseMove)
-    window.addEventListener('mouseup', handleMouseUp)
-    window.addEventListener('pointerup', handleMouseUp)
-    window.addEventListener('blur', handleMouseUp)
+    window.addEventListener('mouseup', handleResizeCommit)
+    window.addEventListener('blur', handleResizeCommit)
     return () => {
+      setRecurringResizePreview(null)
+      window.removeEventListener('pointermove', handlePointerMove)
+      window.removeEventListener('pointerup', handleResizeCommit)
+      window.removeEventListener('pointercancel', handleResizeCommit)
       window.removeEventListener('mousemove', handleMouseMove)
-      window.removeEventListener('mouseup', handleMouseUp)
-      window.removeEventListener('pointerup', handleMouseUp)
-      window.removeEventListener('blur', handleMouseUp)
+      window.removeEventListener('mouseup', handleResizeCommit)
+      window.removeEventListener('blur', handleResizeCommit)
     }
-  }, [items, resizeState, slotMinutes, weekDays])
+  }, [activeModeId, notifyTimeManagementDataChanged, resizeState, slotMinutes, weekDays])
 
   const lastSavedLabel = useMemo(() => {
     if (!lastSavedAt) return null
@@ -6143,11 +6464,19 @@ export default function TimeManagementPage() {
       )
     )
 
+    if (sourceEventId) {
+      pendingMutationEventIdsRef.current.add(sourceEventId)
+    }
     apiClient
       .put(`/api/user-events/${sourceEventId}`, { start_time: startTime, end_time: endTime })
       .catch((err) => {
         console.error('Failed to reschedule item:', err)
         setEvents(previous)
+      })
+      .finally(() => {
+        if (sourceEventId) {
+          pendingMutationEventIdsRef.current.delete(sourceEventId)
+        }
       })
   }
 
@@ -7149,6 +7478,118 @@ export default function TimeManagementPage() {
       showClipboardStatus('Could not delete occurrences. Try again.')
     }
   }
+
+  const handleApplyRecurringResizeToSeries = useCallback(async () => {
+    if (!pendingRecurringResizeSeriesPrompt) return
+
+    const {
+      sourceEventId,
+      createdOccurrenceEventId,
+      originalSeriesEvent,
+      originalOccurrenceStartTime,
+      originalOccurrenceEndTime,
+      finalOccurrenceStartTime,
+      finalOccurrenceEndTime,
+    } = pendingRecurringResizeSeriesPrompt
+
+    const originalSeriesStartMs = new Date(originalSeriesEvent.start_time).getTime()
+    const originalSeriesEndMs = new Date(originalSeriesEvent.end_time).getTime()
+    const originalOccurrenceStartMs = new Date(originalOccurrenceStartTime).getTime()
+    const originalOccurrenceEndMs = new Date(originalOccurrenceEndTime).getTime()
+    const finalOccurrenceStartMs = new Date(finalOccurrenceStartTime).getTime()
+    const finalOccurrenceEndMs = new Date(finalOccurrenceEndTime).getTime()
+
+    if (
+      Number.isNaN(originalSeriesStartMs)
+      || Number.isNaN(originalSeriesEndMs)
+      || Number.isNaN(originalOccurrenceStartMs)
+      || Number.isNaN(originalOccurrenceEndMs)
+      || Number.isNaN(finalOccurrenceStartMs)
+      || Number.isNaN(finalOccurrenceEndMs)
+    ) {
+      setPendingRecurringResizeSeriesPrompt(null)
+      showClipboardStatus('Could not apply this change to the series.')
+      return
+    }
+
+    const deltaStartMs = finalOccurrenceStartMs - originalOccurrenceStartMs
+    const deltaEndMs = finalOccurrenceEndMs - originalOccurrenceEndMs
+    const nextSeriesStartTime = new Date(originalSeriesStartMs + deltaStartMs).toISOString()
+    const nextSeriesEndTime = new Date(originalSeriesEndMs + deltaEndMs).toISOString()
+
+    const baseRule = normaliseRecurrenceRule(originalSeriesEvent.recurrence_rule)
+    const dayShift = Math.round(
+      (toUtcDateParts(new Date(nextSeriesStartTime)) - toUtcDateParts(new Date(originalSeriesEvent.start_time))) / DAY_MS
+    )
+    const nextSeriesRule = shiftRecurrenceRuleByDays(baseRule, dayShift)
+
+    const previous = eventsRef.current
+    setEvents((prev) => {
+      const updatedSource = prev.map((entry) =>
+        entry.id === sourceEventId
+          ? {
+              ...entry,
+              start_time: nextSeriesStartTime,
+              end_time: nextSeriesEndTime,
+              recurrence_rule: nextSeriesRule,
+            }
+          : entry
+      )
+      return updatedSource.filter((entry) => entry.id !== createdOccurrenceEventId)
+    })
+
+    try {
+      await apiClient.put(`/api/user-events/${sourceEventId}`, {
+        start_time: nextSeriesStartTime,
+        end_time: nextSeriesEndTime,
+        recurrence_rule: nextSeriesRule,
+      })
+      await apiClient.delete(`/api/user-events/${createdOccurrenceEventId}`)
+      setPendingRecurringResizeSeriesPrompt(null)
+      setSelectedItemId(sourceEventId)
+      showClipboardStatus('Recurring series updated.')
+      notifyTimeManagementDataChanged('recurring-item-resized-series')
+    } catch (error) {
+      console.error('Failed to apply recurring resize to series:', error)
+      setEvents(previous)
+      showClipboardStatus('Could not apply this change to the series. Try again.')
+    }
+  }, [notifyTimeManagementDataChanged, pendingRecurringResizeSeriesPrompt, showClipboardStatus])
+
+  const handleKeepRecurringResizeForCurrentWeek = useCallback(() => {
+    setPendingRecurringResizeSeriesPrompt(null)
+    showClipboardStatus('Resize kept for this week only.')
+  }, [showClipboardStatus])
+
+  const handleRevertRecurringResize = useCallback(async () => {
+    if (!pendingRecurringResizeSeriesPrompt) return
+
+    const { sourceEventId, createdOccurrenceEventId, originalSeriesEvent } = pendingRecurringResizeSeriesPrompt
+    const previous = eventsRef.current
+
+    setEvents((prev) =>
+      prev
+        .map((entry) => (entry.id === sourceEventId ? { ...originalSeriesEvent } : entry))
+        .filter((entry) => entry.id !== createdOccurrenceEventId)
+    )
+
+    try {
+      await apiClient.put(`/api/user-events/${sourceEventId}`, {
+        start_time: originalSeriesEvent.start_time,
+        end_time: originalSeriesEvent.end_time,
+        recurrence_rule: originalSeriesEvent.recurrence_rule,
+      })
+      await apiClient.delete(`/api/user-events/${createdOccurrenceEventId}`)
+      setPendingRecurringResizeSeriesPrompt(null)
+      setSelectedItemId(sourceEventId)
+      showClipboardStatus('Resize was reverted.')
+      notifyTimeManagementDataChanged('recurring-item-resize-reverted')
+    } catch (error) {
+      console.error('Failed to revert recurring resize:', error)
+      setEvents(previous)
+      showClipboardStatus('Could not revert resize. Try again.')
+    }
+  }, [notifyTimeManagementDataChanged, pendingRecurringResizeSeriesPrompt, showClipboardStatus])
 
   const nudgeSelectionDraftEdge = useCallback((edge: 'start' | 'end', direction: -1 | 1) => {
     setSelectionDraft((prev) => {
@@ -11343,6 +11784,22 @@ export default function TimeManagementPage() {
                 ? Math.max((dragDropPreview.durationMinutes / slotMinutes) * SLOT_HEIGHT, 10)
                 : 0
               const dropPreviewColor = draggingItem ? (sourceMap.get(draggingItem.sourceId)?.color || '#2563eb') : '#2563eb'
+              const resizingPreviewItem = resizeState
+                ? interactionItemMap.get(resizeState.itemId) || items.find((entry) => entry.id === resizeState.itemId)
+                : null
+              const isRecurringResizePreviewVisible =
+                Boolean(resizeState?.isRecurringEvent)
+                && Boolean(recurringResizePreview)
+                && recurringResizePreview?.dayIndex === dayIndex
+              const recurringResizePreviewTop = isRecurringResizePreviewVisible && recurringResizePreview
+                ? (recurringResizePreview.startMinute / slotMinutes) * SLOT_HEIGHT
+                : 0
+              const recurringResizePreviewHeight = isRecurringResizePreviewVisible && recurringResizePreview
+                ? Math.max((recurringResizePreview.durationMinutes / slotMinutes) * SLOT_HEIGHT, 10)
+                : 0
+              const recurringResizePreviewColor = resizingPreviewItem
+                ? (sourceMap.get(resizingPreviewItem.sourceId)?.color || '#2563eb')
+                : '#2563eb'
 
               type SegmentContinuity = { hasConnectedTop: boolean; hasConnectedBottom: boolean }
               const segmentContinuity = new Map<number, SegmentContinuity>()
@@ -11435,28 +11892,13 @@ export default function TimeManagementPage() {
                     const edgeTarget = findEdgeResizeTarget(dayIndex, pointerX, pointerY, rect.width)
                     if (!edgeTarget) return
 
-                    const targetItem = items.find((candidate) => candidate.id === edgeTarget.itemId)
-                    const eventRecord = targetItem ? events.find((candidate) => candidate.id === targetItem.sourceEventId) : null
-                    if (!eventRecord) return
-                    const source = sourceMap.get(eventRecord.source_id || MAIN_SOURCE_ID)
-                    if (isReadOnlySource(source)) return
-
-                    const start = new Date(eventRecord.start_time)
-                    const end = new Date(eventRecord.end_time)
-                    if (Number.isNaN(start.getTime()) || Number.isNaN(end.getTime())) return
-
                     event.preventDefault()
                     event.stopPropagation()
-                    setSelectionDraft(null)
-                    setSelectedItemId(edgeTarget.itemId)
-                    setResizeState({
+                    beginEdgeResize({
                       itemId: edgeTarget.itemId,
                       dayIndex,
                       edge: edgeTarget.edge,
                       dayColumnElement: event.currentTarget,
-                      originalEvent: eventRecord,
-                      originalStartMinute: start.getUTCHours() * 60 + start.getUTCMinutes(),
-                      originalEndMinute: end.getUTCHours() * 60 + end.getUTCMinutes(),
                     })
                   }}
                   onMouseDown={(event) => {
@@ -11471,9 +11913,28 @@ export default function TimeManagementPage() {
                     if (event.pointerType === 'mouse') return
                     if (isResizing) return
                     if (isTemplateSelectionMode) return
+
+                    const rect = event.currentTarget.getBoundingClientRect()
+                    const pointerX = event.clientX - rect.left
+                    const pointerY = Math.max(0, Math.min(rect.height, event.clientY - rect.top))
+                    const edgeTarget = findEdgeResizeTarget(dayIndex, pointerX, pointerY, rect.width)
+                    if (edgeTarget) {
+                      event.preventDefault()
+                      event.stopPropagation()
+                      beginEdgeResize({
+                        itemId: edgeTarget.itemId,
+                        dayIndex,
+                        edge: edgeTarget.edge,
+                        dayColumnElement: event.currentTarget,
+                      })
+                      return
+                    }
+
                     event.preventDefault()
                     event.stopPropagation()
-                    event.currentTarget.setPointerCapture(event.pointerId)
+                    if (typeof event.currentTarget.setPointerCapture === 'function') {
+                      event.currentTarget.setPointerCapture(event.pointerId)
+                    }
                     selectionAnchorDayColumnRef.current = event.currentTarget
                     const minute = minuteFromPointer(event as unknown as MouseEvent<HTMLDivElement>)
                     void startSelectionWithUnsavedGuard(dayIndex, minute, { x: event.clientX, y: event.clientY })
@@ -11487,13 +11948,19 @@ export default function TimeManagementPage() {
                   }}
                   onPointerUp={(event) => {
                     if (event.pointerType === 'mouse') return
-                    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                    if (
+                      typeof event.currentTarget.hasPointerCapture === 'function'
+                      && event.currentTarget.hasPointerCapture(event.pointerId)
+                    ) {
                       event.currentTarget.releasePointerCapture(event.pointerId)
                     }
                   }}
                   onPointerCancel={(event) => {
                     if (event.pointerType === 'mouse') return
-                    if (event.currentTarget.hasPointerCapture(event.pointerId)) {
+                    if (
+                      typeof event.currentTarget.hasPointerCapture === 'function'
+                      && event.currentTarget.hasPointerCapture(event.pointerId)
+                    ) {
                       event.currentTarget.releasePointerCapture(event.pointerId)
                     }
                   }}
@@ -11644,6 +12111,29 @@ export default function TimeManagementPage() {
                     </div>
                   )}
 
+                  {isRecurringResizePreviewVisible && recurringResizePreview && (
+                    <div
+                      className="pointer-events-none absolute left-[4%] right-[4%] z-[14] rounded-md border-2 border-dashed"
+                      style={{
+                        top: `${recurringResizePreviewTop}px`,
+                        height: `${recurringResizePreviewHeight}px`,
+                        borderColor: recurringResizePreviewColor,
+                        backgroundColor: hexToRgba(recurringResizePreviewColor, 0.16),
+                        boxShadow: `0 0 0 2px ${hexToRgba(recurringResizePreviewColor, 0.2)}`,
+                        animation: 'drop-target-pulse 0.9s ease-in-out infinite',
+                      }}
+                    >
+                      <div
+                        className="absolute left-0 right-0 top-0 h-[3px] rounded-full"
+                        style={{
+                          backgroundColor: recurringResizePreviewColor,
+                          boxShadow: `0 0 8px ${hexToRgba(recurringResizePreviewColor, 0.8)}`,
+                          animation: 'drop-target-line 0.9s ease-in-out infinite',
+                        }}
+                      />
+                    </div>
+                  )}
+
                   {layout.eventSegments.map((segment, segmentIndex) => {
                     const item = itemMap.get(segment.eventId)
                     if (!item) return null
@@ -11655,6 +12145,7 @@ export default function TimeManagementPage() {
                     const isBeingResized = resizeState?.itemId === interactionId
                     const isBeingDragged = draggingItemId === interactionId
                     const isMoveSource = movingItemId === interactionId
+                    const isHoverLinkedItem = hoveredInteractionItemId === interactionId
                     const itemHeight = Math.max(segment.height, 18)
                     const primaryStartLabel = formatMinuteLabel(item.startMinute, tzState.primary, slotMinutes)
                     const primaryEndLabel = formatMinuteLabel(item.startMinute + item.durationMinutes, tzState.primary, slotMinutes)
@@ -11709,8 +12200,16 @@ export default function TimeManagementPage() {
                         className={`group absolute rounded-md border-2 px-1 pb-1 pt-0.5 shadow-sm transition-all duration-200 hover:shadow-md ${
                           isSelected ? 'ring-2 ring-blue-400' : ''
                         }`}
+                        data-resize-hover-linked={isHoverLinkedItem ? 'true' : undefined}
                         draggable={!isExternal && !isResizing}
+                        onMouseEnter={() => {
+                          setHoveredInteractionItemId(interactionId)
+                        }}
+                        onMouseLeave={() => {
+                          setHoveredInteractionItemId((current) => (current === interactionId ? null : current))
+                        }}
                         onMouseDown={(event) => event.stopPropagation()}
+                        onPointerDown={(event) => event.stopPropagation()}
                         onContextMenu={(event) => {
                           event.preventDefault()
                           event.stopPropagation()
@@ -12238,6 +12737,40 @@ export default function TimeManagementPage() {
           void handleDeleteCategory(categoryDeleteTarget)
         }}
       />
+
+      {pendingRecurringResizeSeriesPrompt && (
+        <div className="fixed inset-0 z-[210] flex items-center justify-center bg-black/45 px-4" role="dialog" aria-modal="true" aria-label="Recurring resize options">
+          <div className="w-full max-w-md rounded-xl border border-border bg-background p-4 shadow-2xl">
+            <h3 className="text-base font-semibold text-foreground">Recurring item resized</h3>
+            <p className="mt-1.5 text-sm text-muted-foreground">
+              Choose how this resize should be applied.
+            </p>
+            <div className="mt-4 flex flex-col gap-2">
+              <button
+                type="button"
+                onClick={() => { void handleRevertRecurringResize() }}
+                className="w-full rounded-md border border-red-300 bg-red-50 px-3 py-2 text-sm font-semibold text-red-700 hover:bg-red-100 dark:border-red-800 dark:bg-red-950/30 dark:text-red-300 dark:hover:bg-red-950/45"
+              >
+                Cancel and revert changes
+              </button>
+              <button
+                type="button"
+                onClick={handleKeepRecurringResizeForCurrentWeek}
+                className="w-full rounded-md border border-border px-3 py-2 text-sm font-medium text-foreground hover:bg-muted"
+              >
+                Apply only to current week
+              </button>
+              <button
+                type="button"
+                onClick={() => { void handleApplyRecurringResizeToSeries() }}
+                className="w-full rounded-md bg-blue-600 px-3 py-2 text-sm font-semibold text-white hover:bg-blue-700"
+              >
+                Apply to all weeks
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       {calendarItemContextMenu && (
         <div

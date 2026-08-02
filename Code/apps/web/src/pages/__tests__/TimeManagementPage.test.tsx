@@ -1210,6 +1210,196 @@ describe('TimeManagementPage', () => {
     })
   })
 
+  it('resizes recurring items as occurrence-only by default and prompts for series apply', async () => {
+    const weekStart = new Date()
+    weekStart.setHours(0, 0, 0, 0)
+    weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7))
+
+    const baseStart = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 1, 0, 0)).toISOString()
+    const baseEnd = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 1, 15, 0)).toISOString()
+
+    mockDedupedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/calendar-sources') {
+        return { data: { sources: [] } }
+      }
+      if (url === '/api/time-management/modes') {
+        return {
+          data: {
+            activeModeId: 'mode-main',
+            modes: [
+              {
+                id: 'mode-main',
+                name: 'Main',
+                main_color: '#2563eb',
+                slot_minutes: 15,
+                sync_calendars: [],
+                time_backgrounds: [],
+                collapsed_background_ids: [],
+                quick_templates: [],
+                show_quick_templates_in_main: false,
+              },
+            ],
+          },
+        }
+      }
+      if (url === '/api/time-management/categories') {
+        return { data: { categories: [] } }
+      }
+      if (url === '/api/user-events') {
+        return {
+          data: {
+            events: [
+              {
+                id: 'event-recurring-resize',
+                title: 'Recurring resize target',
+                description: null,
+                meeting_link: null,
+                location: null,
+                start_time: baseStart,
+                end_time: baseEnd,
+                source_type: 'manual',
+                source_id: 'coord-main',
+                category_ids: [],
+                recurrence_rule: { type: 'weekly' },
+              },
+            ],
+          },
+        }
+      }
+      return { data: {} }
+    })
+
+    mockComputeDayLayout.mockReturnValue({
+      eventSegments: [
+        {
+          eventId: 'event-recurring-resize',
+          eventIndex: 0,
+          top: 104,
+          height: 26,
+          leftPercent: 0,
+          widthPercent: 100,
+          isFirstSegment: true,
+        },
+      ],
+      overflowSegments: [],
+    })
+
+    mockApiPut.mockResolvedValue({ data: { event: { id: 'event-recurring-resize' } } })
+    mockApiPost.mockImplementation(async (url: string, payload?: unknown) => {
+      if (url !== '/api/user-events') {
+        return { data: {} }
+      }
+      const posted = payload as {
+        title: string
+        description: string | null
+        start_time: string
+        end_time: string
+        category_ids: string[]
+        source_id: string
+        recurrence_rule: { type: 'none' }
+      }
+
+      return {
+        data: {
+          event: {
+            id: 'event-occurrence-resized',
+            title: posted.title,
+            description: posted.description,
+            meeting_link: null,
+            location: null,
+            start_time: posted.start_time,
+            end_time: posted.end_time,
+            source_type: 'manual',
+            source_id: posted.source_id,
+            category_ids: posted.category_ids,
+            recurrence_rule: posted.recurrence_rule,
+          },
+        },
+      }
+    })
+
+    render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    await screen.findByRole('heading', { name: 'Time Management' })
+    await waitFor(() => {
+      expect(document.querySelectorAll('.time-item-resize-handle-bottom').length).toBeGreaterThan(0)
+    })
+
+    const dayColumns = Array.from(document.querySelectorAll<HTMLDivElement>('div[style*="background-image"]'))
+    expect(dayColumns.length).toBeGreaterThanOrEqual(7)
+
+    const dayColumn = dayColumns[0]
+    if (!dayColumn) {
+      throw new Error('Expected at least one day column')
+    }
+
+    Object.defineProperty(dayColumn, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({
+        x: 0,
+        y: 0,
+        top: 0,
+        left: 0,
+        right: 100,
+        bottom: 2496,
+        width: 100,
+        height: 2496,
+        toJSON: () => ({}),
+      }),
+    })
+
+    fireEvent.mouseDown(dayColumn, { button: 0, clientX: 20, clientY: 130 })
+    fireEvent.mouseMove(window, { clientX: 20, clientY: 156 })
+    fireEvent.mouseUp(window)
+
+    await waitFor(() => {
+      expect(mockApiPut).toHaveBeenCalledWith(
+        '/api/user-events/event-recurring-resize',
+        expect.objectContaining({
+          recurrence_rule: expect.objectContaining({ type: 'weekly' }),
+        })
+      )
+      expect(mockApiPost).toHaveBeenCalledWith(
+        '/api/user-events',
+        expect.objectContaining({
+          recurrence_rule: { type: 'none' },
+        })
+      )
+    })
+
+    const directResizePayload = mockApiPut.mock.calls.find((call) => {
+      if (call[0] !== '/api/user-events/event-recurring-resize') return false
+      const payload = call[1] as Record<string, unknown>
+      return Object.prototype.hasOwnProperty.call(payload, 'start_time')
+        || Object.prototype.hasOwnProperty.call(payload, 'end_time')
+    })
+    expect(directResizePayload).toBeUndefined()
+
+    expect(await screen.findByText('Recurring item resized')).toBeInTheDocument()
+    const revertButton = screen.getByRole('button', { name: 'Cancel and revert changes' })
+    expect(revertButton).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Apply only to current week' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Apply to all weeks' })).toBeInTheDocument()
+
+    fireEvent.click(revertButton)
+
+    await waitFor(() => {
+      expect(mockApiDelete).toHaveBeenCalledWith('/api/user-events/event-occurrence-resized')
+      expect(mockApiPut).toHaveBeenCalledWith(
+        '/api/user-events/event-recurring-resize',
+        expect.objectContaining({
+          start_time: baseStart,
+          end_time: baseEnd,
+          recurrence_rule: expect.objectContaining({ type: 'weekly' }),
+        })
+      )
+    })
+  })
+
   it('allows new selection to extend beyond 00:00 UTC and saves as a cross-day item', async () => {
     const weekStart = new Date()
     weekStart.setHours(0, 0, 0, 0)

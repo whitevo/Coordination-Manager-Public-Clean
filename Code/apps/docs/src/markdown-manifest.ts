@@ -6,6 +6,7 @@ import privacyPolicyMarkdown from '../../../../docs/public/PRIVACY_POLICY.md?raw
 import termsOfServiceMarkdown from '../../../../docs/public/TERMS_OF_SERVICE.md?raw'
 import proposalVideoMeetingMarkdown from './content/proposals/video-meeting.md?raw'
 import proposalDataPrivacyMarkdown from './content/proposals/data-privacy.md?raw'
+import proposalOpenSourceSecurityMarkdown from './content/proposals/open-source-security.md?raw'
 
 export type MarkdownSection = 'Legal' | 'Proposals'
 
@@ -64,6 +65,12 @@ export const markdownRoutes: MarkdownRouteEntry[] = [
     path: '/proposals/data-privacy',
     section: 'Proposals',
     markdown: proposalDataPrivacyMarkdown,
+  },
+  {
+    title: 'Open Source Security Improvement',
+    path: '/proposals/open-source-security',
+    section: 'Proposals',
+    markdown: proposalOpenSourceSecurityMarkdown,
   },
 ]
 

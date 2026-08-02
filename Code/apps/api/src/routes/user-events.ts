@@ -1089,6 +1089,107 @@ router.put('/bulk-public', async (req: AuthenticatedRequest, res: Response) => {
   }
 })
 
+// ─── GET /api/user-events/sync-prefs ───────────────────────
+// NOTE: These literal-path routes MUST be registered before the parameterized
+// `/:id` routes below. Otherwise Express matches PUT /sync-prefs against
+// PUT /:id (id="sync-prefs") and rejects it with "Invalid event id" (400).
+
+router.get('/sync-prefs', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('user_event_sync_prefs')
+      .select('source_type, source_id, auto_sync, auto_publish_new, range_months, last_synced_at, last_sync_error, updated_at')
+      .eq('user_id', req.userId)
+      .order('source_type', { ascending: true })
+
+    if (error) return res.status(400).json({ error: error.message })
+    res.json({ prefs: data || [] })
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : 'Failed to fetch sync preferences'
+    res.status(500).json({ error })
+  }
+})
+
+// ─── PUT /api/user-events/sync-prefs ───────────────────────
+
+router.put('/sync-prefs', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const payload: Array<{
+      source_type?: string
+      source_id?: string
+      auto_sync?: boolean
+      auto_publish_new?: boolean
+      range_months?: number
+    }> = Array.isArray(req.body?.prefs) ? req.body.prefs : []
+
+    const normalized = payload
+      .map((p) => {
+        const sourceType = p.source_type
+        const sourceId = typeof p.source_id === 'string' ? p.source_id.trim() : ''
+        if (!sourceId) return null
+        if (sourceType !== 'google_oauth' && sourceType !== 'google_public_url' && sourceType !== 'coordination_calendar') {
+          return null
+        }
+
+        const rangeMonthsRaw = Number(p.range_months)
+        const rangeMonths = Number.isFinite(rangeMonthsRaw)
+          ? Math.min(24, Math.max(1, Math.floor(rangeMonthsRaw)))
+          : 12
+
+        return {
+          user_id: req.userId,
+          source_type: sourceType,
+          source_id: sourceId,
+          auto_sync: p.auto_sync !== false,
+          auto_publish_new: !!p.auto_publish_new,
+          range_months: rangeMonths,
+        }
+      })
+      .filter((row): row is UserEventSyncPrefRow => !!row)
+
+    const activeRows = normalized.filter(row => row.auto_sync)
+    const activeKeys = new Set(activeRows.map(row => `${row.source_type}:${row.source_id}`))
+
+    const { data: existingRows, error: existingErr } = await supabaseAdmin
+      .from('user_event_sync_prefs')
+      .select('source_type, source_id')
+      .eq('user_id', req.userId)
+
+    if (existingErr) return res.status(400).json({ error: existingErr.message })
+
+    const toDelete = (existingRows || []).filter(row => !activeKeys.has(`${row.source_type}:${row.source_id}`))
+    for (const row of toDelete) {
+      const { error: deleteErr } = await supabaseAdmin
+        .from('user_event_sync_prefs')
+        .delete()
+        .eq('user_id', req.userId)
+        .eq('source_type', row.source_type)
+        .eq('source_id', row.source_id)
+
+      if (deleteErr) return res.status(400).json({ error: deleteErr.message })
+    }
+
+    if (activeRows.length > 0) {
+      const { error: upsertErr } = await supabaseAdmin
+        .from('user_event_sync_prefs')
+        .upsert(activeRows, { onConflict: 'user_id,source_type,source_id' })
+
+      if (upsertErr) return res.status(400).json({ error: upsertErr.message })
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('user_event_sync_prefs')
+      .select('source_type, source_id, auto_sync, auto_publish_new, range_months, last_synced_at, last_sync_error, updated_at')
+      .eq('user_id', req.userId)
+
+    if (error) return res.status(400).json({ error: error.message })
+    res.json({ prefs: data || [] })
+  } catch (err: unknown) {
+    const error = err instanceof Error ? err.message : 'Failed to update sync preferences'
+    res.status(500).json({ error })
+  }
+})
+
 // ─── PUT /api/user-events/:id ───────────────────────────────
 // Update an event (title, description, public status, etc.)
 
@@ -1638,104 +1739,6 @@ router.post('/sync-imports', async (req: AuthenticatedRequest, res: Response) =>
     })
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : 'Failed to sync imported events'
-    res.status(500).json({ error })
-  }
-})
-
-// ─── GET /api/user-events/sync-prefs ───────────────────────
-
-router.get('/sync-prefs', async (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const { data, error } = await supabaseAdmin
-      .from('user_event_sync_prefs')
-      .select('source_type, source_id, auto_sync, auto_publish_new, range_months, last_synced_at, last_sync_error, updated_at')
-      .eq('user_id', req.userId)
-      .order('source_type', { ascending: true })
-
-    if (error) return res.status(400).json({ error: error.message })
-    res.json({ prefs: data || [] })
-  } catch (err: unknown) {
-    const error = err instanceof Error ? err.message : 'Failed to fetch sync preferences'
-    res.status(500).json({ error })
-  }
-})
-
-// ─── PUT /api/user-events/sync-prefs ───────────────────────
-
-router.put('/sync-prefs', async (req: AuthenticatedRequest, res: Response) => {
-  try {
-    const payload: Array<{
-      source_type?: string
-      source_id?: string
-      auto_sync?: boolean
-      auto_publish_new?: boolean
-      range_months?: number
-    }> = Array.isArray(req.body?.prefs) ? req.body.prefs : []
-
-    const normalized = payload
-      .map((p) => {
-        const sourceType = p.source_type
-        const sourceId = typeof p.source_id === 'string' ? p.source_id.trim() : ''
-        if (!sourceId) return null
-        if (sourceType !== 'google_oauth' && sourceType !== 'google_public_url' && sourceType !== 'coordination_calendar') {
-          return null
-        }
-
-        const rangeMonthsRaw = Number(p.range_months)
-        const rangeMonths = Number.isFinite(rangeMonthsRaw)
-          ? Math.min(24, Math.max(1, Math.floor(rangeMonthsRaw)))
-          : 12
-
-        return {
-          user_id: req.userId,
-          source_type: sourceType,
-          source_id: sourceId,
-          auto_sync: p.auto_sync !== false,
-          auto_publish_new: !!p.auto_publish_new,
-          range_months: rangeMonths,
-        }
-      })
-      .filter((row): row is UserEventSyncPrefRow => !!row)
-
-    const activeRows = normalized.filter(row => row.auto_sync)
-    const activeKeys = new Set(activeRows.map(row => `${row.source_type}:${row.source_id}`))
-
-    const { data: existingRows, error: existingErr } = await supabaseAdmin
-      .from('user_event_sync_prefs')
-      .select('source_type, source_id')
-      .eq('user_id', req.userId)
-
-    if (existingErr) return res.status(400).json({ error: existingErr.message })
-
-    const toDelete = (existingRows || []).filter(row => !activeKeys.has(`${row.source_type}:${row.source_id}`))
-    for (const row of toDelete) {
-      const { error: deleteErr } = await supabaseAdmin
-        .from('user_event_sync_prefs')
-        .delete()
-        .eq('user_id', req.userId)
-        .eq('source_type', row.source_type)
-        .eq('source_id', row.source_id)
-
-      if (deleteErr) return res.status(400).json({ error: deleteErr.message })
-    }
-
-    if (activeRows.length > 0) {
-      const { error: upsertErr } = await supabaseAdmin
-        .from('user_event_sync_prefs')
-        .upsert(activeRows, { onConflict: 'user_id,source_type,source_id' })
-
-      if (upsertErr) return res.status(400).json({ error: upsertErr.message })
-    }
-
-    const { data, error } = await supabaseAdmin
-      .from('user_event_sync_prefs')
-      .select('source_type, source_id, auto_sync, auto_publish_new, range_months, last_synced_at, last_sync_error, updated_at')
-      .eq('user_id', req.userId)
-
-    if (error) return res.status(400).json({ error: error.message })
-    res.json({ prefs: data || [] })
-  } catch (err: unknown) {
-    const error = err instanceof Error ? err.message : 'Failed to update sync preferences'
     res.status(500).json({ error })
   }
 })

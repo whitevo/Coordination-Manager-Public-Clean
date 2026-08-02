@@ -215,6 +215,14 @@ function isRecurrenceEndType(value: unknown): value is NonNullable<RecurrenceRul
   return value === 'never' || value === 'on' || value === 'after'
 }
 
+function readStorageValue(storage: Storage | undefined, key: string): string | null {
+  try {
+    return storage?.getItem(key) ?? null
+  } catch {
+    return null
+  }
+}
+
 function normalizeRecurrenceRule(value: unknown): RecurrenceRule {
   if (!value || typeof value !== 'object') {
     return { type: 'none' }
@@ -801,7 +809,7 @@ export default function CalendarPage() {
   // Mobile landscape tip state
   const [showLandscapeTip, setShowLandscapeTip] = useState(() => {
     if (typeof window === 'undefined') return false
-    const dismissed = sessionStorage.getItem('landscapeTipDismissed')
+    const dismissed = readStorageValue(sessionStorage, 'landscapeTipDismissed')
     return !dismissed && window.innerWidth < 768
   })
 
@@ -2072,7 +2080,7 @@ export default function CalendarPage() {
   const hasExportTargets = checkedExportableSources.length > 0
 
   // Check if there's pending calendar data to restore (only relevant when authenticated)
-  const hasPendingRestore = !hash && isAuthenticated && !!localStorage.getItem('pendingCalendarData')
+  const hasPendingRestore = !hash && isAuthenticated && !!readStorageValue(localStorage, 'pendingCalendarData')
 
   const setRangeWithSundayDefault = useCallback((startDate: Date, endDate: Date) => {
     const normalizedStart = startDate <= endDate ? startDate : endDate
@@ -5827,13 +5835,7 @@ export default function CalendarPage() {
                   const isPastInActiveWeek = meeting.isPastInActiveWeek
                   const _isUpcomingFutureWeek = meeting.isUpcomingFutureWeek
                   const isEditingThis = editingMeetingIndex === originalIndex && showMeetingSidePanel
-                  const trimmedCalendarName = (eventName || calendarTitle || 'Meeting').trim()
-                  const trimmedMeetingTitle = meeting.title?.trim() || ''
                   const trimmedMeetingDescription = meeting.description?.trim() || ''
-                  const hasCustomMeetingName =
-                    trimmedMeetingTitle.length > 0
-                    && trimmedMeetingTitle !== trimmedCalendarName
-                    && trimmedMeetingTitle !== trimmedMeetingDescription
                   const meetingDisplayTitle = resolveMeetingTitle({
                     title: meeting.title,
                     calendarTitle: eventName || calendarTitle || 'Meeting',
@@ -5894,15 +5896,22 @@ export default function CalendarPage() {
                       }`}
                       style={{ width: '220px' }}
                     >
-                      {isCreator && (
-                        <div className="absolute top-2 right-2">
-                          <button
-                            onClick={(e) => { e.stopPropagation(); setMeetingDeleteIndex(meetingDeleteIndex === originalIndex ? null : originalIndex) }}
-                            className="p-1 text-muted-foreground hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950 rounded transition-colors"
-                            title="Delete meeting"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                      {(isCreator || isPast) && (
+                        <div className="absolute top-2 right-2 flex flex-col items-end gap-1">
+                          {isCreator && (
+                            <button
+                              onClick={(e) => { e.stopPropagation(); setMeetingDeleteIndex(meetingDeleteIndex === originalIndex ? null : originalIndex) }}
+                              className="p-1 text-red-600 hover:text-red-700 hover:bg-red-50 dark:hover:bg-red-950 rounded transition-colors"
+                              title="Delete meeting"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          )}
+                          {isPast && (
+                            <span className="shrink-0 text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-amber-600 dark:bg-amber-700 text-white">
+                              Past
+                            </span>
+                          )}
                           {meetingDeleteIndex === originalIndex && (
                             <div
                               ref={meetingDeleteRef}
@@ -5942,7 +5951,7 @@ export default function CalendarPage() {
                           )}
                         </div>
                       )}
-                      <div className="space-y-2">
+                      <div className={`space-y-2 ${(isCreator || isPast) ? 'pr-12' : ''}`}>
                         <div className="flex items-start gap-2">
                           {hasExportTargets && (
                             <input
@@ -5972,13 +5981,6 @@ export default function CalendarPage() {
                               }`}>
                                 {sortedIndex + 1}
                               </span>
-                              {!hasCustomMeetingName && (
-                                <span className={`shrink-0 text-xs font-medium ${
-                                  isPastInActiveWeek
-                                    ? 'text-foreground/80'
-                                    : 'text-foreground/70'
-                                }`}>Meeting</span>
-                              )}
                               <span
                                 className={`min-w-0 flex-1 overflow-hidden text-sm font-extrabold leading-tight ${
                                   isEditingThis ? 'text-blue-50' : 'text-slate-900'
@@ -5994,11 +5996,6 @@ export default function CalendarPage() {
                               >
                                 {meetingDisplayTitle}
                               </span>
-                              {isPast && (
-                                <span className="shrink-0 text-[10px] font-bold uppercase tracking-wide px-1.5 py-0.5 rounded bg-amber-600 dark:bg-amber-700 text-white">
-                                  Past
-                                </span>
-                              )}
                             </div>
                             <div className="text-sm text-amber-900 font-semibold mt-1">
                               {format(meetingDate, 'EEE, MMM d, yyyy')}
@@ -6875,9 +6872,36 @@ export default function CalendarPage() {
                           pos === 'last' ? 'border-l-2 border-b-2 border-r-2 border-t-0' :
                           'border-l-2 border-r-2 border-t-0 border-b-0'
                         }`
+
+                        const meetingOverlayClasses = isMobile
+                          ? borderClasses.replace('pointer-events-none', 'pointer-events-auto cursor-pointer')
+                          : borderClasses
                         
                         return (
-                          <div key={`${m.meetingIndex}-${idx}-${isRec ? 'r' : 'p'}`} className={borderClasses}>
+                          <div
+                            key={`${m.meetingIndex}-${idx}-${isRec ? 'r' : 'p'}`}
+                            data-testid={`meeting-overlay-${m.meetingIndex}-${idx}`}
+                            role={isMobile ? 'button' : undefined}
+                            tabIndex={isMobile ? 0 : undefined}
+                            aria-label={isMobile ? `Open meeting ${m.chronologicalNumber}` : undefined}
+                            className={meetingOverlayClasses}
+                            onPointerDown={(e) => {
+                              if (!isMobile) return
+                              e.stopPropagation()
+                            }}
+                            onClick={(e) => {
+                              if (!isMobile) return
+                              e.stopPropagation()
+                              openMeetingEditorByIndex(m.meetingIndex, occurrenceCellId)
+                            }}
+                            onKeyDown={(e) => {
+                              if (!isMobile) return
+                              if (e.key !== 'Enter' && e.key !== ' ') return
+                              e.preventDefault()
+                              e.stopPropagation()
+                              openMeetingEditorByIndex(m.meetingIndex, occurrenceCellId)
+                            }}
+                          >
                             {m.isFirstCell && (
                               <div 
                                 className={`absolute top-0 text-white text-[10px] font-bold px-1 leading-tight flex items-center gap-0.5 ${

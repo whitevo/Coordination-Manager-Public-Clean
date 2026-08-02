@@ -415,6 +415,7 @@ export default function AnnouncementsPage() {
   })
   const [sending, setSending] = useState(false)
   const [sendResult, setSendResult] = useState<{ type: 'success' | 'error' | 'warning'; message: string } | null>(null)
+  const [sendWithoutCalendarModalOpen, setSendWithoutCalendarModalOpen] = useState(false)
 
   // Poll state — session-cached
   const [pollEnabled, setPollEnabled] = useState(() => {
@@ -557,6 +558,7 @@ export default function AnnouncementsPage() {
     return new Set<string>()
   })
   const [meetingContextExpanded, setMeetingContextExpanded] = useState(false)
+  const calendarContextSectionRef = useRef<HTMLDivElement>(null)
   // Snapshot of selected IDs at the time the panel was expanded — used to pin selected items to top
   const pinnedMeetingIdsRef = useRef<Set<string>>(new Set())
   const pinnedCalendarIdsRef = useRef<Set<string>>(new Set())
@@ -2382,7 +2384,29 @@ export default function AnnouncementsPage() {
     }
   }, [fetchSchedules])
 
-  const handleSend = async () => {
+  const rollbackPendingSendState = useCallback(() => {
+    sendingRef.current = false
+    setSending(false)
+    setDistributionRows(prev => prev.map(r =>
+      r.selected && (r.status === 'sending' || r.status === 'scheduled')
+        ? { ...r, status: 'composing', status_msg: r.bot_can_send ? 'Ready' : 'No permission' }
+        : r
+    ))
+    setDmRows(prev => prev.map(r =>
+      r.selected && (r.status === 'sending' || r.status === 'scheduled')
+        ? { ...r, status: 'composing', status_msg: 'Ready' }
+        : r
+    ))
+  }, [])
+
+  const jumpToCalendarAttachment = useCallback(() => {
+    setMeetingContextExpanded(true)
+    setTimeout(() => {
+      calendarContextSectionRef.current?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+    }, 60)
+  }, [])
+
+  const handleSend = async (skipCalendarContextConfirm = false) => {
     // Synchronous guard: useRef is immune to React's async state batching,
     // preventing duplicate submissions from rapid double-clicks
     if (sendingRef.current) return
@@ -2553,21 +2577,10 @@ export default function AnnouncementsPage() {
 
     // Warn if sending DMs without a calendar context (no Subscribe button, no invite tracking)
     const hasDmTargets = targets.some(t => t.type === 'discord_dm')
-    if (hasDmTargets && !resolvedCalendarId && allCalendars.length > 0) {
-      const proceed = window.confirm(
-        'No Coordination Calendar is attached. DM recipients will not see a Subscribe button and invite tracking will be skipped.\n\nAttach a calendar from the "Attach Coordination Calendar Context" section to enable subscription management.\n\nSend anyway?'
-      )
-      if (!proceed) {
-        sendingRef.current = false
-        setSending(false)
-        setDistributionRows(prev => prev.map(r =>
-          r.selected && r.status === 'sending' ? { ...r, status: 'composing', status_msg: r.bot_can_send ? 'Ready' : 'No permission' } : r
-        ))
-        setDmRows(prev => prev.map(r =>
-          r.selected && r.status === 'sending' ? { ...r, status: 'composing', status_msg: 'Ready' } : r
-        ))
-        return
-      }
+    if (!skipCalendarContextConfirm && hasDmTargets && !resolvedCalendarId && allCalendars.length > 0) {
+      rollbackPendingSendState()
+      setSendWithoutCalendarModalOpen(true)
+      return
     }
 
     try {
@@ -3151,7 +3164,7 @@ export default function AnnouncementsPage() {
           <div className="flex items-center gap-1.5"><Copy className="w-4 h-4" /> Templates</div>
         </button>
         <button onClick={() => switchTab('scheduled')} className={tabClass('scheduled')}>
-          <div className="flex items-center gap-1.5"><Clock className="w-4 h-4" /> Scheduled</div>
+          <div className="flex items-center gap-1.5 whitespace-nowrap"><Clock className="w-4 h-4" /> Scheduled and History</div>
         </button>
         <button onClick={() => switchTab('responses')} className={tabClass('responses')}>
           <div className="flex items-center gap-1.5"><ListChecks className="w-4 h-4" /> Responses</div>
@@ -3323,7 +3336,7 @@ export default function AnnouncementsPage() {
               )
               const totalSelected = selectedMeetingIds.size + selectedCalendarIds.size
               return (
-              <div className={`border border-border rounded-lg overflow-hidden ${sending ? 'pointer-events-none opacity-70' : ''}`}>
+              <div ref={calendarContextSectionRef} className={`border border-border rounded-lg overflow-hidden ${sending ? 'pointer-events-none opacity-70' : ''}`}>
                 <div
                   role="button"
                   tabIndex={0}
@@ -5951,7 +5964,9 @@ export default function AnnouncementsPage() {
             <div className="flex gap-2">
               {!activeScheduleId ? (
                 <button
-                  onClick={handleSend}
+                  onClick={() => {
+                    void handleSend()
+                  }}
                   disabled={sending || !composeBody.trim() || (distributionRows.filter(r => r.selected).length === 0 && dmRows.filter(r => r.selected).length === 0 && selectedEmailRecipients.size === 0)}
                   className="flex items-center gap-2 px-5 py-2.5 text-sm font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
                 >
@@ -7454,6 +7469,68 @@ export default function AnnouncementsPage() {
                 </div>
               </div>
             )}
+          </div>
+        )}
+
+        {sendWithoutCalendarModalOpen && (
+          <div
+            className="fixed inset-0 z-[110] flex items-center justify-center bg-black/45 backdrop-blur-sm px-4"
+            onClick={() => setSendWithoutCalendarModalOpen(false)}
+          >
+            <div
+              className="w-full max-w-lg rounded-xl border border-border bg-card text-card-foreground shadow-2xl"
+              onClick={e => e.stopPropagation()}
+            >
+              <div className="px-5 py-4 border-b border-border">
+                <div className="flex items-start gap-3">
+                  <div className="mt-0.5 rounded-full bg-amber-500/15 p-2 text-amber-600 dark:text-amber-400">
+                    <AlertTriangle className="w-4 h-4" />
+                  </div>
+                  <div>
+                    <h3 className="text-base font-semibold">Send Without Calendar Context?</h3>
+                    <p className="text-sm text-muted-foreground mt-1">
+                      DM recipients will not see a Subscribe button, and invite tracking will be skipped.
+                    </p>
+                  </div>
+                </div>
+              </div>
+
+              <div className="px-5 py-3">
+                <div className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+                  Tip: Attach a coordination calendar in the "Attach Coordination Calendar Context" section for subscription management.
+                </div>
+              </div>
+
+              <div className="px-5 pb-5 flex flex-col-reverse sm:flex-row sm:justify-end gap-2">
+                <button
+                  type="button"
+                  onClick={() => setSendWithoutCalendarModalOpen(false)}
+                  className="px-3 py-2 rounded-md text-sm font-medium border border-border text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+                >
+                  Cancel
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSendWithoutCalendarModalOpen(false)
+                    jumpToCalendarAttachment()
+                  }}
+                  className="px-3 py-2 rounded-md text-sm font-medium border border-border text-foreground hover:bg-muted transition-colors"
+                >
+                  Attach Calendar
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setSendWithoutCalendarModalOpen(false)
+                    void handleSend(true)
+                  }}
+                  className="px-3 py-2 rounded-md text-sm font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+                >
+                  Send Anyway
+                </button>
+              </div>
+            </div>
           </div>
         )}
       </div>

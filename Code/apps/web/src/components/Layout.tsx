@@ -542,12 +542,12 @@ export default function Layout() {
                       ? 'bg-accent text-accent-foreground'
                       : 'text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground'
                   }`}
-                  aria-label="Events"
-                  title="Events"
+                  aria-label="All Public Events"
+                  title="All Public Events"
                 >
                   <span className="flex items-center gap-1.5">
                     <CalendarDays className="w-4 h-4" />
-                    <span className="hidden xl:inline">Events</span>
+                    <span className="hidden xl:inline">All Public Events</span>
                   </span>
                 </Link>
 
@@ -1035,7 +1035,7 @@ export default function Layout() {
                 >
                   <span className="flex items-center gap-1.5">
                     <CalendarDays className="w-4 h-4" />
-                    Events
+                    All Public Events
                   </span>
                 </Link>
                 <Link

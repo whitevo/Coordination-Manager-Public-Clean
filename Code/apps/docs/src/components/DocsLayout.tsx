@@ -1,4 +1,4 @@
-import { useState, useCallback } from 'react'
+import { useState, useCallback, useEffect } from 'react'
 import { Outlet } from 'react-router-dom'
 import { Sidebar } from './Sidebar'
 import { TopBar } from './TopBar'
@@ -8,13 +8,6 @@ export function DocsLayout() {
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [aiPanelOpen, setAiPanelOpen] = useState(false)
 
-  const toggleAiPanel = useCallback(() => {
-    setAiPanelOpen((prev) => {
-      if (prev) return false
-      return true
-    })
-  }, [])
-
   const handleAiSearchClick = useCallback(() => {
     if (aiPanelOpen) {
       // Already open — pulse to indicate
@@ -23,6 +16,17 @@ export function DocsLayout() {
       setAiPanelOpen(true)
     }
   }, [aiPanelOpen])
+
+  const handleOpenAiSearch = useCallback(() => {
+    setAiPanelOpen(true)
+    window.dispatchEvent(new CustomEvent('ai-search-focus'))
+  }, [])
+
+  useEffect(() => {
+    const openHandler = () => handleOpenAiSearch()
+    window.addEventListener('docs-open-ai-search', openHandler)
+    return () => window.removeEventListener('docs-open-ai-search', openHandler)
+  }, [handleOpenAiSearch])
 
   return (
     <div className="min-h-screen flex flex-col">
