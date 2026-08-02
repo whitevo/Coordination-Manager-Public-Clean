@@ -16,15 +16,15 @@ A web-based platform for scheduling group meetings through shared availability c
 
 ## Live Deployment
 
-- **Frontend:** https://coordinationmanager.com
-- **Backend:** Deployed on Railway (auto-deploys from `main` branch)
+- **Frontend:** Deployed on Vercel (https://coordinationmanager.com)
+- **Backend:** Deployed on Railway
 
 ## Tech Stack
 
 - **Frontend:** React 18 + TypeScript, Vite, TailwindCSS, React Router, Axios
 - **Backend:** Node.js + Express, TypeScript
 - **Database:** Supabase (PostgreSQL) with Row Level Security
-- **Auth:** Supabase Auth (Google OAuth + anonymous/traveler accounts)
+- **Auth:** Supabase Auth (Google OAuth + anonymous/traveler accounts + Cardano Wallets)
 - **Monorepo:** pnpm workspaces
 
 ## Prerequisites

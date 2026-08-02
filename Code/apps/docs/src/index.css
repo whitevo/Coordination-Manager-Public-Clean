@@ -40,7 +40,7 @@
     @apply mb-4;
   }
   .prose-docs a {
-    @apply text-brand-400 hover:text-brand-300 underline underline-offset-2;
+    @apply text-brand-400 hover:text-brand-300 no-underline;
   }
   .prose-docs ul {
     @apply list-disc pl-6 mb-4 space-y-1;

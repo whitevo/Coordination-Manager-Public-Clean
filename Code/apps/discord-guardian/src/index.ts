@@ -66,6 +66,10 @@ let guildNotificationConfig: Map<string, GuildNotificationConfig> = new Map()
 let lastNotificationConfigRefresh = 0
 const NOTIFICATION_CONFIG_REFRESH_INTERVAL = 60_000 // 60 seconds
 
+// Best-effort in-memory dedupe for rapid duplicate gateway events.
+const FEEDBACK_DEDUPE_WINDOW_MS = 30_000
+const recentFeedbackNotificationKeys: Map<string, number> = new Map()
+
 // ─── Rule Engine ──────────────────────────────────────────────────────
 
 let compiledRules: CompiledRule[] = []
@@ -947,6 +951,86 @@ function truncateForEmbed(text: string | null | undefined, max = 1900): string {
   return text.length <= max ? text : text.slice(0, max - 3) + '...'
 }
 
+function normaliseContentForCompare(text: string | null | undefined): string {
+  if (!text) return ''
+  return text.replace(/\s+/g, ' ').trim()
+}
+
+function splitTextForDiscord(text: string, maxLen: number): string[] {
+  if (!text) return ['']
+  const chunks: string[] = []
+  let remaining = text
+
+  while (remaining.length > maxLen) {
+    const boundary = remaining.lastIndexOf('\n', maxLen)
+    const splitAt = boundary > Math.floor(maxLen * 0.6) ? boundary + 1 : maxLen
+    chunks.push(remaining.slice(0, splitAt))
+    remaining = remaining.slice(splitAt)
+  }
+
+  if (remaining.length > 0) chunks.push(remaining)
+  return chunks
+}
+
+function buildResponseFieldValue(existingValue: string | undefined, nextLabel: string): string {
+  const lines = (existingValue || '')
+    .split('\n')
+    .map(line => line.trim())
+    .filter(Boolean)
+  const unique = new Set(lines)
+  unique.add(nextLabel)
+  return Array.from(unique).join('\n')
+}
+
+function shouldSuppressFeedbackDuplicate(key: string): boolean {
+  const now = Date.now()
+  for (const [k, ts] of recentFeedbackNotificationKeys) {
+    if (now - ts > FEEDBACK_DEDUPE_WINDOW_MS) {
+      recentFeedbackNotificationKeys.delete(k)
+    }
+  }
+
+  const prior = recentFeedbackNotificationKeys.get(key)
+  if (prior && now - prior <= FEEDBACK_DEDUPE_WINDOW_MS) {
+    return true
+  }
+
+  recentFeedbackNotificationKeys.set(key, now)
+  return false
+}
+
+async function sendOriginalContentContinuation(
+  channel: TextChannel | NewsChannel | ThreadChannel,
+  fullText: string | null,
+  opts: {
+    caseId: string
+    userId: string
+    heading: string
+    initialCharsUsed: number
+  },
+): Promise<void> {
+  if (!fullText) return
+
+  const remainder = fullText.length > opts.initialCharsUsed
+    ? fullText.slice(opts.initialCharsUsed)
+    : ''
+  if (!remainder) return
+
+  const chunks = splitTextForDiscord(remainder, 1700)
+  for (let i = 0; i < chunks.length; i += 1) {
+    const part = i + 1
+    const total = chunks.length
+    await channel.send({
+      content:
+        `${opts.heading} (continuation ${part}/${total})\n` +
+        `Case: ${opts.caseId}\n` +
+        `User: <@${opts.userId}>\n` +
+        `${chunks[i]}`,
+      allowedMentions: { parse: [] },
+    })
+  }
+}
+
 async function getFlaggedRowId(messageId: string, isEdit: boolean): Promise<string | null> {
   const { data } = await supabase
     .from('guardian_flagged_messages')
@@ -1102,6 +1186,7 @@ async function notifyFeedbackChannel(
   client: Client,
   guildId: string,
   payload: {
+    flaggedMessageId: string
     discordUserId: string
     username: string
     kind: ReactionKind
@@ -1118,6 +1203,62 @@ async function notifyFeedbackChannel(
     const channel = await client.channels.fetch(channelId)
     if (!channel || !('send' in channel) || channel.type === ChannelType.DM) return
 
+    const textChannel = channel as TextChannel | NewsChannel | ThreadChannel
+    const duplicateKey = `${guildId}:${payload.flaggedMessageId}:${payload.discordUserId}:${payload.kind}`
+    if (shouldSuppressFeedbackDuplicate(duplicateKey)) {
+      return
+    }
+
+    const caseId = payload.flaggedMessageId
+    const responseLabel = `- ${REACTION_LABELS[payload.kind]}`
+    const feedbackUsesActionsChannel = channelId === cfg.actionsLogChannelId
+
+    if (feedbackUsesActionsChannel) {
+      try {
+        const recent = await textChannel.messages.fetch({ limit: 30 })
+        const expectedContent = normaliseContentForCompare(payload.flaggedContent)
+        const target = recent.find(msg => {
+          if (msg.author.id !== client.user?.id) return false
+          const firstEmbed = msg.embeds[0]
+          if (!firstEmbed) return false
+          if ((firstEmbed.title || '').toLowerCase().indexOf('guardian: moderation action') === -1) return false
+
+          const footerText = firstEmbed.footer?.text || ''
+          if (footerText.includes(`Case ID: ${caseId}`)) return true
+
+          // Fallback match when older messages predate footer keys.
+          const description = firstEmbed.description || ''
+          const mentionsUser = description.includes(`<@${payload.discordUserId}>`)
+          if (!mentionsUser) return false
+
+          const contentField = firstEmbed.fields.find(f => f.name === 'Original content')
+          if (!contentField) return false
+          const postedContent = normaliseContentForCompare(contentField.value)
+          return postedContent.length > 0 && postedContent === expectedContent
+        })
+
+        if (target && target.embeds[0]) {
+          const existing = target.embeds[0]
+          const merged = EmbedBuilder.from(existing)
+          const fields = [...existing.fields]
+          const responseFieldIdx = fields.findIndex(field => field.name === 'User responses')
+          if (responseFieldIdx >= 0) {
+            const nextValue = buildResponseFieldValue(fields[responseFieldIdx].value, responseLabel)
+            fields[responseFieldIdx] = { ...fields[responseFieldIdx], value: nextValue }
+          } else {
+            fields.push({ name: 'User responses', value: responseLabel, inline: false })
+          }
+
+          merged.setFields(fields)
+          merged.setTimestamp(new Date())
+          await target.edit({ embeds: [merged], allowedMentions: { parse: [] } })
+          return
+        }
+      } catch (err) {
+        console.warn('Failed to merge feedback into moderation action message:', err)
+      }
+    }
+
     const embed = new EmbedBuilder()
       .setColor(0x3B82F6)
       .setTitle('Guardian: user response received')
@@ -1129,11 +1270,19 @@ async function notifyFeedbackChannel(
         { name: 'Original channel', value: payload.sourceChannelId ? `<#${payload.sourceChannelId}>` : 'unknown', inline: true },
         { name: 'Flagged content', value: truncateForEmbed(payload.flaggedContent, 1000) },
       )
+      .setFooter({ text: `Case ID: ${caseId}` })
       .setTimestamp(new Date())
 
-    await (channel as TextChannel | NewsChannel | ThreadChannel).send({
+    await textChannel.send({
       embeds: [embed],
       allowedMentions: { parse: [] },
+    })
+
+    await sendOriginalContentContinuation(textChannel, payload.flaggedContent, {
+      caseId,
+      userId: payload.discordUserId,
+      heading: 'Guardian: user response content continuation',
+      initialCharsUsed: 1000,
     })
   } catch (err) {
     console.error('Failed to post to user-feedback channel:', err)
@@ -1145,6 +1294,7 @@ async function notifyActionsLog(
   message: Message,
   match: MatchResult,
   actions: ActionResult,
+  flaggedMessageId: string | null,
 ): Promise<void> {
   const cfg = getNotificationConfig(message.guildId!)
   if (!cfg.actionsLogChannelId) return
@@ -1152,6 +1302,10 @@ async function notifyActionsLog(
   try {
     const channel = await client.channels.fetch(cfg.actionsLogChannelId)
     if (!channel || !('send' in channel) || channel.type === ChannelType.DM) return
+
+    const textChannel = channel as TextChannel | NewsChannel | ThreadChannel
+    const caseId = flaggedMessageId || `msg:${message.id}`
+    const originalContentHead = truncateForEmbed(message.content, 1000)
 
     const embed = new EmbedBuilder()
       .setColor(actions.banned ? 0xDC2626 : actions.timedOut ? 0xEAB308 : 0xE5A23B)
@@ -1162,13 +1316,21 @@ async function notifyActionsLog(
         { name: 'Source', value: match.sourceType, inline: true },
         { name: 'Actions', value: actions.actionsTaken, inline: true },
         { name: 'Matched text', value: truncateForEmbed(match.matchedText, 300) },
-        { name: 'Original content', value: truncateForEmbed(message.content, 1000) },
+        { name: 'Original content', value: originalContentHead },
       )
+      .setFooter({ text: `Case ID: ${caseId}` })
       .setTimestamp(new Date())
 
-    await (channel as TextChannel | NewsChannel | ThreadChannel).send({
+    await textChannel.send({
       embeds: [embed],
       allowedMentions: { parse: [] },
+    })
+
+    await sendOriginalContentContinuation(textChannel, message.content, {
+      caseId,
+      userId: message.author.id,
+      heading: 'Guardian: original content continuation',
+      initialCharsUsed: originalContentHead.length,
     })
   } catch (err) {
     console.error('Failed to post to actions-log channel:', err)
@@ -1287,6 +1449,10 @@ client.on(Events.MessageCreate, async (message) => {
 
       const flaggedRowId = await getFlaggedRowId(message.id, false)
 
+      // Post moderation action immediately so this always appears before any
+      // user reaction event that might arrive quickly from the DM prompt.
+      await notifyActionsLog(client, message, match, actions, flaggedRowId)
+
       // Send DM whenever any moderation action was taken (or is about to be
       // taken, in the ban case). We DM the user BEFORE the ban executes so
       // they are guaranteed to receive the explanation + reaction prompt.
@@ -1301,9 +1467,6 @@ client.on(Events.MessageCreate, async (message) => {
       if (actions.banned) {
         await executeBan(message, match)
       }
-
-      // Mirror the action into the moderator actions-log channel (if configured)
-      await notifyActionsLog(client, message, match, actions)
     }
   } catch (err) {
     console.error('Error processing message:', err)
@@ -1370,6 +1533,8 @@ client.on(Events.MessageUpdate, async (_oldMessage, newMessage) => {
 
       const flaggedRowId = await getFlaggedRowId(newMessage.id, true)
 
+      await notifyActionsLog(client, newMessage as Message, match, actions, flaggedRowId)
+
       if (actions.deleted || actions.timedOut || actions.banned) {
         await sendUserDeletionDM(newMessage as Message, match, flaggedRowId, actions)
         if (actions.deleted) {
@@ -1381,8 +1546,6 @@ client.on(Events.MessageUpdate, async (_oldMessage, newMessage) => {
       if (actions.banned) {
         await executeBan(newMessage as Message, match)
       }
-
-      await notifyActionsLog(client, newMessage as Message, match, actions)
     }
   } catch (err) {
     console.error('Error processing edited message:', err)
@@ -1481,6 +1644,7 @@ client.on(Events.MessageReactionAdd, async (reaction: MessageReaction | PartialM
     // Forward to the moderator user-feedback channel
     await ensureNotificationConfig()
     await notifyFeedbackChannel(client, flagged.guild_id, {
+      flaggedMessageId: flagged.id,
       discordUserId: user.id,
       username: (user as User).username || 'unknown',
       kind,

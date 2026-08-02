@@ -64,7 +64,9 @@ vi.mock('../../components/ImportAvailabilityModal', () => ({
 }))
 
 vi.mock('../../components/MeetingSidePanel', () => ({
-  default: () => null,
+  default: ({ isOpen, cellId }: { isOpen: boolean; cellId: string | null }) => (
+    <div data-testid="meeting-side-panel" data-open={String(isOpen)} data-cell-id={cellId || ''} />
+  ),
 }))
 
 vi.mock('../../lib/use-timezones', () => ({
@@ -240,6 +242,10 @@ describe('CalendarPage Secret Swarm syncs', () => {
   beforeEach(() => {
     vi.useFakeTimers()
     vi.setSystemTime(new Date('2026-06-10T12:00:00Z'))
+    Object.defineProperty(navigator, 'maxTouchPoints', {
+      configurable: true,
+      value: 1,
+    })
     localStorage.clear()
     mockUseAuth.mockReturnValue({
       user: { id: 'user-1', email: 'user@example.com' },
@@ -255,6 +261,55 @@ describe('CalendarPage Secret Swarm syncs', () => {
     vi.useRealTimers()
     vi.clearAllMocks()
     localStorage.clear()
+  })
+
+  it('opens a confirmed meeting in the side panel when tapped on mobile', async () => {
+    mockCalendarResponse({
+      meetings: [
+        {
+          id: 'meeting-4',
+          time_slots: ['2026-06-10T10:00'],
+          meeting_link: 'https://example.com/meeting-4',
+          description: 'Mobile tap opens the meeting editor',
+          duration_minutes: 60,
+          title: 'Mobile meeting',
+          recurrence_rule: null,
+        },
+      ],
+    })
+
+    renderCalendarPage()
+
+    await flushMicrotasks()
+    await flushMicrotasks()
+
+    const [meetingOverlay] = screen.getAllByTestId('meeting-overlay-0-0')
+    fireEvent.pointerDown(meetingOverlay)
+    fireEvent.click(meetingOverlay)
+
+    expect(screen.getByTestId('meeting-side-panel')).toHaveAttribute('data-open', 'true')
+    expect(screen.getByTestId('meeting-side-panel')).toHaveAttribute('data-cell-id', '2026-06-10_10:00')
+  })
+
+  it('does not crash when landscape tip storage is unavailable', async () => {
+    const originalGetItem = Storage.prototype.getItem
+    const getItemSpy = vi.spyOn(Storage.prototype, 'getItem').mockImplementation(function (this: Storage, key: string) {
+      if (key === 'landscapeTipDismissed') {
+        throw new Error('storage unavailable')
+      }
+      return originalGetItem.call(this, key)
+    })
+
+    try {
+      renderCalendarPage()
+
+      await flushMicrotasks()
+      await flushMicrotasks()
+
+      expect(screen.getByText('Team Calendar')).toBeInTheDocument()
+    } finally {
+      getItemSpy.mockRestore()
+    }
   })
 
   it('shows Secret Swarm only when time items exist, auto-selects it, and marks the busy slot', async () => {

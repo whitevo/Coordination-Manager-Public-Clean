@@ -25,6 +25,7 @@ import {
   Lock,
 } from 'lucide-react'
 import { markdownRoutesBySection } from '../markdown-manifest'
+import { sectionNavigation } from '../docs-content'
 
 interface SidebarProps {
   onNavigate: () => void
@@ -34,12 +35,14 @@ interface SidebarProps {
 
 interface NavSection {
   title: string
+  path: string
   items: { label: string; path: string; icon: React.ReactNode; external?: boolean }[]
 }
 
 const sections: NavSection[] = [
   {
     title: 'General',
+    path: sectionNavigation.find((section) => section.id === 'general')?.path ?? '/section/general',
     items: [
       { label: 'Overview', path: '/overview', icon: <BookOpen className="w-4 h-4" /> },
       { label: 'Architecture', path: '/architecture', icon: <Boxes className="w-4 h-4" /> },
@@ -49,6 +52,7 @@ const sections: NavSection[] = [
   },
   {
     title: 'API Reference',
+    path: sectionNavigation.find((section) => section.id === 'api')?.path ?? '/section/api',
     items: [
       { label: 'Calendars', path: '/api/calendars', icon: <Calendar className="w-4 h-4" /> },
       { label: 'Calendar Sources', path: '/api/calendar-sources', icon: <CalendarSearch className="w-4 h-4" /> },
@@ -60,6 +64,7 @@ const sections: NavSection[] = [
   },
   {
     title: 'Guides',
+    path: sectionNavigation.find((section) => section.id === 'guides')?.path ?? '/section/guides',
     items: [
       { label: 'Examples', path: '/examples', icon: <Code2 className="w-4 h-4" /> },
       { label: 'Roadmap', path: '/roadmap', icon: <Map className="w-4 h-4" /> },
@@ -71,6 +76,7 @@ const sections: NavSection[] = [
   },
   {
     title: 'Legal',
+    path: sectionNavigation.find((section) => section.id === 'legal')?.path ?? '/section/legal',
     items: markdownRoutesBySection.Legal.map((route) => {
       let icon: React.ReactNode = <FileText className="w-4 h-4" />
       if (route.path === '/legal/privacy-policy') icon = <ShieldCheck className="w-4 h-4" />
@@ -87,6 +93,7 @@ const sections: NavSection[] = [
   },
   {
     title: 'Proposals',
+    path: sectionNavigation.find((section) => section.id === 'proposals')?.path ?? '/section/proposals',
     items: markdownRoutesBySection.Proposals.map((route) => ({
       label: route.title,
       path: route.path,
@@ -100,9 +107,20 @@ export function Sidebar({ onNavigate, onAiSearchClick, aiPanelOpen }: SidebarPro
     <nav className="h-full overflow-y-auto py-6 px-4 space-y-6">
       {sections.map((section) => (
         <div key={section.title}>
-          <h3 className="text-xs font-semibold uppercase tracking-wider text-gray-500 mb-2 px-3">
-            {section.title}
-          </h3>
+          <NavLink
+            to={section.path}
+            onClick={onNavigate}
+            className={({ isActive }) =>
+              `flex items-center justify-between gap-2 text-xs font-semibold uppercase tracking-wider mb-2 px-3 py-1.5 rounded-md transition-colors ${
+                isActive
+                  ? 'text-brand-300 bg-brand-600/10'
+                  : 'text-gray-500 hover:text-gray-300 hover:bg-surface-800'
+              }`
+            }
+          >
+            <span>{section.title}</span>
+            <span className="text-[10px] text-gray-600 normal-case tracking-normal">Open</span>
+          </NavLink>
           <ul className="space-y-0.5">
             {section.items.map((item) => (
               <li key={item.path}>
@@ -139,7 +157,6 @@ export function Sidebar({ onNavigate, onAiSearchClick, aiPanelOpen }: SidebarPro
         </div>
       ))}
 
-      {/* AI Search button */}
       <div className="px-3">
         <button
           onClick={() => { onAiSearchClick(); onNavigate(); }}
@@ -154,14 +171,9 @@ export function Sidebar({ onNavigate, onAiSearchClick, aiPanelOpen }: SidebarPro
         </button>
       </div>
 
-      {/* Footer */}
       <div className="pt-6 border-t border-surface-700 px-3">
-        <p className="text-xs text-gray-500">
-          Coordination Manager v1.0
-        </p>
-        <p className="text-xs text-gray-600 mt-1">
-          Built for the SingularityNET ecosystem
-        </p>
+        <p className="text-xs text-gray-500">Coordination Manager v1.0</p>
+        <p className="text-xs text-gray-600 mt-1">Built for the SingularityNET ecosystem</p>
       </div>
     </nav>
   )

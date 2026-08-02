@@ -317,4 +317,5 @@ describe('CoordinateEventsPage network filters', () => {
     expect(screen.getByRole('checkbox', { name: 'Team Calendar selection unavailable while hidden' })).toBeDisabled()
     expect(screen.queryByText('The functions below are activated for selected networks.')).not.toBeInTheDocument()
   })
+
 })

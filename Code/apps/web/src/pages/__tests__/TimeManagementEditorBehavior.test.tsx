@@ -348,6 +348,121 @@ describe('TimeManagement editor regressions', () => {
     })
   })
 
+  it('keeps a pasted item visible after a stale refresh resolves', async () => {
+    const weekStart = startOfWeek(new Date(), { weekStartsOn: 1 })
+    const sourceStart = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 12, 0, 0)).toISOString()
+    const sourceEnd = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 13, 0, 0)).toISOString()
+    const pastedStart = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 15, 0, 0)).toISOString()
+    const pastedEnd = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 16, 0, 0)).toISOString()
+
+    mockDedupedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/calendar-sources') return { data: { sources: [] } }
+      if (url === '/api/time-management/modes') {
+        return {
+          data: {
+            activeModeId: 'mode-main',
+            modes: [
+              {
+                id: 'mode-main',
+                name: 'Main',
+                main_color: '#2563eb',
+                slot_minutes: 30,
+                sync_calendars: [],
+                time_backgrounds: [],
+                collapsed_background_ids: [],
+                quick_templates: [],
+                show_quick_templates_in_main: false,
+              },
+            ],
+          },
+        }
+      }
+      if (url === '/api/time-management/categories') return { data: { categories: [] } }
+      if (url === '/api/user-events') {
+        return {
+          data: {
+            events: [
+              {
+                id: 'event-1',
+                title: 'Copied item title',
+                description: 'Copied notes',
+                meeting_link: null,
+                location: null,
+                start_time: sourceStart,
+                end_time: sourceEnd,
+                source_type: 'manual',
+                source_id: 'mode-main',
+                category_ids: [],
+                recurrence_rule: { type: 'none' },
+              },
+            ],
+          },
+        }
+      }
+      return { data: {} }
+    })
+
+    vi.mocked(apiClient.post).mockResolvedValueOnce({
+      data: {
+        event: {
+          id: 'event-2',
+          title: 'Copied item title',
+          description: 'Copied notes',
+          meeting_link: null,
+          location: null,
+          start_time: pastedStart,
+          end_time: pastedEnd,
+          source_id: 'mode-main',
+          category_ids: [],
+        },
+      },
+    })
+
+    const { container } = render(
+      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    await screen.findByRole('heading', { name: 'Time Management' })
+    await waitFor(() => {
+      expect(screen.getAllByText('Copied item title').length).toBeGreaterThan(0)
+    })
+    const initialTitleCount = screen.getAllByText('Copied item title').length
+
+    const firstDayColumn = container.querySelector("div[style*='repeating-linear-gradient']") as HTMLDivElement | null
+    expect(firstDayColumn).toBeTruthy()
+    if (!firstDayColumn) return
+
+    vi.spyOn(firstDayColumn, 'getBoundingClientRect').mockReturnValue({
+      x: 0,
+      y: 0,
+      left: 0,
+      top: 0,
+      right: 100,
+      bottom: 600,
+      width: 100,
+      height: 600,
+      toJSON: () => ({}),
+    })
+
+    fireEvent.click(screen.getAllByText('Copied item title')[0])
+    fireEvent.keyDown(window, { key: 'c', ctrlKey: true })
+    fireEvent.mouseDown(firstDayColumn, { button: 0, clientX: 20, clientY: 320 })
+    fireEvent.keyDown(window, { key: 'v', ctrlKey: true })
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Copied item title').length).toBeGreaterThan(initialTitleCount)
+    })
+
+    window.dispatchEvent(new Event('focus'))
+    await new Promise((resolve) => window.setTimeout(resolve, 260))
+
+    await waitFor(() => {
+      expect(screen.getAllByText('Copied item title').length).toBeGreaterThan(initialTitleCount)
+    })
+  })
+
   it('appends location to original description when copying from source item', async () => {
     const weekStart = startOfWeek(new Date(), { weekStartsOn: 1 })
     const sourceStart = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 12, 0, 0)).toISOString()

@@ -1,7 +1,22 @@
 {
   "permissions": {
     "defaultMode": "ask",
-    "allow": ["Read", "Edit", "MultiEdit", "Grep", "Glob", "LS", "Run"],
+    "allow": [
+      "Read",
+      "Edit",
+      "MultiEdit",
+      "Grep",
+      "Glob",
+      "LS",
+      "Run",
+      "Run(pnpm test*)",
+      "Run(pnpm --dir ./Code test*)",
+      "Run(pnpm --dir \"Code/apps/web\" test -- *)",
+      "Run(pnpm --filter * test*)",
+      "Run(pnpm exec vitest*)",
+      "Run(vitest*)",
+      "Run(node --test*)"
+    ],
     "deny": []
   }
 }

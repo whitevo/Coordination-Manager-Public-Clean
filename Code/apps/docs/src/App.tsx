@@ -20,6 +20,7 @@ const WorkshopsPage = lazy(() => import('./pages/WorkshopsPage').then(m => ({ de
 const ZoomIntegrationPage = lazy(() => import('./pages/ZoomIntegrationPage').then(m => ({ default: m.ZoomIntegrationPage })))
 const ZoomReviewPage = lazy(() => import('./pages/ZoomReviewPage').then(m => ({ default: m.ZoomReviewPage })))
 const CoordinationFrameworksPage = lazy(() => import('./pages/CoordinationFrameworksPage').then(m => ({ default: m.CoordinationFrameworksPage })))
+const SectionLandingPage = lazy(() => import('./pages/SectionLandingPage').then(m => ({ default: m.SectionLandingPage })))
 
 export default function App() {
   return (
@@ -28,6 +29,7 @@ export default function App() {
         <Route element={<DocsLayout />}>
           <Route path="/" element={<Navigate to="/overview" replace />} />
           <Route path="/overview" element={<OverviewPage />} />
+          <Route path="/section/:sectionId" element={<SectionLandingPage />} />
           <Route path="/architecture" element={<ArchitecturePage />} />
           <Route path="/getting-started" element={<GettingStartedPage />} />
           <Route path="/authentication" element={<AuthenticationPage />} />

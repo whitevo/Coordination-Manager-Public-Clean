@@ -373,6 +373,10 @@ function Invoke-PublicSyncPrCreation {
     Write-Host ('[PASS] Public sync PR created: {0}' -f $publicPrUrl) -ForegroundColor Green
   }
   finally {
+    if ($root) {
+      Set-Location $root
+    }
+
     if (($originalBranch) -and ((& git rev-parse --abbrev-ref HEAD).Trim() -ne $originalBranch)) {
       & git checkout $originalBranch 1>$null
     }

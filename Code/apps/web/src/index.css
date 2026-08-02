@@ -1024,18 +1024,21 @@
 }
 
 /* Show handles when hovering the parent card */
-:is(.absolute.rounded-md.border-2):hover .time-item-resize-handle {
+:is(.absolute.rounded-md.border-2):hover .time-item-resize-handle,
+[data-resize-hover-linked='true'] .time-item-resize-handle {
   opacity: 1;
 }
 
 /* Brighten the top handle on hover */
-:is(.absolute.rounded-md.border-2):hover .time-item-resize-handle-top {
+:is(.absolute.rounded-md.border-2):hover .time-item-resize-handle-top,
+[data-resize-hover-linked='true'] .time-item-resize-handle-top {
   background: rgba(255, 255, 255, 0.7);
   box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.5), 0 0 6px rgba(255, 255, 255, 0.35);
 }
 
 /* Brighten the bottom handle on hover */
-:is(.absolute.rounded-md.border-2):hover .time-item-resize-handle-bottom {
+:is(.absolute.rounded-md.border-2):hover .time-item-resize-handle-bottom,
+[data-resize-hover-linked='true'] .time-item-resize-handle-bottom {
   background: rgba(255, 255, 255, 0.7);
   box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.5), 0 0 6px rgba(255, 255, 255, 0.35);
 }
