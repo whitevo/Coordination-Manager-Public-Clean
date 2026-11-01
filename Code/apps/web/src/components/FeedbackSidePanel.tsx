@@ -1,10 +1,13 @@
-import { useState, useRef, useEffect } from 'react'
-import { X, MessageSquare, Send, CheckCircle, AlertTriangle, ExternalLink, Loader2, Paperclip, X as XIcon, ZoomIn } from 'lucide-react'
+import { useState, useRef } from 'react'
+import { X, MessageSquare, Send, CheckCircle, AlertTriangle, ExternalLink, Paperclip, X as XIcon, ZoomIn } from 'lucide-react'
 import { Link } from 'react-router-dom'
 import { apiClient } from '../lib/api-client'
 import LearnerHelpIcon from './LearnerHelpIcon'
 import MobilePanelSwitcher from './MobilePanelSwitcher'
-import type { PanelId } from './FloatingPanels'
+import CalendarQuickButtonToggle from './CalendarQuickButtonToggle'
+import type { PanelId } from './panel-types'
+import { SHELL_LAYER_CLASS } from '../lib/overlay-layers'
+import { Button, IconButton, Lightbox } from './ui'
 
 interface FeedbackSidePanelProps {
   isOpen: boolean
@@ -20,14 +23,6 @@ export function FeedbackSidePanel({ isOpen, onClose, onPanelChange }: FeedbackSi
   const [attachments, setAttachments] = useState<string[]>([])
   const [previewSrc, setPreviewSrc] = useState<string | null>(null)
   const attachFileRef = useRef<HTMLInputElement>(null)
-
-  // Close lightbox on Escape
-  useEffect(() => {
-    if (!previewSrc) return
-    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') setPreviewSrc(null) }
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  }, [previewSrc])
 
   const readImageFiles = (files: File[], existing: string[]): Promise<string[]> => {
     const remaining = 3 - existing.length
@@ -80,25 +75,23 @@ export function FeedbackSidePanel({ isOpen, onClose, onPanelChange }: FeedbackSi
   return (
     <aside
       className={`
-        fixed inset-y-0 right-0 z-50 w-screen transition-transform duration-300 ease-in-out
-        ${isOpen ? 'translate-x-0 pointer-events-auto sm:w-[22rem] md:w-96' : 'translate-x-full pointer-events-none sm:w-0'}
+        fixed inset-y-0 right-0 ${SHELL_LAYER_CLASS.sidePanel} w-screen transition-transform duration-300 ease-in-out
+        ${isOpen ? 'translate-x-0 pointer-events-auto sm:w-88 md:w-96' : 'translate-x-full pointer-events-none sm:w-0'}
         sm:sticky sm:top-0 sm:h-screen sm:shrink-0 sm:overflow-hidden sm:translate-x-0 sm:pointer-events-auto
       `}
     >
-      <div className={`ml-auto h-full w-screen flex flex-col bg-card border-l-2 border-amber-400 dark:border-amber-500 shadow-xl sm:w-[22rem] sm:min-w-[22rem] md:w-96 md:min-w-[24rem]`}>
+      <div className={`ml-auto h-full w-screen flex flex-col bg-card border-l-2 border-feature-feedback shadow-xl sm:w-88 sm:min-w-88 md:w-96 md:min-w-[24rem]`}>
       {/* ── Header ──────────────────────────────────────────────────────── */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-amber-50 dark:bg-amber-950/40">
+      <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-muted/40">
         <div className="flex items-center gap-2">
-          <MessageSquare className="h-5 w-5 text-amber-500" />
+          <MessageSquare className="h-5 w-5 text-feature-feedback" />
           <h2 className="font-semibold text-sm">Feedback</h2>
-          <LearnerHelpIcon size={4} usePortal description={<><p className="font-semibold text-blue-700 dark:text-blue-300 mb-1">Side Panel — Feedback</p><p className="mb-1.5">Side panels slide in from the right on every page, giving you quick access to conversational tools without leaving what you're doing.</p><p className="mb-1.5">The <strong>Feedback panel</strong> lets you share your thoughts, report bugs, or suggest improvements directly to the platform team.</p><p><strong>Tip:</strong> You can open this from any page — your feedback automatically includes context about where you were.</p></>} />
+          <LearnerHelpIcon size={4} usePortal description={<><p className="font-semibold text-info mb-1">Side Panel — Feedback</p><p className="mb-1.5">Side panels slide in from the right on every page, giving you quick access to conversational tools without leaving what you're doing.</p><p className="mb-1.5">The <strong>Feedback panel</strong> lets you share your thoughts, report bugs, or suggest improvements directly to the platform team.</p><p><strong>Tip:</strong> You can open this from any page — your feedback automatically includes context about where you were.</p></>} />
         </div>
-        <button
-          onClick={onClose}
-          className="p-1.5 rounded-md text-muted-foreground hover:bg-accent/50 transition-colors"
-        >
-          <X className="h-4 w-4" />
-        </button>
+        <div className="flex items-center gap-1">
+          <CalendarQuickButtonToggle toolKey="feedback" label="Feedback" />
+          <IconButton label="Close" icon={<X />} onClick={onClose} />
+        </div>
       </div>
       <MobilePanelSwitcher activePanel="feedback" onPanelChange={onPanelChange} />
 
@@ -117,7 +110,7 @@ export function FeedbackSidePanel({ isOpen, onClose, onPanelChange }: FeedbackSi
             placeholder="What's on your mind? Bugs, ideas, praise — all welcome…"
             rows={5}
             maxLength={2000}
-            className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm resize-none focus:outline-none focus:ring-2 focus:ring-amber-400/50"
+            className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm resize-none focus:outline-hidden focus:ring-2 focus:ring-ring"
           />
 
           {/* Hidden file input */}
@@ -141,15 +134,16 @@ export function FeedbackSidePanel({ isOpen, onClose, onPanelChange }: FeedbackSi
           {/* Attach button + clipboard hint */}
           {attachments.length < 3 && (
             <div className="flex flex-col gap-0.5">
-              <button
-                type="button"
+              <Button
+                emphasis="ghost"
+                size="micro"
                 onClick={() => attachFileRef.current?.click()}
-                className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                className="self-start"
                 title="Attach image (or paste from clipboard)"
+                icon={<Paperclip className="h-3.5 w-3.5" />}
               >
-                <Paperclip className="h-3.5 w-3.5" />
                 {attachments.length > 0 ? `${attachments.length}/3 images` : 'Attach image'}
-              </button>
+              </Button>
               <span className="text-xs text-muted-foreground/60 pl-5">or paste from clipboard (Ctrl+V)</span>
             </div>
           )}
@@ -167,52 +161,46 @@ export function FeedbackSidePanel({ isOpen, onClose, onPanelChange }: FeedbackSi
                     className="absolute inset-0 flex items-center justify-center bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity"
                     title="Enlarge"
                   >
-                    <ZoomIn className="w-5 h-5 text-white drop-shadow" />
+                    <ZoomIn className="w-5 h-5 text-white drop-shadow-sm" />
                   </button>
                   {/* Remove button */}
-                  <button
-                    type="button"
+                  <IconButton
+                    label="Remove"
+                    icon={<XIcon />}
+                    emphasis="solid"
+                    size="micro"
                     onClick={() => setAttachments(prev => prev.filter((_, idx) => idx !== i))}
-                    className="absolute top-0.5 right-0.5 p-0.5 rounded-full bg-black/60 text-white opacity-0 group-hover:opacity-100 transition-opacity z-10"
-                    title="Remove"
-                  >
-                    <XIcon className="w-2.5 h-2.5" />
-                  </button>
+                    className="absolute top-0.5 right-0.5 opacity-0 group-hover:opacity-100 z-10"
+                  />
                 </div>
               ))}
             </div>
           )}
 
           {submitError && (
-            <div className="flex items-start gap-2 text-sm text-red-600 dark:text-red-400">
+            <div className="flex items-start gap-2 text-sm text-danger">
               <AlertTriangle className="h-4 w-4 mt-0.5 shrink-0" />
               <span>{submitError}</span>
             </div>
           )}
 
           {submitSuccess && (
-            <div className="flex items-center gap-2 text-sm text-emerald-600 dark:text-emerald-400">
+            <div className="flex items-center gap-2 text-sm text-success">
               <CheckCircle className="h-4 w-4 shrink-0" />
               <span>Thank you — your feedback has been submitted!</span>
             </div>
           )}
 
-          <button
+          <Button
             type="submit"
-            disabled={submitting || !message.trim()}
-            className={`w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium text-white transition-all duration-200 ${
-              submitting || !message.trim()
-                ? 'bg-amber-300 dark:bg-amber-800 cursor-not-allowed'
-                : 'bg-amber-500 hover:bg-amber-600 shadow-md'
-            }`}
+            intent="primary"
+            fullWidth
+            disabled={!message.trim()}
+            loading={submitting}
+            icon={<Send className="h-4 w-4" />}
           >
-            {submitting ? (
-              <Loader2 className="h-4 w-4 animate-spin" />
-            ) : (
-              <Send className="h-4 w-4" />
-            )}
             {submitting ? 'Sending…' : 'Send Feedback'}
-          </button>
+          </Button>
         </form>
 
         {/* Divider */}
@@ -228,7 +216,7 @@ export function FeedbackSidePanel({ isOpen, onClose, onPanelChange }: FeedbackSi
             onClick={onClose}
             className="flex items-center gap-2 px-3 py-2.5 rounded-lg border border-border text-sm font-medium hover:bg-accent/50 transition-colors"
           >
-            <ExternalLink className="h-4 w-4 text-amber-500" />
+            <ExternalLink className="h-4 w-4 text-feature-feedback" />
             Go to Feedback History
           </Link>
         </div>
@@ -236,28 +224,12 @@ export function FeedbackSidePanel({ isOpen, onClose, onPanelChange }: FeedbackSi
       </div>
       </div>
 
-      {/* Lightbox overlay */}
-      {previewSrc && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
-          onClick={() => setPreviewSrc(null)}
-        >
-          <button
-            type="button"
-            onClick={() => setPreviewSrc(null)}
-            className="absolute top-4 right-4 p-2 rounded-full bg-black/50 text-white hover:bg-black/70 transition-colors"
-            title="Close"
-          >
-            <XIcon className="w-5 h-5" />
-          </button>
-          <img
-            src={previewSrc}
-            alt="Preview"
-            className="max-w-[90vw] max-h-[90vh] rounded-lg shadow-2xl object-contain"
-            onClick={e => e.stopPropagation()}
-          />
-        </div>
-      )}
+      <Lightbox
+        open={previewSrc !== null}
+        onClose={() => setPreviewSrc(null)}
+        src={previewSrc}
+        alt="Attachment preview"
+      />
     </aside>
   )
 }

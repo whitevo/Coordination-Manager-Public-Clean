@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { endOfDay, parseISO } from 'date-fns'
 import {
   AreaChart,
   Area,
@@ -30,6 +31,7 @@ interface Props {
   dateRange: '1d' | '7d' | '30d' | 'all' | 'custom'
   filterSince?: string
   filterUntil?: string
+  resolveDateBounds?: () => { since: string; until: string }
 }
 
 function formatLabel(time: string, mode: Mode): string {
@@ -53,7 +55,7 @@ export interface GuardianTimeSeriesRef {
   refresh: () => Promise<void>
 }
 const GuardianTimeSeries = forwardRef<GuardianTimeSeriesRef, Props>(
-({ dateRange, filterSince, filterUntil }, ref) => {
+({ dateRange, filterSince, filterUntil, resolveDateBounds }, ref) => {
   const [data, setData] = useState<TimeSeriesData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -92,9 +94,13 @@ const GuardianTimeSeries = forwardRef<GuardianTimeSeriesRef, Props>(
     setError(null)
     try {
       const params = new URLSearchParams()
-      if (filterSince && filterUntil) {
-        params.set('since', new Date(filterSince).toISOString())
-        params.set('until', new Date(filterUntil + 'T23:59:59').toISOString())
+      const bounds = resolveDateBounds?.() ?? {
+        since: filterSince ? parseISO(filterSince).toISOString() : '',
+        until: filterUntil ? endOfDay(parseISO(filterUntil)).toISOString() : '',
+      }
+      if (bounds.since && bounds.until) {
+        params.set('since', bounds.since)
+        params.set('until', bounds.until)
       } else if (dateRange !== 'all') {
         params.set('range', dateRange)
       } else {
@@ -109,7 +115,7 @@ const GuardianTimeSeries = forwardRef<GuardianTimeSeriesRef, Props>(
       await new Promise(res => setTimeout(res, 1500))
       setLoading(false)
     }
-  }, [dateRange, filterSince, filterUntil])
+  }, [dateRange, filterSince, filterUntil, resolveDateBounds])
 
   useImperativeHandle(ref, () => ({ refresh: fetchTimeseries }), [fetchTimeseries])
   useEffect(() => { fetchTimeseries() }, [fetchTimeseries])

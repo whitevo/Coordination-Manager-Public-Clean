@@ -1,6 +1,180 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss' source('./');
+@import './theme-tokens.css';
+
+@plugin 'tailwindcss-animate';
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+@utility container {
+  max-width: none;
+  margin-inline: auto;
+  padding-inline: 1.5rem;
+  @media (width >= 1800px) {
+    max-width: 1800px;
+  }
+}
+
+@theme inline {
+  --animate-unmarked-pulse: unmarked-pulse 2s ease-in-out infinite;
+  --animate-spin-once: spin-once 0.5s ease-out;
+  --animate-fade-in-out: fade-in-out 1.8s ease-in-out forwards;
+
+  @keyframes unmarked-pulse {
+    0%,
+    100% {
+      box-shadow: 0 0 4px hsl(var(--warning) / 0.3);
+      border-color: hsl(var(--warning) / 0.75);
+    }
+    50% {
+      box-shadow: 0 0 12px hsl(var(--warning) / 0.6);
+      border-color: hsl(var(--warning));
+    }
+  }
+  @keyframes primary-pulse {
+    0%,
+    100% {
+      box-shadow:
+        0 0 0 2px hsl(var(--primary) / 0.25),
+        0 0 6px hsl(var(--primary) / 0.35);
+    }
+    50% {
+      box-shadow:
+        0 0 0 3px hsl(var(--primary) / 0.45),
+        0 0 16px hsl(var(--primary) / 0.65);
+    }
+  }
+  @keyframes spin-once {
+    from {
+      transform: rotate(0deg);
+    }
+    to {
+      transform: rotate(360deg);
+    }
+  }
+  @keyframes fade-in-out {
+    0% {
+      opacity: 0;
+      transform: translate(-50%, 8px);
+    }
+    15%,
+    80% {
+      opacity: 1;
+      transform: translate(-50%, 0);
+    }
+    100% {
+      opacity: 0;
+      transform: translate(-50%, 8px);
+    }
+  }
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
+
+@layer utilities {
+  @keyframes tools-reveal-wash {
+    0%, 60% { opacity: 1; }
+    100% { opacity: 0; }
+  }
+
+  @keyframes tools-reveal-button-wash {
+    0%, 60% { box-shadow: inset 0 0 0 100vmax hsl(var(--primary) / var(--tools-wash-opacity, 0.12)); }
+    100% { box-shadow: inset 0 0 0 100vmax hsl(var(--primary) / 0); }
+  }
+
+  .tools-reveal-highlight {
+    position: relative;
+    isolation: isolate;
+  }
+
+  .tools-reveal-highlight::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    z-index: -1;
+    border-radius: 0.5rem;
+    background-color: hsl(var(--primary) / 0.08);
+    pointer-events: none;
+    animation: tools-reveal-wash 2s ease-out both;
+  }
+
+  .tools-reveal-highlight button,
+  .tools-reveal-highlight [role='button'] {
+    --tools-wash-opacity: 0.12;
+    animation: tools-reveal-button-wash 2s ease-out both;
+  }
+
+  .tools-reveal-highlight > div {
+    --tools-wash-opacity: 0.08;
+    animation: tools-reveal-button-wash 2s ease-out both;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .tools-reveal-highlight::before {
+      animation: none;
+    }
+
+    .tools-reveal-highlight button,
+    .tools-reveal-highlight [role='button'],
+    .tools-reveal-highlight > div {
+      animation: none;
+      box-shadow: inset 0 0 0 100vmax hsl(var(--primary) / var(--tools-wash-opacity, 0.12));
+    }
+  }
+
+  @keyframes design-catalog-highlight {
+    0%,
+    100% {
+      outline-color: transparent;
+      box-shadow: 0 0 0 0 hsl(var(--primary) / 0);
+    }
+    12%,
+    78% {
+      outline-color: hsl(var(--primary));
+      box-shadow:
+        0 0 0 4px hsl(var(--primary) / 0.32),
+        0 0 24px hsl(var(--primary) / 0.28);
+    }
+    28%,
+    52% {
+      outline-color: hsl(var(--warning));
+      box-shadow:
+        0 0 0 7px hsl(var(--warning) / 0.2),
+        0 0 30px hsl(var(--warning) / 0.32);
+    }
+  }
+
+  .design-catalog-highlight {
+    position: relative;
+    z-index: 1;
+    outline: 3px solid transparent;
+    outline-offset: 4px;
+    animation: design-catalog-highlight 6s ease-in-out both;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    .design-catalog-highlight {
+      animation: none;
+      outline-color: hsl(var(--primary));
+      box-shadow: 0 0 0 4px hsl(var(--primary) / 0.28);
+    }
+  }
+}
 
 @layer base {
   :root {
@@ -21,6 +195,33 @@
     --accent-foreground: 222.2 47.4% 11.2%;
     --destructive: 0 84% 60%;
     --destructive-foreground: 0 0% 98%;
+    /* Semantic roles are deliberately hue-locked: theme overlays change
+       --primary only, so danger stays red under a green theme. */
+    --info: 221 83% 53%;
+    --info-subtle: 214 95% 93%;
+    --info-muted: 213 97% 87%;
+    --info-foreground: 0 0% 100%;
+    --success: 142 71% 45%;
+    --success-subtle: 141 84% 93%;
+    --success-muted: 142 77% 73%;
+    --success-foreground: 0 0% 100%;
+    --warning: 38 92% 50%;
+    --warning-subtle: 48 96% 89%;
+    --warning-muted: 46 97% 65%;
+    --warning-foreground: 20 14% 10%;
+    --danger: 0 72% 51%;
+    --danger-subtle: 0 93% 94%;
+    --danger-muted: 0 94% 82%;
+    --danger-foreground: 0 0% 100%;
+    --neutral: 215 16% 47%;
+    --neutral-subtle: 210 40% 96%;
+    --neutral-muted: 214 32% 91%;
+    --neutral-foreground: 0 0% 100%;
+    --feature-ai: 258 90% 66%;
+    --feature-chat: 199 89% 48%;
+    --feature-support: 221 83% 53%;
+    --feature-feedback: 38 92% 50%;
+    --feature-commons: 347 77% 50%;
     --border: 214.3 31.8% 91.4%;
     --input: 214.3 31.8% 91.4%;
     --ring: 215 20.2% 65.1%;
@@ -46,11 +247,37 @@
     --accent-foreground: 0 0% 98%;
     --destructive: 0 62.8% 30.6%;
     --destructive-foreground: 0 0% 98%;
+    /* Dark-mode semantic hues are lightened, so their on-color flips to dark. */
+    --info: 213 94% 68%;
+    --info-subtle: 224 76% 15%;
+    --info-muted: 216 50% 35%;
+    --info-foreground: 222 47% 11%;
+    --success: 142 69% 58%;
+    --success-subtle: 144 61% 12%;
+    --success-muted: 142 40% 30%;
+    --success-foreground: 144 61% 8%;
+    --warning: 43 96% 56%;
+    --warning-subtle: 22 78% 10%;
+    --warning-muted: 32 55% 28%;
+    --warning-foreground: 20 14% 10%;
+    --danger: 0 91% 71%;
+    --danger-subtle: 0 63% 15%;
+    --danger-muted: 0 45% 35%;
+    --danger-foreground: 0 63% 10%;
+    --neutral: 215 20% 65%;
+    --neutral-subtle: 217 33% 17%;
+    --neutral-muted: 215 25% 27%;
+    --neutral-foreground: 222 47% 11%;
+    --feature-ai: 258 90% 76%;
+    --feature-chat: 199 89% 68%;
+    --feature-support: 213 94% 68%;
+    --feature-feedback: 43 96% 56%;
+    --feature-commons: 347 87% 66%;
     --border: 217.2 32.6% 22.5%; /* lighter border for separation */
     --input: 217.2 32.6% 17.5%;
     --ring: 215 20.2% 65.1%;
     --icon: 0 0% 98%;
-    --shadow-elevated: 0 2px 16px 0 rgba(0,0,0,0.45); /* new shadow for panels */
+    --shadow-elevated: 0 2px 16px 0 rgba(0, 0, 0, 0.45); /* new shadow for panels */
   }
 }
 
@@ -73,7 +300,10 @@
   html body,
   html nav,
   html main {
-    transition: background-color 0.3s ease, color 0.3s ease, border-color 0.3s ease;
+    transition:
+      background-color 0.3s ease,
+      color 0.3s ease,
+      border-color 0.3s ease;
   }
   /* Apply icon color to all Lucide icons */
   .lucide {
@@ -81,45 +311,20 @@
     transition: color 0.3s ease;
   }
   /* Fix native date/time input icons in dark mode */
-  .dark input[type="date"],
-  .dark input[type="time"],
-  .dark input[type="datetime-local"] {
+  .dark input[type='date'],
+  .dark input[type='time'],
+  .dark input[type='datetime-local'] {
     color-scheme: dark;
   }
 }
 
 /* ─── Tiptap editor content styles ─────────────────────────────── */
 
-.tiptap-code-block {
-  display: block;
-  margin: 0.4rem 0;
-  padding: 0.6rem 0.75rem;
-  border-radius: calc(var(--radius) - 2px);
-  border: 1px solid hsl(var(--border));
-  background: hsl(222 50% 6%);
-  color: rgb(134 239 172);
-  font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', Consolas, monospace;
-  font-size: 0.72rem;
-  line-height: 1.6;
-  white-space: pre;
-  overflow-x: auto;
-}
-
-.tiptap-code-block::before {
-  content: 'CODE';
-  display: block;
-  margin-bottom: 0.35rem;
-  font-size: 0.6rem;
-  font-family: inherit;
-  letter-spacing: 0.08em;
-  color: rgb(74 222 128 / 0.6);
-}
-
 .tiptap code {
   padding: 0.1em 0.35em;
   border-radius: 3px;
-  background: hsl(222 50% 8%);
-  color: rgb(134 239 172);
+  background: hsl(var(--muted));
+  color: hsl(var(--primary));
   font-family: 'JetBrains Mono', 'Fira Code', Consolas, monospace;
   font-size: 0.85em;
 }
@@ -150,31 +355,22 @@
 }
 
 .tiptap a {
-  color: rgb(8 145 178);
+  color: hsl(var(--primary));
   text-decoration-line: underline;
-  text-decoration-color: rgb(34 211 238 / 0.75);
+  text-decoration-color: hsl(var(--primary) / 0.6);
   text-underline-offset: 2px;
-  transition: color 150ms ease, text-decoration-color 150ms ease, background-color 150ms ease;
-}
-
-.dark .tiptap a {
-  color: rgb(103 232 249);
-  text-decoration-color: rgb(34 211 238 / 0.9);
+  transition:
+    color 150ms ease,
+    text-decoration-color 150ms ease,
+    background-color 150ms ease;
 }
 
 .tiptap a:hover,
 .tiptap a:focus-visible {
-  color: rgb(6 182 212);
-  text-decoration-color: rgb(34 211 238);
-  background: rgb(6 182 212 / 0.12);
+  color: hsl(var(--primary));
+  text-decoration-color: hsl(var(--primary));
+  background: hsl(var(--primary) / 0.12);
   border-radius: 3px;
-}
-
-.dark .tiptap a:hover,
-.dark .tiptap a:focus-visible {
-  color: rgb(165 243 252);
-  text-decoration-color: rgb(103 232 249);
-  background: rgb(34 211 238 / 0.18);
 }
 
 .tiptap ul[data-type='taskList'] {
@@ -234,10 +430,10 @@
 .tiptap [data-type='details'] {
   position: relative;
   margin: 0.35rem 0;
-  border: 1px solid rgb(34 211 238 / 0.8);
+  border: 1px solid hsl(var(--info) / 0.8);
   border-radius: calc(var(--radius) - 2px);
-  background: rgb(8 47 73 / 0.18);
-  box-shadow: inset 0 0 0 1px rgb(6 182 212 / 0.18);
+  background: hsl(var(--info) / 0.06);
+  box-shadow: inset 0 0 0 1px hsl(var(--info) / 0.18);
 }
 
 .tiptap [data-type='details'] > button {
@@ -259,9 +455,9 @@
   padding: 0.4rem 0.6rem;
   font-weight: 600;
   cursor: pointer;
-  color: rgb(103 232 249);
-  border-bottom: 1px solid rgb(34 211 238 / 0.35);
-  background: rgb(14 116 144 / 0.22);
+  color: hsl(var(--info));
+  border-bottom: 1px solid hsl(var(--info) / 0.35);
+  background: hsl(var(--info) / 0.12);
   list-style: none;
 }
 
@@ -280,10 +476,10 @@
 .tiptap [data-type='detailsContent'] {
   margin: 0.35rem 0.45rem 0.5rem;
   padding: 0.5rem 0.6rem;
-  border: 1px dashed rgb(34 211 238 / 0.6);
+  border: 1px dashed hsl(var(--info) / 0.6);
   border-radius: calc(var(--radius) - 4px);
   min-height: 2.2rem;
-  background: rgb(2 132 199 / 0.08);
+  background: hsl(var(--info) / 0.05);
 }
 
 /* ─── Home Page Animations ─────────────────────────────────────── */
@@ -326,13 +522,19 @@
 
 @keyframes flowMesh {
   0% {
-    background-position: 0% 0%, 100% 100%;
+    background-position:
+      0% 0%,
+      100% 100%;
   }
   50% {
-    background-position: 100% 20%, 0% 80%;
+    background-position:
+      100% 20%,
+      0% 80%;
   }
   100% {
-    background-position: 0% 0%, 100% 100%;
+    background-position:
+      0% 0%,
+      100% 100%;
   }
 }
 
@@ -343,10 +545,12 @@
 }
 
 .home-flow-base-gradient {
-  position: absolute;
+  position: fixed;
   inset: -10% -10% -4% -10%;
   background:
-    radial-gradient(120% 70% at 50% -10%, hsl(var(--primary) / 0.12) 0%, transparent 62%),
+    radial-gradient(90% 60% at 82% 8%, hsl(330 82% 72% / 0.14) 0%, transparent 58%),
+    radial-gradient(90% 60% at 14% 6%, hsl(262 78% 68% / 0.13) 0%, transparent 58%),
+    radial-gradient(120% 70% at 50% -10%, hsl(var(--primary) / 0.1) 0%, transparent 62%),
     linear-gradient(180deg, hsl(198 86% 92% / 0.36) 0%, hsl(182 58% 92% / 0.2) 38%, transparent 80%);
 }
 
@@ -363,7 +567,13 @@
   width: 76%;
   height: 48%;
   transform: skewY(-9deg);
-  background: linear-gradient(95deg, transparent 0%, hsl(196 84% 56% / 0.3) 28%, hsl(176 74% 44% / 0.34) 52%, transparent 100%);
+  background: linear-gradient(
+    95deg,
+    transparent 0%,
+    hsl(196 84% 56% / 0.3) 28%,
+    hsl(176 74% 44% / 0.34) 52%,
+    transparent 100%
+  );
   animation: flowDrift 16s ease-in-out infinite;
 }
 
@@ -373,7 +583,13 @@
   width: 82%;
   height: 42%;
   transform: skewY(8deg);
-  background: linear-gradient(90deg, transparent 0%, hsl(168 78% 43% / 0.28) 30%, hsl(204 90% 57% / 0.3) 58%, transparent 100%);
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    hsl(168 78% 43% / 0.28) 30%,
+    hsl(204 90% 57% / 0.3) 58%,
+    transparent 100%
+  );
   animation: flowDriftReverse 18s ease-in-out infinite;
 }
 
@@ -390,7 +606,12 @@
   height: 42%;
   left: -20%;
   bottom: -8%;
-  background: radial-gradient(80% 120% at 50% 100%, hsl(200 92% 52% / 0.22), hsl(176 74% 42% / 0.08) 64%, transparent 100%);
+  background: radial-gradient(
+    80% 120% at 50% 100%,
+    hsl(200 92% 52% / 0.22),
+    hsl(176 74% 42% / 0.08) 64%,
+    transparent 100%
+  );
 }
 
 .home-flow-wave-b {
@@ -398,7 +619,12 @@
   height: 36%;
   left: -14%;
   bottom: -12%;
-  background: radial-gradient(70% 110% at 52% 100%, hsl(var(--primary) / 0.2), hsl(204 82% 54% / 0.08) 62%, transparent 100%);
+  background: radial-gradient(
+    70% 110% at 52% 100%,
+    hsl(var(--primary) / 0.2),
+    hsl(204 82% 54% / 0.08) 62%,
+    transparent 100%
+  );
   animation-direction: reverse;
   animation-duration: 20s;
 }
@@ -407,9 +633,19 @@
   position: absolute;
   inset: 0;
   opacity: 0.28;
-  background-image: linear-gradient(hsl(var(--primary) / 0.12) 1px, transparent 1px), linear-gradient(90deg, hsl(var(--primary) / 0.1) 1px, transparent 1px);
-  background-size: 72px 72px, 72px 72px;
-  -webkit-mask-image: linear-gradient(to bottom, transparent 8%, black 34%, black 70%, transparent 96%);
+  background-image:
+    linear-gradient(hsl(var(--primary) / 0.12) 1px, transparent 1px),
+    linear-gradient(90deg, hsl(var(--primary) / 0.1) 1px, transparent 1px);
+  background-size:
+    72px 72px,
+    72px 72px;
+  -webkit-mask-image: linear-gradient(
+    to bottom,
+    transparent 8%,
+    black 34%,
+    black 70%,
+    transparent 96%
+  );
   mask-image: linear-gradient(to bottom, transparent 8%, black 34%, black 70%, transparent 96%);
   animation: flowMesh 24s linear infinite;
 }
@@ -420,7 +656,9 @@
 
 .dark .home-flow-base-gradient {
   background:
-    radial-gradient(120% 70% at 50% -10%, hsl(var(--primary) / 0.24) 0%, transparent 62%),
+    radial-gradient(90% 60% at 82% 8%, hsl(330 75% 48% / 0.16) 0%, transparent 58%),
+    radial-gradient(90% 60% at 14% 6%, hsl(262 70% 46% / 0.16) 0%, transparent 58%),
+    radial-gradient(120% 70% at 50% -10%, hsl(var(--primary) / 0.2) 0%, transparent 62%),
     linear-gradient(180deg, hsl(204 38% 22% / 0.62) 0%, hsl(180 36% 18% / 0.5) 38%, transparent 82%);
 }
 
@@ -439,7 +677,9 @@
   }
 
   .home-flow-grid {
-    background-size: 56px 56px, 56px 56px;
+    background-size:
+      56px 56px,
+      56px 56px;
     opacity: 0.22;
   }
 }
@@ -482,17 +722,71 @@
   animation: slide-in-right 0.3s ease-out both;
 }
 
+/* Feedback list: status change flash, exit under the list edge, backfill enter */
+@keyframes feedback-status-flash {
+  0% { box-shadow: 0 0 0 0 hsl(var(--primary) / 0); }
+  30% { box-shadow: 0 0 0 3px hsl(var(--primary) / 0.35); }
+  100% { box-shadow: 0 0 0 0 hsl(var(--primary) / 0); }
+}
+
+@keyframes feedback-step-pop {
+  0% { transform: scale(1); }
+  40% { transform: scale(1.12); }
+  100% { transform: scale(1); }
+}
+
+@keyframes feedback-card-exit {
+  from { opacity: 1; transform: translateY(0); }
+  to { opacity: 0; transform: translateY(60%); }
+}
+
+@keyframes feedback-card-enter {
+  from { opacity: 0; transform: translateY(60%); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.feedback-status-flash {
+  animation: feedback-status-flash 0.7s ease-out;
+}
+
+.feedback-step-pop {
+  animation: feedback-step-pop 0.45s ease-out;
+}
+
+.feedback-card-exit {
+  animation: feedback-card-exit 0.3s ease-in forwards;
+  pointer-events: none;
+}
+
+.feedback-card-enter {
+  animation: feedback-card-enter 0.3s ease-out both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .feedback-status-flash,
+  .feedback-step-pop,
+  .feedback-card-exit,
+  .feedback-card-enter {
+    animation: none !important;
+  }
+}
+
 /* ─── Mobile Responsive Styles ─────────────────────────────────── */
 
 /* Calendar grid: enable touch-based horizontal scrolling on mobile */
 @media (max-width: 767px) {
   .calendar-grid-scroll {
     -webkit-overflow-scrolling: touch;
+    /* Contain sideways panning, but let vertical overscroll chain to the page
+       so a touch drag past the grid edge keeps scrolling the document. */
     overscroll-behavior-x: contain;
+    overscroll-behavior-y: auto;
   }
 
   /* Prevent the page from being wider than the viewport */
-  html, body, #root {
+  html,
+  body,
+  #root {
     max-width: 100vw;
     overflow-x: hidden;
   }
@@ -504,69 +798,6 @@
     padding-left: 0;
   }
 
-  /* Mobile hour slider styling (horizontal timeline) */
-  .mobile-hour-slider {
-    -webkit-appearance: none;
-    appearance: none;
-    width: 100%;
-    height: 24px;
-    background: transparent;
-    margin: 0;
-  }
-  
-  .mobile-hour-slider::-webkit-slider-runnable-track {
-    width: 100%;
-    height: 6px;
-    background: linear-gradient(to right, 
-      hsl(var(--muted)) 0%, 
-      hsl(var(--primary) / 0.3) 50%, 
-      hsl(var(--muted)) 100%);
-    border-radius: 3px;
-    border: 1px solid hsl(var(--border));
-  }
-  
-  .mobile-hour-slider::-webkit-slider-thumb {
-    -webkit-appearance: none;
-    width: 24px;
-    height: 24px;
-    border-radius: 50%;
-    background: hsl(var(--primary));
-    border: 2px solid white;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-    margin-top: -9px;
-    cursor: grab;
-  }
-  
-  .mobile-hour-slider::-webkit-slider-thumb:active {
-    cursor: grabbing;
-    transform: scale(1.1);
-  }
-
-  .mobile-hour-slider::-moz-range-track {
-    width: 100%;
-    height: 6px;
-    background: linear-gradient(to right, 
-      hsl(var(--muted)) 0%, 
-      hsl(var(--primary) / 0.3) 50%, 
-      hsl(var(--muted)) 100%);
-    border-radius: 3px;
-    border: 1px solid hsl(var(--border));
-  }
-  
-  .mobile-hour-slider::-moz-range-thumb {
-    width: 24px;
-    height: 24px;
-    border-radius: 50%;
-    background: hsl(var(--primary));
-    border: 2px solid white;
-    box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-    cursor: grab;
-  }
-  
-  .mobile-hour-slider::-moz-range-thumb:active {
-    cursor: grabbing;
-    transform: scale(1.1);
-  }
 
   /* Landscape tip dismissible banner */
   .landscape-tip {
@@ -574,8 +805,14 @@
   }
 
   @keyframes slideDown {
-    from { transform: translateY(-100%); opacity: 0; }
-    to { transform: translateY(0); opacity: 1; }
+    from {
+      transform: translateY(-100%);
+      opacity: 0;
+    }
+    to {
+      transform: translateY(0);
+      opacity: 1;
+    }
   }
 
   /* Confetti falling animation for GuestBookingPage success */
@@ -619,62 +856,135 @@
 
 /* Settings section highlight — left-to-right golden text shine on quicklink click */
 @keyframes sectionShine {
-  0%   { background-position: -200% center; }
-  100% { background-position: 200% center; }
+  0% {
+    background-position: -200% center;
+  }
+  100% {
+    background-position: 200% center;
+  }
 }
 @keyframes sectionGlow {
-  0%   { filter: drop-shadow(0 0 8px rgb(250 204 21 / 0.5)); }
-  70%  { filter: drop-shadow(0 0 4px rgb(250 204 21 / 0.3)); }
-  100% { filter: drop-shadow(0 0 0px rgb(250 204 21 / 0)); }
+  0% {
+    filter: drop-shadow(0 0 8px hsl(var(--warning) / 0.5));
+  }
+  70% {
+    filter: drop-shadow(0 0 4px hsl(var(--warning) / 0.3));
+  }
+  100% {
+    filter: drop-shadow(0 0 0px hsl(var(--warning) / 0));
+  }
 }
 @keyframes sparkFlash {
-  0%   { opacity: 0; transform: scale(0.3) rotate(-15deg); }
-  15%  { opacity: 1; transform: scale(1.1) rotate(5deg); }
-  40%  { opacity: 0.7; transform: scale(0.9) rotate(-3deg); }
-  60%  { opacity: 0; transform: scale(0.5) rotate(10deg); }
-  100% { opacity: 0; transform: scale(0) rotate(0deg); }
+  0% {
+    opacity: 0;
+    transform: scale(0.3) rotate(-15deg);
+  }
+  15% {
+    opacity: 1;
+    transform: scale(1.1) rotate(5deg);
+  }
+  40% {
+    opacity: 0.7;
+    transform: scale(0.9) rotate(-3deg);
+  }
+  60% {
+    opacity: 0;
+    transform: scale(0.5) rotate(10deg);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(0) rotate(0deg);
+  }
 }
 @keyframes sparkFlash2 {
-  0%   { opacity: 0; transform: scale(0.2) rotate(10deg); }
-  10%  { opacity: 0.9; transform: scale(1.2) rotate(-8deg); }
-  30%  { opacity: 0.5; transform: scale(0.8) rotate(5deg); }
-  50%  { opacity: 0; transform: scale(0.3) rotate(-5deg); }
-  100% { opacity: 0; transform: scale(0) rotate(0deg); }
+  0% {
+    opacity: 0;
+    transform: scale(0.2) rotate(10deg);
+  }
+  10% {
+    opacity: 0.9;
+    transform: scale(1.2) rotate(-8deg);
+  }
+  30% {
+    opacity: 0.5;
+    transform: scale(0.8) rotate(5deg);
+  }
+  50% {
+    opacity: 0;
+    transform: scale(0.3) rotate(-5deg);
+  }
+  100% {
+    opacity: 0;
+    transform: scale(0) rotate(0deg);
+  }
 }
 
 /* AI Assistant button — animated color cycling */
+@keyframes todayRipple {
+  0% {
+    box-shadow: 0 0 0 0 hsl(var(--primary) / 0.55);
+  }
+  60% {
+    box-shadow: 0 0 0 5px hsl(var(--primary) / 0);
+  }
+  100% {
+    box-shadow: 0 0 0 0 hsl(var(--primary) / 0);
+  }
+}
+/* One-shot: the solid primary header is the static "today" signal; the ripple
+   only marks it on arrival so it does not compete with the unmarked pulse. */
+.today-col-header {
+  animation: todayRipple 2.4s ease-out 1;
+}
+
 @keyframes aiColorCycle {
-  0%   { background-position: 0% 50%; }
-  50%  { background-position: 100% 50%; }
-  100% { background-position: 0% 50%; }
+  0% {
+    background-position: 0% 50%;
+  }
+  50% {
+    background-position: 100% 50%;
+  }
+  100% {
+    background-position: 0% 50%;
+  }
 }
-.ai-floating-button {
-  background: linear-gradient(115deg, #7c3aed 0%, #8b5cf6 22%, #d946ef 48%, #6366f1 74%, #7c3aed 100%);
-  background-size: 400% 400%;
-  animation: aiGradientDrift 36s linear infinite;
-  color: white;
-  will-change: background-position;
-  transition: box-shadow 0.2s ease, transform 0.15s ease;
+@keyframes calendarQuickAdd {
+  0% {
+    opacity: 0;
+    transform: translate3d(-26px, -10px, 0) scale(0.88);
+    filter: saturate(1.25);
+  }
+  45% {
+    opacity: 1;
+    transform: translate3d(4px, 0, 0) scale(1.04);
+  }
+  100% {
+    opacity: 1;
+    transform: translate3d(0, 0, 0) scale(1);
+    filter: saturate(1);
+  }
 }
-.ai-floating-button:hover {
-  box-shadow: 0 0 16px rgba(168, 85, 247, 0.35);
-}
-@keyframes aiGradientDrift {
-  0% { background-position: 0% 50%; }
-  25% { background-position: 100% 40%; }
-  50% { background-position: 100% 60%; }
-  75% { background-position: 0% 60%; }
-  100% { background-position: 0% 50%; }
+.animate-calendar-quick-add {
+  animation: calendarQuickAdd 1.45s ease-out both;
 }
 .ai-assistant-btn {
-  background: linear-gradient(135deg, #7c3aed, #a855f7, #ec4899, #6366f1, #7c3aed);
+  background: linear-gradient(
+    135deg,
+    hsl(var(--feature-ai)),
+    hsl(var(--info)),
+    hsl(var(--feature-ai)),
+    hsl(var(--info)),
+    hsl(var(--feature-ai))
+  );
   background-size: 300% 300%;
-  animation: aiColorCycle 3.6s ease-in-out infinite;
-  color: white;
-  transition: box-shadow 0.2s ease, transform 0.15s ease;
+  animation: aiColorCycle 36s ease-in-out infinite;
+  color: hsl(var(--info-foreground));
+  transition:
+    box-shadow 0.2s ease,
+    transform 0.15s ease;
 }
 .ai-assistant-btn:hover {
-  box-shadow: 0 0 16px rgba(168, 85, 247, 0.5);
+  box-shadow: 0 0 16px hsl(var(--feature-ai) / 0.5);
   transform: scale(1.03);
 }
 .section-highlight {
@@ -683,11 +993,11 @@
     90deg,
     currentColor 0%,
     currentColor 20%,
-    rgb(217 160 0) 38%,
-    rgb(250 204 21) 45%,
-    rgb(253 224 71) 50%,
-    rgb(250 204 21) 55%,
-    rgb(217 160 0) 62%,
+    hsl(var(--warning)) 38%,
+    color-mix(in srgb, hsl(var(--warning)) 80%, white) 45%,
+    color-mix(in srgb, hsl(var(--warning)) 60%, white) 50%,
+    color-mix(in srgb, hsl(var(--warning)) 80%, white) 55%,
+    hsl(var(--warning)) 62%,
     currentColor 80%,
     currentColor 100%
   );
@@ -695,25 +1005,9 @@
   background-clip: text !important;
   -webkit-background-clip: text !important;
   -webkit-text-fill-color: transparent !important;
-  animation: sectionShine 3s ease-in-out 2, sectionGlow 6s ease-out forwards !important;
-}
-.dark .section-highlight {
-  background: linear-gradient(
-    90deg,
-    currentColor 0%,
-    currentColor 20%,
-    rgb(234 179 8) 38%,
-    rgb(250 204 21) 45%,
-    rgb(253 224 71) 50%,
-    rgb(250 204 21) 55%,
-    rgb(234 179 8) 62%,
-    currentColor 80%,
-    currentColor 100%
-  );
-  background-size: 200% 100%;
-  background-clip: text !important;
-  -webkit-background-clip: text !important;
-  -webkit-text-fill-color: transparent !important;
+  animation:
+    sectionShine 3s ease-in-out 2,
+    sectionGlow 6s ease-out forwards !important;
 }
 /* Spark elements */
 .section-spark {
@@ -739,14 +1033,6 @@
   animation: sparkFlash 0.6s 0.05s ease-out forwards;
 }
 
-/* ─── Floating Save Button ─────────────────────────────────────── */
-@keyframes bounce-subtle {
-  0%, 100% { transform: translateY(0); }
-  50% { transform: translateY(-4px); }
-}
-.animate-bounce-subtle {
-  animation: bounce-subtle 2s ease-in-out infinite;
-}
 
 /* ─── Cyan Border Trace (slow light moving around the edge) ────── */
 @property --cyan-trace-angle {
@@ -755,7 +1041,9 @@
   inherits: false;
 }
 @keyframes cyan-trace-spin {
-  to { --cyan-trace-angle: 360deg; }
+  to {
+    --cyan-trace-angle: 360deg;
+  }
 }
 .animate-cyan-trace {
   position: relative;
@@ -768,52 +1056,171 @@
   padding: 2px;
   background: conic-gradient(
     from var(--cyan-trace-angle),
-    rgba(165, 243, 252, 1) 0deg,
-    rgba(34, 211, 238, 0.75) 25deg,
-    rgba(34, 211, 238, 0) 90deg,
-    rgba(34, 211, 238, 0) 360deg
+    hsl(var(--info)) 0deg,
+    hsl(var(--info) / 0.75) 25deg,
+    hsl(var(--info) / 0) 90deg,
+    hsl(var(--info) / 0) 360deg
   );
-  -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
-          mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
   -webkit-mask-composite: xor;
-          mask-composite: exclude;
+  mask-composite: exclude;
   animation: cyan-trace-spin 6s linear infinite;
   pointer-events: none;
 }
+/* Progress/active-state loop: keeps running under reduced motion (slowed,
+   never stopped) so the feedback is not lost. */
 @media (prefers-reduced-motion: reduce) {
-  .animate-cyan-trace::before { animation: none; }
+  .animate-cyan-trace::before {
+    animation-duration: 12s;
+  }
+}
+
+/* ─── Mailbox "additional filters still apply" border wave ─────── */
+@property --mailbox-filter-trace-angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+@keyframes mailboxFilterTraceSpin {
+  to {
+    --mailbox-filter-trace-angle: 360deg;
+  }
+}
+.mailbox-filter-highlight-trace {
+  position: relative;
+  border-radius: inherit;
+}
+.mailbox-filter-highlight-trace::before {
+  content: '';
+  position: absolute;
+  inset: -2px;
+  border-radius: inherit;
+  padding: 2px;
+  background: conic-gradient(
+    from var(--mailbox-filter-trace-angle),
+    hsl(var(--primary)) 0deg,
+    hsl(var(--primary) / 0.7) 20deg,
+    hsl(var(--primary) / 0) 70deg,
+    hsl(var(--primary) / 0) 360deg
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  animation: mailboxFilterTraceSpin 1.1s linear infinite;
+  pointer-events: none;
+}
+/* Loading loop (also the email-card "opening" border trace): essential
+   feedback, so it keeps running under reduced motion - slowed, never stopped. */
+@media (prefers-reduced-motion: reduce) {
+  .mailbox-filter-highlight-trace::before {
+    animation-duration: 2.2s;
+  }
+}
+
+@property --switch-card-trace-angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+@keyframes switch-card-trace-spin {
+  to {
+    --switch-card-trace-angle: 360deg;
+  }
+}
+.switch-card-trace::before {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: inherit;
+  padding: 2px;
+  background: conic-gradient(
+    from var(--switch-card-trace-angle),
+    currentColor 0deg,
+    transparent 100deg,
+    transparent 360deg
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0;
+}
+.switch-card:is(:hover, :focus-visible):not(:disabled) .switch-card-trace::before {
+  opacity: 1;
+  animation: switch-card-trace-spin 2s linear infinite;
+}
+.meeting-editor-native-input::-webkit-calendar-picker-indicator {
+  display: none;
+}
+.meeting-editor-pair:is(:hover, :focus-within) > .meeting-editor-control > .switch-card-trace::before {
+  opacity: 1;
+  animation: switch-card-trace-spin 2s linear infinite;
+}
+@media (prefers-reduced-motion: reduce) {
+  .switch-card:is(:hover, :focus-visible):not(:disabled) .switch-card-trace::before,
+  .meeting-editor-pair:is(:hover, :focus-within) > .meeting-editor-control > .switch-card-trace::before {
+    animation: none;
+    background: currentColor;
+  }
 }
 
 /* ─── Subscribe Button Attention Pulse ─────────────────────────── */
+/* Temporary attention loop: shown only while the calendar is not subscribed.
+   Reduced motion holds the peak frame (see the block at the end of the file). */
 @keyframes subscribe-glow {
-  0%, 100% { box-shadow: 0 0 0 0 rgba(234, 179, 8, 0); }
-  50% { box-shadow: 0 0 8px 2px rgba(234, 179, 8, 0.25); }
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 hsl(var(--warning) / 0);
+  }
+  50% {
+    box-shadow: 0 0 8px 2px hsl(var(--warning) / 0.25);
+  }
 }
 .animate-subscribe-attention {
   animation: subscribe-glow 3s ease-in-out infinite;
 }
 
 /* --- Editing Meeting Highlight (selected card + calendar grid) --- */
+/* Temporary attention loop: pulses only while a meeting is being edited.
+   The card glow uses the info token; the grid cell keeps the recorded
+   meeting-selection blue data hue (it sits on the bg-blue-400 data layer).
+   Reduced motion holds a static highlighted frame (block at end of file). */
 @keyframes editingMeetingPulse {
-  0%, 100% {
+  0%,
+  100% {
     box-shadow:
-      0 0 0 2px rgba(59, 130, 246, 0.85),
-      0 0 12px 2px rgba(59, 130, 246, 0.45);
+      0 0 0 2px hsl(var(--info) / 0.85),
+      0 0 12px 2px hsl(var(--info) / 0.45);
   }
   50% {
     box-shadow:
-      0 0 0 3px rgba(96, 165, 250, 1),
-      0 0 22px 6px rgba(96, 165, 250, 0.65);
+      0 0 0 3px hsl(var(--info)),
+      0 0 22px 6px hsl(var(--info) / 0.65);
   }
 }
 .editing-meeting-card {
   animation: editingMeetingPulse 1.8s ease-in-out infinite;
-  border-color: rgb(59 130 246) !important;
+  border-color: hsl(var(--info)) !important;
   position: relative;
   z-index: 1;
 }
 @keyframes editingMeetingCellPulse {
-  0%, 100% {
+  0%,
+  100% {
     background-color: rgb(59 130 246);
     box-shadow: inset 0 0 0 2px rgba(96, 165, 250, 0.9);
   }
@@ -872,24 +1279,26 @@
   transform: translate(-50%, -50%);
   border-radius: 50%;
   background: hsl(var(--primary));
-  border: 2px solid white;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+  border: 2px solid hsl(var(--primary-foreground));
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
   cursor: grab;
   z-index: 2;
   touch-action: none;
-  transition: transform 0.1s ease, box-shadow 0.1s ease;
+  transition:
+    transform 0.1s ease,
+    box-shadow 0.1s ease;
 }
 
 .dual-thumb-horizontal .dual-thumb-handle.active,
 .dual-thumb-horizontal .dual-thumb-handle:active {
   cursor: grabbing;
   transform: translate(-50%, -50%) scale(1.15);
-  box-shadow: 0 3px 8px rgba(0,0,0,0.3);
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.3);
   z-index: 3;
 }
 
 .dual-thumb-horizontal .dual-thumb-handle.hovered {
-  box-shadow: 0 3px 8px rgba(0,0,0,0.25);
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.25);
 }
 
 /* Vertical layout */
@@ -938,24 +1347,26 @@
   transform: translate(-50%, -50%);
   border-radius: 50%;
   background: hsl(var(--primary));
-  border: 2px solid white;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+  border: 2px solid hsl(var(--primary-foreground));
+  box-shadow: 0 2px 4px rgba(0, 0, 0, 0.2);
   cursor: grab;
   z-index: 2;
   touch-action: none;
-  transition: transform 0.1s ease, box-shadow 0.1s ease;
+  transition:
+    transform 0.1s ease,
+    box-shadow 0.1s ease;
 }
 
 .dual-thumb-vertical .dual-thumb-handle.active,
 .dual-thumb-vertical .dual-thumb-handle:active {
   cursor: grabbing;
   transform: translate(-50%, -50%) scale(1.15);
-  box-shadow: 0 3px 8px rgba(0,0,0,0.3);
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.3);
   z-index: 3;
 }
 
 .dual-thumb-vertical .dual-thumb-handle.hovered {
-  box-shadow: 0 3px 8px rgba(0,0,0,0.25);
+  box-shadow: 0 3px 8px rgba(0, 0, 0, 0.25);
 }
 
 /* Tooltip on thumb hover/drag */
@@ -974,7 +1385,7 @@
   pointer-events: none;
   opacity: 0;
   transition: opacity 0.15s;
-  box-shadow: 0 1px 3px rgba(0,0,0,0.2);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
 }
 
 .dual-thumb-vertical .dual-thumb-handle .dual-thumb-tooltip {
@@ -991,17 +1402,27 @@
 }
 
 /* ─── Time Item Resize Handles ────────────────────────────── */
-@keyframes resize-handle-pulse {
-  0%, 100% { opacity: 0.55; transform: scaleX(1); }
-  50%       { opacity: 1;    transform: scaleX(1.08); }
+@keyframes time-item-selection-pulse {
+  0% {
+    box-shadow: 0 0 0 0 hsl(var(--primary) / 0.6);
+  }
+  55% {
+    box-shadow: 0 0 0 5px hsl(var(--primary) / 0.25);
+  }
+  100% {
+    box-shadow: 0 0 0 0 hsl(var(--primary) / 0);
+  }
 }
 
-@keyframes field-dirty-pulse {
-  0%, 100% {
-    box-shadow: 0 0 0 0 rgba(245, 158, 11, 0.12);
+@keyframes resize-handle-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scaleX(1);
   }
   50% {
-    box-shadow: 0 0 0 2px rgba(245, 158, 11, 0.28);
+    opacity: 1;
+    transform: scaleX(1.08);
   }
 }
 
@@ -1020,7 +1441,9 @@
   border-radius: 9999px;
   background: rgba(255, 255, 255, 0.35);
   opacity: 0;
-  transition: opacity 0.15s ease, background 0.15s ease;
+  transition:
+    opacity 0.15s ease,
+    background 0.15s ease;
 }
 
 /* Show handles when hovering the parent card */
@@ -1033,20 +1456,135 @@
 :is(.absolute.rounded-md.border-2):hover .time-item-resize-handle-top,
 [data-resize-hover-linked='true'] .time-item-resize-handle-top {
   background: rgba(255, 255, 255, 0.7);
-  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.5), 0 0 6px rgba(255, 255, 255, 0.35);
+  box-shadow:
+    0 0 0 1.5px rgba(255, 255, 255, 0.5),
+    0 0 6px rgba(255, 255, 255, 0.35);
 }
 
 /* Brighten the bottom handle on hover */
 :is(.absolute.rounded-md.border-2):hover .time-item-resize-handle-bottom,
 [data-resize-hover-linked='true'] .time-item-resize-handle-bottom {
   background: rgba(255, 255, 255, 0.7);
-  box-shadow: 0 0 0 1.5px rgba(255, 255, 255, 0.5), 0 0 6px rgba(255, 255, 255, 0.35);
+  box-shadow:
+    0 0 0 1.5px rgba(255, 255, 255, 0.5),
+    0 0 6px rgba(255, 255, 255, 0.35);
 }
 
 /* Pulse while actively being dragged */
 .time-item-resize-handle[data-resize-active] {
   opacity: 1;
   background: rgba(255, 255, 255, 0.95);
-  box-shadow: 0 0 0 2px rgba(255, 255, 255, 0.7), 0 0 10px rgba(255, 255, 255, 0.5);
+  box-shadow:
+    0 0 0 2px rgba(255, 255, 255, 0.7),
+    0 0 10px rgba(255, 255, 255, 0.5);
   animation: resize-handle-pulse 0.7s ease-in-out infinite;
+}
+
+/* ─── Tab Navigation Thread Wave ──────────────────────────── */
+.tab-thread {
+  --thread-trail: 0px;
+  --thread-wave: 3px;
+  --thread-peak: 1;
+  --thread-rest: 0.3;
+  --thread-thickness: 2;
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 1px;
+  border-radius: 9999px;
+  opacity: var(--thread-rest);
+  background: linear-gradient(
+    90deg,
+    transparent 0%,
+    hsl(var(--primary) / 0.15) 12%,
+    hsl(var(--primary) / 0.95) 50%,
+    hsl(var(--primary) / 0.15) 88%,
+    transparent 100%
+  );
+  filter: drop-shadow(0 0 3px hsl(var(--primary) / 0.55));
+}
+
+/* Per-thread custom properties carry the randomised trail, wave and brightness profile. */
+.tab-thread--travelling {
+  animation-name: tab-thread-slither;
+  animation-timing-function: cubic-bezier(0.22, 1, 0.36, 1);
+  animation-fill-mode: both;
+}
+
+@keyframes tab-thread-slither {
+  0% {
+    transform: translate(var(--thread-trail), 0) scale(0.3, var(--thread-thickness));
+    opacity: 0;
+  }
+  12% {
+    opacity: var(--thread-peak);
+  }
+  35% {
+    transform: translate(calc(var(--thread-trail) * 0.55), var(--thread-wave))
+      scale(0.72, calc(var(--thread-thickness) * 0.75));
+    opacity: var(--thread-peak);
+  }
+  60% {
+    transform: translate(calc(var(--thread-trail) * 0.24), calc(var(--thread-wave) * -1))
+      scale(1.12, calc(var(--thread-thickness) * 0.45));
+    opacity: calc(var(--thread-peak) * 0.7);
+  }
+  82% {
+    transform: translate(calc(var(--thread-trail) * 0.07), calc(var(--thread-wave) * 0.35))
+      scale(1.02, 1);
+    opacity: calc(var(--thread-peak) * 0.4);
+  }
+  100% {
+    transform: translate(0, 0) scale(1, 1);
+    opacity: var(--thread-rest);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .tab-thread--travelling {
+    animation: none;
+  }
+}
+
+/* --- Reduced motion policy for endless loops defined in this file ----------
+   Three classes of loop:
+   - Loading / progress loops (animate-spin, mailbox-filter-highlight-trace,
+     animate-cyan-trace) are essential feedback: they are NOT listed here and
+     keep running (the traces only slow down in their own blocks above).
+   - Temporary attention loops (shown only while a state lasts) hold a static
+     highlighted frame instead of looping.
+   - Ambient decoration stops.
+   Unlayered so it wins over the Tailwind utilities layer. Effects with their
+   own reduced-motion block above (flow*, tab-thread, feedback-*,
+   tools-reveal, design-catalog) are not repeated. */
+@media (prefers-reduced-motion: reduce) {
+  /* Temporary attention loops: static highlighted frame. */
+  .animate-subscribe-attention {
+    animation: none;
+    box-shadow: 0 0 8px 2px hsl(var(--warning) / 0.25);
+  }
+  .editing-meeting-card {
+    animation: none;
+    box-shadow:
+      0 0 0 2px hsl(var(--info) / 0.9),
+      0 0 16px 4px hsl(var(--info) / 0.5);
+  }
+  .editing-meeting-cell {
+    animation: none;
+    background-color: rgb(59 130 246);
+    box-shadow: inset 0 0 0 2px rgba(255, 255, 255, 0.95);
+  }
+  .animate-unmarked-pulse {
+    animation: none;
+    border-color: hsl(var(--warning));
+    box-shadow: 0 0 8px hsl(var(--warning) / 0.45);
+  }
+  .time-item-resize-handle[data-resize-active] {
+    animation: none;
+  }
+  /* Ambient decoration: stops. */
+  .ai-assistant-btn,
+  .today-col-header {
+    animation: none;
+  }
 }

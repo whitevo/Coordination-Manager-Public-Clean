@@ -165,11 +165,11 @@ export default function SentimentGrid({
       <div className="flex items-stretch gap-1">
         {/* Y-axis label */}
         <div className="flex flex-col justify-between text-[10px] text-muted-foreground pr-1 py-0.5" style={{ height: size }}>
-          <span className="text-green-600 dark:text-green-400 font-medium">Good</span>
+          <span className="text-success font-medium">Good</span>
           <span className="opacity-60">Positive</span>
           <span className="opacity-40">Unknown</span>
           <span className="opacity-60">Negative</span>
-          <span className="text-red-600 dark:text-red-400 font-medium">Bad</span>
+          <span className="text-danger font-medium">Bad</span>
         </div>
 
         {/* Grid */}
@@ -229,11 +229,11 @@ export default function SentimentGrid({
 
       {/* X-axis label */}
       <div className="flex justify-between text-[10px] text-muted-foreground" style={{ width: size, marginLeft: 30 }}>
-        <span className="text-red-600 dark:text-red-400 font-medium">Untrust</span>
+        <span className="text-danger font-medium">Untrust</span>
         <span className="opacity-60">Doubt</span>
         <span className="opacity-40">Don't know</span>
         <span className="opacity-60">Believe</span>
-        <span className="text-green-600 dark:text-green-400 font-medium">Trust</span>
+        <span className="text-success font-medium">Trust</span>
       </div>
     </div>
   )

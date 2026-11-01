@@ -2,7 +2,38 @@
   "framework": "vite",
   "buildCommand": "pnpm run build:with-docs",
   "outputDirectory": "dist",
+  "trailingSlash": false,
   "headers": [
+    {
+      "source": "/((?:auth|join|calendar|meeting|mailbox|distribute|announcements|coordinate-events|settings|setup|admin|user-management|guardian|feedback|ai-feedback|ai-chat)(?:/.*)?)",
+      "headers": [
+        { "key": "X-Robots-Tag", "value": "noindex, follow" }
+      ]
+    },
+    {
+      "source": "/(llms.txt|robots.txt)",
+      "headers": [
+        { "key": "Content-Type", "value": "text/plain; charset=utf-8" }
+      ]
+    },
+    {
+      "source": "/sitemap.xml",
+      "headers": [
+        { "key": "Content-Type", "value": "application/xml; charset=utf-8" }
+      ]
+    },
+    {
+      "source": "/.well-known/microsoft-identity-association",
+      "headers": [
+        { "key": "Content-Type", "value": "application/json; charset=utf-8" }
+      ]
+    },
+    {
+      "source": "/.well-known/microsoft-identity-association.json",
+      "headers": [
+        { "key": "Content-Type", "value": "application/json; charset=utf-8" }
+      ]
+    },
     {
       "source": "/(.*)",
       "headers": [
@@ -11,22 +42,46 @@
         { "key": "Referrer-Policy", "value": "strict-origin-when-cross-origin" },
         { "key": "Permissions-Policy", "value": "camera=(), microphone=(), geolocation=()" },
         { "key": "Strict-Transport-Security", "value": "max-age=31536000; includeSubDomains" },
-        { "key": "Content-Security-Policy", "value": "default-src 'self'; script-src 'self' https://challenges.cloudflare.com 'sha256-uHxmYomtXP8jNJ9lDSDyTHXMoPnLcBlCv6DUCl3DjqI='; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https://*.supabase.co https://*.railway.app https://api.coordinationmanager.com; frame-src https://challenges.cloudflare.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" }
+        { "key": "Content-Security-Policy", "value": "default-src 'self'; script-src 'self' https://challenges.cloudflare.com 'sha256-auxNI3YtT9pQnwi4KLv9T0GtJaxyau0afycZ2pvbUHA='; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; font-src 'self' data:; connect-src 'self' https://*.supabase.co https://*.railway.app https://api.coordinationmanager.com; frame-src https://challenges.cloudflare.com; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" }
       ]
     }
   ],
   "rewrites": [
+    { "source": "/", "destination": "/index.html" },
+    { "source": "/llms.txt", "destination": "/llms.txt" },
+    { "source": "/robots.txt", "destination": "/robots.txt" },
+    { "source": "/sitemap.xml", "destination": "/sitemap.xml" },
+    { "source": "/calendars", "destination": "/calendars/index.html" },
+    { "source": "/events-calendar", "destination": "/events-calendar/index.html" },
+    { "source": "/time-management", "destination": "/time-management/index.html" },
+    { "source": "/support", "destination": "/support/index.html" },
+    { "source": "/privacy", "destination": "/privacy/index.html" },
+    { "source": "/terms", "destination": "/terms/index.html" },
+    { "source": "/policy", "destination": "/policy/index.html" },
+    { "source": "/trademark", "destination": "/trademark/index.html" },
+    { "source": "/docs/overview", "destination": "/docs/overview/index.html" },
+    { "source": "/docs/getting-started", "destination": "/docs/getting-started/index.html" },
+    { "source": "/docs/authentication", "destination": "/docs/authentication/index.html" },
+    { "source": "/docs/limits", "destination": "/docs/limits/index.html" },
+    { "source": "/docs/api/calendars", "destination": "/docs/api/calendars/index.html" },
+    { "source": "/docs/api/calendar-sources", "destination": "/docs/api/calendar-sources/index.html" },
+    { "source": "/docs/api/meetings", "destination": "/docs/api/meetings/index.html" },
+    { "source": "/docs/api/announcements", "destination": "/docs/api/announcements/index.html" },
+    { "source": "/docs/api/mailbox", "destination": "/docs/api/mailbox/index.html" },
+    { "source": "/docs/api/discord", "destination": "/docs/api/discord/index.html" },
+    { "source": "/docs/examples", "destination": "/docs/examples/index.html" },
+    { "source": "/docs/assets/:path*", "destination": "/docs/assets/:path*" },
     {
       "source": "/docs/:path*",
-      "destination": "/docs/index.html"
+      "destination": "/docs/app-shell.html"
     },
     {
       "source": "/docs",
-      "destination": "/docs/index.html"
+      "destination": "/docs/overview/index.html"
     },
     {
-      "source": "/((?!assets/|docs/).*)",
-      "destination": "/index.html"
+      "source": "/((?!assets/|docs/|\\.well-known/).*)",
+      "destination": "/app-shell.html"
     }
   ]
 }

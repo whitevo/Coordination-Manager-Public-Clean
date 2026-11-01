@@ -1,15 +1,20 @@
 import type { ReactNode } from 'react'
 import { vi } from 'vitest'
+import { apiClient } from '../../lib/api-client'
+import { clearSessionCacheValue } from '../../lib/session-data-cache'
+import type { UseTimezonesReturn } from '../../lib/use-timezones'
 
 export const mockDedupedGet = vi.fn()
 export const mockUseAuth = vi.fn()
+export const mockUseTimezones = vi.fn(createDefaultTimezoneState)
 
 vi.mock('../../lib/api-client', () => ({
   apiClient: {
-    post: vi.fn(),
-    put: vi.fn(),
-    patch: vi.fn(),
-    delete: vi.fn(),
+    get: vi.fn(async () => ({ data: {} })),
+    post: vi.fn(async () => ({ data: {} })),
+    put: vi.fn(async () => ({ data: {} })),
+    patch: vi.fn(async () => ({ data: {} })),
+    delete: vi.fn(async () => ({ data: {} })),
   },
   dedupedGet: (...args: unknown[]) => mockDedupedGet(...args),
 }))
@@ -31,7 +36,18 @@ vi.mock('../../components/ColorGridPicker', () => ({
 }))
 
 vi.mock('../../lib/use-timezones', () => ({
-  useTimezones: () => ({
+  useTimezones: () => mockUseTimezones(),
+}))
+
+vi.mock('../../lib/timezone-data', async (importOriginal) => ({
+  ...await importOriginal<typeof import('../../lib/timezone-data')>(),
+  convertUtcTimeToTimezone: (value: string) => value,
+  getCurrentTimeInTimezone: () => '00:00',
+  findTimezone: () => undefined,
+}))
+
+function createDefaultTimezoneState(): UseTimezonesReturn {
+  return {
     primary: 'UTC',
     additional: [],
     all: ['UTC'],
@@ -41,14 +57,8 @@ vi.mock('../../lib/use-timezones', () => ({
     replaceTimezone: vi.fn(),
     canAddMore: true,
     getEntry: vi.fn(),
-  }),
-}))
-
-vi.mock('../../lib/timezone-data', () => ({
-  convertUtcTimeToTimezone: (value: string) => value,
-  getCurrentTimeInTimezone: () => '00:00',
-  findTimezone: () => undefined,
-}))
+  }
+}
 
 vi.mock('../../lib/calendarOverlapLayout', () => ({
   computeDayLayout: (events: Array<{ id: string }>) => ({
@@ -66,6 +76,9 @@ vi.mock('../../lib/calendarOverlapLayout', () => ({
 }))
 
 export function installDefaultApiMocks(): void {
+  mockUseTimezones.mockReturnValue(createDefaultTimezoneState())
+  clearSessionCacheValue('time-management:events:anon')
+  vi.mocked(apiClient.get).mockImplementation(async (url) => mockDedupedGet(url))
   mockDedupedGet.mockImplementation(async (url: string) => {
     if (url === '/api/calendar-sources') return { data: { sources: [] } }
     if (url === '/api/time-management/modes') {
@@ -78,7 +91,7 @@ export function installDefaultApiMocks(): void {
               name: 'Main',
               main_color: '#2563eb',
               slot_minutes: 30,
-              sync_calendars: [],
+              sync_calendars: [{ id: 'coord-main', enabled: true }],
               time_backgrounds: [],
               collapsed_background_ids: [],
               quick_templates: [],
@@ -172,9 +185,13 @@ export function installEditorDomPolyfills(): void {
   })
 
   const pointTarget = () => document.body
+  const pointsTarget = () => [document.body]
 
   ;(document as Document & { elementFromPoint?: (x: number, y: number) => Element | null }).elementFromPoint = pointTarget
   ;(Document.prototype as Document & { elementFromPoint?: (x: number, y: number) => Element | null }).elementFromPoint = pointTarget
+
+  ;(document as Document & { elementsFromPoint?: (x: number, y: number) => Element[] }).elementsFromPoint = pointsTarget
+  ;(Document.prototype as Document & { elementsFromPoint?: (x: number, y: number) => Element[] }).elementsFromPoint = pointsTarget
 
   if (typeof ShadowRoot !== 'undefined') {
     ;(

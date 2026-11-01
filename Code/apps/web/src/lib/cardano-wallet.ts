@@ -69,13 +69,6 @@ export function detectWallets(): WalletInfo[] {
   })
 }
 
-/**
- * Check if any Cardano wallet is available in the browser.
- */
-export function hasCardanoWallet(): boolean {
-  return detectWallets().some((w) => w.installed)
-}
-
 // ── Wallet connection ─────────────────────────────────────────────────
 
 /**
@@ -118,9 +111,9 @@ export async function connectWallet(walletId: CardanoWalletId): Promise<CardanoW
           : JSON.stringify(error) || 'Connection failed'
 
     if (message.includes('refuse') || message.includes('reject') || message.includes('denied') || message.includes('cancel')) {
-      throw new Error('Wallet connection was rejected. Please approve the connection request.')
+      throw new Error('Wallet connection was rejected. Please approve the connection request.', { cause: error })
     }
-    throw new Error(`Failed to connect to ${walletId}: ${message}`)
+    throw new Error(`Failed to connect to ${walletId}: ${message}`, { cause: error })
   }
 }
 
@@ -188,10 +181,10 @@ export async function signInWithCardanoWallet(
     const status = axiosErr?.response?.status
 
     if (status === 400 && (serverMsg.toLowerCase().includes('captcha') || serverMsg.toLowerCase().includes('verification'))) {
-      throw new Error('Please complete the human verification checkbox (Cloudflare) before connecting your wallet.')
+      throw new Error('Please complete the human verification checkbox (Cloudflare) before connecting your wallet.', { cause: err })
     }
     // Re-throw with server message if available, otherwise the original error
-    if (serverMsg) throw new Error(serverMsg)
+    if (serverMsg) throw new Error(serverMsg, { cause: err })
     throw err
   }
 
@@ -216,19 +209,19 @@ export async function signInWithCardanoWallet(
     if (cipErr && typeof cipErr === 'object' && 'code' in cipErr) {
       const code = cipErr.code as number
       const info = ((cipErr.info as string) || '').trim()
-      if (code === 3) throw new Error('Signing was cancelled. If the wallet prompt looked broken or frozen, close all open wallet windows and try again.')
-      if (code === 2) throw new Error('This address cannot sign data. Try reconnecting your wallet.')
-      if (code === 1) throw new Error(`Wallet could not generate a proof.${info ? ' ' + info : ''}`)
-      throw new Error(`Wallet signing error (code ${code})${info ? ': ' + info : ''}`)
+      if (code === 3) throw new Error('Signing was cancelled. If the wallet prompt looked broken or frozen, close all open wallet windows and try again.', { cause: error })
+      if (code === 2) throw new Error('This address cannot sign data. Try reconnecting your wallet.', { cause: error })
+      if (code === 1) throw new Error(`Wallet could not generate a proof.${info ? ' ' + info : ''}`, { cause: error })
+      throw new Error(`Wallet signing error (code ${code})${info ? ': ' + info : ''}`, { cause: error })
     }
     if (error instanceof Error) {
       const m = error.message.toLowerCase()
       if (m.includes('declined') || m.includes('rejected') || m.includes('cancel')) {
-        throw new Error('Signing was cancelled. If the wallet prompt looked broken or frozen, close all open wallet windows and try again.')
+        throw new Error('Signing was cancelled. If the wallet prompt looked broken or frozen, close all open wallet windows and try again.', { cause: error })
       }
-      throw new Error(`Failed to sign challenge: ${error.message}`)
+      throw new Error(`Failed to sign challenge: ${error.message}`, { cause: error })
     }
-    throw new Error(`Failed to sign challenge: ${JSON.stringify(error) || 'Wallet returned an unexpected error'}`)
+    throw new Error(`Failed to sign challenge: ${JSON.stringify(error) || 'Wallet returned an unexpected error'}`, { cause: error })
   }
 
   // Step 5: Submit the signed challenge to the backend for verification

@@ -1,0 +1,4 @@
+Contact: mailto:security@coordinationmanager.com
+Policy: https://coordinationmanager.com/docs/legal/security-policy
+Canonical: https://coordinationmanager.com/.well-known/security.txt
+Expires: 2027-09-01T00:00:00Z

@@ -51,9 +51,11 @@ function toICalDate(iso: string): string {
 /** Generate a simple UID for the VEVENT */
 function generateUID(): string {
   const chars = 'abcdefghijklmnopqrstuvwxyz0123456789'
+  const bytes = new Uint8Array(24)
+  crypto.getRandomValues(bytes)
   let uid = ''
   for (let i = 0; i < 24; i++) {
-    uid += chars[Math.floor(Math.random() * chars.length)]
+    uid += chars[bytes[i] % chars.length]
   }
   return `${uid}@coordination-manager`
 }

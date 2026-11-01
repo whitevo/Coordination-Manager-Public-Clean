@@ -6,24 +6,21 @@
  *   npx tsx scripts/reset-dm-state.ts <discord_username>
  *
  * Example:
- *   npx tsx scripts/reset-dm-state.ts tevosaks
+ *   npx tsx scripts/reset-dm-state.ts some_discord_user
  *
- * Requires SUPABASE_URL + SUPABASE_SERVICE_ROLE_KEY in .env
+ * Uses the bot's environment-selected Supabase secret API key.
  */
 import dotenv from 'dotenv'
 dotenv.config()
 
-import { createClient } from '@supabase/supabase-js'
+import { supabase as configuredSupabase, missingSupabaseEnvVars } from '../src/supabase.js'
 
-const supabaseUrl = process.env.SUPABASE_URL
-const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY
-
-if (!supabaseUrl || !supabaseKey) {
-  console.error('Missing SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in .env')
+if (!configuredSupabase) {
+  console.error('Missing Supabase configuration: ' + missingSupabaseEnvVars.join(', '))
   process.exit(1)
 }
 
-const supabase = createClient(supabaseUrl, supabaseKey)
+const supabase = configuredSupabase
 
 const username = process.argv[2]
 if (!username) {

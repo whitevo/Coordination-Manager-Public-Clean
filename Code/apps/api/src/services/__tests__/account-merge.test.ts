@@ -1,3 +1,4 @@
+import crypto from 'crypto'
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 
 // ─── Mock Supabase ──────────────────────────────────────────
@@ -13,6 +14,7 @@ const mockMaybeSingle = vi.fn()
 const mockIn = vi.fn()
 
 const mockOr = vi.fn()
+const mockLt = vi.fn()
 
 function createChain(): Record<string, any> {
   return {
@@ -23,6 +25,7 @@ function createChain(): Record<string, any> {
     eq: mockEq,
     in: mockIn,
     or: mockOr,
+    lt: mockLt,
     single: mockSingle,
     maybeSingle: mockMaybeSingle,
     then: (resolve: (v: any) => void) => resolve({ data: [], error: null }),
@@ -50,7 +53,7 @@ vi.mock('../../supabaseClient.js', () => ({
 // ─── Import after mocks ─────────────────────────────────────
 
 let createMergeToken: typeof import('../../services/account-merge.js').createMergeToken
-let mergeTokenStore: typeof import('../../services/account-merge.js').mergeTokenStore
+let consumeMergeToken: typeof import('../../services/account-merge.js').consumeMergeToken
 let mergeAccounts: typeof import('../../services/account-merge.js').mergeAccounts
 
 beforeEach(async () => {
@@ -62,14 +65,14 @@ beforeEach(async () => {
   mockIn.mockReturnThis()
   mockInsert.mockReturnThis()
   mockOr.mockReturnThis()
+  mockLt.mockReturnThis()
   const mod = await import('../account-merge.js')
   createMergeToken = mod.createMergeToken
-  mergeTokenStore = mod.mergeTokenStore
+  consumeMergeToken = mod.consumeMergeToken
   mergeAccounts = mod.mergeAccounts
 })
 
 afterEach(() => {
-  mergeTokenStore.clear()
   vi.clearAllMocks()
 })
 
@@ -79,40 +82,92 @@ describe('Account Merge Service', () => {
   // ─── createMergeToken ─────────────────────────────────────
 
   describe('createMergeToken', () => {
-    it('creates a token and stores it', () => {
-      const token = createMergeToken('source-user-1', 'cardano')
+    it('creates a token and persists only its hash', async () => {
+      const token = await createMergeToken('source-user-1', 'cardano')
 
-      expect(token).toBeDefined()
       expect(typeof token).toBe('string')
       expect(token.length).toBeGreaterThan(10)
-      expect(mergeTokenStore.has(token)).toBe(true)
+      expect(mockFrom).toHaveBeenCalledWith('account_merge_tokens')
+      expect(mockInsert).toHaveBeenCalledTimes(1)
+
+      const row = mockInsert.mock.calls[0][0]
+      expect(row.token_hash).toBe(crypto.createHash('sha256').update(token).digest('hex'))
+      expect(JSON.stringify(row)).not.toContain(token)
+      expect(row.source_user_id).toBe('source-user-1')
+      expect(row.source_account_type).toBe('cardano')
     })
 
-    it('stores correct metadata', () => {
-      const token = createMergeToken('source-user-1', 'cardano')
-      const stored = mergeTokenStore.get(token)
-
-      expect(stored).toBeDefined()
-      expect(stored!.sourceUserId).toBe('source-user-1')
-      expect(stored!.sourceAccountType).toBe('cardano')
-      expect(stored!.expiresAt).toBeGreaterThan(Date.now())
-    })
-
-    it('creates unique tokens each time', () => {
-      const token1 = createMergeToken('user-1', 'google')
-      const token2 = createMergeToken('user-2', 'google')
+    it('creates unique tokens each time', async () => {
+      const token1 = await createMergeToken('user-1', 'google')
+      const token2 = await createMergeToken('user-2', 'google')
 
       expect(token1).not.toBe(token2)
     })
 
-    it('stores token with 10-minute TTL', () => {
-      const token = createMergeToken('user-1', 'google')
-      const stored = mergeTokenStore.get(token)
+    it('stores token with 10-minute TTL', async () => {
+      await createMergeToken('user-1', 'google')
 
-      // TTL should be approximately 10 minutes (allow 1s tolerance)
+      const row = mockInsert.mock.calls[0][0]
       const expectedExpiry = Date.now() + 10 * 60 * 1000
-      expect(stored!.expiresAt).toBeGreaterThan(expectedExpiry - 1000)
-      expect(stored!.expiresAt).toBeLessThan(expectedExpiry + 1000)
+      const expiresAt = new Date(row.expires_at).getTime()
+      expect(expiresAt).toBeGreaterThan(expectedExpiry - 1000)
+      expect(expiresAt).toBeLessThan(expectedExpiry + 1000)
+    })
+
+    it('throws when the token cannot be persisted', async () => {
+      mockInsert.mockReturnValueOnce({
+        then: (resolve: (v: any) => void) => resolve({ data: null, error: { message: 'db down' } }),
+      })
+
+      await expect(createMergeToken('user-1', 'google')).rejects.toThrow('Failed to create merge token')
+    })
+  })
+
+  // ─── consumeMergeToken ────────────────────────────────────
+
+  describe('consumeMergeToken', () => {
+    it('deletes by token hash and returns the stored data', async () => {
+      mockMaybeSingle.mockResolvedValueOnce({
+        data: {
+          source_user_id: 'source-user-1',
+          source_account_type: 'cardano',
+          expires_at: new Date(Date.now() + 60_000).toISOString(),
+        },
+        error: null,
+      })
+
+      const result = await consumeMergeToken('raw-token')
+
+      expect(mockDelete).toHaveBeenCalledTimes(1)
+      expect(mockEq).toHaveBeenCalledWith('token_hash', crypto.createHash('sha256').update('raw-token').digest('hex'))
+      expect(result).toMatchObject({ sourceUserId: 'source-user-1', sourceAccountType: 'cardano', expired: false })
+    })
+
+    it('flags an expired token (still consumed)', async () => {
+      mockMaybeSingle.mockResolvedValueOnce({
+        data: {
+          source_user_id: 'source-user-1',
+          source_account_type: 'google',
+          expires_at: new Date(Date.now() - 60_000).toISOString(),
+        },
+        error: null,
+      })
+
+      const result = await consumeMergeToken('raw-token')
+
+      expect(result?.expired).toBe(true)
+    })
+
+    it('returns null for an unknown or already-used token', async () => {
+      mockMaybeSingle.mockResolvedValueOnce({ data: null, error: null })
+
+      expect(await consumeMergeToken('missing')).toBeNull()
+    })
+
+    it('throws when the lookup fails', async () => {
+      mockMaybeSingle.mockResolvedValueOnce({ data: null, error: { message: 'db down' } })
+
+      await expect(consumeMergeToken('raw-token')).rejects.toThrow('Failed to verify merge token')
     })
   })
 

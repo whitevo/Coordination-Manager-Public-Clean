@@ -23,6 +23,7 @@ const mockSingle = vi.fn()
 const mockMaybeSingle = vi.fn()
 const mockOrder = vi.fn()
 const mockRange = vi.fn()
+const mockContains = vi.fn()
 
 function createChain() {
   return {
@@ -43,6 +44,9 @@ function createChain() {
     maybeSingle: mockMaybeSingle,
     order: mockOrder,
     range: mockRange,
+    contains: mockContains,
+    then: (resolve: (value: { data: unknown[]; count: number; error: null }) => void) =>
+      resolve({ data: [], count: 0, error: null }),
   }
 }
 
@@ -89,7 +93,7 @@ function resetChainMocks() {
   for (const m of [
     mockSelect, mockEq, mockNeq, mockIn, mockNot, mockIs, mockIlike,
     mockGte, mockLte, mockInsert, mockUpdate, mockDelete, mockUpsert,
-    mockOrder, mockRange,
+    mockOrder, mockRange, mockContains,
   ]) {
     m.mockReturnThis()
   }
@@ -111,6 +115,176 @@ describe('Guardian Routes', () => {
 
   // ─── Access ───────────────────────────────────────────────
 
+  describe('POST /servers/channels/sync metadata writes', () => {
+    const existing = {
+      channel_id: 'channel-1', guild_name: 'Server', channel_name: 'General',
+      channel_type: 0, parent_id: null, is_monitored: false, default_monitor_new_threads: null,
+    }
+
+    async function syncChannels(name = 'General', includeNew = false) {
+      vi.stubEnv('GUARDIAN_BOT_TOKEN', 'test-token')
+      vi.stubGlobal('fetch', vi.fn()
+        .mockResolvedValueOnce({ ok: true, json: async () => [{ id: 'guild-1', name: 'Server' }] })
+        .mockResolvedValueOnce({ ok: true, json: async () => [
+          { id: 'channel-1', name, type: 0, parent_id: null },
+          ...(includeNew ? [{ id: 'new-channel', name: 'New', type: 0, parent_id: null }] : []),
+        ] })
+        .mockResolvedValueOnce({ ok: true, json: async () => ({ threads: [] }) }))
+      try {
+        return await request(app).post('/api/guardian/servers/channels/sync')
+      } finally {
+        vi.unstubAllGlobals()
+        vi.unstubAllEnvs()
+      }
+    }
+
+    it('keeps the response count but skips upserting unchanged channels', async () => {
+      mockIn.mockResolvedValueOnce({ data: [], error: null })
+      mockEq.mockResolvedValueOnce({ data: [existing], error: null })
+      const res = await syncChannels()
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ synced: 1, guilds: 1 })
+      expect(mockUpsert).not.toHaveBeenCalled()
+    })
+
+    it('updates changed metadata without resetting moderator settings', async () => {
+      mockIn.mockResolvedValueOnce({ data: [], error: null })
+      mockEq.mockResolvedValueOnce({ data: [existing], error: null })
+      const res = await syncChannels('Renamed')
+      expect(res.status).toBe(200)
+      const rows = mockUpsert.mock.calls[0][0]
+      expect(rows).toEqual([expect.objectContaining({ channel_name: 'Renamed' })])
+      expect(rows[0]).not.toHaveProperty('is_monitored')
+      expect(rows[0]).not.toHaveProperty('default_monitor_new_threads')
+    })
+
+    it('reports lookup failures without upserting unknown defaults', async () => {
+      mockIn.mockResolvedValueOnce({ data: [], error: null })
+      mockEq.mockResolvedValueOnce({ data: null, error: new Error('lookup failed') })
+      const res = await syncChannels()
+      expect(res.status).toBe(500)
+      expect(mockUpsert).not.toHaveBeenCalled()
+    })
+
+    it('keeps new-channel defaults separate from existing-channel updates', async () => {
+      mockIn.mockResolvedValueOnce({ data: [], error: null })
+      mockEq.mockResolvedValueOnce({ data: [existing], error: null })
+      const res = await syncChannels('Renamed', true)
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ synced: 2, guilds: 1 })
+      expect(mockUpsert).toHaveBeenNthCalledWith(1,
+        [expect.objectContaining({ channel_id: 'new-channel', is_monitored: true })],
+        { onConflict: 'guild_id,channel_id', ignoreDuplicates: true },
+      )
+      expect(mockUpsert).toHaveBeenNthCalledWith(2,
+        [expect.objectContaining({ channel_id: 'channel-1', channel_name: 'Renamed' })],
+        { onConflict: 'guild_id,channel_id', ignoreDuplicates: false },
+      )
+      expect(mockUpsert.mock.calls[1][0][0]).not.toHaveProperty('is_monitored')
+    })
+  })
+
+  describe('GET /recent settings skips', () => {
+    it.each([undefined, '0'])('excludes skips from data by default (%s)', async (includeSkipped) => {
+      mockRange.mockResolvedValueOnce({ data: [], count: 0, error: null })
+      const res = await request(app)
+        .get('/api/guardian/recent')
+        .query(includeSkipped === undefined ? {} : { include_skipped: includeSkipped })
+      expect(res.status).toBe(200)
+      expect(mockIs).toHaveBeenCalledWith('skip_reason', null)
+      expect(res.body).toEqual({ messages: [], total: 0 })
+    })
+
+    it('excludes skips from the separate count query', async () => {
+      const res = await request(app).get('/api/guardian/recent').query({ count_only: '1' })
+      expect(res.status).toBe(200)
+      expect(mockIs).toHaveBeenCalledWith('skip_reason', null)
+      expect(res.body).toEqual({ total: 0 })
+    })
+
+    it('includes skipped audit rows when explicitly requested', async () => {
+      const row = { id: 'log-1', message_id: '123', was_flagged: false, skip_reason: 'ignored_role' }
+      mockRange.mockResolvedValueOnce({ data: [row], count: 1, error: null })
+      const res = await request(app).get('/api/guardian/recent').query({ include_skipped: '1' })
+      expect(res.status).toBe(200)
+      expect(mockIs).not.toHaveBeenCalled()
+      expect(res.body).toEqual({ messages: [{ ...row, total_versions: 1 }], total: 1 })
+    })
+
+    it('includes skipped rows in count-only mode when requested', async () => {
+      const res = await request(app).get('/api/guardian/recent')
+        .query({ include_skipped: '1', count_only: '1' })
+      expect(res.status).toBe(200)
+      expect(mockIs).not.toHaveBeenCalled()
+    })
+
+    it('preserves legacy rows without skip metadata', async () => {
+      mockRange.mockResolvedValueOnce({
+        data: [{ id: 'legacy', message_id: '456', was_flagged: false }],
+        count: 1,
+        error: null,
+      })
+      const res = await request(app).get('/api/guardian/recent')
+      expect(res.status).toBe(200)
+      expect(res.body.messages[0]).toMatchObject({ id: 'legacy', total_versions: 1 })
+    })
+
+    it('combines the skip filter with pagination and existing filters in data and count modes', async () => {
+      const filters = {
+        author_ids: '123,456',
+        filter_mode: 'exclude',
+        group_id: 'group-1',
+        search: 'example',
+        since: '2026-10-01T00:00:00Z',
+        until: '2026-10-04T23:59:59Z',
+        limit: '20',
+        offset: '20',
+      }
+      mockRange.mockResolvedValueOnce({ data: [], error: null })
+      const data = await request(app).get('/api/guardian/recent').query({ ...filters, skip_count: '1' })
+      mockLte.mockResolvedValueOnce({ count: 12, error: null })
+      const count = await request(app).get('/api/guardian/recent').query({ ...filters, count_only: '1' })
+      expect(data.status).toBe(200)
+      expect(data.body).toEqual({ messages: [] })
+      expect(count.body).toEqual({ total: 12 })
+      expect(mockIs).toHaveBeenCalledTimes(2)
+      expect(mockRange).toHaveBeenCalledWith(20, 39)
+      expect(mockNot).toHaveBeenCalledTimes(2)
+      expect(mockEq).toHaveBeenCalledTimes(2)
+      expect(mockIlike).toHaveBeenCalledTimes(2)
+      expect(mockGte).toHaveBeenCalledTimes(2)
+      expect(mockLte).toHaveBeenCalledTimes(2)
+    })
+
+    it.each(['true', 'invalid', ['1', '0']])('rejects invalid include_skipped %j', async (value) => {
+      const res = await request(app).get('/api/guardian/recent').query({ include_skipped: value })
+      expect(res.status).toBe(400)
+      expect(res.body.error).toBe('VALIDATION_ERROR')
+      expect(mockFrom).not.toHaveBeenCalled()
+    })
+
+    it('surfaces database failures', async () => {
+      mockRange.mockResolvedValueOnce({ data: null, error: { message: 'db unavailable' } })
+      const res = await request(app).get('/api/guardian/recent')
+      expect(res.status).toBe(500)
+    })
+  })
+
+  describe('GET /stats actual scan counts', () => {
+    it('excludes settings skips from every scanned total', async () => {
+      const res = await request(app).get('/api/guardian/stats')
+      expect(res.status).toBe(200)
+      expect(mockIs.mock.calls).toEqual(Array.from({ length: 4 }, () => ['skip_reason', null]))
+    })
+
+    it('fails explicitly when scanned counts cannot be read', async () => {
+      mockGte.mockResolvedValueOnce({ count: null, error: { message: 'missing skip_reason column' } })
+      const res = await request(app).get('/api/guardian/stats')
+      expect(res.status).toBe(500)
+      expect(res.body.error).toBe('GUARDIAN_SCAN_COUNT_FAILED')
+    })
+  })
+
   describe('GET /access', () => {
     it('reports moderator role for authorised users', async () => {
       const res = await request(app).get('/api/guardian/access')
@@ -123,6 +297,32 @@ describe('Guardian Routes', () => {
       const res = await request(app).get('/api/guardian/access')
       expect(res.status).toBe(200)
       expect(res.body.isModerator).toBe(false)
+    })
+  })
+
+  describe('GET /moderators', () => {
+    it('returns accounts with moderator access', async () => {
+      mockOrder.mockResolvedValueOnce({
+        data: [{ id: 'u1', email: 'mod@example.com', display_name: 'Moderator' }],
+        error: null,
+      })
+
+      const res = await request(app).get('/api/guardian/moderators')
+
+      expect(res.status).toBe(200)
+      expect(res.body.moderators).toEqual([
+        { id: 'u1', email: 'mod@example.com', display_name: 'Moderator' },
+      ])
+      expect(mockFrom).toHaveBeenCalledWith('users')
+      expect(mockContains).toHaveBeenCalledWith('roles', ['moderator'])
+    })
+
+    it('rejects non-moderators', async () => {
+      mockUserRoles = ['user']
+
+      const res = await request(app).get('/api/guardian/moderators')
+
+      expect(res.status).toBe(403)
     })
   })
 
@@ -402,6 +602,7 @@ describe('Guardian Routes', () => {
       expect(res.body.mode).toBe('hourly')
       expect(res.body.buckets).toHaveLength(24)
       expect(res.body.buckets[0]).toMatchObject({ scanned: 0, flagged: 0, usersFlagged: 0 })
+      expect(mockIs).toHaveBeenCalledWith('skip_reason', null)
     })
 
     it('returns 30 daily buckets for range=30d', async () => {

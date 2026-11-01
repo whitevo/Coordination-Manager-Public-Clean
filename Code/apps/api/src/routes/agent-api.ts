@@ -1,6 +1,7 @@
 import { Router, Request, Response, NextFunction } from 'express'
 import { supabaseAdmin } from '../supabaseClient.js'
 import { sanitizeString, safeErrorMessage } from '../middleware/validation.js'
+import { notifyParticipationChange } from '../services/calendar-notifications.js'
 
 const router: ReturnType<typeof Router> = Router()
 
@@ -155,7 +156,7 @@ router.get('/calendars', requireScope('read'), async (req: AgentRequest, res: Re
       .eq('created_by', req.agentUserId!)
       .order('created_at', { ascending: false })
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
 
     // Flatten config JSONB into top-level fields for agent convenience
     const calendars = (data || []).map((cal: Record<string, unknown>) => {
@@ -243,7 +244,7 @@ router.get('/calendars/:hash/availability', requireScope('read'), async (req: Ag
       .eq('calendar_id', calendar.id)
       .order('created_at', { ascending: false })
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
     return res.json({ availability: data || [] })
   } catch {
     return res.status(500).json({ error: 'Failed to fetch availability' })
@@ -257,7 +258,7 @@ router.post('/calendars/:hash/availability', requireScope('write:calendars'), as
   try {
     const { data: calendar } = await supabaseAdmin
       .from('calendars')
-      .select('id, created_by, visibility')
+      .select('id, created_by, visibility, config')
       .eq('hash', req.params.hash)
       .single()
 
@@ -299,6 +300,13 @@ router.post('/calendars/:hash/availability', requireScope('write:calendars'), as
     }
 
     // Upsert availability (insert or update if username already exists for this calendar)
+    const { data: previous } = await supabaseAdmin
+      .from('availability')
+      .select('time_slots')
+      .eq('calendar_id', calendar.id)
+      .eq('username', cleanUsername)
+      .maybeSingle()
+
     const { data, error } = await supabaseAdmin
       .from('availability')
       .upsert(
@@ -313,7 +321,15 @@ router.post('/calendars/:hash/availability', requireScope('write:calendars'), as
       .select()
       .single()
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
+
+    notifyParticipationChange({
+      calendar,
+      participantName: cleanUsername,
+      before: previous?.time_slots,
+      after: time_slots,
+      actor: { userId: req.agentUserId },
+    })
 
     return res.status(201).json({
       availability: data,
@@ -344,7 +360,7 @@ router.get('/calendars/:hash/meetings', requireScope('read'), async (req: AgentR
       .eq('calendar_id', calendar.id)
       .order('start_time', { ascending: true })
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
     return res.json({ meetings: data || [] })
   } catch {
     return res.status(500).json({ error: 'Failed to fetch meetings' })
@@ -362,7 +378,7 @@ router.get('/calendar-sources', requireScope('read'), async (req: AgentRequest, 
       .eq('user_id', req.agentUserId!)
       .order('created_at', { ascending: true })
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
     return res.json({ sources: data || [] })
   } catch {
     return res.status(500).json({ error: 'Failed to fetch calendar sources' })
@@ -397,7 +413,7 @@ router.get('/calendar-sources/events', requireScope('read'), async (req: AgentRe
     }
 
     const { data: sources, error: srcError } = await sourceQuery
-    if (srcError) return res.status(400).json({ error: srcError.message })
+    if (srcError) return res.status(400).json({ error: safeErrorMessage(srcError) })
 
     if (!sources || sources.length === 0) {
       return res.json({
@@ -597,7 +613,7 @@ router.get('/announcements/templates', requireScope('read'), async (req: AgentRe
       .eq('user_id', req.agentUserId!)
       .order('updated_at', { ascending: false })
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
     return res.json({ templates: data || [] })
   } catch {
     return res.status(500).json({ error: 'Failed to fetch templates' })
@@ -634,7 +650,7 @@ router.get('/discord/servers', requireScope('read'), async (req: AgentRequest, r
       .order('guild_name')
       .order('channel_name')
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
 
     // Group channels by guild
     const guildsMap = new Map<string, {
@@ -801,7 +817,7 @@ router.post('/calendars', requireScope('write:calendars'), async (req: AgentRequ
       .select()
       .single()
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
 
     // Return a flattened view for the agent
     return res.status(201).json({
@@ -874,7 +890,7 @@ router.post('/calendars/:hash/meetings', requireScope('write:meetings'), async (
       .select()
       .single()
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
     return res.status(201).json({
       meeting: data,
       note: 'Meeting created as draft. Importing/exporting and distribution require human action via the web UI.',
@@ -917,7 +933,7 @@ router.post('/announcements/templates', requireScope('write:announcements'), asy
       .select()
       .single()
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
     return res.status(201).json({
       template: data,
       note: 'Template created. Distribution (channel/DM targeting and sending) is handled by the human in the web UI.',
@@ -981,7 +997,7 @@ router.put('/announcements/templates/:id', requireScope('write:announcements'), 
       .select()
       .single()
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
     return res.json({
       template: data,
       note: 'Template updated. Distribution (channel/DM targeting and sending) is handled by the human in the web UI.',
@@ -1041,7 +1057,7 @@ router.get('/feedback', requireScope('read'), async (req: AgentRequest, res: Res
 
     const { data, error, count } = await query.range(offset, offset + limit - 1)
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
     return res.json({ feedback: data || [], total: count || 0, page, limit })
   } catch {
     return res.status(500).json({ error: 'Failed to fetch feedback' })
@@ -1076,7 +1092,7 @@ router.post('/feedback', requireScope('write:feedback'), async (req: AgentReques
 
     if (error) {
       console.error('Agent feedback INSERT failed:', { code: error.code, message: error.message, agentName: req.agentName })
-      return res.status(400).json({ error: error.message })
+      return res.status(400).json({ error: safeErrorMessage(error) })
     }
 
     return res.status(201).json({
@@ -1131,8 +1147,10 @@ function resolveCloudApiUrl(req: AgentRequest): string | undefined {
   return `${proto}://${host}`
 }
 
-const CLOUD_SETUP_COMPONENTS: Record<string, (req: AgentRequest) => Record<string, string>> = {
-  deployment: (req) => {
+// Map (not a plain object) so user-controlled component lookups can never
+// reach prototype members such as "constructor".
+const CLOUD_SETUP_COMPONENTS = new Map<string, (req: AgentRequest) => Record<string, string>>([
+  ['deployment', (req) => {
     const out: Record<string, string> = {}
     if (process.env.NODE_ENV) out.NODE_ENV = process.env.NODE_ENV
     if (process.env.PORT) out.PORT = process.env.PORT
@@ -1143,15 +1161,16 @@ const CLOUD_SETUP_COMPONENTS: Record<string, (req: AgentRequest) => Record<strin
     const apiUrl = resolveCloudApiUrl(req)
     if (apiUrl) out.VITE_API_URL = apiUrl
     return out
-  },
-  database: () => {
+  }],
+  ['database', () => {
     const out: Record<string, string> = {}
     if (process.env.SUPABASE_URL) out.SUPABASE_URL = process.env.SUPABASE_URL
     if (process.env.SUPABASE_KEY) out.SUPABASE_KEY = '(keys secured)'
-    if (process.env.SUPABASE_SERVICE_ROLE_KEY) out.SUPABASE_SERVICE_ROLE_KEY = '(keys secured)'
+    if (process.env.SUPABASE_SECRET_KEY_LOCALHOST) out.SUPABASE_SECRET_KEY_LOCALHOST = '(keys secured)'
+    if (process.env.SUPABASE_SECRET_KEY_PRODUCTION) out.SUPABASE_SECRET_KEY_PRODUCTION = '(keys secured)'
     return out
-  },
-}
+  }],
+])
 
 // GET /api/agent/setup/summary
 //
@@ -1169,7 +1188,7 @@ const CLOUD_SETUP_COMPONENTS: Record<string, (req: AgentRequest) => Record<strin
 // the parameterised route would match 'summary' as the componentId and
 // always 404.
 router.get('/setup/summary', requireScope('read'), (req: AgentRequest, res: Response) => {
-  const components = Object.entries(CLOUD_SETUP_COMPONENTS).map(([id, builder]) => {
+  const components = Array.from(CLOUD_SETUP_COMPONENTS.entries()).map(([id, builder]) => {
     const values = builder(req)
     return { id, covered: Object.keys(values).length > 0, values }
   })
@@ -1188,7 +1207,8 @@ router.get('/setup/:componentId', requireScope('read'), (req: AgentRequest, res:
   if (!componentId) {
     return res.status(400).json({ error: 'componentId is required' })
   }
-  const builder = CLOUD_SETUP_COMPONENTS[componentId]
+  // Map lookup: no prototype members reachable via user-controlled names.
+  const builder = CLOUD_SETUP_COMPONENTS.get(componentId)
   if (!builder) {
     return res.status(404).json({
       message: `The cloud does not currently expose "${componentId}" via the agent API.`,

@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react'
 import { Wallet, Shield } from 'lucide-react'
 import { detectWallets } from '../lib/cardano-wallet'
+import { OVERLAY_LAYER_CLASS } from '../lib/overlay-layers'
 import { useAuth } from '../contexts/AuthContext'
 import type { WalletInfo, CardanoWalletId } from '../lib/cardano-types'
 
@@ -9,10 +10,11 @@ interface CardanoWalletButtonProps {
   onError?: (error: string) => void
   getCaptchaToken?: () => string | null | undefined
   isCaptchaReady?: boolean
+  rememberMe?: boolean
   className?: string
 }
 
-export default function CardanoWalletButton({ onSuccess, onError, getCaptchaToken, isCaptchaReady = true, className = '' }: CardanoWalletButtonProps) {
+export default function CardanoWalletButton({ onSuccess, onError, getCaptchaToken, isCaptchaReady = true, rememberMe, className = '' }: CardanoWalletButtonProps) {
   const { loginWithCardano } = useAuth()
   const [wallets, setWallets] = useState<WalletInfo[]>([])
   const [isOpen, setIsOpen] = useState(false)
@@ -59,7 +61,7 @@ export default function CardanoWalletButton({ onSuccess, onError, getCaptchaToke
         setConnectingWallet(null)
         return
       }
-      await loginWithCardano(walletId, getCaptchaToken?.() || undefined)
+      await loginWithCardano(walletId, getCaptchaToken?.() || undefined, rememberMe)
       onSuccess?.()
     } catch (err) {
       const message = err instanceof Error ? err.message : 'Wallet connection failed'
@@ -68,7 +70,7 @@ export default function CardanoWalletButton({ onSuccess, onError, getCaptchaToke
       setIsConnecting(false)
       setConnectingWallet(null)
     }
-  }, [onSuccess, onError, getCaptchaToken, isCaptchaReady, loginWithCardano])
+  }, [onSuccess, onError, getCaptchaToken, isCaptchaReady, loginWithCardano, rememberMe])
 
   // If no wallets detected, show an install prompt
   if (!hasWallets) {
@@ -78,10 +80,10 @@ export default function CardanoWalletButton({ onSuccess, onError, getCaptchaToke
           href="https://lace.io"
           target="_blank"
           rel="noopener noreferrer"
-          className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-blue-50/70 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-xl hover:bg-blue-100/80 dark:hover:bg-blue-900/60 transition-colors"
+          className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-info-subtle border border-info-muted rounded-xl hover:bg-info-muted transition-colors"
         >
-          <Wallet className="w-5 h-5 text-blue-600 dark:text-blue-400" />
-          <span className="font-medium text-blue-800 dark:text-blue-200">
+          <Wallet className="w-5 h-5 text-primary" />
+          <span className="font-medium text-info">
             Install a Cardano Wallet
           </span>
         </a>
@@ -95,7 +97,7 @@ export default function CardanoWalletButton({ onSuccess, onError, getCaptchaToke
   // Permission info shown below wallet buttons
   const permissionInfo = (
     <div className="mt-3 flex items-start gap-2 text-xs text-muted-foreground">
-      <Shield className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+      <Shield className="w-3.5 h-3.5 mt-0.5 shrink-0" />
       <span>
         Connecting grants read-only access to your <strong>wallet address</strong> and <strong>UTXOs</strong>.
         You will sign a message to prove ownership — no transaction is submitted.
@@ -111,19 +113,19 @@ export default function CardanoWalletButton({ onSuccess, onError, getCaptchaToke
         <button
           onClick={() => handleWalletConnect(wallet.id)}
           disabled={isConnecting}
-          className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-blue-50/70 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-xl hover:bg-blue-100/80 dark:hover:bg-blue-900/60 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+          className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-info-subtle border border-info-muted rounded-xl hover:bg-info-muted transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
         >
           {wallet.icon ? (
             <img src={wallet.icon} alt={wallet.name} className="w-5 h-5 rounded" />
           ) : (
-            <Wallet className="w-5 h-5 text-blue-600 dark:text-blue-400" />
+            <Wallet className="w-5 h-5 text-primary" />
           )}
-          <span className="font-medium text-blue-800 dark:text-blue-200">
+          <span className="font-medium text-info">
             {isConnecting ? 'Connecting...' : `Connect ${wallet.name} Wallet`}
           </span>
         </button>
         {isConnecting && (
-          <p className="text-xs text-center text-amber-600 dark:text-amber-400 mt-2">
+          <p className="text-xs text-center text-warning mt-2">
             Check your wallet extension — open it and click <strong>Sign</strong> to continue.
             The &quot;Confirm Data&quot; screen may show a loading spinner; you can still sign.
           </p>
@@ -139,15 +141,15 @@ export default function CardanoWalletButton({ onSuccess, onError, getCaptchaToke
       <button
         onClick={() => setIsOpen(!isOpen)}
         disabled={isConnecting}
-        className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-blue-50/70 dark:bg-blue-950/40 border border-blue-200 dark:border-blue-800 rounded-xl hover:bg-blue-100/80 dark:hover:bg-blue-900/60 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-info-subtle border border-info-muted rounded-xl hover:bg-info-muted transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
       >
-        <Wallet className="w-5 h-5 text-blue-600 dark:text-blue-400" />
-        <span className="font-medium text-blue-800 dark:text-blue-200">
+        <Wallet className="w-5 h-5 text-primary" />
+        <span className="font-medium text-info">
           {isConnecting ? `Connecting to ${connectingWallet}...` : 'Connect Cardano Wallet'}
         </span>
         {!isConnecting && (
           <svg
-            className={`w-4 h-4 text-blue-600 dark:text-blue-400 transition-transform ${isOpen ? 'rotate-180' : ''}`}
+            className={`w-4 h-4 text-primary transition-transform ${isOpen ? 'rotate-180' : ''}`}
             fill="none"
             stroke="currentColor"
             viewBox="0 0 24 24"
@@ -159,7 +161,7 @@ export default function CardanoWalletButton({ onSuccess, onError, getCaptchaToke
 
       {/* Dropdown list of wallets */}
       {isOpen && (
-        <div className="absolute top-full left-0 right-0 mt-1 bg-card border border-border rounded-xl shadow-lg z-50 overflow-hidden">
+        <div className={`absolute top-full left-0 right-0 mt-1 bg-card border border-border rounded-xl shadow-lg ${OVERLAY_LAYER_CLASS.popover} overflow-hidden`}>
           {installedWallets.map((wallet) => (
             <button
               key={wallet.id}
@@ -177,7 +179,7 @@ export default function CardanoWalletButton({ onSuccess, onError, getCaptchaToke
         </div>
       )}
       {isConnecting && (
-        <p className="text-xs text-center text-amber-600 dark:text-amber-400 mt-2">
+        <p className="text-xs text-center text-warning mt-2">
           Check your wallet extension — open it and click <strong>Sign</strong> to continue.
           The &quot;Confirm Data&quot; screen may show a loading spinner; you can still sign.
         </p>

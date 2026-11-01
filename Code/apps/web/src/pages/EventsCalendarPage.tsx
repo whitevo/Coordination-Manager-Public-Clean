@@ -1,8 +1,8 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
 import { format, startOfWeek, addDays, addWeeks, subWeeks, isSameDay } from 'date-fns'
-import { ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Calendar, ExternalLink, X, Loader2, CalendarDays, Network, Download, CalendarPlus, Copy, Check, Search, LinkIcon } from 'lucide-react'
-import { Link } from 'react-router-dom'
-import { apiClient } from '../lib/api-client'
+import { ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Calendar, ExternalLink, X, Loader2, CalendarDays, Network, Download, CalendarPlus, Copy, Check, Search, LinkIcon, Flag } from 'lucide-react'
+import { Link, useSearchParams } from 'react-router-dom'
+import { apiClient, dedupedGet } from '../lib/api-client'
 import { computeDayLayout } from '../lib/calendarOverlapLayout'
 import { downloadICSFile, buildOutlookCalendarUrl, isSafeUrl, resolveMeetingTitle } from '../lib/calendar-utils'
 import { useAuth } from '../contexts/AuthContext'
@@ -11,6 +11,19 @@ import TimezoneSelector from '../components/TimezoneSelector'
 import { useTimezones } from '../lib/use-timezones'
 import { findTimezone, convertUtcTimeToTimezone, convertUtcTimeToTimezoneOnDate, getCurrentTimeInTimezone, detectDstTransitions, type DstTransition } from '../lib/timezone-data'
 import { subscribePublicEventsSync } from '../lib/public-events-sync'
+import { expandRecurringPublicEvents, type PublicEvent } from '../lib/recurrence'
+import EventFlagPanel, { type EventModerationTarget } from '../components/EventFlagPanel'
+import { Dialog } from '../components/ui/Dialog'
+import { IconButton } from '../components/ui/IconButton'
+import { Button } from '../components/ui/Button'
+import {
+  networkFilterKey, resolveEventNetworkKeys, resolveNetworkFilterKey,
+  type EventNetwork as NetworkDef, type EventNetworkMapping as NetworkMapping,
+  type EventNetworkRule as NetworkRule, type EventNetworkAssignment,
+  type EventNetworkCatalog, type EventNetworkSource,
+} from '@/lib/event-network-relations'
+import { isAxiosError } from 'axios'
+import { stripHtmlTags } from '../lib/strip-html-tags'
 
 /** Strip HTML tags from text and render URLs as clickable links with copy buttons */
 function LinkifyText({ text }: { text: string }) {
@@ -18,7 +31,7 @@ function LinkifyText({ text }: { text: string }) {
   const decodedText = text.replace(/\\u([0-9a-fA-F]{4})/g, (_, hex: string) =>
     String.fromCharCode(Number.parseInt(hex, 16))
   )
-  const stripped = decodedText.replace(/<[^>]*>/g, '')
+  const stripped = stripHtmlTags(decodedText)
   const markdownLinkRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g
   const normalized = stripped.replace(markdownLinkRegex, (_match, label: string, url: string) => {
     const trimmedLabel = label.trim()
@@ -32,14 +45,15 @@ function LinkifyText({ text }: { text: string }) {
       {parts.map((part, i) =>
         /^https?:\/\//.test(part) ? (
           <span key={i} className="inline-flex items-center gap-1">
-            <a href={part} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline break-all">{part}</a>
-            <button
+            <a href={part} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline break-all">{part}</a>
+            <IconButton
+              size="micro"
+              intent={copiedUrl === part ? 'success' : 'neutral'}
+              label="Copy link"
+              icon={copiedUrl === part ? <Check /> : <Copy />}
               onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(part); setCopiedUrl(part); setTimeout(() => setCopiedUrl(null), 2000) }}
-              className="inline-flex p-0.5 rounded hover:bg-muted transition-colors shrink-0 align-middle"
-              title="Copy link"
-            >
-              {copiedUrl === part ? <Check className="w-3 h-3 text-green-500" /> : <Copy className="w-3 h-3 text-muted-foreground" />}
-            </button>
+              className="align-middle"
+            />
           </span>
         ) : (
           <span key={i}>{part}</span>
@@ -51,227 +65,31 @@ function LinkifyText({ text }: { text: string }) {
 
 const SLOT_HEIGHT = 48
 
+/** Strip the "coord_" prefix and any "__occ__<timestamp>" recurrence suffix to recover the underlying meeting/event id */
+function getBaseEventId(id: string): string {
+  return id.replace(/__occ__.*$/, '').replace(/^coord_/, '')
+}
+
 // ─── Types ──────────────────────────────────────────────────
-
-type PublicEvent = {
-  id: string
-  title: string
-  description: string | null
-  meeting_link: string | null
-  location: string | null
-  start_time: string
-  end_time: string
-  is_public: boolean
-  source_type: string
-  recurrence_rule?: unknown
-  created_at: string
-  updated_at?: string
-  calendar_title?: string
-  calendar_hash?: string
-}
-
-type RecurrenceType = 'none' | 'weekly' | 'biweekly' | 'monthly' | 'custom'
-type RecurrenceUnit = 'day' | 'week' | 'month'
-type RecurrenceEndType = 'never' | 'on' | 'after'
-
-type RecurrenceRule = {
-  type: RecurrenceType
-  interval?: number
-  unit?: RecurrenceUnit
-  weekDays?: number[]
-  endType?: RecurrenceEndType
-  endDate?: string
-  endCount?: number
-  exceptions?: string[]
-}
-
-const DAY_MS = 24 * 60 * 60 * 1000
-const RECURRENCE_MAX_LOOKAHEAD_DAYS = 365 * 20
-
-const isRecurrenceType = (value: unknown): value is RecurrenceRule['type'] =>
-  value === 'none' || value === 'weekly' || value === 'biweekly' || value === 'monthly' || value === 'custom'
-
-const isRecurrenceUnit = (value: unknown): value is NonNullable<RecurrenceRule['unit']> =>
-  value === 'day' || value === 'week' || value === 'month'
-
-const isRecurrenceEndType = (value: unknown): value is NonNullable<RecurrenceRule['endType']> =>
-  value === 'never' || value === 'on' || value === 'after'
-
-const normalizeRecurrenceRule = (value: unknown): RecurrenceRule => {
-  if (!value || typeof value !== 'object') return { type: 'none' }
-
-  const candidate = value as Record<string, unknown>
-  const type = isRecurrenceType(candidate.type) ? candidate.type : 'none'
-  if (type === 'none') return { type: 'none' }
-
-  const intervalValue = typeof candidate.interval === 'number' ? candidate.interval : Number(candidate.interval)
-  const interval = Number.isFinite(intervalValue) && intervalValue > 0 ? Math.min(99, Math.floor(intervalValue)) : 1
-  const unit = isRecurrenceUnit(candidate.unit) ? candidate.unit : 'week'
-  const weekDays = Array.isArray(candidate.weekDays)
-    ? Array.from(new Set(candidate.weekDays.filter((entry): entry is number => Number.isInteger(entry) && entry >= 0 && entry <= 6)))
-    : undefined
-  const endType = isRecurrenceEndType(candidate.endType) ? candidate.endType : 'never'
-  const endDate = typeof candidate.endDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(candidate.endDate) ? candidate.endDate : undefined
-  const endCountValue = typeof candidate.endCount === 'number' ? candidate.endCount : Number(candidate.endCount)
-  const endCount = Number.isFinite(endCountValue) && endCountValue > 0 ? Math.min(500, Math.floor(endCountValue)) : undefined
-  const exceptions = Array.isArray(candidate.exceptions)
-    ? Array.from(new Set(candidate.exceptions.filter((entry): entry is string => typeof entry === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(entry)))).slice(0, 500)
-    : undefined
-
-  return {
-    type,
-    interval,
-    unit,
-    weekDays: weekDays && weekDays.length > 0 ? weekDays : undefined,
-    endType,
-    endDate,
-    endCount,
-    exceptions: exceptions && exceptions.length > 0 ? exceptions : undefined,
-  }
-}
-
-const getUtcDateKey = (date: Date): string => date.toISOString().slice(0, 10)
-
-const getRecurrenceWeekdayIndex = (date: Date): number => {
-  const jsDay = date.getUTCDay()
-  return jsDay === 0 ? 6 : jsDay - 1
-}
-
-const buildRecurrenceOccurrenceStart = (baseStart: Date, day: Date): string => {
-  return new Date(Date.UTC(
-    day.getUTCFullYear(),
-    day.getUTCMonth(),
-    day.getUTCDate(),
-    baseStart.getUTCHours(),
-    baseStart.getUTCMinutes(),
-    0,
-    0,
-  )).toISOString()
-}
-
-const isRecurringOccurrenceDate = (candidate: Date, baseStart: Date, rule: RecurrenceRule): boolean => {
-  const dayDiff = Math.floor((candidate.getTime() - baseStart.getTime()) / DAY_MS)
-  if (dayDiff < 0) return false
-
-  if (rule.type === 'weekly' || rule.type === 'biweekly') {
-    const interval = rule.type === 'biweekly' ? 14 : 7
-    return dayDiff % interval === 0 && getRecurrenceWeekdayIndex(candidate) === getRecurrenceWeekdayIndex(baseStart)
-  }
-
-  if (rule.type === 'monthly') {
-    const monthDiff = (candidate.getUTCFullYear() - baseStart.getUTCFullYear()) * 12 + (candidate.getUTCMonth() - baseStart.getUTCMonth())
-    return candidate.getUTCDate() === baseStart.getUTCDate() && monthDiff % 1 === 0
-  }
-
-  if (rule.type !== 'custom') return false
-
-  const interval = rule.interval || 1
-  const unit = rule.unit || 'week'
-  if (unit === 'day') return dayDiff % interval === 0
-
-  if (unit === 'week') {
-    const allowedWeekDays = rule.weekDays && rule.weekDays.length > 0 ? rule.weekDays : [getRecurrenceWeekdayIndex(baseStart)]
-    const weekDiff = Math.floor(dayDiff / 7)
-    return weekDiff % interval === 0 && allowedWeekDays.includes(getRecurrenceWeekdayIndex(candidate))
-  }
-
-  const monthDiff = (candidate.getUTCFullYear() - baseStart.getUTCFullYear()) * 12 + (candidate.getUTCMonth() - baseStart.getUTCMonth())
-  return candidate.getUTCDate() === baseStart.getUTCDate() && monthDiff % interval === 0
-}
-
-const getRecurringEventStartsInRange = (event: PublicEvent, rangeStart: Date, rangeEnd: Date): string[] => {
-  const recurrenceRule = normalizeRecurrenceRule(event.recurrence_rule)
-  if (recurrenceRule.type === 'none') return []
-
-  const baseStart = new Date(event.start_time)
-  if (Number.isNaN(baseStart.getTime())) return []
-
-  const endDate = recurrenceRule.endType === 'on' && recurrenceRule.endDate ? new Date(`${recurrenceRule.endDate}T00:00:00Z`) : null
-  const exceptionDates = recurrenceRule.exceptions && recurrenceRule.exceptions.length > 0 ? new Set(recurrenceRule.exceptions) : null
-  const matchedStarts: string[] = []
-  let matchedCount = 0
-
-  const baseDay = new Date(Date.UTC(baseStart.getUTCFullYear(), baseStart.getUTCMonth(), baseStart.getUTCDate()))
-  if (rangeEnd.getTime() <= baseDay.getTime()) return []
-
-  const daysUntilRangeEnd = Math.max(0, Math.floor((rangeEnd.getTime() - baseDay.getTime()) / DAY_MS))
-  const maxOffset = Math.min(RECURRENCE_MAX_LOOKAHEAD_DAYS, daysUntilRangeEnd + 7)
-
-  for (let offset = 0; offset <= maxOffset; offset++) {
-    const candidate = addDays(baseStart, offset)
-    const candidateDay = new Date(Date.UTC(candidate.getUTCFullYear(), candidate.getUTCMonth(), candidate.getUTCDate()))
-    if (candidateDay.getTime() < baseDay.getTime()) continue
-    if (endDate && candidateDay.getTime() > Date.UTC(endDate.getUTCFullYear(), endDate.getUTCMonth(), endDate.getUTCDate())) break
-    if (!isRecurringOccurrenceDate(candidate, baseStart, recurrenceRule)) continue
-
-    matchedCount++
-    if (recurrenceRule.endType === 'after' && recurrenceRule.endCount && matchedCount > recurrenceRule.endCount) {
-      break
-    }
-
-    if (exceptionDates && exceptionDates.has(getUtcDateKey(candidate))) {
-      if (candidateDay.getTime() >= rangeEnd.getTime()) break
-      continue
-    }
-
-    if (candidateDay.getTime() >= rangeStart.getTime() && candidateDay.getTime() < rangeEnd.getTime()) {
-      matchedStarts.push(buildRecurrenceOccurrenceStart(baseStart, candidate))
-    }
-
-    if (candidateDay.getTime() >= rangeEnd.getTime()) {
-      break
-    }
-  }
-
-  return matchedStarts
-}
-
-function expandRecurringPublicEvents(events: PublicEvent[], windowStart: Date, windowEnd: Date): PublicEvent[] {
-  const expanded: PublicEvent[] = []
-
-  for (const ev of events) {
-    const rule = normalizeRecurrenceRule(ev.recurrence_rule)
-    const evStart = new Date(ev.start_time)
-    const evEnd = new Date(ev.end_time)
-
-    if (rule.type === 'none') {
-      if (evStart < windowEnd && evEnd > windowStart) {
-        expanded.push(ev)
-      }
-      continue
-    }
-
-    const durationMs = evEnd.getTime() - evStart.getTime()
-    if (!Number.isFinite(durationMs) || durationMs <= 0) continue
-
-    const starts = getRecurringEventStartsInRange(ev, windowStart, windowEnd)
-    for (const occStartIso of starts) {
-      const occStart = new Date(occStartIso)
-      const occEnd = new Date(occStart.getTime() + durationMs)
-      expanded.push({
-        ...ev,
-        id: `${ev.id}__occ__${occStartIso}`,
-        start_time: occStart.toISOString(),
-        end_time: occEnd.toISOString(),
-      })
-    }
-  }
-
-  return expanded
-}
 
 type TimeSession = { start_time: string; end_time: string }
 
 type GroupedPublicEvent = PublicEvent & {
   sessions: TimeSession[]
   source_labels: string[]
+  moderation_targets: EventModerationTarget[]
+  network_inputs: PublicEvent[]
 }
 
 function getEventPriorityTime(ev: PublicEvent): number {
-  const updatedAt = ev.updated_at ? new Date(ev.updated_at).getTime() : Number.NaN
-  if (Number.isFinite(updatedAt)) return updatedAt
-  const createdAt = new Date(ev.created_at).getTime()
-  if (Number.isFinite(createdAt)) return createdAt
+  if (ev.updated_at) {
+    const updatedAt = new Date(ev.updated_at).getTime()
+    if (Number.isFinite(updatedAt)) return updatedAt
+  }
+  if (ev.created_at) {
+    const createdAt = new Date(ev.created_at).getTime()
+    if (Number.isFinite(createdAt)) return createdAt
+  }
   const startTime = new Date(ev.start_time).getTime()
   return Number.isFinite(startTime) ? startTime : 0
 }
@@ -287,6 +105,7 @@ function groupDuplicateEvents(events: PublicEvent[]): GroupedPublicEvent[] {
 
     const existing = groups.get(key)
     if (existing) {
+      existing.network_inputs.push(ev)
       const existingPriority = getEventPriorityTime(existing)
       const incomingPriority = getEventPriorityTime(ev)
 
@@ -300,14 +119,21 @@ function groupDuplicateEvents(events: PublicEvent[]): GroupedPublicEvent[] {
       if (!existing.source_labels.includes(sourceLabel)) {
         existing.source_labels.push(sourceLabel)
       }
+      const mergedTargets = new Map(
+        [...existing.moderation_targets, ...(ev.moderation_targets || [])]
+          .map(target => [`${target.type}:${target.id}`, target]),
+      )
       if (incomingPriority >= existingPriority) {
         Object.assign(existing, ev)
       }
+      existing.moderation_targets = [...mergedTargets.values()]
     } else {
       groups.set(key, {
         ...ev,
         sessions: [{ start_time: ev.start_time, end_time: ev.end_time }],
         source_labels: [sourceLabel],
+        moderation_targets: ev.moderation_targets || [],
+        network_inputs: [ev],
       })
     }
   }
@@ -325,82 +151,6 @@ type CalendarSource = {
   display_name: string
   color: string
   is_active: boolean
-}
-
-type NetworkDef = {
-  id: string
-  name: string
-  color: string
-  description: string | null
-}
-
-type NetworkMapping = {
-  id: string
-  network_id: string
-  source_string: string
-  source_type: 'calendar_title' | 'meeting_title' | 'description'
-}
-
-type NetworkRule = {
-  id: string
-  network_id: string
-  pattern: string
-  match_type: 'contains' | 'starts_with' | 'exact' | 'regex'
-  match_field: 'calendar_title' | 'meeting_title' | 'description'
-  priority: number
-  is_active: boolean
-}
-
-/** Resolve an event to a network using mappings first, then rules */
-function resolveNetwork(
-  ev: { title: string; calendar_title?: string; description?: string | null },
-  mappings: NetworkMapping[],
-  rules: NetworkRule[],
-): string | null {
-  // 1. Check direct mappings (fastest)
-  for (const m of mappings) {
-    if (m.source_type === 'calendar_title' && ev.calendar_title === m.source_string) return m.network_id
-    if (m.source_type === 'meeting_title' && ev.title === m.source_string) return m.network_id
-    if (m.source_type === 'description' && ev.description === m.source_string) return m.network_id
-  }
-
-  // 2. Check rules (sorted by priority desc from API)
-  for (const r of rules) {
-    const field = r.match_field === 'calendar_title' ? (ev.calendar_title || '')
-      : r.match_field === 'meeting_title' ? ev.title
-      : (ev.description || '')
-
-    if (!field) continue
-
-    let matched = false
-    const lower = field.toLowerCase()
-    const patLower = r.pattern.toLowerCase()
-
-    if (r.match_type === 'exact') {
-      matched = lower === patLower
-    } else if (r.match_type === 'contains') {
-      matched = lower.includes(patLower)
-    } else if (r.match_type === 'starts_with') {
-      matched = lower.startsWith(patLower)
-    } else if (r.match_type === 'regex') {
-      try { matched = new RegExp(r.pattern, 'i').test(field) } catch { /* invalid regex */ }
-    }
-
-    if (matched) return r.network_id
-  }
-
-  return null
-}
-
-function getEventNetworkFilterIdFromResolvedData(
-  ev: { id: string; calendar_title?: string },
-  eventNetworkMap: Map<string, string | null>,
-  networkMap: Map<string, NetworkDef>,
-): string | null {
-  const netId = eventNetworkMap.get(ev.id)
-  if (netId && networkMap.has(netId)) return netId
-  if (ev.calendar_title) return `cal_${ev.calendar_title}`
-  return null
 }
 
 const FALLBACK_COLOR_PALETTE = ['#3B82F6', '#10B981', '#F59E0B', '#EF4444', '#8B5CF6', '#EC4899', '#06B6D4', '#84CC16', '#F97316', '#14B8A6']
@@ -422,6 +172,8 @@ function getFallbackColorForKey(key: string): string {
 // ─── Component ──────────────────────────────────────────────
 
 export default function EventsCalendarPage() {
+  const [searchParams, setSearchParams] = useSearchParams()
+  const selectedNetwork = searchParams.get('network')
   const { isAuthenticated } = useAuth()
   const { showToast } = useToast()
   const [currentWeekStart, setCurrentWeekStart] = useState(() =>
@@ -434,10 +186,10 @@ export default function EventsCalendarPage() {
   const [rawEvents, setRawEvents] = useState<PublicEvent[]>([])
   const [loading, setLoading] = useState(true)
   const [selectedEvent, setSelectedEvent] = useState<GroupedPublicEvent | null>(null)
+  const [flagPanelEvent, setFlagPanelEvent] = useState<GroupedPublicEvent | null>(null)
   const [selectedEventSourcesExpanded, setSelectedEventSourcesExpanded] = useState(false)
   const [copiedLink, setCopiedLink] = useState(false)
   const [overflowPanelEvents, setOverflowPanelEvents] = useState<GroupedPublicEvent[] | null>(null)
-  const [selectedNetworks, setSelectedNetworks] = useState<Set<string>>(new Set())
   const [searchQuery, setSearchQuery] = useState('')
   const [hoveredEventTitle, setHoveredEventTitle] = useState<string | null>(null)
   const [networksExpanded, setNetworksExpanded] = useState(false)
@@ -460,10 +212,11 @@ export default function EventsCalendarPage() {
   const [networkDefs, setNetworkDefs] = useState<NetworkDef[]>([])
   const [networkMappings, setNetworkMappings] = useState<NetworkMapping[]>([])
   const [networkRules, setNetworkRules] = useState<NetworkRule[]>([])
-
-  // Auth for admin check
-  const authCtx = useAuth()
-  const isAdmin = authCtx.user?.roles?.includes('admin')
+  const [networkAssignments, setNetworkAssignments] = useState<EventNetworkAssignment[]>([])
+  const [networkSources, setNetworkSources] = useState<EventNetworkSource[]>([])
+  const [networkError, setNetworkError] = useState<string | null>(null)
+  const [loadingNetworks, setLoadingNetworks] = useState(false)
+  const sharedNetworkJumpRef = useRef<string | null>(null)
 
   // Google Calendar sync state
   const [calendarSources, setCalendarSources] = useState<CalendarSource[]>([])
@@ -591,27 +344,74 @@ export default function EventsCalendarPage() {
     }
   }, [])
 
-  // Fetch public events on initial mount.
+  const fetchNetworkData = useCallback(async () => {
+    setLoadingNetworks(true)
+    const read = async <T,>(path: string, label: string) => {
+      try {
+        return await dedupedGet<T>(path)
+      } catch (error) {
+        const detail = isAxiosError<{ message?: string; error?: string }>(error)
+          ? error.response?.data?.message || error.response?.data?.error || error.message
+          : 'Unexpected response'
+        const status = isAxiosError(error) && error.response ? `, HTTP ${error.response.status}` : ''
+        throw new Error(`Network filters could not be loaded (${label}${status}): ${detail}`, { cause: error })
+      }
+    }
+    try {
+      const [nRes, mRes, rRes, aRes] = await Promise.all([
+        read<Pick<EventNetworkCatalog, 'networks'>>('/api/network-relations/networks', 'networks'),
+        read<Pick<EventNetworkCatalog, 'mappings'>>('/api/network-relations/mappings', 'direct mappings'),
+        read<Pick<EventNetworkCatalog, 'rules'>>('/api/network-relations/rules', 'matching rules'),
+        read<Pick<EventNetworkCatalog, 'assignments' | 'sources'>>('/api/network-relations/assignments', 'assignments and sources'),
+      ])
+      if (![nRes.data.networks, mRes.data.mappings, rRes.data.rules, aRes.data.assignments, aRes.data.sources].every(Array.isArray)) {
+        throw new Error('Invalid network catalog response')
+      }
+      for (const rule of rRes.data.rules || []) {
+        if (rule.match_type === 'regex') new RegExp(rule.pattern, 'i')
+      }
+      for (const network of nRes.data.networks) resolveNetworkFilterKey(network.id, nRes.data.networks)
+      setNetworkDefs(nRes.data.networks)
+      setNetworkMappings(mRes.data.mappings)
+      setNetworkRules(rRes.data.rules)
+      setNetworkAssignments(aRes.data.assignments)
+      setNetworkSources(aRes.data.sources)
+      setNetworkError(null)
+    } catch (err) {
+      console.error('Failed to fetch network relations:', err)
+      const message = err instanceof Error ? err.message : 'Unexpected response'
+      setNetworkError(message.startsWith('Network filters could not be loaded')
+        ? message : `Network filters could not be loaded: ${message}`)
+    } finally {
+      setLoadingNetworks(false)
+    }
+  }, [])
+
+  // Fetch public events and network relationships on initial mount.
   useEffect(() => {
     void fetchPublicEvents()
-  }, [fetchPublicEvents])
+    void fetchNetworkData()
+  }, [fetchPublicEvents, fetchNetworkData])
 
   // Refresh when other pages announce a successful sync.
   useEffect(() => {
     return subscribePublicEventsSync(() => {
       void fetchPublicEvents({ silent: true })
+      void fetchNetworkData()
     })
-  }, [fetchPublicEvents])
+  }, [fetchPublicEvents, fetchNetworkData])
 
   // Refresh on focus/visibility so stale tabs recover quickly.
   useEffect(() => {
     const onFocus = () => {
       void fetchPublicEvents({ silent: true })
+      void fetchNetworkData()
     }
 
     const onVisibilityChange = () => {
       if (document.visibilityState === 'visible') {
         void fetchPublicEvents({ silent: true })
+        void fetchNetworkData()
       }
     }
 
@@ -621,26 +421,7 @@ export default function EventsCalendarPage() {
       window.removeEventListener('focus', onFocus)
       document.removeEventListener('visibilitychange', onVisibilityChange)
     }
-  }, [fetchPublicEvents])
-
-  // Fetch network relations (networks, mappings, rules)
-  useEffect(() => {
-    const fetchNetworkData = async () => {
-      try {
-        const [nRes, mRes, rRes] = await Promise.all([
-          apiClient.get('/api/network-relations/networks'),
-          apiClient.get('/api/network-relations/mappings'),
-          apiClient.get('/api/network-relations/rules'),
-        ])
-        setNetworkDefs(nRes.data.networks || [])
-        setNetworkMappings(mRes.data.mappings || [])
-        setNetworkRules(rRes.data.rules || [])
-      } catch (err) {
-        console.error('Failed to fetch network relations:', err)
-      }
-    }
-    fetchNetworkData()
-  }, [])
+  }, [fetchPublicEvents, fetchNetworkData])
 
   // Fetch calendar sources for Google Calendar sync (authenticated users only)
   useEffect(() => {
@@ -758,37 +539,92 @@ export default function EventsCalendarPage() {
   const daySlots = buildDaySlots()
 
   // Resolve events to networks and assign consistent colors
-  const networkMap = useMemo(() => new Map(networkDefs.map(n => [n.id, n])), [networkDefs])
+  const networkMap = useMemo(() => new Map(networkDefs.map(n => [networkFilterKey(n), n])), [networkDefs])
+  const filterSources = useMemo(() => {
+    const sources = new Map(networkSources.map(source => [source.key, source]))
+    for (const event of events) {
+      for (const input of event.network_inputs) {
+        if (input.network_source_key && input.calendar_title && !sources.has(input.network_source_key)) {
+          sources.set(input.network_source_key, { key: input.network_source_key, name: input.calendar_title })
+        }
+      }
+    }
+    return [...sources.values()]
+  }, [networkSources, events])
+  const activeNetworkKey = selectedNetwork ? resolveNetworkFilterKey(selectedNetwork, networkDefs, filterSources) : null
+  useEffect(() => {
+    if (!selectedNetwork || !activeNetworkKey || selectedNetwork === activeNetworkKey) return
+    const next = new URLSearchParams(searchParams)
+    next.delete('network')
+    next.set('network', activeNetworkKey)
+    setSearchParams(next, { replace: true })
+  }, [selectedNetwork, activeNetworkKey, searchParams, setSearchParams])
 
-  /** Map each event to its resolved network_id (or null) */
+  /** Preserve memberships from every source represented by a merged meeting. */
   const eventNetworkMap = useMemo(() => {
-    const map = new Map<string, string | null>()
+    const map = new Map<string, Set<string>>()
     for (const ev of events) {
-      map.set(ev.id, resolveNetwork(ev, networkMappings, networkRules))
+      map.set(ev.id, resolveEventNetworkKeys({
+        inputs: ev.network_inputs, networks: networkDefs, mappings: networkMappings,
+        rules: networkRules, assignments: networkAssignments,
+        sources: filterSources,
+      }))
     }
     return map
-  }, [events, networkMappings, networkRules])
+  }, [events, networkDefs, networkMappings, networkRules, networkAssignments, filterSources])
 
   const nextWeekStartByNetwork = useMemo(() => {
     const now = Date.now()
     const map = new Map<string, Date>()
 
     for (const ev of events) {
-      const filterId = getEventNetworkFilterIdFromResolvedData(ev, eventNetworkMap, networkMap)
-      if (!filterId) continue
-
       const evEndMs = new Date(ev.end_time).getTime()
       if (evEndMs < now) continue
 
       const evWeekStart = startOfWeek(new Date(ev.start_time), { weekStartsOn: 1 })
-      const existing = map.get(filterId)
-      if (!existing || evWeekStart.getTime() < existing.getTime()) {
-        map.set(filterId, evWeekStart)
+      for (const filterId of eventNetworkMap.get(ev.id) || []) {
+        const existing = map.get(filterId)
+        if (!existing || evWeekStart.getTime() < existing.getTime()) {
+          map.set(filterId, evWeekStart)
+        }
       }
     }
 
     return map
-  }, [events, eventNetworkMap, networkMap])
+  }, [events, eventNetworkMap])
+
+  useEffect(() => {
+    if (!activeNetworkKey) {
+      sharedNetworkJumpRef.current = null
+      return
+    }
+    if (sharedNetworkJumpRef.current === activeNetworkKey) return
+    const target = nextWeekStartByNetwork.get(activeNetworkKey)
+    if (target) {
+      sharedNetworkJumpRef.current = activeNetworkKey
+      setCurrentWeekStart(target)
+      setHighlightedSlotEvents(null)
+    }
+  }, [activeNetworkKey, nextWeekStartByNetwork])
+
+  const setNetworkFilter = (key: string | null) => {
+    const next = new URLSearchParams(searchParams)
+    next.delete('network')
+    if (key) next.set('network', key)
+    setSearchParams(next)
+  }
+
+  const copyNetworkLink = async () => {
+    try {
+      const url = new URL(window.location.href)
+      url.search = searchParams.toString()
+      await navigator.clipboard.writeText(url.toString())
+      showToast('Network filter link copied')
+    } catch (error) {
+      console.error('Failed to copy network filter link:', error)
+      showToast('Could not copy the link. Copy it from your address bar instead.', 'error')
+    }
+  }
 
   // Events for current week, filtered by network and search
   const eventsInWeek = useMemo(() => {
@@ -799,33 +635,25 @@ export default function EventsCalendarPage() {
     })
 
     // Network filter: if any networks are selected, only show matching events
-    if (selectedNetworks.size > 0) {
-      filtered = filtered.filter(ev => {
-        const netId = eventNetworkMap.get(ev.id)
-        if (netId && selectedNetworks.has(netId)) return true
-        // Also match by calendar_title for unresolved ones
-        const calKey = ev.calendar_title ? `cal_${ev.calendar_title}` : null
-        if (calKey && selectedNetworks.has(calKey)) return true
-        return false
-      })
+    if (activeNetworkKey) {
+      filtered = filtered.filter(ev => eventNetworkMap.get(ev.id)?.has(activeNetworkKey))
     }
 
     // Search filter
     if (searchQuery.trim()) {
       const q = searchQuery.trim().toLowerCase()
       filtered = filtered.filter(ev => {
-        const calTitle = (ev.calendar_title || '').toLowerCase()
+        const calTitle = ev.source_labels.join(' ').toLowerCase()
         const meetTitle = ev.title.toLowerCase()
         const desc = (ev.description || '').toLowerCase()
         // Also check resolved network name
-        const netId = eventNetworkMap.get(ev.id)
-        const netName = netId ? (networkMap.get(netId)?.name || '').toLowerCase() : ''
+        const netName = [...(eventNetworkMap.get(ev.id) || [])].map(key => networkMap.get(key)?.name || '').join(' ').toLowerCase()
         return calTitle.includes(q) || meetTitle.includes(q) || desc.includes(q) || netName.includes(q)
       })
     }
 
     return filtered
-  }, [events, currentWeekStart, weekEnd, selectedNetworks, searchQuery, eventNetworkMap, networkMap])
+  }, [events, currentWeekStart, weekEnd, activeNetworkKey, searchQuery, eventNetworkMap, networkMap])
 
   // ─── Overlap layout per day ──────────────────────────────
 
@@ -858,7 +686,9 @@ export default function EventsCalendarPage() {
     const map = new Map<string, string>()
 
     for (const ev of events) {
-      const netId = eventNetworkMap.get(ev.id)
+      const memberships = eventNetworkMap.get(ev.id)
+      const netId = activeNetworkKey && memberships?.has(activeNetworkKey) ? activeNetworkKey
+        : [...(memberships || [])].find(key => networkMap.has(key))
       if (netId) {
         const net = networkMap.get(netId)
         if (net) {
@@ -872,7 +702,7 @@ export default function EventsCalendarPage() {
       map.set(ev.id, getFallbackColorForKey(groupKey))
     }
     return map
-  }, [events, eventNetworkMap, networkMap])
+  }, [events, eventNetworkMap, networkMap, activeNetworkKey])
 
   const getEventColor = (ev: PublicEvent) => eventColors.get(ev.id) || '#6B7280'
 
@@ -880,61 +710,37 @@ export default function EventsCalendarPage() {
 
   const networks = useMemo(() => {
     const now = Date.now()
-    // Build network list: resolved networks + unresolved calendar_titles
-    const netStats = new Map<string, { count: number; hasUpcoming: boolean; isInVisibleWeek: boolean }>()
-    const unresolvedTitles = new Map<string, { name: string; count: number; color: string; hasUpcoming: boolean; isInVisibleWeek: boolean }>()
+    const stats = new Map<string, {
+      id: string; name: string; color: string
+      count: number; hasUpcoming: boolean; isInVisibleWeek: boolean
+    }>()
 
     for (const ev of events) {
       const hasUpcoming = new Date(ev.end_time).getTime() >= now
       const isInVisibleWeek = new Date(ev.start_time) < weekEnd && new Date(ev.end_time) > currentWeekStart
-      const netId = eventNetworkMap.get(ev.id)
-      if (netId && networkMap.has(netId)) {
-        const existing = netStats.get(netId)
+      for (const key of eventNetworkMap.get(ev.id) || []) {
+        const network = networkMap.get(key)
+        const name = network?.name || filterSources.find(source => source.key === key)?.name
+          || ev.network_inputs.find(input => input.network_source_key === key)?.calendar_title
+          || (key.startsWith('cal_') ? key.slice(4) : null)
+        if (!name) continue
+        const existing = stats.get(key)
         if (existing) {
           existing.count += 1
           existing.hasUpcoming = existing.hasUpcoming || hasUpcoming
           existing.isInVisibleWeek = existing.isInVisibleWeek || isInVisibleWeek
         } else {
-          netStats.set(netId, { count: 1, hasUpcoming, isInVisibleWeek })
-        }
-      } else {
-        const name = ev.calendar_title
-        if (!name) continue
-        if (!unresolvedTitles.has(name)) {
-          unresolvedTitles.set(name, {
-            name,
-            count: 0,
-            color: getFallbackColorForKey(name),
-            hasUpcoming: false,
-            isInVisibleWeek: false,
+          stats.set(key, {
+            id: key, name, color: network?.color || getFallbackColorForKey(name),
+            count: 1, hasUpcoming, isInVisibleWeek,
           })
         }
-        const existing = unresolvedTitles.get(name)!
-        existing.count += 1
-        existing.hasUpcoming = existing.hasUpcoming || hasUpcoming
-        existing.isInVisibleWeek = existing.isInVisibleWeek || isInVisibleWeek
       }
     }
-
-    const resolved = Array.from(netStats.entries())
-      .filter(([, stats]) => stats.hasUpcoming || stats.isInVisibleWeek)
-      .map(([netId, stats]) => {
-      const net = networkMap.get(netId)!
-      return { id: netId, name: net.name, count: stats.count, color: net.color, isNetwork: true }
-    })
-
-    const unresolved = Array.from(unresolvedTitles.values())
-      .filter((title) => title.hasUpcoming || title.isInVisibleWeek)
-      .map(t => ({
-        id: `cal_${t.name}`,
-        name: t.name,
-        count: t.count,
-        color: t.color,
-        isNetwork: false,
-      }))
-
-    return [...resolved.sort((a, b) => a.name.localeCompare(b.name)), ...unresolved.sort((a, b) => a.name.localeCompare(b.name))]
-  }, [events, currentWeekStart, eventNetworkMap, networkMap, weekEnd])
+    return [...stats.values()]
+      .filter(network => network.hasUpcoming || network.isInVisibleWeek)
+      .sort((a, b) => a.name.localeCompare(b.name))
+  }, [events, currentWeekStart, eventNetworkMap, networkMap, filterSources, weekEnd])
 
   // Detect if network cards overflow the collapsed container
   useEffect(() => {
@@ -972,24 +778,11 @@ export default function EventsCalendarPage() {
   }, [networks.length, networksExpanded, networksOverflow])
 
   const toggleNetwork = (id: string) => {
-    setSelectedNetworks(prev => {
-      const next = new Set(prev)
-      if (next.has(id)) {
-        next.delete(id)
-      } else {
-        next.add(id)
-        const targetWeekStart = nextWeekStartByNetwork.get(id)
-        if (targetWeekStart) {
-          setCurrentWeekStart(targetWeekStart)
-          setHighlightedSlotEvents(null)
-        }
-      }
-      return next
-    })
+    setNetworkFilter(activeNetworkKey === id ? null : id)
   }
 
   const weekHasSelectedNetwork = useCallback((weekStart: Date) => {
-    if (selectedNetworks.size === 0) return true
+    if (!activeNetworkKey) return true
 
     const weekEnd = addDays(weekStart, 7)
 
@@ -998,17 +791,11 @@ export default function EventsCalendarPage() {
       const evEnd = new Date(ev.end_time)
       if (evStart >= weekEnd || evEnd <= weekStart) continue
 
-      const netId = eventNetworkMap.get(ev.id)
-      if (netId && selectedNetworks.has(netId)) return true
-
-      if (ev.calendar_title) {
-        const calKey = `cal_${ev.calendar_title}`
-        if (selectedNetworks.has(calKey)) return true
-      }
+      if (eventNetworkMap.get(ev.id)?.has(activeNetworkKey)) return true
     }
 
     return false
-  }, [events, eventNetworkMap, selectedNetworks])
+  }, [events, eventNetworkMap, activeNetworkKey])
 
   /** Networks that contain events matching the current search query */
   const searchMatchedNetworks = useMemo(() => {
@@ -1016,24 +803,20 @@ export default function EventsCalendarPage() {
     const q = searchQuery.trim().toLowerCase()
     const matched = new Set<string>()
     for (const ev of events) {
-      const calTitle = (ev.calendar_title || '').toLowerCase()
+      const calTitle = ev.source_labels.join(' ').toLowerCase()
       const meetTitle = ev.title.toLowerCase()
       const desc = (ev.description || '').toLowerCase()
-      const netId = eventNetworkMap.get(ev.id)
-      const netName = netId ? (networkMap.get(netId)?.name || '').toLowerCase() : ''
+      const memberships = eventNetworkMap.get(ev.id) || new Set<string>()
+      const netName = [...memberships].map(key => networkMap.get(key)?.name || '').join(' ').toLowerCase()
       if (calTitle.includes(q) || meetTitle.includes(q) || desc.includes(q) || netName.includes(q)) {
-        if (netId && networkMap.has(netId)) {
-          matched.add(netId)
-        } else if (ev.calendar_title) {
-          matched.add(`cal_${ev.calendar_title}`)
-        }
+        for (const key of memberships) matched.add(key)
       }
     }
     return matched
   }, [searchQuery, events, eventNetworkMap, networkMap])
 
   /** Whether we're in filtered mode (at least one network selected) */
-  const isNetworkFiltered = selectedNetworks.size > 0
+  const isNetworkFiltered = Boolean(activeNetworkKey)
 
   /** Get the display label for an event chip */
   const getChipLabel = (ev: GroupedPublicEvent) => {
@@ -1088,7 +871,7 @@ export default function EventsCalendarPage() {
     setHighlightedSlotEvents(null)
 
     if (!weekHasSelectedNetwork(todayWeekStart)) {
-      setSelectedNetworks(new Set())
+      setNetworkFilter(null)
     }
   }
 
@@ -1099,7 +882,7 @@ export default function EventsCalendarPage() {
         <div className="flex flex-col gap-2">
           <div className={`flex ${isPhoneViewport ? 'flex-col items-start gap-2' : 'items-center justify-between'}`}>
             <div className="flex items-center gap-2">
-              <CalendarDays className="w-5 h-5 md:w-6 md:h-6 text-blue-600" />
+              <CalendarDays className="w-5 h-5 md:w-6 md:h-6 text-info" />
               <h1 className="text-base md:text-2xl font-bold">Events Calendar</h1>
             </div>
             <div className={`flex items-center gap-2 flex-wrap ${isPhoneViewport ? 'w-full' : 'justify-end'}`}>
@@ -1110,10 +893,10 @@ export default function EventsCalendarPage() {
                 <Calendar className="w-3.5 h-3.5" />
                 {isAuthenticated ? 'Your Calendar' : 'Sign in to Coordinate'}
               </Link>
-              {isAdmin && (
+              {isAuthenticated && (
                 <Link
                   to="/admin/network-relations"
-                  className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-sky-100 text-sky-700 hover:bg-sky-200 dark:bg-sky-900/30 dark:text-sky-300 dark:hover:bg-sky-900/50 transition-colors w-full sm:w-auto"
+                  className="flex items-center justify-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium bg-info-subtle text-info hover:bg-info-muted transition-colors w-full sm:w-auto"
                 >
                   <LinkIcon className="w-3.5 h-3.5" />
                   Network Relations
@@ -1134,15 +917,15 @@ export default function EventsCalendarPage() {
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
                 placeholder="Search calendars, meetings, networks..."
-                className="w-full pl-8 pr-8 py-1.5 text-sm border border-border rounded-md bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-blue-500"
+                className="w-full pl-8 pr-8 py-1.5 text-sm border border-border rounded-md bg-background text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-ring"
               />
               {searchQuery && (
-                <button
+                <IconButton
+                  label="Clear search"
                   onClick={() => setSearchQuery('')}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-muted transition-colors"
-                >
-                  <X className="w-3 h-3 text-muted-foreground" />
-                </button>
+                  className="absolute right-0.5 top-1/2 -translate-y-1/2"
+                  icon={<X className="w-3 h-3" />}
+                />
               )}
             </div>
           </div>
@@ -1150,6 +933,23 @@ export default function EventsCalendarPage() {
       </div>
 
       {/* Network Cards */}
+      {networkError && (
+        <div role="alert" className="mb-2 flex flex-wrap items-center gap-2 text-sm text-danger">
+          <span>{networkError}</span>
+          <Button emphasis="outline" size="compact" disabled={loadingNetworks} onClick={fetchNetworkData}>
+            {loadingNetworks ? 'Retrying...' : 'Retry network filters'}
+          </Button>
+        </div>
+      )}
+      {activeNetworkKey && (
+        <div className="flex flex-wrap items-center gap-2 mb-2">
+          <span className="text-xs text-muted-foreground">
+            Filtering: {networkMap.get(activeNetworkKey)?.name || networks.find(network => network.id === activeNetworkKey)?.name || 'Unavailable network'}
+          </span>
+          <Button emphasis="outline" size="compact" icon={<Copy />} onClick={copyNetworkLink}>Copy filter link</Button>
+          <Button emphasis="ghost" size="compact" onClick={() => setNetworkFilter(null)}>Clear network filter</Button>
+        </div>
+      )}
       {!loading && networks.length > 0 && (
         <div ref={networksStickyRef} className="mb-2 sticky top-0 z-20 bg-background py-1 -mx-2 px-2 md:-mx-6 md:px-6 border-b border-border/50">
           <div className="flex items-center justify-between mb-1.5">
@@ -1159,89 +959,46 @@ export default function EventsCalendarPage() {
               <span className="text-[10px] text-muted-foreground/60">({networks.length})</span>
             </div>
             {networksOverflow && (
-              <button
+              <Button
+                emphasis="ghost"
+                size="compact"
                 onClick={() => setNetworksExpanded(prev => !prev)}
-                className="flex items-center gap-1 px-2 py-0.5 text-[10px] font-medium text-muted-foreground hover:text-foreground hover:bg-accent/50 rounded transition-colors"
               >
                 {networksExpanded ? 'Show less' : 'Show all'}
                 {networksExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-              </button>
+              </Button>
             )}
           </div>
           <div
             ref={networksContainerRef}
-            className="flex flex-wrap gap-1.5 overflow-hidden transition-all duration-300"
-            style={{ maxHeight: networksExpanded ? `${Math.ceil(networks.length / 6) * 34}px` : '66px' }}
+            className={`flex flex-wrap gap-1.5 overflow-hidden transition-all duration-300 motion-reduce:transition-none ${networksExpanded ? '' : 'max-h-[66px]'}`}
           >
-            {(() => {
-              const properNets = networks.filter(n => n.isNetwork)
-              const calNets = networks.filter(n => !n.isNetwork)
+            {networks.map(net => {
+              const isSelected = activeNetworkKey === net.id
+              const isSearchMatch = searchMatchedNetworks.size > 0 && searchMatchedNetworks.has(net.id)
               return (
-                <>
-                  {properNets.map(net => {
-                    const isSelected = selectedNetworks.has(net.id)
-                    const isSearchMatch = searchMatchedNetworks.size > 0 && searchMatchedNetworks.has(net.id)
-                    return (
-                      <button
-                        key={net.id}
-                        onClick={() => toggleNetwork(net.id)}
-                        aria-label={net.name}
-                        className="flex items-center gap-1.5 w-[140px] px-2 py-1.5 rounded-md text-[11px] font-medium transition-all border"
-                        style={{
-                          backgroundColor: isSelected ? `${net.color}25` : isSearchMatch ? `${net.color}15` : 'transparent',
-                          borderColor: isSelected ? net.color : isSearchMatch ? `${net.color}80` : 'var(--border)',
-                          color: isSelected || isSearchMatch ? net.color : 'var(--muted-foreground)',
-                          boxShadow: isSearchMatch && !isSelected ? `0 0 6px ${net.color}30` : 'none',
-                        }}
-                      >
-                        <span
-                          className="w-2.5 h-2.5 rounded-full shrink-0"
-                          style={{ backgroundColor: net.color, opacity: isSelected || isSearchMatch ? 1 : 0.4 }}
-                        />
-                        <span className="truncate flex-1 text-left">{net.name}</span>
-                        <span className="opacity-50 shrink-0">{net.count}</span>
-                      </button>
-                    )
-                  })}
-                  {calNets.length > 0 && (
-                    <>
-                      {properNets.length > 0 && (
-                        <div className="w-full flex items-center gap-2 mt-0.5">
-                          <div className="h-px flex-1 bg-border" />
-                          <span className="text-[10px] text-muted-foreground/60 whitespace-nowrap">Member calendars</span>
-                          <div className="h-px flex-1 bg-border" />
-                        </div>
-                      )}
-                      {calNets.map(net => {
-                        const isSelected = selectedNetworks.has(net.id)
-                        const isSearchMatch = searchMatchedNetworks.size > 0 && searchMatchedNetworks.has(net.id)
-                        return (
-                          <button
-                            key={net.id}
-                            onClick={() => toggleNetwork(net.id)}
-                            aria-label={net.name}
-                            className="flex items-center gap-1.5 w-[140px] px-2 py-1.5 rounded-md text-[11px] font-medium transition-all border border-dashed"
-                            style={{
-                              backgroundColor: isSelected ? `${net.color}25` : isSearchMatch ? `${net.color}15` : 'transparent',
-                              borderColor: isSelected ? net.color : isSearchMatch ? `${net.color}80` : 'var(--border)',
-                              color: isSelected || isSearchMatch ? net.color : 'var(--muted-foreground)',
-                              boxShadow: isSearchMatch && !isSelected ? `0 0 6px ${net.color}30` : 'none',
-                            }}
-                          >
-                            <span
-                              className="w-2.5 h-2.5 rounded-sm shrink-0"
-                              style={{ backgroundColor: net.color, opacity: isSelected || isSearchMatch ? 1 : 0.4 }}
-                            />
-                            <span className="truncate flex-1 text-left">{net.name}</span>
-                            <span className="opacity-50 shrink-0">{net.count}</span>
-                          </button>
-                        )
-                      })}
-                    </>
-                  )}
-                </>
+                <button
+                  key={net.id}
+                  onClick={() => toggleNetwork(net.id)}
+                  aria-label={net.name}
+                  aria-pressed={isSelected}
+                  className="flex items-center gap-1.5 w-[140px] px-2 py-1.5 rounded-md text-[11px] font-medium transition-all motion-reduce:transition-none border"
+                  style={{
+                    backgroundColor: isSelected ? `${net.color}25` : isSearchMatch ? `${net.color}15` : 'transparent',
+                    borderColor: isSelected ? net.color : isSearchMatch ? `${net.color}80` : 'hsl(var(--border))',
+                    color: isSelected || isSearchMatch ? net.color : 'hsl(var(--muted-foreground))',
+                    boxShadow: isSearchMatch && !isSelected ? `0 0 6px ${net.color}30` : 'none',
+                  }}
+                >
+                  <span
+                    className="w-2.5 h-2.5 rounded-full shrink-0"
+                    style={{ backgroundColor: net.color, opacity: isSelected || isSearchMatch ? 1 : 0.4 }}
+                  />
+                  <span className="truncate flex-1 text-left" title={net.name}>{net.name}</span>
+                  <span className="opacity-50 shrink-0">{net.count}</span>
+                </button>
               )
-            })()}
+            })}
           </div>
         </div>
       )}
@@ -1249,19 +1006,17 @@ export default function EventsCalendarPage() {
       {/* Week Navigation */}
       <div className="flex items-center mb-2 px-1">
         <style>{`@keyframes week-range-flash {
-  0% { opacity: 0; transform: translateY(6px) scale(0.96); color: rgb(37 99 235); background-color: rgba(59,130,246,0.28); box-shadow: 0 0 0 4px rgba(59,130,246,0.18); }
-  25% { opacity: 1; transform: translateY(0) scale(1.06); color: rgb(37 99 235); background-color: rgba(59,130,246,0.28); }
-  60% { transform: scale(1); color: rgb(37 99 235); background-color: rgba(59,130,246,0.16); }
-  100% { color: inherit; background-color: rgba(59,130,246,0); box-shadow: 0 0 0 0 rgba(59,130,246,0); transform: scale(1); }
+  0% { opacity: 0; transform: translateY(6px) scale(0.96); color: hsl(var(--info)); background-color: hsl(var(--info) / 0.28); box-shadow: 0 0 0 4px hsl(var(--info) / 0.18); }
+  25% { opacity: 1; transform: translateY(0) scale(1.06); color: hsl(var(--info)); background-color: hsl(var(--info) / 0.28); }
+  60% { transform: scale(1); color: hsl(var(--info)); background-color: hsl(var(--info) / 0.16); }
+  100% { color: inherit; background-color: hsl(var(--info) / 0); box-shadow: 0 0 0 0 hsl(var(--info) / 0); transform: scale(1); }
 }
 @keyframes week-row-sweep {
-  0% { background-color: rgba(59,130,246,0.22); }
-  40% { background-color: rgba(59,130,246,0.14); }
+  0% { background-color: hsl(var(--info) / 0.22); }
+  40% { background-color: hsl(var(--info) / 0.14); }
   100% { background-color: transparent; }
 }`}</style>
-        <button aria-label="Previous week" onClick={goToPrevWeek} className="p-1.5 rounded-md hover:bg-accent/50 transition-colors">
-          <ChevronLeft className="w-5 h-5" />
-        </button>
+        <IconButton label="Previous week" showTitle={false} onClick={goToPrevWeek} icon={<ChevronLeft className="w-5 h-5" />} />
         <div className="flex-1 text-center">
           <span
             key={currentWeekStart.getTime()}
@@ -1271,15 +1026,14 @@ export default function EventsCalendarPage() {
           </span>
         </div>
         <div className="flex items-center gap-1">
-          <button
+          <Button
+            emphasis="outline"
+            size="compact"
             onClick={goToToday}
-            className="px-3 py-1 text-xs font-semibold rounded-md bg-blue-600 text-white hover:bg-blue-700 dark:bg-blue-500 dark:hover:bg-blue-600 transition-colors shadow-sm"
           >
             Today
-          </button>
-          <button aria-label="Next week" onClick={goToNextWeek} className="p-1.5 rounded-md hover:bg-accent/50 transition-colors">
-            <ChevronRight className="w-5 h-5" />
-          </button>
+          </Button>
+          <IconButton label="Next week" showTitle={false} onClick={goToNextWeek} icon={<ChevronRight className="w-5 h-5" />} />
         </div>
       </div>
 
@@ -1293,24 +1047,23 @@ export default function EventsCalendarPage() {
       {highlightedSlotEvents && highlightedSlotEvents.length > 0 && (
         <div
           ref={highlightBarRef}
-          className="mb-2 border border-blue-300 dark:border-blue-700 rounded-lg bg-blue-50/80 dark:bg-blue-950/40 p-3 animate-in fade-in slide-in-from-top-2 duration-200"
+          className="mb-2 border border-info-muted rounded-lg bg-info-subtle p-3 animate-in fade-in slide-in-from-top-2 duration-200"
         >
           <div className="flex items-center justify-between mb-2">
             <div className="flex items-center gap-2">
-              <Calendar className="w-4 h-4 text-blue-600 dark:text-blue-400" />
-              <span className="text-sm font-semibold text-blue-800 dark:text-blue-200">
+              <Calendar className="w-4 h-4 text-primary" />
+              <span className="text-sm font-semibold text-info">
                 Meetings at {highlightedSlotLabel}
               </span>
-              <span className="text-[10px] text-blue-600/60 dark:text-blue-400/60 bg-blue-100 dark:bg-blue-900/50 px-1.5 py-0.5 rounded-full">
+              <span className="text-[10px] text-info bg-info-subtle px-1.5 py-0.5 rounded-full">
                 {highlightedSlotEvents.length}
               </span>
             </div>
-            <button
+            <IconButton
+              label="Close meetings list"
               onClick={() => setHighlightedSlotEvents(null)}
-              className="p-1 rounded hover:bg-blue-200/50 dark:hover:bg-blue-800/50 transition-colors"
-            >
-              <X className="w-3.5 h-3.5 text-blue-600 dark:text-blue-400" />
-            </button>
+              icon={<X className="w-3.5 h-3.5" />}
+            />
           </div>
           <div className="flex flex-wrap gap-2">
             {highlightedSlotEvents.map(ev => {
@@ -1322,7 +1075,7 @@ export default function EventsCalendarPage() {
                   onClick={() => { setSelectedEvent(ev); setHighlightedSlotEvents(null) }}
                   onMouseEnter={() => setHoveredEventTitle(ev.title)}
                   onMouseLeave={() => setHoveredEventTitle(null)}
-                  className="flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-card hover:bg-accent/50 transition-all shadow-sm hover:shadow-md"
+                  className="flex items-center gap-2 px-3 py-2 rounded-lg border border-border bg-card hover:bg-accent/50 transition-all shadow-xs hover:shadow-md"
                   style={{ borderLeft: `4px solid ${color}` }}
                 >
                   <div className="text-left">
@@ -1390,7 +1143,7 @@ export default function EventsCalendarPage() {
                   ? `${utcNow.getUTCHours().toString().padStart(2, '0')}:${utcNow.getUTCMinutes().toString().padStart(2, '0')}`
                   : getCurrentTimeInTimezone(tzState.primary)
                 return (
-                  <div className="p-2 text-xs text-blue-600 dark:text-blue-400 font-medium border-r border-border flex flex-col items-end justify-between">
+                  <div className="p-2 text-xs text-primary font-medium border-r border-border flex flex-col items-end justify-between">
                     <span className="text-[10px] font-bold">{label}</span>
                     {abbr && <span className="text-[9px] opacity-70">{abbr}</span>}
                     <style>{`@keyframes blink-colon { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }`}</style>
@@ -1408,10 +1161,10 @@ export default function EventsCalendarPage() {
                   const offsetBefore = t.offsetBefore >= 0 ? `+${t.offsetBefore / 60}` : `${t.offsetBefore / 60}`
                   const offsetAfter = t.offsetAfter >= 0 ? `+${t.offsetAfter / 60}` : `${t.offsetAfter / 60}`
                   return (
-                    <div key={`day-dst-hdr-${t.iana}-${slotIdx}`} className="p-1 text-center border-l border-amber-400 bg-amber-50/60 dark:bg-amber-950/30 flex flex-col items-center justify-center">
-                      <span className="text-[8px] font-semibold text-amber-700 dark:text-amber-300 truncate max-w-full">{city}</span>
-                      <span className="text-[9px] font-bold text-amber-600 dark:text-amber-400">GMT</span>
-                      <span className="text-[9px] font-bold text-amber-600 dark:text-amber-400">{offsetBefore} to {offsetAfter}</span>
+                    <div key={`day-dst-hdr-${t.iana}-${slotIdx}`} className="p-1 text-center border-l border-warning-muted bg-warning-subtle flex flex-col items-center justify-center">
+                      <span className="text-[8px] font-semibold text-warning truncate max-w-full">{city}</span>
+                      <span className="text-[9px] font-bold text-warning">GMT</span>
+                      <span className="text-[9px] font-bold text-warning">{offsetBefore} to {offsetAfter}</span>
                     </div>
                   )
                 }
@@ -1421,11 +1174,11 @@ export default function EventsCalendarPage() {
                   <div
                     key={day.toISOString()}
                     className={`p-2 text-center text-xs font-medium border-r border-border last:border-r-0 ${
-                      isToday ? 'bg-blue-50 dark:bg-blue-950/30 text-blue-700 dark:text-blue-300' : 'text-muted-foreground'
+                      isToday ? 'bg-info-subtle text-info' : 'text-muted-foreground'
                     }`}
                   >
                     <div>{format(day, 'EEE')}</div>
-                    <div className={`text-lg font-bold ${isToday ? 'text-blue-600 dark:text-blue-400' : 'text-foreground'}`}>
+                    <div className={`text-lg font-bold ${isToday ? 'text-primary' : 'text-foreground'}`}>
                       {format(day, 'd')}
                     </div>
                   </div>
@@ -1449,7 +1202,7 @@ export default function EventsCalendarPage() {
                     </div>
                   ))}
                   {/* Primary timezone time label */}
-                  <div className="p-1 text-[10px] text-blue-600 dark:text-blue-400 font-semibold font-mono tabular-nums border-r border-border flex items-start justify-end pr-2 pt-1">
+                  <div className="p-1 text-[10px] text-primary font-semibold font-mono tabular-nums border-r border-border flex items-start justify-end pr-2 pt-1">
                     {formatTimeLabel(time)}
                   </div>
                   {daySlots.map((slot, slotIdx) => {
@@ -1460,9 +1213,9 @@ export default function EventsCalendarPage() {
                       const beforeTime = convertUtcTimeToTimezoneOnDate(time, t.iana, beforeDay)
                       const isChanged = dstTime !== beforeTime
                       return (
-                        <div key={`dst-${t.iana}-${time}-${slotIdx}`} className={`p-1 text-[10px] text-center border-l border-amber-400 font-mono tabular-nums flex items-start justify-center pt-1 ${
+                        <div key={`dst-${t.iana}-${time}-${slotIdx}`} className={`p-1 text-[10px] text-center border-l border-warning-muted font-mono tabular-nums flex items-start justify-center pt-1 ${
                           isChanged
-                            ? 'bg-amber-50/40 dark:bg-amber-950/20 text-amber-700 dark:text-amber-300 font-semibold'
+                            ? 'bg-warning-subtle text-warning font-semibold'
                             : 'text-muted-foreground/40'
                         }`}>
                           {dstTime}
@@ -1477,7 +1230,7 @@ export default function EventsCalendarPage() {
                         onClick={() => highlightSlotMeetings(slot.dayIdx, time)}
                         onContextMenu={(e) => handleSlotContextMenu(e, slot.dayIdx, time)}
                         className={`border-r border-border last:border-r-0 cursor-pointer ${
-                          isToday ? 'bg-blue-50/30 dark:bg-blue-950/10' : ''
+                          isToday ? 'bg-info-subtle' : ''
                         }`}
                       />
                     )
@@ -1568,7 +1321,7 @@ export default function EventsCalendarPage() {
                             <button
                               key={`overflow-${i}`}
                               onClick={() => setOverflowPanelEvents(overflowEvs)}
-                              className="text-left px-1 rounded-sm text-[10px] leading-tight font-medium transition-colors hover:opacity-80 overflow-hidden"
+                              className="text-left px-1 rounded-sm text-[10px] leading-tight font-medium transition-colors hover:opacity-80 overflow-hidden bg-neutral-subtle text-neutral border-l-[3px] border-neutral"
                               style={{
                                 position: 'absolute',
                                 top: seg.top,
@@ -1576,9 +1329,6 @@ export default function EventsCalendarPage() {
                                 left: `calc(${seg.leftPercent}% + 1px)`,
                                 width: `calc(${seg.widthPercent}% - 2px)`,
                                 pointerEvents: 'auto',
-                                backgroundColor: '#6B728020',
-                                borderLeft: '3px solid #6B7280',
-                                color: '#6B7280',
                                 zIndex: 5,
                               }}
                               title={`${seg.count} more meeting${seg.count !== 1 ? 's' : ''}`}
@@ -1601,7 +1351,7 @@ export default function EventsCalendarPage() {
                 return (
                   <div 
                     ref={nowLineRef}
-                    className="absolute left-0 right-0 pointer-events-none z-[15]"
+                    className="absolute left-0 right-0 pointer-events-none z-15"
                     style={{ 
                       top: `${position}px`,
                       height: '3px',
@@ -1623,14 +1373,13 @@ export default function EventsCalendarPage() {
 
       {/* Overflow Panel Modal */}
       {overflowPanelEvents && (
-        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setOverflowPanelEvents(null)}>
-          <div className="bg-card text-card-foreground rounded-lg p-5 max-w-md w-full mx-4 shadow-xl border border-border" onClick={e => e.stopPropagation()}>
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-lg font-bold">Overlapping Meetings</h2>
-              <button onClick={() => setOverflowPanelEvents(null)} className="p-1 rounded hover:bg-muted transition-colors shrink-0">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
+        <Dialog
+          open
+          onClose={() => setOverflowPanelEvents(null)}
+          title="Overlapping Meetings"
+          size="md"
+          showCloseButton
+        >
             <div className="space-y-2 max-h-[60vh] overflow-auto">
               {overflowPanelEvents.map(ev => {
                 const color = getEventColor(ev)
@@ -1650,31 +1399,37 @@ export default function EventsCalendarPage() {
                 )
               })}
             </div>
-          </div>
-        </div>
+        </Dialog>
       )}
 
       {/* Event Details Modal */}
       {selectedEvent && (
-        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setSelectedEvent(null)}>
-          <div className="bg-card text-card-foreground rounded-lg p-5 max-w-md w-full mx-4 my-4 max-h-[90vh] overflow-y-auto shadow-xl border border-border" onClick={e => e.stopPropagation()}>
-            <div className="flex items-center justify-between mb-1">
-              <h2 className="text-lg font-bold pr-4">{resolveMeetingTitle({ title: selectedEvent.title, calendarTitle: selectedEvent.calendar_title })}</h2>
-              <button onClick={() => setSelectedEvent(null)} className="p-1 rounded hover:bg-muted transition-colors shrink-0">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
+        <Dialog
+          open
+          onClose={() => setSelectedEvent(null)}
+          title={resolveMeetingTitle({ title: selectedEvent.title, calendarTitle: selectedEvent.calendar_title })}
+          size="md"
+          showCloseButton
+          closeLabel="Close event details"
+          headerActions={
+            <IconButton
+              label="Flag this public event"
+              icon={<Flag />}
+              onClick={() => setFlagPanelEvent(selectedEvent)}
+            />
+          }
+        >
 
             {/* Network / Calendar source label */}
             {(() => {
-              const netId = eventNetworkMap.get(selectedEvent.id)
-              const net = netId ? networkMap.get(netId) : null
-              const label = net?.name || selectedEvent.calendar_title
-              if (!label) return null
+              const memberships = [...(eventNetworkMap.get(selectedEvent.id) || [])]
+              const labels = memberships.map(key => networkMap.get(key)?.name || networkSources.find(source => source.key === key)?.name
+                || (key.startsWith('cal_') ? key.slice(4) : key))
+              if (!labels.length) return null
               return (
                 <div className="flex items-center gap-1.5 mb-3">
                   <Network className="w-3.5 h-3.5 shrink-0 text-muted-foreground" />
-                  <span className="text-xs text-muted-foreground font-medium">{label}</span>
+                  <span className="text-xs text-muted-foreground font-medium">{labels.join(', ')}</span>
                 </div>
               )
             })()}
@@ -1707,18 +1462,16 @@ export default function EventsCalendarPage() {
                     href={selectedEvent.meeting_link ?? undefined}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="flex items-center gap-1.5 text-blue-600 hover:underline text-sm font-medium min-w-0 break-all"
+                    className="flex items-center gap-1.5 text-primary hover:underline text-sm font-medium min-w-0 break-all"
                   >
                     <ExternalLink className="w-3.5 h-3.5 shrink-0" />
                     Join Meeting
                   </a>
-                  <button
+                  <IconButton
+                    label="Copy link"
                     onClick={() => { navigator.clipboard.writeText(selectedEvent.meeting_link!); setCopiedLink(true); setTimeout(() => setCopiedLink(false), 2000) }}
-                    className="p-1 rounded hover:bg-muted transition-colors shrink-0"
-                    title="Copy link"
-                  >
-                    {copiedLink ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5 text-muted-foreground" />}
-                  </button>
+                    icon={copiedLink ? <Check className="w-3.5 h-3.5 text-success" /> : <Copy className="w-3.5 h-3.5" />}
+                  />
                 </div>
               )}
 
@@ -1735,13 +1488,14 @@ export default function EventsCalendarPage() {
                     <CalendarDays className="w-3.5 h-3.5 shrink-0" />
                     {getSourceCountLabel(selectedEvent)}
                   </span>
-                  <button
+                  <Button
+                    emphasis="outline"
+                    size="compact"
                     onClick={() => setSelectedEventSourcesExpanded(prev => !prev)}
-                    className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded border border-border hover:bg-accent/50 transition-colors"
                   >
                     {selectedEventSourcesExpanded ? 'Hide sources' : 'Show sources'}
                     {selectedEventSourcesExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-                  </button>
+                  </Button>
                 </div>
 
                 {selectedEventSourcesExpanded && (
@@ -1774,7 +1528,8 @@ export default function EventsCalendarPage() {
                   <CalendarPlus className="w-4 h-4" />
                   Outlook
                 </a>
-                <button
+                <Button
+                  icon={<Download className="w-4 h-4" />}
                   onClick={() => downloadICSFile({
                     title: resolveMeetingTitle({ title: selectedEvent.title, calendarTitle: selectedEvent.calendar_title }),
                     description: selectedEvent.description,
@@ -1783,45 +1538,45 @@ export default function EventsCalendarPage() {
                     meeting_link: selectedEvent.meeting_link,
                     location: selectedEvent.location,
                   })}
-                  className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-muted text-foreground hover:bg-muted/80 transition-colors"
                   title="Download .ics file for Apple Calendar and others"
                 >
-                  <Download className="w-4 h-4" />
                   .ics
-                </button>
+                </Button>
                 {googleOAuthSources.length === 1 ? (
-                  <button
+                  <Button
+                    intent="primary"
+                    icon={<CalendarPlus className="w-4 h-4" />}
                     onClick={() => handleSyncToGoogle({
                       title: resolveMeetingTitle({ title: selectedEvent.title, calendarTitle: selectedEvent.calendar_title }), description: selectedEvent.description,
                       start_time: selectedEvent.start_time, end_time: selectedEvent.end_time,
                       meeting_link: selectedEvent.meeting_link, location: selectedEvent.location,
                     })}
                     disabled={syncingToGoogle}
-                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors disabled:opacity-50"
+                    className="flex-1"
                     title={`Add to ${googleOAuthSources[0].display_name}`}
                   >
-                    <CalendarPlus className="w-4 h-4" />
                     {syncingToGoogle ? 'Syncing...' : 'Add to Google'}
-                  </button>
+                  </Button>
                 ) : googleOAuthSources.length > 1 ? (
-                  <button
+                  <Button
+                    intent="primary"
+                    icon={<CalendarPlus className="w-4 h-4" />}
                     onClick={() => setShowGoogleSyncPicker({
                       title: resolveMeetingTitle({ title: selectedEvent.title, calendarTitle: selectedEvent.calendar_title }), description: selectedEvent.description,
                       start_time: selectedEvent.start_time, end_time: selectedEvent.end_time,
                       meeting_link: selectedEvent.meeting_link, location: selectedEvent.location,
                     })}
-                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors"
+                    className="flex-1"
                     title="Choose which Google Calendar to add to"
                   >
-                    <CalendarPlus className="w-4 h-4" />
                     Add to Google
-                  </button>
+                  </Button>
                 ) : (
                   <a
                     href={`https://calendar.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(resolveMeetingTitle({ title: selectedEvent.title, calendarTitle: selectedEvent.calendar_title }))}&dates=${new Date(selectedEvent.start_time).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '')}/${new Date(selectedEvent.end_time).toISOString().replace(/[-:]/g, '').replace(/\.\d{3}/, '')}${selectedEvent.description ? `&details=${encodeURIComponent(selectedEvent.description)}` : ''}${selectedEvent.location ? `&location=${encodeURIComponent(selectedEvent.location)}` : selectedEvent.meeting_link ? `&location=${encodeURIComponent(selectedEvent.meeting_link)}` : ''}`}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors"
+                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-primary text-primary-foreground hover:opacity-90 transition-colors"
                     title="Add to Google Calendar"
                   >
                     <CalendarPlus className="w-4 h-4" />
@@ -1830,34 +1585,41 @@ export default function EventsCalendarPage() {
                 )}
               </div>
 
-              {/* Meeting page link */}
-              {selectedEvent.source_type === 'coordination_calendar' && selectedEvent.id.startsWith('coord_') && (
-                <div className="mt-2">
-                  <Link
-                    to={`/meeting/${selectedEvent.id.replace('coord_', '')}`}
-                    className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium text-blue-600 bg-blue-50 dark:bg-blue-950/30 hover:bg-blue-100 dark:hover:bg-blue-950/50 transition-colors w-full"
-                  >
-                    <ExternalLink className="w-4 h-4" />
-                    Meeting Page
-                  </Link>
-                </div>
-              )}
+              {/* Meeting page link -- shareable landing page for this single event */}
+              <div className="mt-2">
+                <Link
+                  to={`/meeting/${getBaseEventId(selectedEvent.id)}`}
+                  className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium text-info bg-info-subtle hover:bg-info-muted transition-colors w-full"
+                >
+                  <ExternalLink className="w-4 h-4" />
+                  Meeting Page
+                </Link>
+              </div>
             </div>
-          </div>
-        </div>
+        </Dialog>
+      )}
+
+      {flagPanelEvent && (
+        <EventFlagPanel
+          eventTitle={resolveMeetingTitle({ title: flagPanelEvent.title, calendarTitle: flagPanelEvent.calendar_title })}
+          targets={flagPanelEvent.moderation_targets}
+          onClose={() => setFlagPanelEvent(null)}
+          onSubmitted={() => {
+            setFlagPanelEvent(null)
+            void fetchPublicEvents({ silent: true })
+          }}
+        />
       )}
 
       {/* Google Calendar Sync Picker Modal */}
       {showGoogleSyncPicker && (
-        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-[60]" onClick={() => { setShowGoogleSyncPicker(null); setSelectedSyncSourceIds(new Set()) }}>
-          <div className="bg-card text-card-foreground rounded-lg p-5 max-w-sm w-full mx-4 shadow-xl border border-border" onClick={e => e.stopPropagation()}>
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-base font-bold">Choose Calendar</h2>
-              <button onClick={() => { setShowGoogleSyncPicker(null); setSelectedSyncSourceIds(new Set()) }} className="p-1 rounded hover:bg-muted transition-colors">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <p className="text-xs text-muted-foreground mb-3">Select which Google Calendar(s) to add "{showGoogleSyncPicker.title}" to:</p>
+        <Dialog
+          open
+          onClose={() => { setShowGoogleSyncPicker(null); setSelectedSyncSourceIds(new Set()) }}
+          title="Choose Calendar"
+          description={`Select which Google Calendar(s) to add "${showGoogleSyncPicker.title}" to:`}
+          showCloseButton
+        >
             <div className="space-y-2 mb-4">
               {googleOAuthSources.map(source => (
                 <label key={source.id} className="flex items-center gap-2 p-2 rounded-md hover:bg-muted cursor-pointer transition-colors">
@@ -1872,21 +1634,21 @@ export default function EventsCalendarPage() {
                     })}
                     className="w-4 h-4 rounded border-border text-primary focus:ring-primary"
                   />
-                  <span className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: source.color }} />
+                  <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: source.color }} />
                   <span className="text-sm truncate">{source.display_name}</span>
                 </label>
               ))}
             </div>
-            <button
+            <Button
+              intent="primary"
+              fullWidth
+              icon={<CalendarPlus className="w-4 h-4" />}
               onClick={() => handleSyncToGoogle(showGoogleSyncPicker, Array.from(selectedSyncSourceIds))}
               disabled={selectedSyncSourceIds.size === 0 || syncingToGoogle}
-              className="w-full flex items-center justify-center gap-1.5 px-4 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors disabled:opacity-50"
             >
-              <CalendarPlus className="w-4 h-4" />
               {syncingToGoogle ? 'Adding...' : `Add to ${selectedSyncSourceIds.size} Calendar(s)`}
-            </button>
-          </div>
-        </div>
+            </Button>
+        </Dialog>
       )}
     </div>
   )

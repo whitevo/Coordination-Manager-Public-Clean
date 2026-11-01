@@ -1,5 +1,5 @@
 import { useState, useCallback } from 'react'
-import { MAX_TIMEZONES, findTimezone } from './timezone-data'
+import { MAX_TIMEZONES, findTimezone, detectLocalTimezone } from './timezone-data'
 import type { TimezoneEntry } from './timezone-data'
 
 export const STORAGE_KEY = 'coordination-timezones'
@@ -20,6 +20,11 @@ export interface TimezoneState {
   additional: string[]
 }
 
+interface TimezoneOptions {
+  initialState?: TimezoneState
+  persist?: boolean
+}
+
 function loadState(): TimezoneState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY)
@@ -32,7 +37,9 @@ function loadState(): TimezoneState {
   } catch {
     // ignore
   }
-  return { primary: 'UTC', additional: [] }
+  // No stored preference yet -- default to the browser's local IANA timezone
+  // (detected via Intl.DateTimeFormat, no IP lookup or network request involved).
+  return { primary: detectLocalTimezone(), additional: [] }
 }
 
 function saveState(state: TimezoneState): void {
@@ -71,10 +78,12 @@ export interface UseTimezonesReturn {
  * @param overridePrimary - If provided, overrides the primary timezone
  *   (e.g. when a calendar has a fixed timezone set by creator).
  *   User can still add additional display timezones.
+ * @param options - Optional initial state and persistence policy for isolated
+ *   views such as guest invites. Existing callers keep their saved preferences.
  */
-export function useTimezones(overridePrimary?: string): UseTimezonesReturn {
+export function useTimezones(overridePrimary?: string, options?: TimezoneOptions): UseTimezonesReturn {
   const [state, setState] = useState<TimezoneState>(() => {
-    const loaded = loadState()
+    const loaded = options?.initialState ?? loadState()
     if (overridePrimary) {
       return { ...loaded, primary: overridePrimary }
     }
@@ -82,16 +91,20 @@ export function useTimezones(overridePrimary?: string): UseTimezonesReturn {
   })
 
   const primary = overridePrimary || state.primary
+  const persist = options?.persist ?? true
+  const persistState = useCallback((next: TimezoneState) => {
+    if (persist) saveState(next)
+  }, [persist])
 
   const setPrimary = useCallback((iana: string) => {
     setState((prev) => {
       // Remove from additional if it was there
       const additional = prev.additional.filter((a) => a !== iana)
       const next = { primary: iana, additional }
-      saveState(next)
+      persistState(next)
       return next
     })
-  }, [])
+  }, [persistState])
 
   const addTimezone = useCallback((iana: string) => {
     setState((prev) => {
@@ -99,25 +112,25 @@ export function useTimezones(overridePrimary?: string): UseTimezonesReturn {
       if (prev.additional.includes(iana)) return prev
       if (prev.additional.length >= MAX_TIMEZONES - 1) return prev
       const next = { ...prev, additional: [...prev.additional, iana] }
-      saveState(next)
+      persistState(next)
       return next
     })
-  }, [])
+  }, [persistState])
 
   const removeTimezone = useCallback((iana: string) => {
     setState((prev) => {
       const next = { ...prev, additional: prev.additional.filter((a) => a !== iana) }
-      saveState(next)
+      persistState(next)
       return next
     })
-  }, [])
+  }, [persistState])
 
   const replaceTimezone = useCallback((slot: number, iana: string) => {
     setState((prev) => {
       if (slot === 0) {
         const additional = prev.additional.filter((a) => a !== iana)
         const next = { primary: iana, additional }
-        saveState(next)
+        persistState(next)
         return next
       }
       const idx = slot - 1
@@ -127,10 +140,10 @@ export function useTimezones(overridePrimary?: string): UseTimezonesReturn {
       if (existingIdx !== -1) additional.splice(existingIdx, 1)
       additional[idx] = iana
       const next = { ...prev, additional: additional.filter(Boolean) }
-      saveState(next)
+      persistState(next)
       return next
     })
-  }, [])
+  }, [persistState])
 
   const getEntry = useCallback((iana: string) => findTimezone(iana), [])
 

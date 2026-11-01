@@ -6,20 +6,29 @@ import {
   type ThemePreferences,
   PRESET_THEMES,
   COLOR_VAR_MAP,
+  ACTIVE_THEME_CACHE_KEY,
+  DEFAULT_DARK_THEME_ID,
+  createDefaultThemePreferences,
 } from '../lib/theme-types'
 import { apiClient, dedupedGet } from '../lib/api-client'
 
-type ThemeMode = 'light' | 'dark' | 'system'
+/** Appearance mode. The old 'system' mode is migrated on load (see resolveStoredMode). */
+type ThemeMode = 'light' | 'dark'
 
 interface ThemeContextType {
-  /** Current theme mode: 'light', 'dark', or 'system' */
+  /** Current theme mode: 'light' or 'dark' */
   mode: ThemeMode
-  /** Whether the resolved/active appearance is dark */
+  /** Whether the active appearance is dark */
   isDark: boolean
   /** Set theme mode */
   setMode: (mode: ThemeMode) => void
-  /** Toggle between light and dark (ignores system) */
+  /** Toggle between light and dark */
   toggleDark: () => void
+
+  /** Whether the Theme (palette) button is pinned to the nav menu bar (default true) */
+  showNavThemeToggle: boolean
+  /** Pin or unpin the Theme button in the nav menu bar */
+  setShowNavThemeToggle: (show: boolean) => void
 
   /** ID of the color-theme overlay for the *current* mode (dark or light) */
   activeThemeId: string | null
@@ -45,7 +54,22 @@ interface ThemeContextType {
 const ThemeContext = createContext<ThemeContextType | undefined>(undefined)
 
 function getSystemPrefersDark(): boolean {
-  return window.matchMedia('(prefers-color-scheme: dark)').matches
+  try {
+    return window.matchMedia('(prefers-color-scheme: dark)').matches
+  } catch {
+    return true // matchMedia unavailable: keep the dark default
+  }
+}
+
+/**
+ * Concrete mode for a stored value. The 'system' option was removed, so a
+ * saved 'system' resolves once to the current OS preference (callers persist
+ * the result so the migration does not repeat).
+ */
+function resolveStoredMode(mode: ThemePreferences['mode'] | null | undefined): ThemeMode {
+  if (mode === 'light' || mode === 'dark') return mode
+  if (mode === 'system') return getSystemPrefersDark() ? 'dark' : 'light'
+  return 'dark'
 }
 
 // ─── Persistence helpers ──────────────────────────────────────────────
@@ -58,14 +82,24 @@ function loadLocal(): ThemePreferences {
       // Ensure fields exist even if missing in old data
       if (parsed.darkThemeId === undefined) (parsed as { darkThemeId: string | null }).darkThemeId = null
       if (parsed.lightThemeId === undefined) (parsed as { lightThemeId: string | null }).lightThemeId = null
+      if (parsed.mode !== 'light' && parsed.mode !== 'dark') {
+        // One-time migration of the removed 'system' mode (or a corrupt value)
+        const migrated: ThemePreferences = { ...parsed, mode: resolveStoredMode(parsed.mode) }
+        saveLocal(migrated)
+        return migrated
+      }
       return parsed
     }
   } catch { /* ignore */ }
 
   // Migrate from old localStorage keys
-  const oldMode = localStorage.getItem('theme-mode') as ThemeMode | null
+  const oldMode = localStorage.getItem('theme-mode') as ThemePreferences['mode'] | null
   const oldEnabled = localStorage.getItem('random-color-enabled') === 'true'
   const oldThemeRaw = localStorage.getItem('active-color-theme')
+
+  // Nothing saved at all: a new visitor gets the default "Dark Forest" theme.
+  // Keep this in sync with the first-paint bootstrap script in index.html.
+  if (!oldMode && !oldThemeRaw) return createDefaultThemePreferences()
   let oldThemeName: string | null = null
   if (oldThemeRaw) {
     try { oldThemeName = (JSON.parse(oldThemeRaw) as { name: string }).name } catch { /* ignore */ }
@@ -78,17 +112,19 @@ function loadLocal(): ThemePreferences {
     if (preset) legacyThemeId = preset.id
   }
 
-  return {
-    mode: oldMode || 'dark',
+  const legacyPrefs: ThemePreferences = {
+    mode: resolveStoredMode(oldMode),
     darkThemeId: legacyThemeId,
     lightThemeId: null,
     customThemes: [],
   }
+  if (oldMode === 'system') saveLocal(legacyPrefs)
+  return legacyPrefs
 }
 
 function saveLocal(prefs: ThemePreferences) {
   localStorage.setItem('theme-preferences', JSON.stringify(prefs))
-  // Also keep legacy key for dark mode toggle in Layout which reads theme-mode
+  // Also keep the legacy key; its presence marks a returning visitor (see index.html bootstrap)
   localStorage.setItem('theme-mode', prefs.mode)
 }
 
@@ -109,33 +145,52 @@ function saveToBackend(prefs: ThemePreferences) {
 
 function applyCssVariables(colors: ThemeColors | null) {
   const root = document.documentElement
-  if (!colors) {
-    // Remove all overrides → fall back to CSS defaults
-    for (const cssVar of Object.values(COLOR_VAR_MAP)) {
-      root.style.removeProperty(cssVar)
-    }
-    return
+  // Clear first so a theme that omits a key never inherits the previous theme's value
+  for (const cssVar of Object.values(COLOR_VAR_MAP)) {
+    root.style.removeProperty(cssVar)
   }
+  if (!colors) return // fall back to the index.css defaults
   for (const [key, cssVar] of Object.entries(COLOR_VAR_MAP)) {
     const value = colors[key as keyof ThemeColors]
     if (value) root.style.setProperty(cssVar, value)
   }
 }
 
+/**
+ * Remember the resolved overlay so the index.html bootstrap can paint it
+ * before React mounts (no flash of the default palette on reload).
+ */
+function cacheActiveTheme(theme: ColorTheme | null) {
+  try {
+    if (!theme) {
+      localStorage.removeItem(ACTIVE_THEME_CACHE_KEY)
+      return
+    }
+    const vars: Record<string, string> = {}
+    for (const [key, cssVar] of Object.entries(COLOR_VAR_MAP)) {
+      const value = theme.colors[key as keyof ThemeColors]
+      if (value) vars[cssVar] = value
+    }
+    localStorage.setItem(ACTIVE_THEME_CACHE_KEY, JSON.stringify({ id: theme.id, vars }))
+  } catch {
+    // Storage full or blocked: first paint falls back to the bootstrap defaults
+  }
+}
+
 // ─── Provider ─────────────────────────────────────────────────────────
 
 export function ThemeProvider({ children }: { children: React.ReactNode }) {
-  const { isAuthenticated, user } = useAuth()
+  const { isAuthenticated, isLoading: authLoading, user } = useAuth()
   // Increment to trigger a forced reload from backend (e.g. after account merge)
   const [backendLoadKey, setBackendLoadKey] = useState(0)
   const lastLoadedKey = useRef(-1)
 
   // ─── State ──────────────────────────────────────────────────
   const [prefs, setPrefs] = useState<ThemePreferences>(loadLocal)
-  const [systemDark, setSystemDark] = useState(getSystemPrefersDark)
 
-  const mode = prefs.mode
-  const isDark = mode === 'system' ? systemDark : mode === 'dark'
+  // loadLocal and the backend loader migrate 'system', so this is already concrete
+  const mode = resolveStoredMode(prefs.mode)
+  const isDark = mode === 'dark'
 
   const activeThemeIdForMode = isDark ? prefs.darkThemeId : prefs.lightThemeId
 
@@ -168,6 +223,11 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     setMode(isDark ? 'light' : 'dark')
   }, [isDark, setMode])
 
+  const showNavThemeToggle = prefs.showNavThemeToggle ?? true
+  const setShowNavThemeToggle = useCallback((show: boolean) => {
+    persistUpdate(prev => ({ ...prev, showNavThemeToggle: show }))
+  }, [persistUpdate])
+
   // Apply / remove `.dark` class on <html>
   useEffect(() => {
     const root = document.documentElement
@@ -175,20 +235,11 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     else root.classList.remove('dark')
   }, [isDark])
 
-  // Listen for system theme changes when in 'system' mode
-  useEffect(() => {
-    if (mode !== 'system') return
-    const mq = window.matchMedia('(prefers-color-scheme: dark)')
-    const handler = (e: MediaQueryListEvent) => setSystemDark(e.matches)
-    mq.addEventListener('change', handler)
-    return () => mq.removeEventListener('change', handler)
-  }, [mode])
-
   // ─── Color theme (per-mode overlay) ───────────────────────────────
   const applyTheme = useCallback((themeId: string | null) => {
     persistUpdate(prev => {
       // Resolve which mode is currently active
-      const currentlyDark = prev.mode === 'system' ? getSystemPrefersDark() : prev.mode === 'dark'
+      const currentlyDark = resolveStoredMode(prev.mode) === 'dark'
       if (currentlyDark) {
         return { ...prev, darkThemeId: themeId }
       } else {
@@ -226,11 +277,8 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
 
   // Apply CSS variables whenever active theme or mode changes
   useEffect(() => {
-    if (activeColorTheme) {
-      applyCssVariables(activeColorTheme.colors)
-    } else {
-      applyCssVariables(null)
-    }
+    applyCssVariables(activeColorTheme ? activeColorTheme.colors : null)
+    cacheActiveTheme(activeColorTheme)
   }, [activeColorTheme, isDark])
 
   // Load theme preferences from AuthContext user data (avoids duplicate /api/auth/me call)
@@ -244,15 +292,21 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
 
     const applyPrefs = (backendPrefs: ThemePreferences | null | undefined) => {
       if (backendPrefs) {
+        // The JSONB also stores notification/calendar/AI settings. Without a saved
+        // mode the account never chose a theme, so it gets the new-user default;
+        // with one, a missing overlay id means "no overlay" (their choice).
+        const hasSavedTheme = Boolean(backendPrefs.mode)
         const merged: ThemePreferences = {
           ...backendPrefs,
-          mode: backendPrefs.mode || 'dark',
-          darkThemeId: backendPrefs.darkThemeId ?? null,
+          mode: resolveStoredMode(backendPrefs.mode),
+          darkThemeId: hasSavedTheme ? backendPrefs.darkThemeId ?? null : backendPrefs.darkThemeId ?? DEFAULT_DARK_THEME_ID,
           lightThemeId: backendPrefs.lightThemeId ?? null,
           customThemes: backendPrefs.customThemes ?? [],
         }
         setPrefs(merged)
         saveLocal(merged)
+        // One-time migration of the removed 'system' mode on the account too
+        if (backendPrefs.mode === 'system') saveToBackend(merged)
       }
       lastLoadedKey.current = backendLoadKey
     }
@@ -268,22 +322,17 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
     }
   }, [isAuthenticated, user, backendLoadKey])  
 
-  // Reset to clean defaults when user logs out
+  // Reset to clean defaults once auth has resolved as signed out (logout, or a
+  // visit without a session). Waiting for auth to resolve keeps a returning
+  // user's saved theme on screen instead of flashing the defaults first.
   useEffect(() => {
-    if (!isAuthenticated) {
-      lastLoadedKey.current = -1
-      // Clear overlay and custom themes, revert to default dark mode
-      const cleanDefaults: ThemePreferences = {
-        mode: 'dark',
-        darkThemeId: null,
-        lightThemeId: null,
-        customThemes: [],
-      }
-      setPrefs(cleanDefaults)
-      saveLocal(cleanDefaults)
-      applyCssVariables(null) // immediately strip any lingering overlay
-    }
-  }, [isAuthenticated])
+    if (authLoading || isAuthenticated) return
+    lastLoadedKey.current = -1
+    // Clear custom themes and revert to the default "Dark Forest" theme
+    const cleanDefaults = createDefaultThemePreferences()
+    setPrefs(cleanDefaults)
+    saveLocal(cleanDefaults)
+  }, [authLoading, isAuthenticated])
 
   const reloadThemeFromBackend = useCallback(() => {
     setBackendLoadKey(k => k + 1)
@@ -296,6 +345,8 @@ export function ThemeProvider({ children }: { children: React.ReactNode }) {
         isDark,
         setMode,
         toggleDark,
+        showNavThemeToggle,
+        setShowNavThemeToggle,
         activeThemeId: activeThemeIdForMode,
         activeColorTheme,
         customThemes: prefs.customThemes,

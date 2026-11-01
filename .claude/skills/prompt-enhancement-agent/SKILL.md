@@ -1,126 +1,82 @@
 ---
 name: prompt-enhancement-agent
-description: Reason about a new user prompt across iterations and scaffold it into intent, As-Is/To-Be, dependencies, tests, and ready-to-run next steps
+description: Turns an ambiguous or multi-part Coordination Manager request into an implementation-ready plan -- checks whether scope, target, constraints, and acceptance criteria are clear, asks up to 3 decision-changing questions, and for feature requests maps the prompt onto real files with As-Is/To-Be, cross-page dependencies, test gaps, and next-step choices. Use when the request is ambiguous or has several parts whose scope is unclear, or when the user asks for a plan, scaffold, or breakdown before work starts. Not for clear single tasks (start the work directly), single-file fixes, factual questions, slash commands, deploys, env/config edits, or pasted AI feedback improvement blocks (use ai-feedback-loop).
 ---
 
 # prompt-enhancement-agent
 
-## Purpose
+Clear, well-specified tasks go straight to work: no questions, no plan, no
+menu. Skip this skill for factual questions, slash commands, deploys, env/config
+edits, and a single named file with one change. Run it only when the request is
+ambiguous or multi-part, or the user asks for a plan or scaffold.
 
-Intercepts a new user message, decomposes intent across 3+ reasoning iterations,
-maps the request onto the real codebase, surfaces cross-page dependencies, and
-returns a verbose, well-formatted scaffolding response. The user can then agree to
-a proposed plan and hand the implementation off to the right skill. Non-feature
-work is routed to a faster quick-command path that skips this analysis.
+## 1. Clarity check
 
-## When to Use
+Split the message into units (goal, context, location, As-Is critique, To-Be
+spec, constraint, question). Check:
+- Is the target area identified?
+- Is the expected behaviour clear?
+- Are constraints and non-goals stated?
+- Are acceptance checks stated?
 
-- A new session starts and the user writes a feature/change request
-- The message has multiple sentences, a URL, or mixed intents
-- The user references a page, component, or visual behaviour to change
-- Skip this skill (use quick-command mode) for: questions, single-line fixes,
-  deploys, env/config edits, or any task scoped to one known file
+Verdict: **sufficient** or **needs clarification**. Never invent missing facts.
+- **Sufficient and no plan requested:** stop here and do the work. Do not ask
+  questions or show a menu.
+- **Needs clarification:** ask at most 3 decision-changing questions, most
+  likely answer first.
 
-## Inputs
+## 2. Pick the path
 
-| Input | Source | Required |
-|-------|--------|----------|
-| User message | The raw prompt text | yes |
-| Page URL | A coordinationmanager.com or localhost link in the prompt | no |
-| Prior context | Earlier turns in the session | no |
+Score the message with [references/classifier.md](references/classifier.md).
+- **Feature score >= 0.6, or the user asked for a plan/scaffold:** full
+  scaffolding (step 3).
+- **Otherwise:** quick path. Return a short formalized request (objective,
+  scope in/out, assumptions, acceptance checks) plus any questions from step 1,
+  then stop.
 
-## Workflow
+## 3. Full scaffolding
 
-1. **Classify intent** (see `references/classifier.md`):
-   - Score feature vs maintenance vs meta/question
-   - If feature score >= 0.6: run full scaffolding (steps 2-8)
-   - Else: offer quick-command mode and stop
+Do at least 3 passes. Sentences are often out of order, and each pass adds
+context from the others.
 
-2. **Iteration 1 - Surface parse**:
-   - Split the message by sentence and newline; treat each as a unit
-   - Tag each unit: URL/context, experience/goal, location, As-Is critique,
-     To-Be spec, constraint, or question
-   - Extract raw entities (pages, sections, components, data types)
+1. **Surface parse.** Tag each unit and extract the entities it names (pages,
+   sections, components, data types).
+2. **Link to code.** Resolve a URL to its page component (routes are in
+   `Code/apps/web/src/App.tsx`). Map each named feature to real files with
+   grep/glob. Note existing patterns that already do something similar.
+3. **Dependencies.** Find every page or component that reuses an affected
+   component. Surface hidden assumptions and edge cases. Propose 1-2
+   alternatives. Flag backward-compatibility risks.
+4. **As-Is / To-Be.** Build both from verified file contents: current
+   location, behaviour, schema, and styling, against the proposed changes and
+   the file list.
+5. **Tests.** Grep existing tests that cover the touched components. List
+   what exists and what is missing (unit, integration, e2e, a11y).
+6. **Render** with [references/output-template.md](references/output-template.md).
+   Keep three things visibly separate: the user's own sentences (quoted), your
+   inference, and the decisions only the user can make. When a component is
+   shared, list the affected pages with localhost URLs.
 
-3. **Iteration 2 - Contextual linking**:
-   - Resolve the URL to a real page file (e.g. time-management -> the page component)
-   - Map each named section/feature to actual files via grep/glob
-   - Note existing patterns that already do something similar
+## 4. Next steps
 
-4. **Iteration 3 - Dependency mapping** (run at least 3 passes total because
-   sentences are often out of order; each pass adds context from the others):
-   - Find every page/component that reuses an affected component
-   - Surface hidden assumptions and edge cases
-   - Propose 1-2 alternative implementations
-   - Flag backward-compatibility and test gaps
+Show the Decisions and Next Steps menu only when the verdict is **needs
+clarification** or the user asked for a plan. Offer explicit choices: Agree and
+start, Customize, Quick fix with the listed assumptions, or Different approach.
+When the user agrees, hand off to the owning skill:
 
-5. **Build As-Is and To-Be snapshots** from real file contents, not guesses
-   (current location, behaviour, schema, styling vs proposed changes + file list).
-
-6. **Analyse tests**: grep existing test files for coverage of the touched
-   components; list what exists and what is missing (unit, integration, e2e, a11y).
-
-7. **Render the scaffolding response** using `references/output-template.md`.
-   Use formatting to clearly separate: (a) what the user said, (b) what the agent
-   inferred, and (c) decisions the user must make.
-
-8. **Offer next steps** as explicit choices: Agree & Auto-Start, Customize,
-   Quick Fix Mode, Different Approach. On agreement, route to the owning skill(s).
-
-## Routing Targets
-
-| Change type | Route to skill |
-|-------------|----------------|
-| UI / components / pages | react-frontend |
-| API endpoints / middleware | express-api |
-| Schema / migrations / RLS | supabase-database |
-| Calendar / availability / meetings | coordination-calendar |
-| FAB / side panels | side-panel-design |
+| Change type | Skill |
+|-------------|-------|
+| React components, pages, hooks, routes, data fetching | react-frontend |
+| Which component, variant, color token, motion, overlay layer | design-system (with react-frontend for UI work) |
+| Mobile or touch behaviour | mobile-ux |
+| API endpoints, middleware | express-api |
+| Schema, migrations, RLS | supabase-database |
+| Calendar, availability, meetings | coordination-calendar |
+| Mailbox sync, rules, AI drafts, MailboxPage | mailbox-feature |
+| Side panels, Assistance dropdown | side-panel-design |
 | Auth flows | authentication-system |
-| Discord bot / guardian | discord-integration |
-| Any new or changed tests | testing-strategy |
+| Discord bot, guardian | discord-integration |
+| New or changed tests | testing-strategy |
 
-## Outputs
-
-| Output | Format | Location |
-|--------|--------|----------|
-| Scaffolding response | Markdown sections (verbose) | Chat reply |
-| Clarification questions | 1-3 focused items | Chat reply |
-| Implementation plan | Stepwise checklist with estimates | Chat reply |
-| Handoff | Invocation of the routed skill(s) | Follow-up turn |
-
-## Constraints
-
-- Verbose by default; use headings, blockquotes, and labels to separate user
-  words from agent inference from required decisions
-- Always quote the user's own sentences back when reflecting intent
-- Run at least 3 reasoning iterations before rendering As-Is/To-Be
-- Never invent files or features; verify with grep/glob/view first
-- Always list affected pages with clickable localhost URLs when a component is shared
-- Ask 1-3 clarification questions max; do not block on them if Quick Fix is chosen
-- ASCII-safe characters only; no smart quotes or em dashes
-- Do not run this analysis for slash commands or single-file fixes
-
-## Self-Validation
-
-### Trigger Indicators
-- [ ] New feature/change request with multiple sentences or a page URL
-- [ ] Message references a section, component, or visual behaviour
-
-### Completion Markers
-- [ ] Intent reflected back using the user's own quoted sentences
-- [ ] As-Is and To-Be built from verified file contents
-- [ ] Cross-page dependencies listed with localhost URLs
-- [ ] Test gaps identified and next-step choices offered
-
-### Quality Signals
-- [ ] At least 3 reasoning iterations performed
-- [ ] User words, agent inference, and required decisions visually separated
-- [ ] 1-3 clarification questions, each genuinely decision-changing
-- [ ] Correct owning skill selected for handoff
-
-### Lint Checks
-- [ ] YAML frontmatter has exactly 2 `---` markers
-- [ ] All required sections present
-- [ ] No non-ASCII characters
-- [ ] No absolute paths
+Ops and config requests (deploy, env vars, CI, security, dependencies) use
+their own skill directly and are not scaffolded.

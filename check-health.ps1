@@ -1,13 +1,14 @@
 # check-health.ps1 - Verify all dev services are responding
-# Usage: .\check-health.ps1 [-StartupDelaySeconds 8] [-StateFile .cm-dev-state.json]
+# Usage: .\check-health.ps1 [-StartupDelaySeconds 3] [-StateFile .cm-dev-state.json] [-Mode full|localhost]
 
 [CmdletBinding()]
 param(
-    [int]$StartupDelaySeconds = 8,
+    [int]$StartupDelaySeconds = 3,
     [int]$MaxWaitSeconds = 45,
-    [int]$PollIntervalSeconds = 3,
-    [int]$ObservationSeconds = 6,
-    [int]$LogTailLines = 120,
+    [int]$PollIntervalSeconds = 2,
+    [int]$ObservationSeconds = 4,
+    [ValidateRange(0, 2147483647)]
+    [int]$LogTailLines = 0,
     [string]$StateFile = (Join-Path $(if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.Path) { Split-Path -Parent $MyInvocation.MyCommand.Path } else { (Get-Location).Path }) ".cm-dev-state.json"),
     [ValidateSet("full", "localhost")]
     [string]$Mode = "full"
@@ -18,23 +19,30 @@ $rootDir = if ($PSScriptRoot) { $PSScriptRoot } elseif ($MyInvocation.MyCommand.
 $defaultLogDir = Join-Path $rootDir ".cm-dev-logs"
 
 $consoleErrorPatterns = @(
-    '(?i)\\bunhandled rejection\\b',
-    '(?i)\\buncaught exception\\b',
-    '(?i)\\bexception\\b',
-    '(?i)\\bfatal\\b',
-    '(?i)\\bvalidationerror\\b',
-    '(?i)\\bfail(?:ed|ure)?\\b',
-    '(?i)\\berror\\b',
-    '(?i)\\bwarn(?:ing)?\\b'
+    '(?i)\bunhandled rejection\b',
+    '(?i)\buncaught exception\b',
+    '(?i)\bfatal\b',
+    '(?i)\bvalidationerror\b',
+    '(?i)\bfailed(?:\s+to)?\b',
+    '(?i)\berror:\s',
+    '(?i)\bexception:\s',
+    '(?i)\berr\b'
+)
+
+$consoleWarningPatterns = @(
+    '(?i)\bwarn(?:ing)?s?\b',
+    '(?i)\bdeprecated\b',
+    '(?i)PostCSS plugin did not pass'
 )
 
 $consoleIgnorePatterns = @(
-    '(?i)\\b0\\s+errors?\\b',
-    '(?i)\\bno\\s+errors?\\b',
-    '(?i)\\bwithout\\s+errors?\\b',
-    '(?i)\\b0\\s+warnings?\\b',
-    '(?i)\\bno\\s+warnings?\\b',
-    '(?i)\\bwithout\\s+warnings?\\b'
+    '(?i)\bfailed=0(?=\s|$|[,;])',
+    '(?i)\b0\s+errors?\b',
+    '(?i)\bno\s+errors?\b',
+    '(?i)\bwithout\s+errors?\b',
+    '(?i)\b0\s+warnings?\b',
+    '(?i)\bno\s+warnings?\b',
+    '(?i)\bwithout\s+warnings?\b'
 )
 
 function Get-ServiceLogMap {
@@ -61,7 +69,7 @@ function Get-ServiceLogMap {
                 }
             }
         } catch {
-            # If state is unreadable, continue with fallback log paths.
+            Write-Warning "Cannot read service state '$StateFilePath': $($_.Exception.Message). Using fallback log paths."
         }
     }
 
@@ -80,58 +88,76 @@ function Test-ServiceConsoleLog {
         [string]$LogPath,
         [int]$TailLines,
         [string[]]$Patterns,
+        [string[]]$WarningPatterns,
         [string[]]$IgnorePatterns
     )
 
     if (-not (Test-Path $LogPath)) {
-        return [pscustomobject]@{ ok = $true; detail = "No console log file yet" }
+        return [pscustomobject]@{ ok = $true; warning = $true; detail = "Console log missing; diagnostics unavailable: $LogPath" }
     }
 
     try {
-        $lines = @(Get-Content -Path $LogPath -Tail $TailLines -ErrorAction Stop)
+        $readOptions = @{ LiteralPath = $LogPath; ErrorAction = 'Stop' }
+        if ($TailLines -gt 0) { $readOptions.Tail = $TailLines }
+        $lines = @(Get-Content @readOptions)
     } catch {
-        return [pscustomobject]@{ ok = $false; detail = "Cannot read console log: $($_.Exception.Message)" }
+        return [pscustomobject]@{ ok = $false; warning = $false; detail = "Cannot read console log: $($_.Exception.Message)" }
     }
 
-    if ($lines.Count -eq 0) {
-        return [pscustomobject]@{ ok = $true; detail = "No console output yet" }
+    if ($lines.Count -eq 0 -or [string]::IsNullOrWhiteSpace(($lines -join ''))) {
+        return [pscustomobject]@{ ok = $true; warning = $true; detail = "Console log empty; diagnostics unavailable: $LogPath" }
     }
 
+    $warnings = @()
     for ($idx = $lines.Count - 1; $idx -ge 0; $idx--) {
-        $line = $lines[$idx]
+        $line = $lines[$idx] -replace '\x1b\[[0-?]*[ -/]*[@-~]', ''
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
 
-        $match = Select-String -InputObject $line -Pattern $Patterns -AllMatches
-        if (-not $match) { continue }
-
-        $isIgnored = $false
+        $diagnosticText = $line
         foreach ($ignorePattern in $IgnorePatterns) {
-            if ($line -match $ignorePattern) {
-                $isIgnored = $true
-                break
-            }
+            $diagnosticText = $diagnosticText -replace $ignorePattern, ''
         }
-        if ($isIgnored) { continue }
+        $isError = Select-String -InputObject $diagnosticText -Pattern $Patterns
+        $isWarning = Select-String -InputObject $diagnosticText -Pattern $WarningPatterns
+        if (-not $isError -and -not $isWarning) { continue }
 
         $snippet = $line.Trim()
         if ($snippet.Length -gt 180) {
             $snippet = $snippet.Substring(0, 180) + '...'
         }
 
-        return [pscustomobject]@{ ok = $false; detail = "Console contains error text: $snippet" }
+        if ($isError) {
+            return [pscustomobject]@{ ok = $false; warning = $false; detail = "Console contains error text: $snippet" }
+        }
+        if ($warnings.Count -lt 3 -and $warnings -notcontains $snippet) {
+            $warnings += $snippet
+        }
     }
 
-    return [pscustomobject]@{ ok = $true; detail = "No error keywords in recent console output" }
+    if ($warnings.Count -gt 0) {
+        return [pscustomobject]@{ ok = $true; warning = $true; detail = "Console warnings: $($warnings -join ' | ') (log: $LogPath)" }
+    }
+    return [pscustomobject]@{ ok = $true; warning = $false; detail = "No console errors or warnings" }
 }
 
 function Test-Http {
     param(
         [string]$Url,
-        [int]$ExpectedStatusCode = 200
+        [int]$ExpectedStatusCode = 200,
+        [string]$ExpectedContentType
     )
 
     try {
         $response = Invoke-WebRequest -Uri $Url -UseBasicParsing -TimeoutSec 6
+        if ($ExpectedContentType -and (
+            [string]$response.Headers['Content-Type'] -notlike "$ExpectedContentType*" -or
+            [string]::IsNullOrWhiteSpace([string]$response.Content)
+        )) {
+            return [pscustomobject]@{
+                ok = $false
+                detail = "Expected nonempty $ExpectedContentType response from $Url; got HTTP $($response.StatusCode), Content-Type: $($response.Headers['Content-Type'])"
+            }
+        }
         return [pscustomobject]@{
             ok = ($response.StatusCode -eq $ExpectedStatusCode)
             detail = "HTTP $($response.StatusCode)"
@@ -142,6 +168,59 @@ function Test-Http {
             detail = $_.Exception.Message
         }
     }
+}
+
+function Test-Frontend {
+    param([string]$Url, [string]$CssUrl)
+
+    $page = Test-Http -Url $Url
+    if (-not $page.ok) { return $page }
+
+    $css = Test-Http -Url $CssUrl -ExpectedContentType 'text/css'
+    return [pscustomobject]@{
+        ok = $css.ok
+        detail = "Page: $($page.detail); CSS transform: $($css.detail)"
+    }
+}
+
+function Get-ServiceHealthResult {
+    param($TransportResult, $ConsoleResult)
+
+    return [pscustomobject]@{
+        ok = ($TransportResult.ok -and $ConsoleResult.ok)
+        warning = $ConsoleResult.warning
+        detail = if ($ConsoleResult.ok -and -not $ConsoleResult.warning) {
+            $TransportResult.detail
+        } else {
+            "{0} | {1}" -f $TransportResult.detail, $ConsoleResult.detail
+        }
+    }
+}
+
+function Write-HealthSummary {
+    param([object[]]$Results)
+
+    $allPass = $true
+    $hasWarnings = $false
+    Write-Host "Coordination Manager Health"
+    Write-Host "---------------------------"
+    foreach ($result in $Results) {
+        $status = if (-not $result.check.ok) { "FAIL" } elseif ($result.check.warning) { "WARN" } else { "PASS" }
+        if (-not $result.check.ok) { $allPass = $false }
+        if ($result.check.warning) { $hasWarnings = $true }
+        Write-Host ("[{0}] {1} ({2}) - {3}" -f $status, $result.service, $result.endpoint, $result.check.detail)
+    }
+
+    if (-not $allPass) {
+        Write-Host "Result: FAILURES DETECTED"
+        return 1
+    }
+    if ($hasWarnings) {
+        Write-Host "Result: SERVICES RESPONDING WITH WARNINGS - review diagnostics above"
+    } else {
+        Write-Host "Result: ALL SERVICES HEALTHY"
+    }
+    return 0
 }
 
 function Test-ListeningPort {
@@ -185,18 +264,15 @@ $deadline = (Get-Date).AddSeconds($MaxWaitSeconds)
 $stableSince = $null
 $serviceLogMap = Get-ServiceLogMap -StateFilePath $StateFile -FallbackLogDir $defaultLogDir
 $serviceChecks = @(
-    [pscustomobject]@{ id = "web"; service = "Web"; endpoint = "http://localhost:5173"; tester = { Test-Http -Url "http://localhost:5173" } },
+    [pscustomobject]@{ id = "web"; service = "Web"; endpoint = "http://localhost:5173"; tester = { Test-Frontend -Url "http://localhost:5173" -CssUrl "http://localhost:5173/src/index.css?direct" } },
     [pscustomobject]@{ id = "api"; service = "API"; endpoint = "http://localhost:3001/health"; tester = { Test-Http -Url "http://localhost:3001/health" } },
     [pscustomobject]@{ id = "bot"; service = "Bot"; endpoint = "localhost:3002"; tester = { Test-ListeningPort -Port 3002 } },
     [pscustomobject]@{ id = "guardian"; service = "Guardian"; endpoint = "console-only"; tester = { Test-GuardianProcess } },
-    [pscustomobject]@{ id = "docs"; service = "Docs"; endpoint = "http://localhost:5174"; tester = { Test-Http -Url "http://localhost:5174" } }
+    [pscustomobject]@{ id = "docs"; service = "Docs"; endpoint = "http://localhost:5174/docs/"; tester = { Test-Frontend -Url "http://localhost:5174/docs/" -CssUrl "http://localhost:5174/docs/src/index.css?direct" } }
 )
 
 if ($Mode -eq "localhost") {
-    $serviceChecks = @(
-        [pscustomobject]@{ id = "web"; service = "Web"; endpoint = "http://localhost:5173"; tester = { Test-Http -Url "http://localhost:5173" } },
-        [pscustomobject]@{ id = "api"; service = "API"; endpoint = "http://localhost:3001/health"; tester = { Test-Http -Url "http://localhost:3001/health" } }
-    )
+    $serviceChecks = @($serviceChecks | Where-Object { $_.id -in @('web', 'api', 'docs') })
 }
 
 $latestResults = @{}
@@ -207,16 +283,8 @@ while ((Get-Date) -lt $deadline) {
     foreach ($serviceCheck in $serviceChecks) {
         $transportResult = & $serviceCheck.tester
         $logPath = $serviceLogMap[$serviceCheck.id]
-        $consoleResult = Test-ServiceConsoleLog -ServiceName $serviceCheck.service -LogPath $logPath -TailLines $LogTailLines -Patterns $consoleErrorPatterns -IgnorePatterns $consoleIgnorePatterns
-
-        $combined = [pscustomobject]@{
-            ok = ($transportResult.ok -and $consoleResult.ok)
-            detail = if ($consoleResult.ok) {
-                $transportResult.detail
-            } else {
-                "{0} | {1}" -f $transportResult.detail, $consoleResult.detail
-            }
-        }
+        $consoleResult = Test-ServiceConsoleLog -ServiceName $serviceCheck.service -LogPath $logPath -TailLines $LogTailLines -Patterns $consoleErrorPatterns -WarningPatterns $consoleWarningPatterns -IgnorePatterns $consoleIgnorePatterns
+        $combined = Get-ServiceHealthResult -TransportResult $transportResult -ConsoleResult $consoleResult
 
         $latestResults[$serviceCheck.service] = $combined
         if (-not $combined.ok) {
@@ -248,22 +316,4 @@ $results = foreach ($serviceCheck in $serviceChecks) {
     }
 }
 
-$allPass = $true
-Write-Host "Coordination Manager Health"
-Write-Host "---------------------------"
-foreach ($result in $results) {
-    $status = if ($result.check.ok) { "PASS" } else { "FAIL" }
-    if (-not $result.check.ok) {
-        $allPass = $false
-    }
-
-    Write-Host ("[{0}] {1} ({2}) - {3}" -f $status, $result.service, $result.endpoint, $result.check.detail)
-}
-
-if ($allPass) {
-    Write-Host "Result: ALL SERVICES HEALTHY"
-    exit 0
-}
-
-Write-Host "Result: FAILURES DETECTED"
-exit 1
+exit (Write-HealthSummary -Results $results)

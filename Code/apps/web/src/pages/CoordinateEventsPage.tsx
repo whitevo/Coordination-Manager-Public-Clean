@@ -1,19 +1,27 @@
 import { useState, useEffect, useMemo, useCallback, useRef } from 'react'
-import { Link } from 'react-router-dom'
+import { Link, useLocation } from 'react-router-dom'
 import { format, startOfWeek, addDays, addWeeks, subWeeks, addMonths, isSameDay, parse } from 'date-fns'
-import { ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Calendar, Plus, Trash2, X, Download, Eye, EyeOff, Check, ExternalLink, Loader2, Search, Bell, BellOff, Network, CalendarPlus, Copy, RefreshCw, PanelLeftClose, PanelLeftOpen, Repeat2, AlertTriangle } from 'lucide-react'
+import { ChevronLeft, ChevronRight, ChevronDown, ChevronUp, Calendar, Plus, Trash2, X, Download, Eye, EyeOff, Check, ExternalLink, Loader2, Search, Bell, BellOff, Network, CalendarPlus, Copy, RefreshCw, PanelLeftClose, PanelLeftOpen, Repeat2, AlertTriangle, Scale, Filter, Flag } from 'lucide-react'
 import { apiClient } from '../lib/api-client'
 import { useAuth } from '../contexts/AuthContext'
 import { computeDayLayout } from '../lib/calendarOverlapLayout'
 import TimezoneSelector from '../components/TimezoneSelector'
 import { LeftPanelPortal } from '../contexts/LayoutContext'
+import { useMobileNavigationPanelDismiss } from '../hooks/use-mobile-navigation-panel-dismiss'
 import { useTimezones } from '../lib/use-timezones'
 import { findTimezone, convertUtcTimeToTimezone, convertUtcTimeToTimezoneOnDate, getCurrentTimeInTimezone, detectDstTransitions, type DstTransition } from '../lib/timezone-data'
+import { notifyPublicEventsSync } from '../lib/public-events-sync'
+import { OVERLAY_LAYER_CLASS, OVERLAY_SCRIM, isTopOverlay } from '../lib/overlay-layers'
+import { useOverlayLayer } from '../lib/use-overlay-layer'
+import { getTopObstructionPx } from '../lib/top-obstruction'
+import { getRecurringEventStartsInRange, getUtcWeekRange, splitRecurringEventRule } from '../lib/recurrence'
+import CalendarSubscriptionList, { type CalendarSubscription as Subscription } from '@/components/calendar-subscription-list'
+import { stripHtmlTags } from '../lib/strip-html-tags'
 
 /** Strip HTML tags from text and render URLs as clickable links with copy buttons */
 function LinkifyText({ text }: { text: string }) {
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null)
-  const stripped = text.replace(/<[^>]*>/g, '')
+  const stripped = stripHtmlTags(text)
   const markdownLinkRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g
   const normalized = stripped.replace(markdownLinkRegex, (_match, label: string, url: string) => {
     const trimmedLabel = label.trim()
@@ -26,14 +34,15 @@ function LinkifyText({ text }: { text: string }) {
       {parts.map((part, i) =>
         /^https?:\/\//.test(part) ? (
           <span key={i} className="inline-flex items-center gap-1">
-            <a href={part} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline break-all">{part}</a>
-            <button
+            <a href={part} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline break-all">{part}</a>
+            <IconButton
+              size="micro"
+              intent={copiedUrl === part ? 'success' : 'neutral'}
+              label="Copy link"
+              icon={copiedUrl === part ? <Check /> : <Copy />}
               onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(part); setCopiedUrl(part); setTimeout(() => setCopiedUrl(null), 2000) }}
-              className="inline-flex p-0.5 rounded hover:bg-muted transition-colors shrink-0 align-middle"
-              title="Copy link"
-            >
-              {copiedUrl === part ? <Check className="w-3 h-3 text-green-500" /> : <Copy className="w-3 h-3 text-muted-foreground" />}
-            </button>
+              className="align-middle"
+            />
           </span>
         ) : (
           <span key={i}>{part}</span>
@@ -44,6 +53,8 @@ function LinkifyText({ text }: { text: string }) {
 }
 import { downloadICSFile, buildOutlookCalendarUrl, isSafeUrl, resolveMeetingTitle } from '../lib/calendar-utils'
 import ConfirmDialog from '../components/ConfirmDialog'
+import { Dialog } from '../components/ui/Dialog'
+import { Button, CountBadge, Disclosure, IconButton, ToggleButton } from '../components/ui'
 import { useToast } from '../components/Toast'
 
 const SLOT_HEIGHT = 48
@@ -68,15 +79,16 @@ type UserEvent = {
   updated_at: string
 }
 
-type RecurrenceType = 'none' | 'weekly' | 'biweekly' | 'monthly' | 'custom'
+type RecurrenceType = 'none' | 'weekly' | 'biweekly' | 'monthly' | 'monthlyWeek' | 'custom'
 type RecurrenceUnit = 'day' | 'week' | 'month'
-type RecurrenceEndType = 'never' | 'on' | 'after'
+type RecurrenceEndType = 'never' | 'on' | 'after' | 'whenCompleted'
 
 type RecurrenceRule = {
   type: RecurrenceType
   interval?: number
   unit?: RecurrenceUnit
   weekDays?: number[]
+  monthWeeks?: number[]
   endType?: RecurrenceEndType
   endDate?: string
   endCount?: number
@@ -115,13 +127,6 @@ type SubscribedMeeting = {
   meeting_link: string | null
   created_at: string
   source_type: 'subscription'
-}
-
-type Subscription = {
-  id: string
-  calendar_id: string
-  created_at: string
-  calendars: { id: string; hash: string; title: string; visibility: string } | null
 }
 
 type ImportSyncMode = 'once' | 'range' | 'indefinite'
@@ -166,17 +171,15 @@ const NETWORK_FILTER_MODES_KEY = 'coordinateEventsNetworkFilterModes'
 const MAIN_NETWORK_LABEL = 'Secret Swarm'
 const MAIN_CALENDAR_MODE_LABEL = 'Main'
 const MAIN_CALENDAR_DATA_CONTROLLER_LABEL = 'Volatire Swarm as data controller'
-const DAY_MS = 24 * 60 * 60 * 1000
-const RECURRENCE_MAX_LOOKAHEAD_DAYS = 365 * 20
 
 const isRecurrenceType = (value: unknown): value is RecurrenceRule['type'] =>
-  value === 'none' || value === 'weekly' || value === 'biweekly' || value === 'monthly' || value === 'custom'
+  value === 'none' || value === 'weekly' || value === 'biweekly' || value === 'monthly' || value === 'monthlyWeek' || value === 'custom'
 
 const isRecurrenceUnit = (value: unknown): value is NonNullable<RecurrenceRule['unit']> =>
   value === 'day' || value === 'week' || value === 'month'
 
 const isRecurrenceEndType = (value: unknown): value is NonNullable<RecurrenceRule['endType']> =>
-  value === 'never' || value === 'on' || value === 'after'
+  value === 'never' || value === 'on' || value === 'after' || value === 'whenCompleted'
 
 const normalizeRecurrenceRule = (value: unknown): RecurrenceRule => {
   if (!value || typeof value !== 'object') return { type: 'none' }
@@ -191,6 +194,9 @@ const normalizeRecurrenceRule = (value: unknown): RecurrenceRule => {
   const weekDays = Array.isArray(candidate.weekDays)
     ? Array.from(new Set(candidate.weekDays.filter((entry): entry is number => Number.isInteger(entry) && entry >= 0 && entry <= 6)))
     : undefined
+  const monthWeeks = Array.isArray(candidate.monthWeeks)
+    ? Array.from(new Set(candidate.monthWeeks.filter((entry): entry is number => Number.isInteger(entry) && entry >= 1 && entry <= 4))).sort((a, b) => a - b)
+    : undefined
   const endType = isRecurrenceEndType(candidate.endType) ? candidate.endType : 'never'
   const endDate = typeof candidate.endDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(candidate.endDate) ? candidate.endDate : undefined
   const endCountValue = typeof candidate.endCount === 'number' ? candidate.endCount : Number(candidate.endCount)
@@ -204,6 +210,7 @@ const normalizeRecurrenceRule = (value: unknown): RecurrenceRule => {
     interval,
     unit,
     weekDays: weekDays && weekDays.length > 0 ? weekDays : undefined,
+    monthWeeks: monthWeeks && monthWeeks.length > 0 ? monthWeeks : undefined,
     endType,
     endDate,
     endCount,
@@ -213,103 +220,6 @@ const normalizeRecurrenceRule = (value: unknown): RecurrenceRule => {
 
 const getUtcDateKey = (date: Date): string => date.toISOString().slice(0, 10)
 
-const getRecurrenceWeekdayIndex = (date: Date): number => {
-  const jsDay = date.getUTCDay()
-  return jsDay === 0 ? 6 : jsDay - 1
-}
-
-const buildRecurrenceOccurrenceStart = (baseStart: Date, day: Date): string => {
-  return new Date(Date.UTC(
-    day.getUTCFullYear(),
-    day.getUTCMonth(),
-    day.getUTCDate(),
-    baseStart.getUTCHours(),
-    baseStart.getUTCMinutes(),
-    0,
-    0,
-  )).toISOString()
-}
-
-const isRecurringOccurrenceDate = (candidate: Date, baseStart: Date, rule: RecurrenceRule): boolean => {
-  const dayDiff = Math.floor((candidate.getTime() - baseStart.getTime()) / DAY_MS)
-  if (dayDiff < 0) return false
-
-  if (rule.type === 'weekly' || rule.type === 'biweekly') {
-    const interval = rule.type === 'biweekly' ? 14 : 7
-    return dayDiff % interval === 0 && getRecurrenceWeekdayIndex(candidate) === getRecurrenceWeekdayIndex(baseStart)
-  }
-
-  if (rule.type === 'monthly') {
-    const monthDiff = (candidate.getUTCFullYear() - baseStart.getUTCFullYear()) * 12 + (candidate.getUTCMonth() - baseStart.getUTCMonth())
-    return candidate.getUTCDate() === baseStart.getUTCDate() && monthDiff % 1 === 0
-  }
-
-  if (rule.type !== 'custom') return false
-
-  const interval = rule.interval || 1
-  const unit = rule.unit || 'week'
-  if (unit === 'day') {
-    return dayDiff % interval === 0
-  }
-
-  if (unit === 'week') {
-    const allowedWeekDays = rule.weekDays && rule.weekDays.length > 0 ? rule.weekDays : [getRecurrenceWeekdayIndex(baseStart)]
-    const weekDiff = Math.floor(dayDiff / 7)
-    return weekDiff % interval === 0 && allowedWeekDays.includes(getRecurrenceWeekdayIndex(candidate))
-  }
-
-  const monthDiff = (candidate.getUTCFullYear() - baseStart.getUTCFullYear()) * 12 + (candidate.getUTCMonth() - baseStart.getUTCMonth())
-  return candidate.getUTCDate() === baseStart.getUTCDate() && monthDiff % interval === 0
-}
-
-const getRecurringEventStartsInWeek = (event: UserEvent, currentWeekStart: Date): string[] => {
-  const recurrenceRule = normalizeRecurrenceRule(event.recurrence_rule)
-  if (recurrenceRule.type === 'none') return []
-
-  const baseStart = new Date(event.start_time)
-  if (Number.isNaN(baseStart.getTime())) return []
-
-  const weekStart = new Date(currentWeekStart.getTime())
-  const weekEnd = addDays(currentWeekStart, 7)
-  const endDate = recurrenceRule.endType === 'on' && recurrenceRule.endDate ? new Date(`${recurrenceRule.endDate}T00:00:00Z`) : null
-  const exceptionDates = recurrenceRule.exceptions && recurrenceRule.exceptions.length > 0 ? new Set(recurrenceRule.exceptions) : null
-  const matchedStarts: string[] = []
-  let matchedCount = 0
-
-  const baseDay = new Date(Date.UTC(baseStart.getUTCFullYear(), baseStart.getUTCMonth(), baseStart.getUTCDate()))
-  if (weekEnd.getTime() <= baseDay.getTime()) return []
-
-  const daysUntilWeekEnd = Math.max(0, Math.floor((weekEnd.getTime() - baseDay.getTime()) / DAY_MS))
-  const maxOffset = Math.min(RECURRENCE_MAX_LOOKAHEAD_DAYS, daysUntilWeekEnd + 7)
-
-  for (let offset = 0; offset <= maxOffset; offset++) {
-    const candidate = addDays(baseStart, offset)
-    const candidateDay = new Date(Date.UTC(candidate.getUTCFullYear(), candidate.getUTCMonth(), candidate.getUTCDate()))
-    if (candidateDay.getTime() < baseDay.getTime()) continue
-    if (endDate && candidateDay.getTime() > Date.UTC(endDate.getUTCFullYear(), endDate.getUTCMonth(), endDate.getUTCDate())) break
-    if (!isRecurringOccurrenceDate(candidate, baseStart, recurrenceRule)) continue
-
-    matchedCount++
-    if (recurrenceRule.endType === 'after' && recurrenceRule.endCount && matchedCount > recurrenceRule.endCount) {
-      break
-    }
-
-    if (exceptionDates && exceptionDates.has(getUtcDateKey(candidate))) {
-      if (candidateDay.getTime() >= weekEnd.getTime()) break
-      continue
-    }
-
-    if (candidateDay.getTime() >= weekStart.getTime() && candidateDay.getTime() < weekEnd.getTime()) {
-      matchedStarts.push(buildRecurrenceOccurrenceStart(baseStart, candidate))
-    }
-
-    if (candidateDay.getTime() >= weekEnd.getTime()) {
-      break
-    }
-  }
-
-  return matchedStarts
-}
 
 const formatRecurrenceSummary = (rule: RecurrenceRule): string => {
   if (rule.type === 'none') return 'One-off'
@@ -318,6 +228,11 @@ const formatRecurrenceSummary = (rule: RecurrenceRule): string => {
   if (rule.type === 'weekly') base = 'Weekly'
   else if (rule.type === 'biweekly') base = 'Bi-weekly'
   else if (rule.type === 'monthly') base = 'Monthly'
+  else if (rule.type === 'monthlyWeek') {
+    const weekLabels = ['1st', '2nd', '3rd', '4th']
+    const weeks = rule.monthWeeks && rule.monthWeeks.length > 0 ? rule.monthWeeks : []
+    base = weeks.length > 0 ? `Monthly (${weeks.map((w) => weekLabels[w - 1] || `${w}th`).join(', ')})` : 'Monthly (by week)'
+  }
   else if (rule.type === 'custom') {
     const interval = rule.interval || 1
     const unit = rule.unit || 'week'
@@ -326,6 +241,7 @@ const formatRecurrenceSummary = (rule: RecurrenceRule): string => {
 
   if (rule.endType === 'on' && rule.endDate) return `${base} until ${rule.endDate}`
   if (rule.endType === 'after' && rule.endCount) return `${base} (${rule.endCount} times)`
+  if (rule.endType === 'whenCompleted') return `${base} until marked as completed`
   return base
 }
 
@@ -489,8 +405,52 @@ export default function CoordinateEventsPage() {
     const [onConfirmAction, setOnConfirmAction] = useState<(() => void) | null>(null);
   const { user, isAuthenticated } = useAuth()
   const { showToast } = useToast()
+  const location = useLocation()
   const calendarGridRef = useRef<HTMLDivElement>(null)
   const nowLineRef = useRef<HTMLDivElement>(null)
+
+  // Flagged public event moderation tracking
+  const [activeFlaggedTargetIds, setActiveFlaggedTargetIds] = useState<Set<string>>(new Set())
+  const [activeFlaggedTitles, setActiveFlaggedTitles] = useState<Set<string>>(new Set())
+  const [hoveredFlagDetail, setHoveredFlagDetail] = useState<{
+    targetIds: string[]
+    targetTitles: string[]
+  } | null>(null)
+
+  const loadActiveFlags = useCallback(async () => {
+    if (!isAuthenticated) return
+    try {
+      const res = await apiClient.get('/api/event-flags/mine')
+      const flags = res.data.flags || []
+      const ids = new Set<string>()
+      const titles = new Set<string>()
+      for (const flag of flags) {
+        if (flag.status === 'pending' || flag.status === 'expired') {
+          for (const target of flag.targets) {
+            if (target.id) ids.add(target.id)
+            if (target.title) titles.add(target.title.trim().toLowerCase())
+          }
+        }
+      }
+      setActiveFlaggedTargetIds(ids)
+      setActiveFlaggedTitles(titles)
+    } catch {
+      // Ignore
+    }
+  }, [isAuthenticated])
+
+  useEffect(() => {
+    void loadActiveFlags()
+  }, [loadActiveFlags])
+
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const custom = e as CustomEvent<{ targetIds: string[]; targetTitles: string[] } | null>
+      setHoveredFlagDetail(custom.detail || null)
+    }
+    window.addEventListener('cm:hover-event-flag', handler)
+    return () => window.removeEventListener('cm:hover-event-flag', handler)
+  }, [])
 
   // Calendar grid state
   const [currentWeekStart, setCurrentWeekStart] = useState(() =>
@@ -563,13 +523,27 @@ export default function CoordinateEventsPage() {
   // Selected event for details
   type GridItem = { kind: 'event'; data: EventOccurrence } | { kind: 'sub'; data: SubscribedMeeting }
   const [selectedEvent, setSelectedEvent] = useState<UserEvent | null>(null)
+  // Start of the clicked occurrence; selectedEvent holds the series row for recurring items.
+  const [selectedOccurrenceStart, setSelectedOccurrenceStart] = useState<string | null>(null)
   const [selectedSubMeeting, setSelectedSubMeeting] = useState<SubscribedMeeting | null>(null)
   const [copiedLink, setCopiedLink] = useState(false)
   const [overflowPanelItems, setOverflowPanelItems] = useState<GridItem[] | null>(null)
 
+  // Remove public series modal state
+  const [removePublicModalEvent, setRemovePublicModalEvent] = useState<UserEvent | null>(null)
+  const [removePublicOccurrenceStart, setRemovePublicOccurrenceStart] = useState<string | null>(null)
+  const [removePublicScope, setRemovePublicScope] = useState<'this-only' | 'this-and-future' | 'all-series'>('this-and-future')
+  const [isRemovingPublic, setIsRemovingPublic] = useState(false)
+
   // Subscriptions state
   const [subscriptions, setSubscriptions] = useState<Subscription[]>([])
   const [subscribedMeetings, setSubscribedMeetings] = useState<SubscribedMeeting[]>([])
+  const [subscriptionsLoading, setSubscriptionsLoading] = useState(false)
+  const [subscriptionsError, setSubscriptionsError] = useState(false)
+  const [meetingsLoading, setMeetingsLoading] = useState(false)
+  const [meetingsError, setMeetingsError] = useState(false)
+  const [pendingUnsubscribeHashes, setPendingUnsubscribeHashes] = useState<Set<string>>(new Set())
+  const unsubscribeRequests = useRef(new Set<string>())
 
   // Search for coordination calendars
   const [coordCalendars, setCoordCalendars] = useState<Array<{ hash: string; title: string; visibility?: string }>>([])
@@ -630,10 +604,26 @@ export default function CoordinateEventsPage() {
   // Collapsible section states
   const [_bulkExpanded, _setBulkExpanded] = useState(false)
   const [isLeftToolsPanelOpen, setIsLeftToolsPanelOpen] = useState(false)
+  useMobileNavigationPanelDismiss(() => setIsLeftToolsPanelOpen(false))
+  const [calendarFiltersExpanded, setCalendarFiltersExpanded] = useState(true)
+  const [showOnlyPublic, setShowOnlyPublic] = useState(false)
   const [networksExpanded, setNetworksExpanded] = useState(true)
   const [followingExpanded, setFollowingExpanded] = useState(true)
   const [sidePanelPublishAutoSync, setSidePanelPublishAutoSync] = useState(true)
   const [sidePanelPublishAutoPublishNew, setSidePanelPublishAutoPublishNew] = useState(false)
+
+  useEffect(() => {
+    const handler = () => {
+      setIsLeftToolsPanelOpen(true)
+      setShowOnlyPublic(true)
+      setCalendarFiltersExpanded(true)
+    }
+    window.addEventListener('openCommonsPanel', handler)
+    if (location.state?.openCommons) {
+      handler()
+    }
+    return () => window.removeEventListener('openCommonsPanel', handler)
+  }, [location.state])
 
   // Network card filtering
   const [networkFilterModes, setNetworkFilterModes] = useState<Record<string, NetworkFilterMode>>(loadStoredNetworkFilterModes)
@@ -654,6 +644,34 @@ export default function CoordinateEventsPage() {
     return true
   }, [networkFilterModes])
 
+  const isEventFlagged = useCallback((ev: UserEvent): boolean => {
+    if (activeFlaggedTargetIds.has(ev.id)) return true
+    if (ev.external_event_id && activeFlaggedTargetIds.has(ev.external_event_id)) return true
+    if (activeFlaggedTitles.has(ev.title.trim().toLowerCase())) return true
+    return false
+  }, [activeFlaggedTargetIds, activeFlaggedTitles])
+
+  const isEventHoveredFromCommons = useCallback((ev: UserEvent): boolean => {
+    if (!hoveredFlagDetail) return false
+    const { targetIds, targetTitles } = hoveredFlagDetail
+    if (targetIds.includes(ev.id)) return true
+    if (ev.external_event_id && targetIds.includes(ev.external_event_id)) return true
+    const normTitle = ev.title.trim().toLowerCase()
+    if (targetTitles.some(t => t.trim().toLowerCase() === normTitle)) return true
+    return false
+  }, [hoveredFlagDetail])
+
+  const hoveredNetworkNamesFromCommons = useMemo(() => {
+    if (!hoveredFlagDetail) return new Set<string>()
+    const highlightedNets = new Set<string>()
+    for (const ev of events) {
+      if (isEventHoveredFromCommons(ev)) {
+        highlightedNets.add(getNetworkLabel(ev.source_type, ev.source_id))
+      }
+    }
+    return highlightedNets
+  }, [hoveredFlagDetail, events, isEventHoveredFromCommons, getNetworkLabel])
+
   // Current time state for red line and UTC clock
   const [currentTime, setCurrentTime] = useState(new Date())
   const [utcNow, setUtcNow] = useState(() => new Date())
@@ -673,6 +691,47 @@ export default function CoordinateEventsPage() {
     return () => mq.removeEventListener('change', onChange)
   }, [])
 
+  // Phone tools drawer: claims the drawer tier (scrim renders first, panel
+  // shares the claim), starts right below the app nav so it covers the page
+  // header, closes on Escape when topmost, and moves focus in and back out.
+  const isPhoneToolsDrawerOpen = isPhoneViewport && isLeftToolsPanelOpen
+  const { z: phoneToolsDrawerZ, layer: phoneToolsDrawerLayer } = useOverlayLayer('drawer', isPhoneToolsDrawerOpen)
+  const [phoneToolsDrawerTop, setPhoneToolsDrawerTop] = useState(0)
+  const phoneToolsCloseRef = useRef<HTMLButtonElement>(null)
+
+  useEffect(() => {
+    if (!isPhoneToolsDrawerOpen) return
+    const updateTop = () => setPhoneToolsDrawerTop(getTopObstructionPx())
+    updateTop()
+    window.addEventListener('resize', updateTop)
+    window.addEventListener('scroll', updateTop, { passive: true })
+    return () => {
+      window.removeEventListener('resize', updateTop)
+      window.removeEventListener('scroll', updateTop)
+    }
+  }, [isPhoneToolsDrawerOpen])
+
+  useEffect(() => {
+    if (!isPhoneToolsDrawerOpen) return
+    const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : null
+    phoneToolsCloseRef.current?.focus()
+    return () => {
+      if (trigger?.isConnected) trigger.focus()
+    }
+  }, [isPhoneToolsDrawerOpen])
+
+  useEffect(() => {
+    if (!phoneToolsDrawerLayer) return
+    const layerId = phoneToolsDrawerLayer.id
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== 'Escape' || event.defaultPrevented || !isTopOverlay(layerId)) return
+      event.preventDefault()
+      setIsLeftToolsPanelOpen(false)
+    }
+    window.addEventListener('keydown', handleKeyDown)
+    return () => window.removeEventListener('keydown', handleKeyDown)
+  }, [phoneToolsDrawerLayer])
+
   // ─── Data fetching ──────────────────────────────────────────
 
   const fetchEvents = useCallback(async () => {
@@ -686,6 +745,16 @@ export default function CoordinateEventsPage() {
       setEventsLoading(false)
     }
   }, [isAuthenticated])
+
+  useEffect(() => {
+    const handleFlagsChanged = () => {
+      void loadActiveFlags()
+      void fetchEvents()
+      setHoveredFlagDetail(null)
+    }
+    window.addEventListener('eventFlagsChanged', handleFlagsChanged)
+    return () => window.removeEventListener('eventFlagsChanged', handleFlagsChanged)
+  }, [loadActiveFlags, fetchEvents])
 
   const fetchCalendarSources = useCallback(async () => {
     if (!isAuthenticated) return
@@ -716,16 +785,22 @@ export default function CoordinateEventsPage() {
 
   const fetchSubscriptions = useCallback(async () => {
     if (!isAuthenticated) return
+    setSubscriptionsLoading(true)
     try {
       const res = await apiClient.get('/api/calendar-subscriptions')
       setSubscriptions(res.data.subscriptions || [])
-    } catch {
-      // ignore
+      setSubscriptionsError(false)
+    } catch (err) {
+      console.error('Failed to fetch subscriptions:', err)
+      setSubscriptionsError(true)
+    } finally {
+      setSubscriptionsLoading(false)
     }
   }, [isAuthenticated])
 
   const fetchSubscribedMeetings = useCallback(async () => {
     if (!isAuthenticated) return
+    setMeetingsLoading(true)
     try {
       const res = await apiClient.get('/api/calendar-subscriptions/meetings')
       // Ensure timestamps are treated as UTC (meetings table uses plain TIMESTAMP)
@@ -737,8 +812,12 @@ export default function CoordinateEventsPage() {
         end_time: ensureUTC(m.end_time),
       }))
       setSubscribedMeetings(normalized)
-    } catch {
-      // ignore
+      setMeetingsError(false)
+    } catch (err) {
+      console.error('Failed to fetch subscribed meetings:', err)
+      setMeetingsError(true)
+    } finally {
+      setMeetingsLoading(false)
     }
   }, [isAuthenticated])
 
@@ -789,12 +868,19 @@ export default function CoordinateEventsPage() {
   }, [isAuthenticated])
 
   const handleUnsubscribe = async (calendarHash: string) => {
+    if (unsubscribeRequests.current.has(calendarHash)) return
+    unsubscribeRequests.current.add(calendarHash)
+    setPendingUnsubscribeHashes(new Set(unsubscribeRequests.current))
     try {
       await apiClient.delete(`/api/calendar-subscriptions/${calendarHash}`)
       setSubscriptions(prev => prev.filter(s => s.calendars?.hash !== calendarHash))
       setSubscribedMeetings(prev => prev.filter(m => m.calendar_hash !== calendarHash))
     } catch (err) {
       console.error('Failed to unsubscribe:', err)
+      showToast('Failed to unsubscribe. Please try again.', 'error')
+    } finally {
+      unsubscribeRequests.current.delete(calendarHash)
+      setPendingUnsubscribeHashes(new Set(unsubscribeRequests.current))
     }
   }
 
@@ -1048,7 +1134,8 @@ export default function CoordinateEventsPage() {
 
   const timeSlots = generateTimeSlots()
   const weekDays = useMemo(() => Array.from({ length: 7 }, (_, i) => addDays(currentWeekStart, i)), [currentWeekStart])
-  const weekEnd = addDays(currentWeekStart, 7)
+  // Grid rows are UTC times, so week filters use the UTC range of the visible date labels.
+  const { start: utcWeekStart, end: weekEnd } = useMemo(() => getUtcWeekRange(currentWeekStart), [currentWeekStart])
 
   const formatTimeLabel = (time: string) => convertUtcTimeToTimezone(time, tzState.primary)
 
@@ -1118,7 +1205,11 @@ export default function CoordinateEventsPage() {
     const occurrences: EventOccurrence[] = []
 
     for (const ev of representativeEvents) {
-      if (!isNetworkVisibleByName(getNetworkLabel(ev.source_type, ev.source_id))) continue
+      if (showOnlyPublic) {
+        if (!ev.is_public) continue
+      } else {
+        if (!isNetworkVisibleByName(getNetworkLabel(ev.source_type, ev.source_id))) continue
+      }
 
       const baseStart = new Date(ev.start_time)
       const baseEnd = new Date(ev.end_time)
@@ -1127,7 +1218,7 @@ export default function CoordinateEventsPage() {
 
       const recurrenceRule = normalizeRecurrenceRule(ev.recurrence_rule)
       if (recurrenceRule.type === 'none') {
-        if (baseStart < weekEnd && baseEnd > currentWeekStart) {
+        if (baseStart < weekEnd && baseEnd > utcWeekStart) {
           occurrences.push({
             event: ev,
             start_time: ev.start_time,
@@ -1138,11 +1229,11 @@ export default function CoordinateEventsPage() {
         continue
       }
 
-      const recurringStarts = getRecurringEventStartsInWeek(ev, currentWeekStart)
+      const recurringStarts = getRecurringEventStartsInRange(ev, utcWeekStart, weekEnd, { calendarDayCadence: true })
       for (const occStartIso of recurringStarts) {
         const occStart = new Date(occStartIso)
         const occEnd = new Date(occStart.getTime() + durationMs)
-        if (occStart < weekEnd && occEnd > currentWeekStart) {
+        if (occStart < weekEnd && occEnd > utcWeekStart) {
           occurrences.push({
             event: ev,
             start_time: occStart.toISOString(),
@@ -1154,15 +1245,18 @@ export default function CoordinateEventsPage() {
     }
 
     return occurrences
-  }, [representativeEvents, currentWeekStart, weekEnd, getNetworkLabel, isNetworkVisibleByName])
+  }, [representativeEvents, utcWeekStart, weekEnd, getNetworkLabel, isNetworkVisibleByName, showOnlyPublic])
 
   const subMeetingsInWeek = useMemo(() => {
     return subscribedMeetings.filter(m => {
       const mStart = new Date(m.start_time)
       const mEnd = new Date(m.end_time)
-      return mStart < weekEnd && mEnd > currentWeekStart && isNetworkVisibleByName(getNetworkLabel('sub', m.calendar_hash, m.calendar_title || 'Subscription'))
+      const matchesTime = mStart < weekEnd && mEnd > utcWeekStart
+      if (!matchesTime) return false
+      if (showOnlyPublic) return true
+      return isNetworkVisibleByName(getNetworkLabel('sub', m.calendar_hash, m.calendar_title || 'Subscription'))
     })
-  }, [subscribedMeetings, currentWeekStart, weekEnd, getNetworkLabel, isNetworkVisibleByName])
+  }, [subscribedMeetings, utcWeekStart, weekEnd, getNetworkLabel, isNetworkVisibleByName, showOnlyPublic])
 
   // Combined items for grid display
 
@@ -1333,6 +1427,7 @@ export default function CoordinateEventsPage() {
       await apiClient.put('/api/user-events/bulk-public', { event_ids: ids, is_public: isPublic })
       setEvents(prev => prev.map(e => ids.includes(e.id) ? { ...e, is_public: isPublic } : e))
       setSelectedCells(new Set())
+      notifyPublicEventsSync('public-toggle')
     } catch (err) {
       console.error('Failed to bulk update:', err)
     }
@@ -1390,7 +1485,164 @@ export default function CoordinateEventsPage() {
 
   // ─── Event actions ────────────────────────────────────────
 
-  const handleTogglePublic = async (event: UserEvent) => {
+  const getMatchingSeriesEvents = useCallback((event: UserEvent): UserEvent[] => {
+    const normTitle = normalizeIdentityField(event.title)
+    if (!normTitle) return [event]
+
+    const normLink = normalizeIdentityField(event.meeting_link)
+    const normLoc = normalizeIdentityField(event.location)
+
+    return events.filter(e => {
+      if (e.id === event.id) return true
+      const eTitle = normalizeIdentityField(e.title)
+      if (eTitle !== normTitle) return false
+
+      const eLink = normalizeIdentityField(e.meeting_link)
+      if (normLink && eLink) return normLink === eLink
+
+      const eLoc = normalizeIdentityField(e.location)
+      if (normLoc && eLoc) return normLoc === eLoc
+
+      if (e.source_id && event.source_id) return e.source_id === event.source_id
+      return true
+    })
+  }, [events])
+
+  const isEventRecurringSeries = useCallback((event: UserEvent): boolean => {
+    const rule = normalizeRecurrenceRule(event.recurrence_rule)
+    if (rule.endType === 'whenCompleted') return false
+    if (rule.type !== 'none') return true
+    const matching = getMatchingSeriesEvents(event)
+    return matching.length > 1
+  }, [getMatchingSeriesEvents])
+
+  const openRemovePublicSeriesModal = (event: UserEvent, occurrenceStart?: string | null) => {
+    setRemovePublicModalEvent(event)
+    setRemovePublicOccurrenceStart(occurrenceStart || event.start_time)
+    setRemovePublicScope('this-and-future')
+  }
+
+  const handleConfirmRemovePublicSeries = async () => {
+    if (!removePublicModalEvent) return
+    setIsRemovingPublic(true)
+
+    const event = removePublicModalEvent
+    const occurrenceStart = removePublicOccurrenceStart || event.start_time
+    const occurrenceEnd = new Date(new Date(occurrenceStart).getTime()
+      + (new Date(event.end_time).getTime() - new Date(event.start_time).getTime())).toISOString()
+    const rule = normalizeRecurrenceRule(event.recurrence_rule)
+    const isRecurringRule = rule.type !== 'none'
+    const matchingEvents = getMatchingSeriesEvents(event)
+    const groupedRows = groupedEventsByRepresentativeId.get(event.id) || [event]
+
+    try {
+      if (removePublicScope === 'this-only') {
+        if (isRecurringRule) {
+          const occDateKey = getUtcDateKey(new Date(occurrenceStart))
+          const nextExceptions = Array.from(new Set([...(rule.exceptions || []), occDateKey]))
+          const updatedRule: RecurrenceRule = { ...rule, exceptions: nextExceptions }
+
+          await apiClient.put(`/api/user-events/${event.id}`, { recurrence_rule: updatedRule })
+
+          // Private copy of just this occurrence, linked to its series.
+          const newStandaloneRes = await apiClient.post('/api/user-events', {
+            title: event.title,
+            description: event.description,
+            start_time: occurrenceStart,
+            end_time: occurrenceEnd,
+            meeting_link: event.meeting_link,
+            location: event.location,
+            is_public: false,
+            source_id: event.source_id,
+            recurrence_rule: { type: 'none' },
+            series_id: event.id,
+            original_start_time: occurrenceStart,
+          })
+
+          const createdStandalone = newStandaloneRes.data?.event
+
+          setEvents(prev => [
+            ...prev.map(e => e.id === event.id ? { ...e, recurrence_rule: updatedRule } : e),
+            ...(createdStandalone ? [createdStandalone] : []),
+          ])
+        } else {
+          const ids = groupedRows.map(e => e.id)
+          await apiClient.put('/api/user-events/bulk-public', { event_ids: ids, is_public: false })
+          setEvents(prev => prev.map(e => ids.includes(e.id) ? { ...e, is_public: false } : e))
+        }
+        showToast('Public status removed for this session.')
+      } else if (removePublicScope === 'this-and-future') {
+        const selectedStartTs = new Date(occurrenceStart).getTime()
+        if (isRecurringRule) {
+          const occDateKey = getUtcDateKey(new Date(occurrenceStart))
+          const baseDateKey = getUtcDateKey(new Date(event.start_time))
+          if (occDateKey <= baseDateKey) {
+            // First occurrence: "this and future" is the whole series.
+            const ids = Array.from(new Set([...matchingEvents.map(e => e.id), ...groupedRows.map(e => e.id)]))
+            await apiClient.put('/api/user-events/bulk-public', { event_ids: ids, is_public: false })
+            setEvents(prev => prev.map(e => ids.includes(e.id) ? { ...e, is_public: false } : e))
+          } else {
+            // Split: the public series ends the day before; a private series continues from here.
+            const { previousRule, nextRule } = splitRecurringEventRule(event, occurrenceStart, 'future')
+            const updatedRule = previousRule as RecurrenceRule
+            await apiClient.put(`/api/user-events/${event.id}`, { recurrence_rule: updatedRule })
+
+            const newRecurringRes = await apiClient.post('/api/user-events', {
+              title: event.title,
+              description: event.description,
+              start_time: occurrenceStart,
+              end_time: occurrenceEnd,
+              meeting_link: event.meeting_link,
+              location: event.location,
+              is_public: false,
+              source_id: event.source_id,
+              recurrence_rule: nextRule,
+            })
+
+            const createdRecurring = newRecurringRes.data?.event
+
+            setEvents(prev => [
+              ...prev.map(e => e.id === event.id ? { ...e, recurrence_rule: updatedRule } : e),
+              ...(createdRecurring ? [createdRecurring] : []),
+            ])
+          }
+        } else {
+          const futureIds = matchingEvents
+            .filter(e => new Date(e.start_time).getTime() >= selectedStartTs)
+            .map(e => e.id)
+          if (futureIds.length > 0) {
+            await apiClient.put('/api/user-events/bulk-public', { event_ids: futureIds, is_public: false })
+            setEvents(prev => prev.map(e => futureIds.includes(e.id) ? { ...e, is_public: false } : e))
+          }
+        }
+        showToast('Public status removed for this and future sessions.')
+      } else {
+        // 'all-series'
+        const allIds = Array.from(new Set([
+          ...matchingEvents.map(e => e.id),
+          ...groupedRows.map(e => e.id),
+        ]))
+        await apiClient.put('/api/user-events/bulk-public', { event_ids: allIds, is_public: false })
+        setEvents(prev => prev.map(e => allIds.includes(e.id) ? { ...e, is_public: false } : e))
+        showToast('Public status removed for all sessions in this series.')
+      }
+
+      // After a split the series row keeps its public earlier sessions.
+      const seriesStillPublic = isRecurringRule && removePublicScope !== 'all-series'
+        && !(removePublicScope === 'this-and-future' && getUtcDateKey(new Date(occurrenceStart)) <= getUtcDateKey(new Date(event.start_time)))
+      if (selectedEvent?.id === event.id && !seriesStillPublic) {
+        setSelectedEvent(prev => prev ? { ...prev, is_public: false } : null)
+      }
+      setRemovePublicModalEvent(null)
+    } catch (err) {
+      console.error('Failed to remove public status:', err)
+      showToast('Failed to remove public status.', 'error')
+    } finally {
+      setIsRemovingPublic(false)
+    }
+  }
+
+  const _handleTogglePublic = async (event: UserEvent) => {
     try {
       await apiClient.put(`/api/user-events/${event.id}`, { is_public: !event.is_public })
       setEvents(prev => prev.map(e => e.id === event.id ? { ...e, is_public: !e.is_public } : e))
@@ -1470,6 +1722,7 @@ export default function CoordinateEventsPage() {
       const res = await apiClient.put('/api/user-events/bulk-public', body)
       // Refresh events
       await fetchEvents()
+      notifyPublicEventsSync('public-toggle')
       return res.data.updated || 0
     } catch (err) {
       console.error('Failed to bulk update:', err)
@@ -1780,13 +2033,13 @@ export default function CoordinateEventsPage() {
 
   const getNetworkFilterButtonClassName = (mode?: NetworkFilterMode): string => {
     if (mode === 'pinned') {
-      return 'border-sky-300 bg-sky-100 text-sky-700 dark:border-sky-800 dark:bg-sky-900/30 dark:text-sky-300'
+      return 'border-primary-muted bg-primary-subtle text-primary'
     }
     if (mode === 'focus') {
-      return 'border-blue-300 bg-blue-100 text-blue-700 dark:border-blue-800 dark:bg-blue-900/30 dark:text-blue-300'
+      return 'border-info-muted bg-info-subtle text-info'
     }
     if (mode === 'hidden') {
-      return 'border-amber-300 bg-amber-100 text-amber-700 dark:border-amber-800 dark:bg-amber-900/30 dark:text-amber-300'
+      return 'border-warning-muted bg-warning-subtle text-warning'
     }
     return 'border-border bg-background text-muted-foreground hover:bg-accent/50 hover:text-foreground'
   }
@@ -2078,7 +2331,7 @@ export default function CoordinateEventsPage() {
             return next
           })
         }}
-        className="mt-0.5 accent-green-600 w-4 h-4 shrink-0"
+        className="mt-0.5 accent-success w-4 h-4 shrink-0"
       />
       <div className="min-w-0 flex-1">
         <p className="text-sm font-medium text-foreground truncate">{ev.title}</p>
@@ -2087,7 +2340,7 @@ export default function CoordinateEventsPage() {
         </p>
       </div>
       {ev.is_public && (
-        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300 shrink-0">
+        <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-success-subtle text-success shrink-0">
           already public
         </span>
       )}
@@ -2111,58 +2364,105 @@ export default function CoordinateEventsPage() {
   return (
     <>
       <LeftPanelPortal>
+        {isPhoneToolsDrawerOpen && (
+          <button
+            type="button"
+            aria-label="Close tools drawer"
+            data-testid="coordinate-events-tools-scrim"
+            className={`fixed inset-0 ${OVERLAY_SCRIM.drawer}`}
+            style={{ zIndex: phoneToolsDrawerZ }}
+            onClick={() => setIsLeftToolsPanelOpen(false)}
+          />
+        )}
         <aside
+          data-testid="coordinate-events-tools-panel"
+          data-open={isLeftToolsPanelOpen}
+          aria-label={isPhoneViewport ? 'Calendar tools' : undefined}
+          aria-hidden={isPhoneViewport && !isLeftToolsPanelOpen ? true : undefined}
+          inert={isPhoneViewport && !isLeftToolsPanelOpen}
           className={isPhoneViewport
-            ? `${isLeftToolsPanelOpen ? 'fixed inset-0 z-40 bg-background/70 backdrop-blur-[1px]' : 'hidden'}`
+            ? `fixed bottom-0 left-0 w-screen overflow-hidden border-0 bg-card shadow-2xl transition-[transform,visibility] duration-300 ease-out motion-reduce:transition-none ${
+              isLeftToolsPanelOpen ? 'visible translate-x-0' : 'invisible -translate-x-full'
+            }`
             : `sticky top-0 h-screen shrink-0 overflow-hidden border-r border-border bg-card transition-all duration-300 ${
               isLeftToolsPanelOpen ? 'w-96' : 'w-0'
             }`
           }
+          style={isPhoneViewport ? { top: phoneToolsDrawerTop, zIndex: phoneToolsDrawerZ } : undefined}
         >
-          {isPhoneViewport && (
-            <button
-              aria-label="Close tools drawer"
-              onClick={() => setIsLeftToolsPanelOpen(false)}
-              className="absolute inset-0"
-            />
-          )}
-          <div className={`flex h-full flex-col ${isPhoneViewport ? 'relative z-10 w-full min-w-0 bg-card shadow-xl' : 'w-96 min-w-[24rem]'}`}>
+          <div className={`flex h-full flex-col ${isPhoneViewport ? 'w-full min-w-0' : 'w-96 min-w-[24rem]'}`}>
             <div className="flex items-center justify-between border-b border-border px-4 py-3">
               <div className="flex items-center gap-2">
-                <PanelLeftOpen className="h-4 w-4 text-blue-600" />
+                <PanelLeftOpen className="h-4 w-4 text-info" />
                 <h2 className="text-sm font-semibold text-foreground">Calendar Tools</h2>
               </div>
-              <button
+              <IconButton
+                ref={phoneToolsCloseRef}
+                label="Hide side panel"
                 onClick={() => setIsLeftToolsPanelOpen(false)}
-                className="rounded-md p-1.5 text-muted-foreground hover:bg-muted hover:text-foreground"
-                title="Hide side panel"
-              >
-                <PanelLeftClose className="h-4 w-4" />
-              </button>
+                icon={<PanelLeftClose className="h-4 w-4" />}
+              />
             </div>
 
             <div className="flex-1 overflow-y-auto px-3 py-3 after:block after:h-[33vh] after:content-['']">
               <div className="border border-border rounded-lg overflow-hidden mb-3">
-                <button
-                  onClick={() => setNetworksExpanded(prev => !prev)}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-muted-foreground hover:bg-accent/50 transition-colors"
-                >
-                  <Network className="w-3.5 h-3.5" />
-                  <span>Networks</span>
-                  <span className="text-[10px] opacity-60">{networks.length}</span>
-                  {networkFilters.actionable.size > 0 && (
-                    <span className="text-[10px] px-1.5 py-0.5 bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300 rounded-full">{networkFilters.actionable.size} view active</span>
-                  )}
-                  {selectedPublishNetworks.length > 0 && (
-                    <span className="text-[10px] px-1.5 py-0.5 bg-emerald-100 dark:bg-emerald-900/30 text-emerald-700 dark:text-emerald-300 rounded-full">{selectedPublishNetworks.length} selected</span>
-                  )}
-                  {networkFilters.hidden.size > 0 && (
-                    <span className="text-[10px] px-1.5 py-0.5 bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 rounded-full">{networkFilters.hidden.size} hidden</span>
-                  )}
-                  <span className="ml-auto">{networksExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}</span>
-                </button>
+                <Disclosure
+                  size="compact"
+                  title="Calendar Filters"
+                  icon={<Filter />}
+                  trailing={showOnlyPublic ? (
+                    <span className="text-[10px] px-1.5 py-0.5 bg-success-subtle text-success rounded-full font-medium">Public only</span>
+                  ) : undefined}
+                  expanded={calendarFiltersExpanded}
+                  onToggle={(next) => setCalendarFiltersExpanded(next)}
+                  panelId="coordinate-events-calendar-filters"
+                />
+                {calendarFiltersExpanded && (
+                  <div id="coordinate-events-calendar-filters" className="px-3 pb-2.5 pt-1 space-y-2">
+                    <label className="flex items-center gap-2.5 cursor-pointer text-xs font-medium text-foreground">
+                      <input
+                        type="checkbox"
+                        checked={showOnlyPublic}
+                        onChange={e => setShowOnlyPublic(e.target.checked)}
+                        className="w-4 h-4 rounded accent-success cursor-pointer"
+                      />
+                      <div className="flex items-center gap-1.5">
+                        <Eye className="w-3.5 h-3.5 text-success shrink-0" />
+                        <span>Show Only Public</span>
+                      </div>
+                    </label>
+                    <p className="text-[10px] text-muted-foreground leading-tight pl-6">
+                      When enabled, only meetings that are published to the public Events Calendar are displayed. Includes public items from hidden networks.
+                    </p>
+                  </div>
+                )}
+              </div>
+
+              <div className="border border-border rounded-lg overflow-hidden mb-3">
+                <Disclosure
+                  size="compact"
+                  title="Networks"
+                  icon={<Network />}
+                  trailing={
+                    <span className="flex flex-wrap items-center justify-end gap-1">
+                      <CountBadge count={networks.length} />
+                      {networkFilters.actionable.size > 0 && (
+                        <span className="text-[10px] px-1.5 py-0.5 bg-info-subtle text-info rounded-full">{networkFilters.actionable.size} view active</span>
+                      )}
+                      {selectedPublishNetworks.length > 0 && (
+                        <span className="text-[10px] px-1.5 py-0.5 bg-success-subtle text-success rounded-full">{selectedPublishNetworks.length} selected</span>
+                      )}
+                      {networkFilters.hidden.size > 0 && (
+                        <span className="text-[10px] px-1.5 py-0.5 bg-warning-subtle text-warning rounded-full">{networkFilters.hidden.size} hidden</span>
+                      )}
+                    </span>
+                  }
+                  expanded={networksExpanded}
+                  onToggle={(next) => setNetworksExpanded(next)}
+                  panelId="coordinate-events-networks"
+                />
                 {networksExpanded && (
-                  <div className="px-3 pb-2">
+                  <div id="coordinate-events-networks" className="px-3 pb-2">
                     {networks.length === 0 ? (
                       <p className="rounded-md border border-border bg-background/50 p-3 text-xs text-muted-foreground">
                         No networks available yet. Import or create events to populate this list.
@@ -2188,8 +2488,14 @@ export default function CoordinateEventsPage() {
                               const filterMode = getNetworkFilterMode(net.name)
                               const isPublishSelected = publishSelectedNetworks.has(net.name)
                               const isPublishDisabled = filterMode === 'hidden'
+                              const isHoveredFromCommons = hoveredNetworkNamesFromCommons.has(net.name)
                               return (
-                                <tr key={net.name} className="border-b border-border last:border-b-0">
+                                <tr
+                                  key={net.name}
+                                  className={`border-b border-border last:border-b-0 transition-colors ${
+                                    isHoveredFromCommons ? 'bg-danger-subtle ring-2 ring-danger font-bold shadow-xs animate-pulse' : ''
+                                  }`}
+                                >
                                   <td className="py-1">
                                     <button
                                       type="button"
@@ -2205,9 +2511,9 @@ export default function CoordinateEventsPage() {
                                     <label
                                       className={`inline-flex h-6 min-w-[48px] items-center justify-center rounded border px-1.5 ${
                                         isPublishDisabled
-                                          ? 'border-amber-300 bg-amber-100 text-amber-700 dark:border-amber-800 dark:bg-amber-900/30 dark:text-amber-300 cursor-not-allowed'
+                                          ? 'border-warning-muted bg-warning-subtle text-warning cursor-not-allowed'
                                           : isPublishSelected
-                                            ? 'border-emerald-300 bg-emerald-100 dark:border-emerald-800 dark:bg-emerald-900/30'
+                                            ? 'border-success-muted bg-success-subtle'
                                             : 'border-border bg-background'
                                       }`}
                                       title={isPublishDisabled ? `${net.name} is hidden from view and cannot be selected` : `Select ${net.name}`}
@@ -2217,7 +2523,7 @@ export default function CoordinateEventsPage() {
                                         checked={isPublishSelected && !isPublishDisabled}
                                         disabled={isPublishDisabled}
                                         onChange={() => togglePublishNetworkSelection(net.name)}
-                                        className="h-3.5 w-3.5 accent-emerald-600 cursor-pointer disabled:cursor-not-allowed"
+                                        className="h-3.5 w-3.5 accent-success cursor-pointer disabled:cursor-not-allowed"
                                         aria-label={isPublishDisabled ? `${net.name} selection unavailable while hidden` : `${net.name} selected`}
                                       />
                                     </label>
@@ -2226,7 +2532,7 @@ export default function CoordinateEventsPage() {
                                   <td className="py-1">
                                     <div className="flex items-center gap-2 min-w-0">
                                       <span className="w-2.5 h-2.5 rounded-full inline-block shrink-0" style={{ backgroundColor: net.color }} />
-                                      <span className="whitespace-normal break-words leading-tight" title={getNetworkHoverTitle(net.sourceKey)}>{net.name}</span>
+                                      <span className="whitespace-normal wrap-break-word leading-tight" title={getNetworkHoverTitle(net.sourceKey)}>{net.name}</span>
                                     </div>
                                   </td>
                                   <td className="py-1">
@@ -2265,7 +2571,7 @@ export default function CoordinateEventsPage() {
                                       })()}
                                       <span className={`text-[9px] px-1 py-0.5 rounded-full ${
                                         syncDetails.isInSync
-                                          ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300'
+                                          ? 'bg-success-subtle text-success'
                                           : 'bg-muted text-muted-foreground'
                                       }`}>
                                         {syncDetails.statusLabel}
@@ -2295,7 +2601,7 @@ export default function CoordinateEventsPage() {
                                   type="checkbox"
                                   checked={sidePanelPublishAutoSync}
                                   onChange={e => setSidePanelPublishAutoSync(e.target.checked)}
-                                  className="mt-0.5 accent-blue-600 w-3.5 h-3.5 shrink-0"
+                                  className="mt-0.5 accent-primary w-3.5 h-3.5 shrink-0"
                                 />
                                 <span className="text-[10px] leading-tight text-muted-foreground">
                                   Auto-sync updates after publish
@@ -2306,14 +2612,18 @@ export default function CoordinateEventsPage() {
                                   type="checkbox"
                                   checked={sidePanelPublishAutoPublishNew}
                                   onChange={e => setSidePanelPublishAutoPublishNew(e.target.checked)}
-                                  className="mt-0.5 accent-blue-600 w-3.5 h-3.5 shrink-0"
+                                  className="mt-0.5 accent-primary w-3.5 h-3.5 shrink-0"
                                 />
                                 <span className="text-[10px] leading-tight text-muted-foreground">
                                   Auto-publish new meetings from selected calendars
                                 </span>
                               </label>
                             </div>
-                            <button
+                            <Button
+                              intent="primary"
+                              size="compact"
+                              fullWidth
+                              icon={<Eye className="w-3.5 h-3.5" />}
                               onClick={() => {
                                 const selected = selectedPublishNetworks
                                 const eventsToPublish = events.filter(ev => {
@@ -2345,12 +2655,13 @@ export default function CoordinateEventsPage() {
                                   autoPublishNew: sidePanelPublishAutoPublishNew,
                                 })
                               }}
-                              className="w-full flex items-center justify-center gap-2 px-3 py-2 text-xs font-semibold bg-green-600 text-white rounded-md hover:bg-green-700 transition-colors shadow-sm"
                             >
-                              <Eye className="w-3.5 h-3.5" />
                               Make Network Events Public
-                            </button>
-                            <button
+                            </Button>
+                            <Button
+                              size="compact"
+                              fullWidth
+                              icon={<EyeOff className="w-3.5 h-3.5" />}
                               onClick={() => {
                                 const selected = selectedPublishNetworks
                                 selected.forEach(net => {
@@ -2360,12 +2671,15 @@ export default function CoordinateEventsPage() {
                                   if (srcType && srcId && srcType !== 'sub') handleBulkPublic(false, srcId, srcType)
                                 })
                               }}
-                              className="w-full flex items-center justify-center gap-2 px-3 py-2 text-xs font-semibold bg-muted text-muted-foreground border border-border rounded-md hover:bg-accent hover:text-foreground transition-colors shadow-sm"
                             >
-                              <EyeOff className="w-3.5 h-3.5" />
                               Make Network Events Private
-                            </button>
-                            <button
+                            </Button>
+                            <Button
+                              emphasis="outline"
+                              intent="danger"
+                              size="compact"
+                              fullWidth
+                              icon={<Trash2 className="w-3.5 h-3.5" />}
                               onClick={() => {
                                 const selected = selectedPublishNetworks
                                 if (selected.length === 0) return
@@ -2388,11 +2702,9 @@ export default function CoordinateEventsPage() {
                                 })
                                 setTimeout(() => setConfirmOpen(true), 0)
                               }}
-                              className="w-full flex items-center justify-center gap-2 px-3 py-2 text-xs font-semibold bg-red-50 dark:bg-red-950/30 text-red-600 dark:text-red-400 border border-red-200 dark:border-red-800 rounded-md hover:bg-red-100 dark:hover:bg-red-900/50 transition-colors shadow-sm"
                             >
-                              <Trash2 className="w-3.5 h-3.5" />
                               Remove from Calendar
-                            </button>
+                            </Button>
                           </div>
                         )}
                       </>
@@ -2402,36 +2714,29 @@ export default function CoordinateEventsPage() {
               </div>
 
               <div className="border border-border rounded-lg overflow-hidden">
-                <button
-                  onClick={() => setFollowingExpanded(prev => !prev)}
-                  className="w-full flex items-center gap-2 px-3 py-1.5 text-xs font-semibold text-muted-foreground hover:bg-accent/50 transition-colors"
-                >
-                  <Bell className="w-3.5 h-3.5" />
-                  <span>Subscribed</span>
-                  <span className="text-[10px] opacity-60">{subscriptions.length}</span>
-                  <span className="ml-auto">{followingExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}</span>
-                </button>
+                <Disclosure
+                  size="compact"
+                  title="Subscribed"
+                  icon={<Bell />}
+                  trailing={<CountBadge count={subscriptions.length} />}
+                  expanded={followingExpanded}
+                  onToggle={(next) => setFollowingExpanded(next)}
+                  panelId="subscribed-calendar-list"
+                />
                 {followingExpanded && (
-                  <div className="px-3 pb-2 flex flex-wrap items-center gap-2">
-                    {subscriptions.length === 0 ? (
-                      <p className="rounded-md border border-border bg-background/50 p-3 text-xs text-muted-foreground w-full">
-                        You are not subscribed to any coordination calendars yet.
-                      </p>
-                    ) : (
-                      subscriptions.map(sub => (
-                        <div key={sub.id} className="flex items-center gap-1 px-2 py-1 text-xs font-medium rounded bg-purple-50 dark:bg-purple-950/30 text-purple-700 dark:text-purple-300 border border-purple-200 dark:border-purple-800">
-                          <Bell className="w-3 h-3" />
-                          <a href={`/calendar/${sub.calendars?.hash}`} className="hover:underline">{sub.calendars?.title || sub.calendars?.hash}</a>
-                          <button
-                            onClick={() => sub.calendars?.hash && handleUnsubscribe(sub.calendars.hash)}
-                            className="ml-1 p-0.5 hover:bg-purple-200 dark:hover:bg-purple-800 rounded transition-colors"
-                            title="Unsubscribe"
-                          >
-                            <X className="w-3 h-3" />
-                          </button>
-                        </div>
-                      ))
-                    )}
+                  <div id="subscribed-calendar-list">
+                    <CalendarSubscriptionList
+                      subscriptions={subscriptions}
+                      meetings={subscribedMeetings}
+                      subscriptionsLoading={subscriptionsLoading}
+                      subscriptionsError={subscriptionsError}
+                      meetingsLoading={meetingsLoading}
+                      meetingsError={meetingsError}
+                      pendingHashes={pendingUnsubscribeHashes}
+                      timezone={tzState.primary}
+                      onUnsubscribe={handleUnsubscribe}
+                      onRetry={() => { void fetchSubscriptions(); void fetchSubscribedMeetings() }}
+                    />
                   </div>
                 )}
               </div>
@@ -2452,21 +2757,32 @@ export default function CoordinateEventsPage() {
                 className="flex items-center justify-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md transition-colors border border-border bg-background text-foreground hover:bg-accent/50 w-full sm:w-auto"
               >
                 <Calendar className="w-4 h-4" />
-                Discover Events
+                Public Events
               </Link>
+              <Button
+                emphasis="outline"
+                size="compact"
+                icon={<Scale className="h-4 w-4" />}
+                onClick={() => window.dispatchEvent(new Event('openCommonsPanel'))}
+              >
+                Commons
+              </Button>
               {isPhoneViewport ? (
-                <button
+                <Button
+                  emphasis="outline"
+                  size="compact"
+                  icon={<PanelLeftOpen className="w-4 h-4" />}
                   onClick={() => setIsLeftToolsPanelOpen(true)}
-                  className="flex items-center justify-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md transition-colors border bg-background text-foreground border-border hover:bg-accent/50"
                 >
-                  <PanelLeftOpen className="w-4 h-4" />
                   Tools
                   <span className="text-[10px] opacity-80">{networks.length + subscriptions.length}</span>
-                </button>
+                </Button>
               ) : (
                 <>
-                  <button
-                    onClick={() => {
+                  <ToggleButton
+                    size="compact"
+                    pressed={isLeftToolsPanelOpen && networksExpanded}
+                    onPressedChange={() => {
                       if (!isLeftToolsPanelOpen) {
                         setIsLeftToolsPanelOpen(true)
                         setNetworksExpanded(true)
@@ -2474,11 +2790,6 @@ export default function CoordinateEventsPage() {
                         setNetworksExpanded(prev => !prev)
                       }
                     }}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md transition-colors border ${
-                      isLeftToolsPanelOpen && networksExpanded
-                        ? 'bg-blue-600 text-white border-blue-600 hover:bg-blue-700'
-                        : 'bg-background text-foreground border-border hover:bg-accent/50'
-                    }`}
                     title={isLeftToolsPanelOpen && networksExpanded ? 'Collapse networks section' : 'Show networks'}
                   >
                     {isLeftToolsPanelOpen ? <PanelLeftClose className="w-4 h-4" /> : <PanelLeftOpen className="w-4 h-4" />}
@@ -2486,18 +2797,20 @@ export default function CoordinateEventsPage() {
                     Networks
                     <span className="text-[10px] opacity-80">{networks.length}</span>
                     {selectedPublishNetworks.length > 0 && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-white/15">
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-muted text-foreground">
                         {selectedPublishNetworks.length}
                       </span>
                     )}
                     {networkFilters.hidden.size > 0 && (
-                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-amber-500/25 text-amber-100">
+                      <span className="text-[10px] px-1.5 py-0.5 rounded-full bg-warning-subtle text-warning">
                         {networkFilters.hidden.size} hidden
                       </span>
                     )}
-                  </button>
-                  <button
-                    onClick={() => {
+                  </ToggleButton>
+                  <ToggleButton
+                    size="compact"
+                    pressed={isLeftToolsPanelOpen && followingExpanded}
+                    onPressedChange={() => {
                       if (!isLeftToolsPanelOpen) {
                         setIsLeftToolsPanelOpen(true)
                         setFollowingExpanded(true)
@@ -2505,34 +2818,31 @@ export default function CoordinateEventsPage() {
                         setFollowingExpanded(prev => !prev)
                       }
                     }}
-                    className={`flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium rounded-md transition-colors border ${
-                      isLeftToolsPanelOpen && followingExpanded
-                        ? 'bg-purple-600 text-white border-purple-600 hover:bg-purple-700'
-                        : 'bg-background text-foreground border-border hover:bg-accent/50'
-                    }`}
                     title={isLeftToolsPanelOpen && followingExpanded ? 'Collapse subscribed section' : 'Show subscribed'}
                   >
                     {isLeftToolsPanelOpen ? <PanelLeftClose className="w-4 h-4" /> : <PanelLeftOpen className="w-4 h-4" />}
                     <Bell className="w-4 h-4" />
                     Subscribed
                     <span className="text-[10px] opacity-80">{subscriptions.length}</span>
-                  </button>
+                  </ToggleButton>
                 </>
               )}
-              <button
+              <Button
+                intent="primary"
+                size="compact"
+                icon={<Plus className="w-4 h-4" />}
                 onClick={() => setShowCreateModal(true)}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium bg-primary text-primary-foreground rounded-md hover:bg-primary/90 transition-colors"
               >
-                <Plus className="w-4 h-4" />
                 Create Event
-              </button>
-              <button
+              </Button>
+              <Button
+                emphasis="outline"
+                size="compact"
+                icon={<Download className="w-4 h-4" />}
                 onClick={() => { setShowImportModal(true); setImportType(null); setImportResult(null); fetchCoordCalendars() }}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium bg-blue-600 text-white rounded-md hover:bg-blue-700 transition-colors"
               >
-                <Download className="w-4 h-4" />
                 Import
-              </button>
+              </Button>
             </div>
           </div>
 
@@ -2541,14 +2851,15 @@ export default function CoordinateEventsPage() {
               <TimezoneSelector timezones={tzState} />
               <span>{events.length} event{events.length !== 1 ? 's' : ''}</span>
               <span>{events.filter(e => e.is_public).length} public</span>
-              <button
+              <Button
+                emphasis="outline"
+                size="compact"
+                icon={isAutoSyncing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
                 onClick={() => runImportedSourcesSync(true)}
                 disabled={isAutoSyncing || sourceSyncConfigs.length === 0}
-                className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-border hover:bg-accent/50 disabled:opacity-50"
               >
-                {isAutoSyncing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
                 Sync
-              </button>
+              </Button>
               {lastAutoSyncAt && (
                 <span className="opacity-80">Last sync {format(new Date(lastAutoSyncAt), 'HH:mm')}</span>
               )}
@@ -2559,32 +2870,33 @@ export default function CoordinateEventsPage() {
                   onMouseEnter={() => setSyncErrorDetailsHovered(true)}
                   onMouseLeave={() => setSyncErrorDetailsHovered(false)}
                 >
-                  <button
-                    type="button"
+                  <Button
+                    size="micro"
+                    emphasis="ghost"
+                    intent="warning"
+                    icon={<AlertTriangle className="w-3.5 h-3.5" />}
                     onClick={() => setSyncErrorDetailsPinned(prev => !prev)}
-                    className="inline-flex items-center gap-1 text-amber-700 dark:text-amber-300 hover:text-amber-800 dark:hover:text-amber-200"
                     title="Click to inspect sync errors"
                     aria-expanded={isSyncErrorDetailsOpen}
                     aria-label="Show sync error details"
                   >
-                    <AlertTriangle className="w-3.5 h-3.5" />
                     <span>
                       {syncErrorDetails.length} source{syncErrorDetails.length !== 1 ? 's' : ''} with sync errors
                     </span>
-                  </button>
+                  </Button>
 
                   {isSyncErrorDetailsOpen && (
-                    <div className="absolute z-40 mt-2 right-0 w-[22rem] max-w-[90vw] rounded-lg border border-amber-300/70 dark:border-amber-800 bg-amber-50 dark:bg-slate-900 text-amber-900 dark:text-amber-100 shadow-xl p-3">
+                    <div className={`absolute ${OVERLAY_LAYER_CLASS.popover} mt-2 right-0 w-88 max-w-[90vw] rounded-lg border border-warning-muted bg-warning-subtle text-foreground shadow-xl p-3`}>
                       <p className="text-xs font-semibold mb-2">Sync error details</p>
                       <div className="space-y-2 max-h-72 overflow-y-auto">
                         {syncErrorDetails.map(detail => (
-                          <div key={detail.prefKey} className="rounded border border-amber-200/70 dark:border-amber-800/70 bg-white/60 dark:bg-slate-950/70 p-2">
-                            <p className="text-xs font-medium break-words">{detail.sourceLabel}</p>
+                          <div key={detail.prefKey} className="rounded border border-warning-muted bg-background/60 p-2">
+                            <p className="text-xs font-medium wrap-break-word">{detail.sourceLabel}</p>
                             <p className="text-[11px] opacity-90">{detail.sourceTypeLabel}</p>
                             <p className="text-[11px] mt-1"><strong>Likely issue:</strong> {detail.diagnosis.category}</p>
                             <p className="text-[11px]"><strong>Possible cause:</strong> {detail.diagnosis.likelyCause}</p>
                             <p className="text-[11px]"><strong>Suggested action:</strong> {detail.diagnosis.suggestedAction}</p>
-                            <p className="text-[11px] mt-1 break-words"><strong>Error:</strong> {detail.rawMessage}</p>
+                            <p className="text-[11px] mt-1 wrap-break-word"><strong>Error:</strong> {detail.rawMessage}</p>
                             {detail.updatedAt && (
                               <p className="text-[10px] mt-1 opacity-80">Last attempt: {format(new Date(detail.updatedAt), 'MMM d, yyyy HH:mm')}</p>
                             )}
@@ -2605,14 +2917,15 @@ export default function CoordinateEventsPage() {
               <span>{events.filter(e => e.is_public).length} public</span>
               <span className="text-border mx-1">|</span>
               <span className="text-xs opacity-80">Auto-sync sources: {sourceSyncConfigs.length}</span>
-              <button
+              <Button
+                emphasis="outline"
+                size="compact"
+                icon={isAutoSyncing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
                 onClick={() => runImportedSourcesSync(true)}
                 disabled={isAutoSyncing || sourceSyncConfigs.length === 0}
-                className="inline-flex items-center gap-1 px-2 py-1 text-xs rounded border border-border hover:bg-accent/50 disabled:opacity-50"
               >
-                {isAutoSyncing ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <RefreshCw className="w-3.5 h-3.5" />}
                 Sync now
-              </button>
+              </Button>
               {lastAutoSyncAt && (
                 <span className="text-xs opacity-80">
                   Last sync {format(new Date(lastAutoSyncAt), 'HH:mm')} ({autoSyncSummary || 'no changes'})
@@ -2630,32 +2943,33 @@ export default function CoordinateEventsPage() {
                   onMouseEnter={() => setSyncErrorDetailsHovered(true)}
                   onMouseLeave={() => setSyncErrorDetailsHovered(false)}
                 >
-                  <button
-                    type="button"
+                  <Button
+                    size="micro"
+                    emphasis="ghost"
+                    intent="warning"
+                    icon={<AlertTriangle className="w-3.5 h-3.5" />}
                     onClick={() => setSyncErrorDetailsPinned(prev => !prev)}
-                    className="inline-flex items-center gap-1 text-xs text-amber-700 dark:text-amber-300 hover:text-amber-800 dark:hover:text-amber-200"
                     title="Click to inspect sync errors"
                     aria-expanded={isSyncErrorDetailsOpen}
                     aria-label="Show sync error details"
                   >
-                    <AlertTriangle className="w-3.5 h-3.5" />
                     <span>
                       {syncErrorDetails.length} source{syncErrorDetails.length !== 1 ? 's' : ''} with sync errors
                     </span>
-                  </button>
+                  </Button>
 
                   {isSyncErrorDetailsOpen && (
-                    <div className="absolute z-40 mt-2 right-0 w-[28rem] max-w-[92vw] rounded-lg border border-amber-300/70 dark:border-amber-800 bg-amber-50 dark:bg-slate-900 text-amber-900 dark:text-amber-100 shadow-xl p-3">
+                    <div className={`absolute ${OVERLAY_LAYER_CLASS.popover} mt-2 right-0 w-md max-w-[92vw] rounded-lg border border-warning-muted bg-warning-subtle text-foreground shadow-xl p-3`}>
                       <p className="text-xs font-semibold mb-2">Sync error details</p>
                       <div className="space-y-2 max-h-80 overflow-y-auto">
                         {syncErrorDetails.map(detail => (
-                          <div key={detail.prefKey} className="rounded border border-amber-200/70 dark:border-amber-800/70 bg-white/60 dark:bg-slate-950/70 p-2">
-                            <p className="text-xs font-medium break-words">{detail.sourceLabel}</p>
+                          <div key={detail.prefKey} className="rounded border border-warning-muted bg-background/60 p-2">
+                            <p className="text-xs font-medium wrap-break-word">{detail.sourceLabel}</p>
                             <p className="text-[11px] opacity-90">{detail.sourceTypeLabel}</p>
                             <p className="text-[11px] mt-1"><strong>Likely issue:</strong> {detail.diagnosis.category}</p>
                             <p className="text-[11px]"><strong>Possible cause:</strong> {detail.diagnosis.likelyCause}</p>
                             <p className="text-[11px]"><strong>Suggested action:</strong> {detail.diagnosis.suggestedAction}</p>
-                            <p className="text-[11px] mt-1 break-words"><strong>Error:</strong> {detail.rawMessage}</p>
+                            <p className="text-[11px] mt-1 wrap-break-word"><strong>Error:</strong> {detail.rawMessage}</p>
                             {detail.updatedAt && (
                               <p className="text-[10px] mt-1 opacity-80">Last attempt: {format(new Date(detail.updatedAt), 'MMM d, yyyy HH:mm')}</p>
                             )}
@@ -2678,14 +2992,18 @@ export default function CoordinateEventsPage() {
 
       {/* Selection Toolbar */}
       {selectedCells.size > 0 && (
-        <div className="mb-2 px-3 py-2 bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 rounded-lg flex flex-wrap items-center gap-2">
-          <span className="text-xs font-semibold text-blue-700 dark:text-blue-300">
+        <div className="mb-2 px-3 py-2 bg-info-subtle border border-info-muted rounded-lg flex flex-wrap items-center gap-2">
+          <span className="text-xs font-semibold text-info">
             {selectedCells.size} slot{selectedCells.size !== 1 ? 's' : ''} selected
             {selectedEvents.length > 0 && ` · ${selectedEvents.length} event${selectedEvents.length !== 1 ? 's' : ''}`}
           </span>
           {selectedEvents.length > 0 && (
             <>
-              <button
+              <Button
+                emphasis="outline"
+                intent="primary"
+                size="compact"
+                icon={<Eye className="w-3 h-3" />}
                 onClick={() => {
                   openPublishModal(selectedEvents, async (ids, options) => {
                     await apiClient.put('/api/user-events/bulk-public', { event_ids: ids, is_public: true })
@@ -2695,61 +3013,61 @@ export default function CoordinateEventsPage() {
                     setSelectedCells(new Set())
                   })
                 }}
-                className="px-2 py-1 text-xs font-medium bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 rounded hover:bg-green-200 dark:hover:bg-green-900/50 transition-colors"
               >
-                <Eye className="w-3 h-3 inline mr-1" />
                 Make Public
-              </button>
-              <button
+              </Button>
+              <Button
+                emphasis="outline"
+                size="compact"
+                icon={<EyeOff className="w-3 h-3" />}
                 onClick={() => handleBulkPublicSelected(false)}
-                className="px-2 py-1 text-xs font-medium bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-400 rounded hover:bg-orange-200 dark:hover:bg-orange-900/50 transition-colors"
               >
-                <EyeOff className="w-3 h-3 inline mr-1" />
                 Make Private
-              </button>
-              <button
+              </Button>
+              <Button
+                emphasis="outline"
+                intent="danger"
+                size="compact"
+                icon={<Trash2 className="w-3 h-3" />}
                 onClick={() => {
                   setConfirmTitle('Delete Selected Events?');
                   setConfirmMessage(`Delete ${selectedEvents.length} selected event${selectedEvents.length !== 1 ? 's' : ''}? This cannot be undone.`);
                   setOnConfirmAction(() => handleBulkDeleteSelected);
                   setConfirmOpen(true);
                 }}
-                className="px-2 py-1 text-xs font-medium bg-red-100 text-red-600 dark:bg-red-900/30 dark:text-red-400 rounded hover:bg-red-200 dark:hover:bg-red-900/50 transition-colors"
               >
-                <Trash2 className="w-3 h-3 inline mr-1" />
                 Delete Selected
-              </button>
+              </Button>
             </>
           )}
-          <button
+          <Button
+            emphasis="ghost"
+            size="compact"
+            icon={<X className="w-3 h-3" />}
             onClick={clearSelection}
-            className="ml-auto px-2 py-1 text-xs font-medium bg-muted text-muted-foreground rounded hover:bg-muted/80 transition-colors"
+            className="ml-auto"
           >
-            <X className="w-3 h-3 inline mr-1" />
             Clear
-          </button>
+          </Button>
         </div>
       )}
 
       {/* Week Navigation */}
       <div className="flex items-center justify-between mb-2 px-1">
-        <button onClick={goToPrevWeek} className="p-1.5 rounded-md hover:bg-accent/50 transition-colors">
-          <ChevronLeft className="w-5 h-5" />
-        </button>
+        <IconButton label="Previous week" onClick={goToPrevWeek} icon={<ChevronLeft className="w-5 h-5" />} />
         <div className="flex items-center gap-2">
           <span className="text-sm font-semibold">
             {format(currentWeekStart, 'MMM d')} – {format(addDays(currentWeekStart, 6), 'MMM d, yyyy')}
           </span>
-          <button
+          <Button
+            emphasis="outline"
+            size="compact"
             onClick={goToToday}
-            className="px-2 py-0.5 text-xs font-medium bg-accent/50 rounded hover:bg-accent transition-colors"
           >
             Today
-          </button>
+          </Button>
         </div>
-        <button onClick={goToNextWeek} className="p-1.5 rounded-md hover:bg-accent/50 transition-colors">
-          <ChevronRight className="w-5 h-5" />
-        </button>
+        <IconButton label="Next week" onClick={goToNextWeek} icon={<ChevronRight className="w-5 h-5" />} />
       </div>
 
       {/* Calendar Grid */}
@@ -2795,7 +3113,7 @@ export default function CoordinateEventsPage() {
                   ? `${utcNow.getUTCHours().toString().padStart(2, '0')}:${utcNow.getUTCMinutes().toString().padStart(2, '0')}`
                   : getCurrentTimeInTimezone(tzState.primary)
                 return (
-                  <div className="p-2 text-xs text-blue-600 dark:text-blue-400 font-medium border-r border-border flex flex-col items-end justify-between">
+                  <div className="p-2 text-xs text-primary font-medium border-r border-border flex flex-col items-end justify-between">
                     <span className="text-[10px] font-bold">{label}</span>
                     {abbr && <span className="text-[9px] opacity-70">{abbr}</span>}
                     <style>{`@keyframes blink-colon { 0%, 49% { opacity: 1; } 50%, 100% { opacity: 0; } }`}</style>
@@ -2813,10 +3131,10 @@ export default function CoordinateEventsPage() {
                   const offsetBefore = t.offsetBefore >= 0 ? `+${t.offsetBefore / 60}` : `${t.offsetBefore / 60}`
                   const offsetAfter = t.offsetAfter >= 0 ? `+${t.offsetAfter / 60}` : `${t.offsetAfter / 60}`
                   return (
-                    <div key={`day-dst-hdr-${t.iana}-${slotIdx}`} className="p-1 text-center border-l border-amber-400 bg-amber-50/60 dark:bg-amber-950/30 flex flex-col items-center justify-center">
-                      <span className="text-[8px] font-semibold text-amber-700 dark:text-amber-300 truncate max-w-full">{city}</span>
-                      <span className="text-[9px] font-bold text-amber-600 dark:text-amber-400">GMT</span>
-                      <span className="text-[9px] font-bold text-amber-600 dark:text-amber-400">{offsetBefore} to {offsetAfter}</span>
+                    <div key={`day-dst-hdr-${t.iana}-${slotIdx}`} className="p-1 text-center border-l border-warning-muted bg-warning-subtle flex flex-col items-center justify-center">
+                      <span className="text-[8px] font-semibold text-warning truncate max-w-full">{city}</span>
+                      <span className="text-[9px] font-bold text-warning">GMT</span>
+                      <span className="text-[9px] font-bold text-warning">{offsetBefore} to {offsetAfter}</span>
                     </div>
                   )
                 }
@@ -2826,11 +3144,11 @@ export default function CoordinateEventsPage() {
                   <div
                     key={day.toISOString()}
                     className={`p-2 text-center text-xs font-medium border-r border-border last:border-r-0 ${
-                      isToday ? 'bg-blue-50 dark:bg-blue-950/30 text-blue-700 dark:text-blue-300' : 'text-muted-foreground'
+                      isToday ? 'bg-info-subtle text-info' : 'text-muted-foreground'
                     }`}
                   >
                     <div>{format(day, 'EEE')}</div>
-                    <div className={`text-lg font-bold ${isToday ? 'text-blue-600 dark:text-blue-400' : 'text-foreground'}`}>
+                    <div className={`text-lg font-bold ${isToday ? 'text-primary' : 'text-foreground'}`}>
                       {format(day, 'd')}
                     </div>
                   </div>
@@ -2854,7 +3172,7 @@ export default function CoordinateEventsPage() {
                     </div>
                   ))}
                   {/* Primary timezone time label */}
-                  <div className="p-1 text-[10px] text-blue-600 dark:text-blue-400 font-semibold font-mono tabular-nums border-r border-border flex items-start justify-end pr-2 pt-1">
+                  <div className="p-1 text-[10px] text-primary font-semibold font-mono tabular-nums border-r border-border flex items-start justify-end pr-2 pt-1">
                     {formatTimeLabel(time)}
                   </div>
                   {daySlots.map((slot, slotIdx) => {
@@ -2865,9 +3183,9 @@ export default function CoordinateEventsPage() {
                       const beforeTime = convertUtcTimeToTimezoneOnDate(time, t.iana, beforeDay)
                       const isChanged = dstTime !== beforeTime
                       return (
-                        <div key={`dst-${t.iana}-${time}-${slotIdx}`} className={`p-1 text-[10px] text-center border-l border-amber-400 font-mono tabular-nums flex items-start justify-center pt-1 ${
+                        <div key={`dst-${t.iana}-${time}-${slotIdx}`} className={`p-1 text-[10px] text-center border-l border-warning-muted font-mono tabular-nums flex items-start justify-center pt-1 ${
                           isChanged
-                            ? 'bg-amber-50/40 dark:bg-amber-950/20 text-amber-700 dark:text-amber-300 font-semibold'
+                            ? 'bg-warning-subtle text-warning font-semibold'
                             : 'text-muted-foreground/40'
                         }`}>
                           {dstTime}
@@ -2887,8 +3205,8 @@ export default function CoordinateEventsPage() {
                         onMouseEnter={() => handleCellMouseEnter(day, time)}
                         className={`border-r border-border last:border-r-0 cursor-crosshair touch-none ${
                           isSelected
-                            ? 'bg-blue-100 dark:bg-blue-900/30 ring-1 ring-inset ring-blue-400 dark:ring-blue-600'
-                            : isToday ? 'bg-blue-50/30 dark:bg-blue-950/10' : ''
+                            ? 'bg-info-subtle ring-1 ring-inset ring-info'
+                            : isToday ? 'bg-info-subtle' : ''
                         }`}
                       />
                     )
@@ -2929,12 +3247,16 @@ export default function CoordinateEventsPage() {
                             const ev = item.data.event
                             const occ = item.data
                             const color = getEventColor(ev)
+                            const flagged = isEventFlagged(ev)
+                            const hoveredFromCommons = isEventHoveredFromCommons(ev)
                             return (
                               <button
                                 key={`${seg.eventId}-${occ.start_time}-${i}`}
-                                onClick={(e) => { e.stopPropagation(); setSelectedEvent(ev); setSelectedSubMeeting(null) }}
+                                onClick={(e) => { e.stopPropagation(); setSelectedEvent(ev); setSelectedOccurrenceStart(occ.start_time); setSelectedSubMeeting(null) }}
                                 onMouseDown={(e) => e.stopPropagation()}
-                                className="flex flex-col items-start justify-start px-1 rounded-sm text-[10px] leading-tight transition-colors hover:opacity-80 overflow-hidden"
+                                className={`flex flex-col items-start justify-start px-1 rounded-sm text-[10px] leading-tight transition-colors hover:opacity-80 overflow-hidden ${
+                                  hoveredFromCommons ? 'animate-pulse' : ''
+                                }`}
                                 style={{
                                   position: 'absolute',
                                   top: seg.top,
@@ -2945,15 +3267,27 @@ export default function CoordinateEventsPage() {
                                   backgroundColor: `${color}20`,
                                   borderLeft: `3px solid ${color}`,
                                   color: color,
-                                  zIndex: 5,
+                                  zIndex: hoveredFromCommons ? 30 : flagged ? 10 : 5,
+                                  border: hoveredFromCommons
+                                    ? '3px solid #F43F5E'
+                                    : flagged
+                                      ? '2px solid #F43F5E'
+                                      : undefined,
+                                  boxShadow: hoveredFromCommons
+                                    ? '0 0 16px rgba(244,63,94,0.95)'
+                                    : flagged
+                                      ? '0 0 8px rgba(244,63,94,0.7)'
+                                      : undefined,
+                                  transform: hoveredFromCommons ? 'scale(1.03)' : undefined,
                                 }}
                                 title={getEventChipLabel(ev, occ.isRecurringOccurrence)}
                               >
                                 {seg.isFirstSegment && (
                                   <>
                                     <div className="flex items-center gap-0.5 min-w-0 pt-0.5 max-w-full">
-                                      {ev.is_public && <Eye className="w-2.5 h-2.5 shrink-0 text-green-500" />}
-                                      {occ.isRecurringOccurrence && <Repeat2 className="w-2.5 h-2.5 shrink-0 text-blue-600 dark:text-blue-400" />}
+                                      {flagged && <Flag className="w-2.5 h-2.5 shrink-0 text-danger animate-pulse" />}
+                                      {ev.is_public && <Eye className="w-2.5 h-2.5 shrink-0 text-success" />}
+                                      {occ.isRecurringOccurrence && <Repeat2 className="w-2.5 h-2.5 shrink-0 text-primary" />}
                                       <span className="block truncate font-medium min-w-0">{getEventChipLabel(ev, occ.isRecurringOccurrence)}</span>
                                     </div>
                                     <div className="text-[9px] opacity-70 truncate max-w-full">
@@ -3006,7 +3340,7 @@ export default function CoordinateEventsPage() {
                               key={`overflow-${i}`}
                               onClick={(e) => { e.stopPropagation(); setOverflowPanelItems(overflowItems) }}
                               onMouseDown={(e) => e.stopPropagation()}
-                              className="text-left px-1 rounded-sm text-[10px] leading-tight font-medium transition-colors hover:opacity-80 overflow-hidden"
+                              className="text-left px-1 rounded-sm text-[10px] leading-tight font-medium transition-colors hover:opacity-80 overflow-hidden bg-neutral-subtle text-neutral border-l-[3px] border-neutral"
                               style={{
                                 position: 'absolute',
                                 top: seg.top,
@@ -3014,9 +3348,6 @@ export default function CoordinateEventsPage() {
                                 left: `calc(${seg.leftPercent}% + 1px)`,
                                 width: `calc(${seg.widthPercent}% - 2px)`,
                                 pointerEvents: isDragging ? 'none' : 'auto',
-                                backgroundColor: '#6B728020',
-                                borderLeft: '3px solid #6B7280',
-                                color: '#6B7280',
                                 zIndex: 5,
                               }}
                               title={`${seg.count} more meeting${seg.count !== 1 ? 's' : ''}`}
@@ -3039,7 +3370,7 @@ export default function CoordinateEventsPage() {
                 return (
                   <div 
                     ref={nowLineRef}
-                    className="absolute left-0 right-0 pointer-events-none z-[15]"
+                    className="absolute left-0 right-0 pointer-events-none z-15"
                     style={{ 
                       top: `${position}px`,
                       height: '3px',
@@ -3061,14 +3392,13 @@ export default function CoordinateEventsPage() {
 
       {/* Overflow Panel Modal */}
       {overflowPanelItems && (
-        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setOverflowPanelItems(null)}>
-          <div className="bg-card text-card-foreground rounded-lg p-5 max-w-md w-full mx-4 my-4 max-h-[90vh] overflow-y-auto shadow-xl border border-border" onClick={e => e.stopPropagation()}>
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-lg font-bold">Overlapping Meetings</h2>
-              <button onClick={() => setOverflowPanelItems(null)} className="p-1 rounded hover:bg-muted transition-colors shrink-0">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
+        <Dialog
+          open
+          onClose={() => setOverflowPanelItems(null)}
+          title="Overlapping Meetings"
+          size="md"
+          showCloseButton
+        >
             <div className="space-y-2 max-h-[60vh] overflow-auto">
               {overflowPanelItems.map(item => {
                 if (item.kind === 'event') {
@@ -3078,13 +3408,13 @@ export default function CoordinateEventsPage() {
                   return (
                     <button
                       key={`${ev.id}_${occ.start_time}`}
-                      onClick={() => { setOverflowPanelItems(null); setSelectedEvent(ev); setSelectedSubMeeting(null) }}
+                      onClick={() => { setOverflowPanelItems(null); setSelectedEvent(ev); setSelectedOccurrenceStart(occ.start_time); setSelectedSubMeeting(null) }}
                       className="w-full text-left p-3 rounded-lg border border-border hover:bg-accent/50 transition-colors"
                       style={{ borderLeft: `4px solid ${color}` }}
                     >
                       <div className="flex items-center gap-1 font-medium text-sm" style={{ color }}>
-                        {ev.is_public && <Eye className="w-3 h-3 shrink-0 text-green-500" />}
-                        {occ.isRecurringOccurrence && <Repeat2 className="w-3 h-3 shrink-0 text-blue-600 dark:text-blue-400" />}
+                        {ev.is_public && <Eye className="w-3 h-3 shrink-0 text-success" />}
+                        {occ.isRecurringOccurrence && <Repeat2 className="w-3 h-3 shrink-0 text-primary" />}
                         {getEventChipLabel(ev, occ.isRecurringOccurrence)}
                       </div>
                       <div className="text-xs text-muted-foreground mt-1">
@@ -3110,20 +3440,18 @@ export default function CoordinateEventsPage() {
                 }
               })}
             </div>
-          </div>
-        </div>
+        </Dialog>
       )}
 
       {/* Event Details Panel */}
       {selectedEvent && (
-        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setSelectedEvent(null)}>
-          <div className="bg-card text-card-foreground rounded-lg p-5 max-w-md w-full mx-4 my-4 max-h-[90vh] overflow-y-auto shadow-xl border border-border" onClick={e => e.stopPropagation()}>
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-lg font-bold truncate pr-4">{resolveMeetingTitle({ title: selectedEvent.title })}</h2>
-              <button onClick={() => setSelectedEvent(null)} className="p-1 rounded hover:bg-muted transition-colors">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
+        <Dialog
+          open
+          onClose={() => setSelectedEvent(null)}
+          title={<span className="block truncate">{resolveMeetingTitle({ title: selectedEvent.title })}</span>}
+          size="md"
+          showCloseButton
+        >
 
             <div className="space-y-2 text-sm">
               <div className="flex items-center gap-2 text-muted-foreground">
@@ -3137,7 +3465,7 @@ export default function CoordinateEventsPage() {
 
               {selectedEventRecurrenceSummary && (
                 <div className="flex items-center gap-2 text-muted-foreground">
-                  <Repeat2 className="w-4 h-4 shrink-0 text-blue-600 dark:text-blue-400" />
+                  <Repeat2 className="w-4 h-4 shrink-0 text-primary" />
                   <span className="text-xs">{selectedEventRecurrenceSummary}</span>
                 </div>
               )}
@@ -3154,18 +3482,16 @@ export default function CoordinateEventsPage() {
                     href={selectedEvent.meeting_link ?? undefined}
                     target="_blank"
                     rel="noopener noreferrer"
-                    className="flex items-center gap-1.5 text-blue-600 hover:underline text-xs min-w-0 break-all"
+                    className="flex items-center gap-1.5 text-primary hover:underline text-xs min-w-0 break-all"
                   >
                     <ExternalLink className="w-3.5 h-3.5 shrink-0" />
                     Meeting Link
                   </a>
-                  <button
+                  <IconButton
+                    label="Copy link"
                     onClick={() => { navigator.clipboard.writeText(selectedEvent.meeting_link!); setCopiedLink(true); setTimeout(() => setCopiedLink(false), 2000) }}
-                    className="p-1 rounded hover:bg-muted transition-colors shrink-0"
-                    title="Copy link"
-                  >
-                    {copiedLink ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5 text-muted-foreground" />}
-                  </button>
+                    icon={copiedLink ? <Check className="w-3.5 h-3.5 text-success" /> : <Copy className="w-3.5 h-3.5" />}
+                  />
                 </div>
               )}
 
@@ -3183,13 +3509,14 @@ export default function CoordinateEventsPage() {
                     {selectedEventSourceNetworkNames.length > 1 ? ` +${selectedEventSourceNetworkNames.length - 1}` : ''}
                   </span>
                   {selectedEventSourceNetworkNames.length > 1 && (
-                    <button
+                    <Button
+                      emphasis="outline"
+                      size="compact"
+                      icon={showEventSourceNetworks ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
                       onClick={() => setShowEventSourceNetworks(prev => !prev)}
-                      className="inline-flex items-center gap-1 text-[11px] px-1.5 py-0.5 rounded border border-border hover:bg-accent/50"
                     >
-                      {showEventSourceNetworks ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
                       {showEventSourceNetworks ? 'Hide' : 'Show'}
-                    </button>
+                    </Button>
                   )}
                 </div>
                 {showEventSourceNetworks && selectedEventSourceNetworkNames.length > 1 && (
@@ -3223,7 +3550,8 @@ export default function CoordinateEventsPage() {
                 <CalendarPlus className="w-4 h-4" />
                 Outlook
               </a>
-              <button
+              <Button
+                icon={<Download className="w-4 h-4" />}
                 onClick={() => downloadICSFile({
                   title: selectedEvent.title,
                   description: selectedEvent.description,
@@ -3232,45 +3560,45 @@ export default function CoordinateEventsPage() {
                   meeting_link: selectedEvent.meeting_link,
                   location: selectedEvent.location,
                 })}
-                className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-muted text-foreground hover:bg-muted/80 transition-colors"
                 title="Download .ics file for Apple Calendar and others"
               >
-                <Download className="w-4 h-4" />
                 .ics
-              </button>
+              </Button>
               {googleOAuthSources.length === 1 ? (
-                <button
+                <Button
+                  intent="primary"
+                  icon={<CalendarPlus className="w-4 h-4" />}
                   onClick={() => handleSyncToGoogle({
                     title: selectedEvent.title, description: selectedEvent.description,
                     start_time: selectedEvent.start_time, end_time: selectedEvent.end_time,
                     meeting_link: selectedEvent.meeting_link, location: selectedEvent.location,
                   })}
                   disabled={syncingToGoogle}
-                  className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors disabled:opacity-50"
+                  className="flex-1"
                   title={`Add to ${googleOAuthSources[0].display_name}`}
                 >
-                  <CalendarPlus className="w-4 h-4" />
                   {syncingToGoogle ? 'Syncing...' : 'Add to Google'}
-                </button>
+                </Button>
               ) : googleOAuthSources.length > 1 ? (
-                <button
+                <Button
+                  intent="primary"
+                  icon={<CalendarPlus className="w-4 h-4" />}
                   onClick={() => setShowGoogleSyncPicker({
                     title: selectedEvent.title, description: selectedEvent.description,
                     start_time: selectedEvent.start_time, end_time: selectedEvent.end_time,
                     meeting_link: selectedEvent.meeting_link, location: selectedEvent.location,
                   })}
-                  className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors"
+                  className="flex-1"
                   title="Choose which Google Calendar to add to"
                 >
-                  <CalendarPlus className="w-4 h-4" />
                   Add to Google
-                </button>
+                </Button>
               ) : (
                 <a
                   href={`https://calendar.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(selectedEvent.title)}&dates=${new Date(selectedEvent.start_time).toISOString().replace(/[-:]/g, '').replace(/\.\\d{3}/, '')}/${new Date(selectedEvent.end_time).toISOString().replace(/[-:]/g, '').replace(/\.\\d{3}/, '')}${selectedEvent.description ? `&details=${encodeURIComponent(selectedEvent.description)}` : ''}${selectedEvent.location ? `&location=${encodeURIComponent(selectedEvent.location)}` : selectedEvent.meeting_link ? `&location=${encodeURIComponent(selectedEvent.meeting_link)}` : ''}`}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors"
+                  className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-primary text-primary-foreground hover:opacity-90 transition-colors"
                   title="Add to Google Calendar"
                 >
                   <CalendarPlus className="w-4 h-4" />
@@ -3284,7 +3612,7 @@ export default function CoordinateEventsPage() {
               <div className="mt-2">
                 <Link
                   to={`/meeting/${selectedEvent.external_event_id}`}
-                  className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium text-blue-600 bg-blue-50 dark:bg-blue-950/30 hover:bg-blue-100 dark:hover:bg-blue-950/50 transition-colors w-full"
+                  className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium text-info bg-info-subtle hover:bg-info-muted transition-colors w-full"
                 >
                   <ExternalLink className="w-4 h-4" />
                   Meeting Page
@@ -3293,7 +3621,10 @@ export default function CoordinateEventsPage() {
             )}
 
             <div className="flex items-center gap-2 mt-2">
-              <button
+              <Button
+                emphasis={selectedEvent.is_public ? 'outline' : 'solid'}
+                intent={selectedEvent.is_public ? 'danger' : 'neutral'}
+                icon={selectedEvent.is_public ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                 onClick={async () => {
                   if (!selectedEvent.is_public) {
                     openPublishModal(selectedEventGroupedRows, async (ids, options) => {
@@ -3313,34 +3644,38 @@ export default function CoordinateEventsPage() {
                       }
                       const selectedRows = selectedEventGroupedRows.filter(ev => ids.includes(ev.id))
                       setAutoSyncForEvents(selectedRows, options.autoSync, options.autoPublishNew)
+                      notifyPublicEventsSync('public-toggle')
                     })
                     return
                   }
 
-                  const targetPublic = false
-                  const ids = selectedEventGroupedRows.map(e => e.id)
-                  if (ids.length <= 1) {
-                    await handleTogglePublic(selectedEvent)
-                    return
-                  }
-                  try {
-                    await apiClient.put('/api/user-events/bulk-public', { event_ids: ids, is_public: targetPublic })
-                    setEvents(prev => prev.map(e => ids.includes(e.id) ? { ...e, is_public: targetPublic } : e))
-                    setSelectedEvent(prev => prev ? { ...prev, is_public: targetPublic } : null)
-                  } catch (err) {
-                    console.error('Failed to update merged event visibility:', err)
+                  if (isEventRecurringSeries(selectedEvent)) {
+                    openRemovePublicSeriesModal(selectedEvent, selectedOccurrenceStart)
+                  } else {
+                    const ids = selectedEventGroupedRows.map(e => e.id)
+                    try {
+                      await apiClient.put('/api/user-events/bulk-public', { event_ids: ids, is_public: false })
+                      setEvents(prev => prev.map(e => ids.includes(e.id) ? { ...e, is_public: false } : e))
+                      setSelectedEvent(prev => prev ? { ...prev, is_public: false } : null)
+                      showToast('Public status removed for this event.')
+                      notifyPublicEventsSync('public-toggle')
+                    } catch (err) {
+                      console.error('Failed to update merged event visibility:', err)
+                      showToast('Failed to remove public status.', 'error')
+                    }
                   }
                 }}
-                className={`flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium transition-colors ${
-                  selectedEvent.is_public
-                    ? 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-400 hover:bg-green-200 dark:hover:bg-green-900/50'
-                    : 'bg-muted text-muted-foreground hover:bg-muted/80'
-                }`}
+                className="flex-1"
+                title={selectedEvent.is_public ? 'Remove Public Status' : 'Publish Event'}
               >
-                {selectedEvent.is_public ? <Eye className="w-4 h-4" /> : <EyeOff className="w-4 h-4" />}
-                {selectedEvent.is_public ? 'Public' : 'Publish'}
-              </button>
-              <button
+                {selectedEvent.is_public ? 'Remove Public' : 'Publish'}
+              </Button>
+              <IconButton
+                emphasis="outline"
+                intent="danger"
+                size="standard"
+                label="Delete event"
+                icon={<Trash2 className="w-4 h-4" />}
                 onClick={() => {
                   setConfirmTitle('Delete Event?');
                   setConfirmMessage(selectedEventGroupedRows.length > 1
@@ -3362,10 +3697,7 @@ export default function CoordinateEventsPage() {
                   });
                   setConfirmOpen(true);
                 }}
-                className="px-3 py-2 rounded-md text-sm font-medium text-red-600 bg-red-50 dark:bg-red-950/30 hover:bg-red-100 dark:hover:bg-red-950/50 transition-colors"
-              >
-                <Trash2 className="w-4 h-4" />
-              </button>
+              />
             </div>
 
             {selectedEvent.is_public && selectedEventSyncPrefKeys.length > 0 && (
@@ -3375,7 +3707,7 @@ export default function CoordinateEventsPage() {
                     type="checkbox"
                     checked={selectedEventAutoSyncEnabled}
                     onChange={e => setAutoSyncForEvents(selectedEventGroupedRows, e.target.checked)}
-                    className="mt-0.5 accent-blue-600 w-4 h-4 shrink-0"
+                    className="mt-0.5 accent-primary w-4 h-4 shrink-0"
                   />
                   <div>
                     <p className="text-xs font-medium text-foreground">Auto-sync this published item</p>
@@ -3386,20 +3718,18 @@ export default function CoordinateEventsPage() {
                 </label>
               </div>
             )}
-          </div>
-        </div>
+        </Dialog>
       )}
 
       {/* Subscribed Meeting Details */}
       {selectedSubMeeting && (
-        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setSelectedSubMeeting(null)}>
-          <div className="bg-card text-card-foreground rounded-lg p-5 max-w-md w-full mx-4 my-4 max-h-[90vh] overflow-y-auto shadow-xl border border-border" onClick={e => e.stopPropagation()}>
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-lg font-bold pr-4">{resolveMeetingTitle({ title: selectedSubMeeting.title, calendarTitle: selectedSubMeeting.calendar_title })}</h2>
-              <button onClick={() => setSelectedSubMeeting(null)} className="p-1 rounded hover:bg-muted transition-colors shrink-0">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
+        <Dialog
+          open
+          onClose={() => setSelectedSubMeeting(null)}
+          title={resolveMeetingTitle({ title: selectedSubMeeting.title, calendarTitle: selectedSubMeeting.calendar_title })}
+          size="md"
+          showCloseButton
+        >
 
             <div className="space-y-2 text-sm">
               <div className="flex items-center gap-2 text-muted-foreground">
@@ -3420,23 +3750,21 @@ export default function CoordinateEventsPage() {
               {isSafeUrl(selectedSubMeeting.meeting_link) && (
                 <div className="flex items-center gap-2">
                   <a href={selectedSubMeeting.meeting_link ?? undefined} target="_blank" rel="noopener noreferrer"
-                    className="flex items-center gap-1.5 text-blue-600 hover:underline text-xs min-w-0 break-all">
+                    className="flex items-center gap-1.5 text-primary hover:underline text-xs min-w-0 break-all">
                     <ExternalLink className="w-3.5 h-3.5 shrink-0" />
                     Meeting Link
                   </a>
-                  <button
+                  <IconButton
+                    label="Copy link"
                     onClick={() => { navigator.clipboard.writeText(selectedSubMeeting.meeting_link!); setCopiedLink(true); setTimeout(() => setCopiedLink(false), 2000) }}
-                    className="p-1 rounded hover:bg-muted transition-colors shrink-0"
-                    title="Copy link"
-                  >
-                    {copiedLink ? <Check className="w-3.5 h-3.5 text-green-500" /> : <Copy className="w-3.5 h-3.5 text-muted-foreground" />}
-                  </button>
+                    icon={copiedLink ? <Check className="w-3.5 h-3.5 text-success" /> : <Copy className="w-3.5 h-3.5" />}
+                  />
                 </div>
               )}
 
               <div className="flex items-center gap-1.5 text-xs text-muted-foreground border-t border-border pt-2 mt-2">
                 <Bell className="w-3.5 h-3.5 shrink-0" />
-                <span>Subscribed: <a href={`/calendar/${selectedSubMeeting.calendar_hash}`} className="text-blue-600 hover:underline font-medium">{selectedSubMeeting.calendar_title}</a></span>
+                <span>Subscribed: <a href={`/calendar/${selectedSubMeeting.calendar_hash}`} className="text-primary hover:underline font-medium">{selectedSubMeeting.calendar_title}</a></span>
               </div>
             </div>
 
@@ -3458,7 +3786,8 @@ export default function CoordinateEventsPage() {
                 <CalendarPlus className="w-4 h-4" />
                 Outlook
               </a>
-              <button
+              <Button
+                icon={<Download className="w-4 h-4" />}
                 onClick={() => downloadICSFile({
                   title: resolveMeetingTitle({ title: selectedSubMeeting.title, calendarTitle: selectedSubMeeting.calendar_title }),
                   description: selectedSubMeeting.description,
@@ -3466,45 +3795,45 @@ export default function CoordinateEventsPage() {
                   end_time: selectedSubMeeting.end_time,
                   meeting_link: selectedSubMeeting.meeting_link,
                 })}
-                className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-muted text-foreground hover:bg-muted/80 transition-colors"
                 title="Download .ics file for Apple Calendar and others"
               >
-                <Download className="w-4 h-4" />
                 .ics
-              </button>
+              </Button>
               {googleOAuthSources.length === 1 ? (
-                <button
+                <Button
+                  intent="primary"
+                  icon={<CalendarPlus className="w-4 h-4" />}
                   onClick={() => handleSyncToGoogle({
                     title: resolveMeetingTitle({ title: selectedSubMeeting.title, calendarTitle: selectedSubMeeting.calendar_title }), description: selectedSubMeeting.description,
                     start_time: selectedSubMeeting.start_time, end_time: selectedSubMeeting.end_time,
                     meeting_link: selectedSubMeeting.meeting_link,
                   })}
                   disabled={syncingToGoogle}
-                  className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors disabled:opacity-50"
+                  className="flex-1"
                   title={`Add to ${googleOAuthSources[0].display_name}`}
                 >
-                  <CalendarPlus className="w-4 h-4" />
                   {syncingToGoogle ? 'Syncing...' : 'Add to Google'}
-                </button>
+                </Button>
               ) : googleOAuthSources.length > 1 ? (
-                <button
+                <Button
+                  intent="primary"
+                  icon={<CalendarPlus className="w-4 h-4" />}
                   onClick={() => setShowGoogleSyncPicker({
                     title: resolveMeetingTitle({ title: selectedSubMeeting.title, calendarTitle: selectedSubMeeting.calendar_title }), description: selectedSubMeeting.description,
                     start_time: selectedSubMeeting.start_time, end_time: selectedSubMeeting.end_time,
                     meeting_link: selectedSubMeeting.meeting_link,
                   })}
-                  className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors"
+                  className="flex-1"
                   title="Choose which Google Calendar to add to"
                 >
-                  <CalendarPlus className="w-4 h-4" />
                   Add to Google
-                </button>
+                </Button>
               ) : (
                 <a
                   href={`https://calendar.google.com/calendar/render?action=TEMPLATE&text=${encodeURIComponent(resolveMeetingTitle({ title: selectedSubMeeting.title, calendarTitle: selectedSubMeeting.calendar_title }))}&dates=${new Date(selectedSubMeeting.start_time).toISOString().replace(/[-:]/g, '').replace(/\.\\d{3}/, '')}/${new Date(selectedSubMeeting.end_time).toISOString().replace(/[-:]/g, '').replace(/\.\\d{3}/, '')}${selectedSubMeeting.description ? `&details=${encodeURIComponent(selectedSubMeeting.description)}` : ''}${selectedSubMeeting.meeting_link ? `&location=${encodeURIComponent(selectedSubMeeting.meeting_link)}` : ''}`}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors"
+                  className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium bg-primary text-primary-foreground hover:opacity-90 transition-colors"
                   title="Add to Google Calendar"
                 >
                   <CalendarPlus className="w-4 h-4" />
@@ -3517,7 +3846,7 @@ export default function CoordinateEventsPage() {
             <div className="mt-2">
               <Link
                 to={`/meeting/${selectedSubMeeting.id.replace(/^sub_/, '')}`}
-                className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium text-blue-600 bg-blue-50 dark:bg-blue-950/30 hover:bg-blue-100 dark:hover:bg-blue-950/50 transition-colors w-full"
+                className="flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium text-info bg-info-subtle hover:bg-info-muted transition-colors w-full"
               >
                 <ExternalLink className="w-4 h-4" />
                 Meeting Page
@@ -3525,29 +3854,28 @@ export default function CoordinateEventsPage() {
             </div>
 
             <div className="flex items-center gap-2 mt-2">
-              <button
+              <Button
+                emphasis="outline"
+                intent="danger"
+                icon={<BellOff className="w-4 h-4" />}
                 onClick={() => { handleUnsubscribe(selectedSubMeeting.calendar_hash); setSelectedSubMeeting(null) }}
-                className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-md text-sm font-medium text-red-600 bg-red-50 dark:bg-red-950/30 hover:bg-red-100 dark:hover:bg-red-950/50 transition-colors"
+                className="flex-1"
               >
-                <BellOff className="w-4 h-4" />
                 Unsubscribe from Calendar
-              </button>
+              </Button>
             </div>
-          </div>
-        </div>
+        </Dialog>
       )}
 
       {/* Google Calendar Source Picker Modal */}
       {showGoogleSyncPicker && (
-        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-[60]" onClick={() => { setShowGoogleSyncPicker(null); setSelectedSyncSourceIds(new Set()) }}>
-          <div className="bg-card text-card-foreground rounded-lg p-5 max-w-sm w-full mx-4 my-4 max-h-[90vh] overflow-y-auto shadow-xl border border-border" onClick={e => e.stopPropagation()}>
-            <div className="flex items-center justify-between mb-3">
-              <h2 className="text-base font-bold">Choose Calendar</h2>
-              <button onClick={() => { setShowGoogleSyncPicker(null); setSelectedSyncSourceIds(new Set()) }} className="p-1 rounded hover:bg-muted transition-colors">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
-            <p className="text-xs text-muted-foreground mb-3">Select which Google Calendar(s) to add "{showGoogleSyncPicker.title}" to:</p>
+        <Dialog
+          open
+          onClose={() => { setShowGoogleSyncPicker(null); setSelectedSyncSourceIds(new Set()) }}
+          title="Choose Calendar"
+          description={`Select which Google Calendar(s) to add "${showGoogleSyncPicker.title}" to:`}
+          showCloseButton
+        >
             <div className="space-y-2 mb-4">
               {googleOAuthSources.map(source => (
                 <label key={source.id} className="flex items-center gap-2 p-2 rounded-md hover:bg-muted cursor-pointer transition-colors">
@@ -3562,33 +3890,33 @@ export default function CoordinateEventsPage() {
                     })}
                     className="w-4 h-4 rounded border-border text-primary focus:ring-primary"
                   />
-                  <span className="w-3 h-3 rounded-full flex-shrink-0" style={{ backgroundColor: source.color }} />
+                  <span className="w-3 h-3 rounded-full shrink-0" style={{ backgroundColor: source.color }} />
                   <span className="text-sm truncate">{source.display_name}</span>
                 </label>
               ))}
             </div>
-            <button
+            <Button
+              intent="primary"
+              fullWidth
+              icon={<CalendarPlus className="w-4 h-4" />}
               onClick={() => handleSyncToGoogle(showGoogleSyncPicker, Array.from(selectedSyncSourceIds))}
               disabled={selectedSyncSourceIds.size === 0 || syncingToGoogle}
-              className="w-full flex items-center justify-center gap-1.5 px-4 py-2 rounded-md text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors disabled:opacity-50"
             >
-              <CalendarPlus className="w-4 h-4" />
               {syncingToGoogle ? 'Adding...' : `Add to ${selectedSyncSourceIds.size} Calendar(s)`}
-            </button>
-          </div>
-        </div>
+            </Button>
+        </Dialog>
       )}
 
       {/* Create Event Modal */}
       {showCreateModal && (
-        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setShowCreateModal(false)}>
-          <div className="bg-card text-card-foreground rounded-lg p-5 max-w-md w-full mx-4 my-4 max-h-[90vh] overflow-y-auto shadow-xl border border-border" onClick={e => e.stopPropagation()}>
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-lg font-bold">Create Event</h2>
-              <button onClick={() => setShowCreateModal(false)} className="p-1 rounded hover:bg-muted transition-colors">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
+        <Dialog
+          open
+          onClose={() => setShowCreateModal(false)}
+          title="Create Event"
+          kind="focusModal"
+          size="md"
+          showCloseButton
+        >
 
             <div className="space-y-3">
               <div>
@@ -3597,7 +3925,7 @@ export default function CoordinateEventsPage() {
                   type="text"
                   value={createForm.title}
                   onChange={e => setCreateForm(p => ({ ...p, title: e.target.value }))}
-                  className="w-full px-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary"
+                  className="w-full px-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-hidden focus:ring-2 focus:ring-primary"
                   placeholder="Event title"
                 />
               </div>
@@ -3606,7 +3934,7 @@ export default function CoordinateEventsPage() {
                 <textarea
                   value={createForm.description}
                   onChange={e => setCreateForm(p => ({ ...p, description: e.target.value }))}
-                  className="w-full px-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary resize-none"
+                  className="w-full px-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-hidden focus:ring-2 focus:ring-primary resize-none"
                   rows={2}
                   placeholder="Optional description"
                 />
@@ -3617,7 +3945,7 @@ export default function CoordinateEventsPage() {
                   type="url"
                   value={createForm.meeting_link}
                   onChange={e => setCreateForm(p => ({ ...p, meeting_link: e.target.value }))}
-                  className="w-full px-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary"
+                  className="w-full px-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-hidden focus:ring-2 focus:ring-primary"
                   placeholder="https://..."
                 />
               </div>
@@ -3628,7 +3956,7 @@ export default function CoordinateEventsPage() {
                     type="date"
                     value={createForm.start_date}
                     onChange={e => setCreateForm(p => ({ ...p, start_date: e.target.value, end_date: p.end_date || e.target.value }))}
-                    className="w-full px-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary"
+                    className="w-full px-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-hidden focus:ring-2 focus:ring-primary"
                   />
                 </div>
                 <div>
@@ -3637,7 +3965,7 @@ export default function CoordinateEventsPage() {
                     type="time"
                     value={createForm.start_time}
                     onChange={e => setCreateForm(p => ({ ...p, start_time: e.target.value }))}
-                    className="w-full px-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary"
+                    className="w-full px-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-hidden focus:ring-2 focus:ring-primary"
                   />
                 </div>
                 <div>
@@ -3646,7 +3974,7 @@ export default function CoordinateEventsPage() {
                     type="date"
                     value={createForm.end_date}
                     onChange={e => setCreateForm(p => ({ ...p, end_date: e.target.value }))}
-                    className="w-full px-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary"
+                    className="w-full px-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-hidden focus:ring-2 focus:ring-primary"
                   />
                 </div>
                 <div>
@@ -3655,7 +3983,7 @@ export default function CoordinateEventsPage() {
                     type="time"
                     value={createForm.end_time}
                     onChange={e => setCreateForm(p => ({ ...p, end_time: e.target.value }))}
-                    className="w-full px-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary"
+                    className="w-full px-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-hidden focus:ring-2 focus:ring-primary"
                   />
                 </div>
               </div>
@@ -3666,37 +3994,37 @@ export default function CoordinateEventsPage() {
                   onChange={e => setCreateForm(p => ({ ...p, is_public: e.target.checked }))}
                   className="rounded"
                 />
-                <Eye className="w-3.5 h-3.5 text-green-600" />
+                <Eye className="w-3.5 h-3.5 text-success" />
                 Publish to Events Calendar
               </label>
             </div>
 
             <div className="flex gap-2 mt-4 pt-3 border-t border-border">
-              <button onClick={() => setShowCreateModal(false)} className="flex-1 px-3 py-2 text-sm font-medium bg-muted rounded-md hover:bg-muted/80">
+              <Button emphasis="ghost" onClick={() => setShowCreateModal(false)} className="flex-1">
                 Cancel
-              </button>
-              <button
+              </Button>
+              <Button
+                intent="primary"
                 onClick={handleCreateEvent}
                 disabled={!createForm.title || !createForm.start_date || !createForm.end_date}
-                className="flex-1 px-3 py-2 text-sm font-medium bg-primary text-primary-foreground rounded-md hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed"
+                className="flex-1"
               >
                 Create
-              </button>
+              </Button>
             </div>
-          </div>
-        </div>
+        </Dialog>
       )}
 
       {/* Import Modal */}
       {showImportModal && (
-        <div className="fixed inset-0 bg-black/30 flex items-center justify-center z-50" onClick={() => setShowImportModal(false)}>
-          <div className="bg-card text-card-foreground rounded-lg p-5 max-w-lg w-full mx-4 my-4 max-h-[90vh] overflow-y-auto shadow-xl border border-border" onClick={e => e.stopPropagation()}>
-            <div className="flex items-center justify-between mb-4">
-              <h2 className="text-lg font-bold">Import Events</h2>
-              <button onClick={() => setShowImportModal(false)} className="p-1 rounded hover:bg-muted transition-colors">
-                <X className="w-4 h-4" />
-              </button>
-            </div>
+        <Dialog
+          open
+          onClose={() => setShowImportModal(false)}
+          title="Import Events"
+          kind="focusModal"
+          size="lg"
+          showCloseButton
+        >
 
             {!importType ? (
               <div className="space-y-3">
@@ -3745,7 +4073,7 @@ export default function CoordinateEventsPage() {
                     onClick={() => { setImportType('coordination_calendar'); fetchCoordCalendars() }}
                     className="w-full flex items-center gap-2.5 p-2.5 rounded-md border border-border hover:bg-accent/50 transition-colors"
                   >
-                    <Calendar className="w-4 h-4 text-blue-500" />
+                    <Calendar className="w-4 h-4 text-info" />
                     <span className="text-sm font-medium">Browse Coordination Calendars</span>
                   </button>
                 </div>
@@ -3753,7 +4081,7 @@ export default function CoordinateEventsPage() {
             ) : importType === 'calendar_source' ? (
               <div className="space-y-3">
                 <div className="flex items-center gap-2 text-sm">
-                  <button onClick={() => setImportType(null)} className="text-blue-600 hover:underline text-xs">← Back</button>
+                  <button onClick={() => setImportType(null)} className="text-primary hover:underline text-xs">← Back</button>
                   <span className="font-medium">Import from: {calendarSources.find(s => s.id === importSourceId)?.display_name}</span>
                 </div>
 
@@ -3803,7 +4131,7 @@ export default function CoordinateEventsPage() {
                 </div>
 
                 {importResult && (
-                  <div className={`text-sm p-2 rounded-md ${importResult.startsWith('Error') ? 'bg-red-50 text-red-600 dark:bg-red-950/30 dark:text-red-400 space-y-2' : 'bg-green-50 text-green-600 dark:bg-green-950/30 dark:text-green-400'}`}>
+                  <div className={`text-sm p-2 rounded-md ${importResult.startsWith('Error') ? 'bg-danger-subtle text-danger space-y-2' : 'bg-success-subtle text-success'}`}>
                     <p>{importResult}</p>
                     {importResult.includes('invalid_grant') && (
                       <Link
@@ -3817,19 +4145,20 @@ export default function CoordinateEventsPage() {
                   </div>
                 )}
 
-                <button
+                <Button
+                  intent="primary"
+                  fullWidth
+                  icon={isImporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
                   onClick={handleImport}
                   disabled={isImporting}
-                  className="w-full px-3 py-2 text-sm font-medium bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 flex items-center justify-center gap-2"
                 >
-                  {isImporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
                   {isImporting ? 'Importing...' : importPrimaryLabel}
-                </button>
+                </Button>
               </div>
             ) : (
               <div className="space-y-3">
                 <div className="flex items-center gap-2 text-sm">
-                  <button onClick={() => setImportType(null)} className="text-blue-600 hover:underline text-xs">← Back</button>
+                  <button onClick={() => setImportType(null)} className="text-primary hover:underline text-xs">← Back</button>
                   <span className="font-medium">Import from Coordination Calendar</span>
                 </div>
 
@@ -3841,7 +4170,7 @@ export default function CoordinateEventsPage() {
                       type="text"
                       value={coordSearch}
                       onChange={e => { setCoordSearch(e.target.value); setImportCalendarHash(e.target.value) }}
-                      className="w-full pl-9 pr-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-none focus:ring-2 focus:ring-primary"
+                      className="w-full pl-9 pr-3 py-2 text-sm border border-border rounded-md bg-background focus:outline-hidden focus:ring-2 focus:ring-primary"
                       placeholder="Search or paste calendar hash..."
                     />
                   </div>
@@ -3856,15 +4185,15 @@ export default function CoordinateEventsPage() {
                           key={cal.hash}
                           onClick={() => { setImportCalendarHash(cal.hash); setCoordSearch(cal.title) }}
                           className={`w-full flex items-center gap-2 p-2 rounded-md text-left text-sm transition-colors ${
-                            importCalendarHash === cal.hash ? 'bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800' : 'hover:bg-muted/50 border border-transparent'
+                            importCalendarHash === cal.hash ? 'bg-info-subtle border border-info-muted' : 'hover:bg-muted/50 border border-transparent'
                           }`}
                         >
-                          <Calendar className="w-3.5 h-3.5 text-blue-500 shrink-0" />
+                          <Calendar className="w-3.5 h-3.5 text-info shrink-0" />
                           <div className="flex-1 min-w-0">
                             <div className="font-medium truncate">{cal.title}</div>
                             <div className="text-xs text-muted-foreground">{cal.hash}</div>
                           </div>
-                          {importCalendarHash === cal.hash && <Check className="w-4 h-4 text-blue-600" />}
+                          {importCalendarHash === cal.hash && <Check className="w-4 h-4 text-info" />}
                         </button>
                       ))}
                   </div>
@@ -3902,7 +4231,7 @@ export default function CoordinateEventsPage() {
                 </div>
 
                 {importResult && (
-                  <div className={`text-sm p-2 rounded-md ${importResult.startsWith('Error') ? 'bg-red-50 text-red-600 dark:bg-red-950/30 dark:text-red-400 space-y-2' : 'bg-green-50 text-green-600 dark:bg-green-950/30 dark:text-green-400'}`}>
+                  <div className={`text-sm p-2 rounded-md ${importResult.startsWith('Error') ? 'bg-danger-subtle text-danger space-y-2' : 'bg-success-subtle text-success'}`}>
                     <p>{importResult}</p>
                     {importResult.includes('invalid_grant') && (
                       <Link
@@ -3916,18 +4245,18 @@ export default function CoordinateEventsPage() {
                   </div>
                 )}
 
-                <button
+                <Button
+                  intent="primary"
+                  fullWidth
+                  icon={isImporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
                   onClick={handleImport}
                   disabled={isImporting || !importCalendarHash}
-                  className="w-full px-3 py-2 text-sm font-medium bg-blue-600 text-white rounded-md hover:bg-blue-700 disabled:opacity-50 flex items-center justify-center gap-2"
                 >
-                  {isImporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
                   {isImporting ? 'Importing...' : importPrimaryLabel}
-                </button>
+                </Button>
               </div>
             )}
-          </div>
-        </div>
+        </Dialog>
       )}
       {/* Confirm Delete Dialog */}
       <ConfirmDialog
@@ -3945,24 +4274,113 @@ export default function CoordinateEventsPage() {
 
       {/* Publish Events Modal */}
       {publishModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 backdrop-blur-sm">
-          <div className="bg-card border border-border rounded-xl shadow-2xl w-full max-w-lg mx-4 max-h-[85vh] flex flex-col">
-            <div className="flex items-center justify-between px-5 py-4 border-b border-border">
-              <div>
-                <h2 className="text-base font-semibold text-foreground">Publish Events</h2>
-                <p className="text-xs text-muted-foreground mt-0.5">
-                  Review and select which events to make public
+        <Dialog
+          open
+          onClose={() => setPublishModalOpen(false)}
+          title="Publish Events"
+          description="Review and select which events to make public"
+          kind="focusModal"
+          size="lg"
+          showCloseButton
+          closeOnScrimClick={false}
+          scrollBody
+          footer={
+            <div className="space-y-3">
+              {publishModalSyncOptionsMode === 'imported' ? (
+                <div className="space-y-2.5">
+                  <label className="flex items-start gap-3 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={publishModalAutoSync}
+                      onChange={e => setPublishModalAutoSync(e.target.checked)}
+                      className="mt-0.5 accent-primary w-4 h-4 shrink-0"
+                    />
+                    <div>
+                      <p className="text-sm font-medium text-foreground">Auto-sync imported source updates</p>
+                      <p className="text-xs text-muted-foreground">
+                        Applies only to imported calendars. If source items change (time, title, or are removed), the published copy updates automatically.
+                      </p>
+                    </div>
+                  </label>
+                  <label className="flex items-start gap-3 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={publishModalAutoPublishNew}
+                      onChange={e => setPublishModalAutoPublishNew(e.target.checked)}
+                      className="mt-0.5 accent-primary w-4 h-4 shrink-0"
+                    />
+                    <div>
+                      <p className="text-sm font-medium text-foreground">Auto-publish new imported meetings</p>
+                      <p className="text-xs text-muted-foreground">
+                        Applies only to imported calendars. New items from the same imported source will be published automatically.
+                      </p>
+                    </div>
+                  </label>
+                </div>
+              ) : publishModalSyncOptionsMode === 'manual-recurring' ? (
+                <div className="space-y-2.5">
+                  <label className="flex items-start gap-3">
+                    <input
+                      type="checkbox"
+                      checked
+                      readOnly
+                      className="mt-0.5 accent-primary w-4 h-4 shrink-0 cursor-default"
+                    />
+                    <div>
+                      <p className="text-sm font-medium text-foreground">Sync with recurrence</p>
+                      <p className="text-xs text-muted-foreground">
+                        This recurring Time Item keeps its public visibility while recurrence settings change.
+                      </p>
+                    </div>
+                  </label>
+                  <label className="flex items-start gap-3">
+                    <input
+                      type="checkbox"
+                      checked
+                      readOnly
+                      className="mt-0.5 accent-primary w-4 h-4 shrink-0 cursor-default"
+                    />
+                    <div>
+                      <p className="text-sm font-medium text-foreground">Sync with this specific Time Item changes</p>
+                      <p className="text-xs text-muted-foreground">
+                        Edits and cut/move on this same item continue to sync with public visibility. Copy now inherits this link, including visibility and recurrence settings.
+                      </p>
+                    </div>
+                  </label>
+                </div>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  Sync automation is not shown for Time Items (manual calendar mode) because they do not use imported source sync.
                 </p>
+              )}
+              <div className="flex gap-3 pt-1">
+                <Button
+                  emphasis="outline"
+                  onClick={() => setPublishModalOpen(false)}
+                  className="flex-1"
+                >
+                  Cancel
+                </Button>
+                <Button
+                  intent="primary"
+                  disabled={publishModalSelectedIds.size === 0}
+                  onClick={async () => {
+                    if (!publishModalOnConfirm) return
+                    const ids = Array.from(publishModalSelectedIds)
+                    await publishModalOnConfirm(ids, {
+                      autoSync: publishModalAutoSync,
+                      autoPublishNew: publishModalAutoPublishNew,
+                    })
+                    setPublishModalOpen(false)
+                  }}
+                  className="flex-1"
+                >
+                  Publish {publishModalSelectedIds.size > 0 ? `${publishModalSelectedIds.size} event${publishModalSelectedIds.size !== 1 ? 's' : ''}` : ''}
+                </Button>
               </div>
-              <button
-                onClick={() => setPublishModalOpen(false)}
-                className="p-1.5 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
-              >
-                <X className="w-4 h-4" />
-              </button>
             </div>
-
-            <div className="flex-1 overflow-y-auto px-5 py-3">
+          }
+        >
               <div className="space-y-1">
                 <div className="flex items-center justify-between py-1 mb-2">
                   <span className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
@@ -3971,7 +4389,7 @@ export default function CoordinateEventsPage() {
                   <div className="flex gap-2">
                     <button
                       onClick={() => setPublishModalSelectedIds(new Set(publishModalEvents.map(e => e.id)))}
-                      className="text-xs text-blue-600 hover:underline"
+                      className="text-xs text-primary hover:underline"
                     >
                       Select all
                     </button>
@@ -3991,15 +4409,15 @@ export default function CoordinateEventsPage() {
                     value={publishModalSearch}
                     onChange={e => setPublishModalSearch(e.target.value)}
                     placeholder="Search events in this list..."
-                    className="w-full pl-8 pr-8 py-1.5 text-sm border border-border rounded-md bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-1 focus:ring-blue-500"
+                    className="w-full pl-8 pr-8 py-1.5 text-sm border border-border rounded-md bg-background text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-1 focus:ring-ring"
                   />
                   {publishModalSearch && (
-                    <button
+                    <IconButton
+                      label="Clear search"
                       onClick={() => setPublishModalSearch('')}
-                      className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-muted transition-colors"
-                    >
-                      <X className="w-3 h-3 text-muted-foreground" />
-                    </button>
+                      className="absolute right-0.5 top-1/2 -translate-y-1/2"
+                      icon={<X className="w-3 h-3" />}
+                    />
                   )}
                 </div>
                 {publishModalEvents.length === 0 ? (
@@ -4019,17 +4437,16 @@ export default function CoordinateEventsPage() {
 
                     {publishModalFilteredGroups.history.length > 0 && (
                       <div className="mt-2 border border-border rounded-lg overflow-hidden">
-                        <button
-                          type="button"
-                          onClick={() => setPublishModalHistoryExpanded(prev => !prev)}
-                          className="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-muted/40 transition-colors"
-                        >
-                          {publishModalHistoryExpanded ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
-                          <span>History (last week and earlier)</span>
-                          <span className="ml-auto text-[10px]">{publishModalFilteredGroups.history.length}</span>
-                        </button>
+                        <Disclosure
+                          size="compact"
+                          title="History (last week and earlier)"
+                          trailing={<CountBadge count={publishModalFilteredGroups.history.length} />}
+                          expanded={publishModalHistoryExpanded}
+                          onToggle={(next) => setPublishModalHistoryExpanded(next)}
+                          panelId="coordinate-events-publish-history"
+                        />
                         {publishModalHistoryExpanded && (
-                          <div className="border-t border-border py-1">
+                          <div id="coordinate-events-publish-history" className="border-t border-border py-1">
                             {publishModalFilteredGroups.history.map(ev => renderPublishModalEventRow(ev))}
                           </div>
                         )}
@@ -4038,102 +4455,119 @@ export default function CoordinateEventsPage() {
                   </>
                 )}
               </div>
+        </Dialog>
+      )}
+
+      {/* Remove Public Series Modal */}
+      {removePublicModalEvent && (
+        <Dialog
+          open
+          onClose={() => setRemovePublicModalEvent(null)}
+          title={
+            <span className="flex items-center gap-2">
+              <EyeOff className="w-5 h-5 text-danger shrink-0" />
+              Remove Public Status
+            </span>
+          }
+          description={
+            <>
+              <span className="font-medium text-foreground">{removePublicModalEvent.title}</span> is part of a recurring meeting series.
+            </>
+          }
+          size="md"
+          showCloseButton
+          closeLabel="Close modal"
+        >
+          <div className="space-y-4">
+            <p className="text-xs text-muted-foreground">
+              Which sessions would you like to remove from the public calendar?
+            </p>
+
+            <div className="space-y-2">
+              <label className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                removePublicScope === 'this-only'
+                  ? 'border-primary bg-primary/5 dark:bg-primary/10'
+                  : 'border-border hover:bg-muted/50'
+              }`}>
+                <input
+                  type="radio"
+                  name="removePublicScope"
+                  value="this-only"
+                  checked={removePublicScope === 'this-only'}
+                  onChange={() => setRemovePublicScope('this-only')}
+                  className="mt-0.5 accent-primary"
+                />
+                <div className="text-xs space-y-0.5">
+                  <div className="font-medium text-foreground">Only this session</div>
+                  <div className="text-muted-foreground">
+                    Remove public status only for the meeting on {formatUTC(removePublicOccurrenceStart || removePublicModalEvent.start_time, 'EEE, MMM d, yyyy')}. Other sessions in the series remain public.
+                  </div>
+                </div>
+              </label>
+
+              <label className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                removePublicScope === 'this-and-future'
+                  ? 'border-primary bg-primary/5 dark:bg-primary/10'
+                  : 'border-border hover:bg-muted/50'
+              }`}>
+                <input
+                  type="radio"
+                  name="removePublicScope"
+                  value="this-and-future"
+                  checked={removePublicScope === 'this-and-future'}
+                  onChange={() => setRemovePublicScope('this-and-future')}
+                  className="mt-0.5 accent-primary"
+                />
+                <div className="text-xs space-y-0.5">
+                  <div className="font-medium text-foreground">This and future sessions</div>
+                  <div className="text-muted-foreground">
+                    Remove public status from {formatUTC(removePublicOccurrenceStart || removePublicModalEvent.start_time, 'EEE, MMM d, yyyy')} onwards. The series is split here: earlier sessions stay public.
+                  </div>
+                </div>
+              </label>
+
+              <label className={`flex items-start gap-3 p-3 rounded-lg border cursor-pointer transition-colors ${
+                removePublicScope === 'all-series'
+                  ? 'border-primary bg-primary/5 dark:bg-primary/10'
+                  : 'border-border hover:bg-muted/50'
+              }`}>
+                <input
+                  type="radio"
+                  name="removePublicScope"
+                  value="all-series"
+                  checked={removePublicScope === 'all-series'}
+                  onChange={() => setRemovePublicScope('all-series')}
+                  className="mt-0.5 accent-primary"
+                />
+                <div className="text-xs space-y-0.5">
+                  <div className="font-medium text-foreground">All sessions in the series (including history)</div>
+                  <div className="text-muted-foreground">
+                    Remove public status for all past, current, and future sessions of this meeting series.
+                  </div>
+                </div>
+              </label>
             </div>
 
-            <div className="border-t border-border px-5 py-4 space-y-3">
-              {publishModalSyncOptionsMode === 'imported' ? (
-                <div className="space-y-2.5">
-                  <label className="flex items-start gap-3 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={publishModalAutoSync}
-                      onChange={e => setPublishModalAutoSync(e.target.checked)}
-                      className="mt-0.5 accent-blue-600 w-4 h-4 shrink-0"
-                    />
-                    <div>
-                      <p className="text-sm font-medium text-foreground">Auto-sync imported source updates</p>
-                      <p className="text-xs text-muted-foreground">
-                        Applies only to imported calendars. If source items change (time, title, or are removed), the published copy updates automatically.
-                      </p>
-                    </div>
-                  </label>
-                  <label className="flex items-start gap-3 cursor-pointer">
-                    <input
-                      type="checkbox"
-                      checked={publishModalAutoPublishNew}
-                      onChange={e => setPublishModalAutoPublishNew(e.target.checked)}
-                      className="mt-0.5 accent-blue-600 w-4 h-4 shrink-0"
-                    />
-                    <div>
-                      <p className="text-sm font-medium text-foreground">Auto-publish new imported meetings</p>
-                      <p className="text-xs text-muted-foreground">
-                        Applies only to imported calendars. New items from the same imported source will be published automatically.
-                      </p>
-                    </div>
-                  </label>
-                </div>
-              ) : publishModalSyncOptionsMode === 'manual-recurring' ? (
-                <div className="space-y-2.5">
-                  <label className="flex items-start gap-3">
-                    <input
-                      type="checkbox"
-                      checked
-                      readOnly
-                      className="mt-0.5 accent-blue-600 w-4 h-4 shrink-0 cursor-default"
-                    />
-                    <div>
-                      <p className="text-sm font-medium text-foreground">Sync with recurrence</p>
-                      <p className="text-xs text-muted-foreground">
-                        This recurring Time Item keeps its public visibility while recurrence settings change.
-                      </p>
-                    </div>
-                  </label>
-                  <label className="flex items-start gap-3">
-                    <input
-                      type="checkbox"
-                      checked
-                      readOnly
-                      className="mt-0.5 accent-blue-600 w-4 h-4 shrink-0 cursor-default"
-                    />
-                    <div>
-                      <p className="text-sm font-medium text-foreground">Sync with this specific Time Item changes</p>
-                      <p className="text-xs text-muted-foreground">
-                        Edits and cut/move on this same item continue to sync with public visibility. Copy now inherits this link, including visibility and recurrence settings.
-                      </p>
-                    </div>
-                  </label>
-                </div>
-              ) : (
-                <p className="text-xs text-muted-foreground">
-                  Sync automation is not shown for Time Items (manual calendar mode) because they do not use imported source sync.
-                </p>
-              )}
-              <div className="flex gap-3 pt-1">
-                <button
-                  onClick={() => setPublishModalOpen(false)}
-                  className="flex-1 px-4 py-2 text-sm font-medium border border-border rounded-md text-foreground hover:bg-muted transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  disabled={publishModalSelectedIds.size === 0}
-                  onClick={async () => {
-                    if (!publishModalOnConfirm) return
-                    const ids = Array.from(publishModalSelectedIds)
-                    await publishModalOnConfirm(ids, {
-                      autoSync: publishModalAutoSync,
-                      autoPublishNew: publishModalAutoPublishNew,
-                    })
-                    setPublishModalOpen(false)
-                  }}
-                  className="flex-1 px-4 py-2 text-sm font-semibold bg-green-600 text-white rounded-md hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-                >
-                  Publish {publishModalSelectedIds.size > 0 ? `${publishModalSelectedIds.size} event${publishModalSelectedIds.size !== 1 ? 's' : ''}` : ''}
-                </button>
-              </div>
+            <div className="flex items-center justify-end gap-2 pt-2 border-t border-border">
+              <Button
+                emphasis="outline"
+                size="compact"
+                onClick={() => setRemovePublicModalEvent(null)}
+              >
+                Cancel
+              </Button>
+              <Button
+                intent="danger"
+                size="compact"
+                icon={isRemovingPublic ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <EyeOff className="w-3.5 h-3.5" />}
+                onClick={handleConfirmRemovePublicSeries}
+                disabled={isRemovingPublic}
+              >
+                Remove Public Status
+              </Button>
             </div>
           </div>
-        </div>
+        </Dialog>
       )}
       </div>
     </>

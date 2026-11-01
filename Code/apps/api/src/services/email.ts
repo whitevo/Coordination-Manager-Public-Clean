@@ -3,12 +3,12 @@
  *
  * Two modes:
  *   1. Per-user SMTP: user configures their own email + app password
- *   2. Platform default: coreswarm@gmail.com (configured via env vars)
+ *   2. Platform default: the SMTP_USER sender (configured via env vars)
  *
  * Environment variables (platform default):
  *   SMTP_HOST              - default: smtp.gmail.com
  *   SMTP_PORT              - default: 587
- *   SMTP_USER              - default sender, e.g. coreswarm@gmail.com
+ *   SMTP_USER              - default sender, e.g. sender@example.com
  *   SMTP_PASS              - app password for the default sender
  *   SMTP_ENCRYPTION_KEY    - 32-byte hex key for encrypting user SMTP passwords
  */

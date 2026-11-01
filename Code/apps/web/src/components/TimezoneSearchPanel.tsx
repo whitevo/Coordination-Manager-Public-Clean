@@ -1,21 +1,21 @@
-import { useState, useMemo, useRef, useEffect } from 'react'
-import { Search, X, MapPin, Clock, Globe } from 'lucide-react'
+import { useState, useMemo, useRef, useEffect, useId } from 'react'
+import { Search, X, MapPin, Clock, Globe, LocateFixed } from 'lucide-react'
 import {
   searchTimezones,
   groupByRegion,
   groupByCountry,
+  detectLocalTimezone,
   type TimezoneEntry,
 } from '../lib/timezone-data'
+import { IconButton, SegmentedControl } from './ui'
 
 interface TimezoneSearchPanelProps {
   /** Called when a timezone is selected */
   onSelect: (entry: TimezoneEntry) => void
-  /** Called when the panel should close */
-  onClose: () => void
+  /** Called when the user chooses to apply the browser-detected timezone */
+  onApplyBrowserTimezone?: () => void
   /** Currently active timezone IANA ids (to highlight) */
   activeTimezones?: string[]
-  /** Label shown in header, e.g. "Set Primary Timezone" */
-  title?: string
 }
 
 const REGION_LABELS: Record<string, string> = {
@@ -36,31 +36,18 @@ type GroupMode = 'region' | 'country'
 
 export default function TimezoneSearchPanel({
   onSelect,
-  onClose,
+  onApplyBrowserTimezone,
   activeTimezones = [],
-  title = 'Select Timezone',
 }: TimezoneSearchPanelProps) {
   const [query, setQuery] = useState('')
   const [groupMode, setGroupMode] = useState<GroupMode>('region')
   const inputRef = useRef<HTMLInputElement>(null)
-  const panelRef = useRef<HTMLDivElement>(null)
+  const inputId = useId()
+  const browserTimezone = useMemo(() => detectLocalTimezone(), [])
 
-  // Auto-focus search input
   useEffect(() => {
-    const timer = setTimeout(() => inputRef.current?.focus(), 100)
-    return () => clearTimeout(timer)
+    inputRef.current?.focus()
   }, [])
-
-  // Close on Escape
-  useEffect(() => {
-    function handleKey(e: KeyboardEvent) {
-      if (e.key === 'Escape') onClose()
-    }
-    window.addEventListener('keydown', handleKey)
-    return () => window.removeEventListener('keydown', handleKey)
-  }, [onClose])
-
-  // No click-outside-to-close -- panel stays open until user clicks X or presses Escape
 
   const filtered = useMemo(() => searchTimezones(query), [query])
 
@@ -86,79 +73,78 @@ export default function TimezoneSearchPanel({
   const totalResults = filtered.length
 
   return (
-    <div
-      ref={panelRef}
-      className="absolute z-50 mt-2 w-[28rem] bg-card border border-border rounded-xl shadow-xl overflow-hidden animate-in fade-in slide-in-from-top-2 duration-200"
-    >
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-muted/30">
-        <h3 className="text-sm font-semibold text-foreground">{title}</h3>
-        <button
-          onClick={onClose}
-          className="p-1 rounded-md hover:bg-muted text-muted-foreground hover:text-foreground transition-colors"
-        >
-          <X className="w-4 h-4" />
-        </button>
-      </div>
-
+    <div className="space-y-3">
       {/* Search Input */}
-      <div className="px-4 py-3 border-b border-border">
+      <div className="pb-3 border-b border-border">
         <div className="relative">
           <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-muted-foreground" />
           <input
             ref={inputRef}
-            id="timezone-search-input"
+            id={inputId}
+            aria-label="Search timezones"
             name="timezoneSearch"
             type="text"
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search city, country, or timezone..."
-            className="w-full pl-10 pr-10 py-2 text-sm border border-border rounded-lg bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500"
+            className="w-full min-h-11 pl-10 pr-10 py-2 text-sm border border-border rounded-lg bg-background text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring/50 focus:border-ring"
           />
           {query && (
-            <button
-              onClick={() => setQuery('')}
-              className="absolute right-3 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-muted text-muted-foreground"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
+            <IconButton
+              label="Clear search"
+              icon={<X />}
+              onClick={() => {
+                setQuery('')
+                inputRef.current?.focus()
+              }}
+              className="absolute right-1 top-1/2 -translate-y-1/2 min-h-11 min-w-11"
+            />
           )}
         </div>
 
         {/* Group mode toggle + result count */}
-        <div className="flex items-center justify-between mt-2">
+        <div className="flex flex-wrap items-center justify-between gap-2 mt-2">
           <span className="text-xs text-muted-foreground">
             {totalResults} timezone{totalResults !== 1 ? 's' : ''}
           </span>
-          <div className="flex rounded-md border border-border overflow-hidden">
-            <button
-              onClick={() => setGroupMode('region')}
-              className={`px-2.5 py-1 text-xs font-medium transition-colors ${
-                groupMode === 'region'
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-background text-muted-foreground hover:bg-muted'
-              }`}
-            >
-              <Globe className="w-3 h-3 inline mr-1" />
-              Region
-            </button>
-            <button
-              onClick={() => setGroupMode('country')}
-              className={`px-2.5 py-1 text-xs font-medium transition-colors border-l border-border ${
-                groupMode === 'country'
-                  ? 'bg-blue-600 text-white'
-                  : 'bg-background text-muted-foreground hover:bg-muted'
-              }`}
-            >
-              <MapPin className="w-3 h-3 inline mr-1" />
-              Country
-            </button>
-          </div>
+          <SegmentedControl<GroupMode>
+            label="Group timezones by"
+            size="compact"
+            className="[&_button]:min-h-11 sm:[&_button]:min-h-0"
+            value={groupMode}
+            onChange={setGroupMode}
+            options={[
+              {
+                value: 'region',
+                label: 'Region',
+                icon: <Globe className="w-3 h-3" aria-hidden="true" />,
+              },
+              {
+                value: 'country',
+                label: 'Country',
+                icon: <MapPin className="w-3 h-3" aria-hidden="true" />,
+              },
+            ]}
+          />
         </div>
       </div>
 
-      {/* Scrollable Results */}
-      <div className="max-h-[28rem] overflow-y-auto overscroll-contain">
+      <div>
+        {onApplyBrowserTimezone && !query && (
+          <button
+            type="button"
+            onClick={onApplyBrowserTimezone}
+            className="flex w-full min-h-11 items-center gap-2 px-3 py-2.5 text-left sm:px-4 border-b border-border bg-info-subtle hover:bg-info-muted transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            <LocateFixed className="w-4 h-4 shrink-0 text-primary" />
+            <span className="flex-1 min-w-0">
+              <span className="text-sm font-medium text-info">Apply browser timezone</span>
+              <span className="block text-xs text-muted-foreground truncate">
+                {browserTimezone}
+              </span>
+            </span>
+          </button>
+        )}
         {groupKeys.length === 0 ? (
           <div className="px-4 py-8 text-center text-sm text-muted-foreground">
             No timezones found for &quot;{query}&quot;
@@ -167,53 +153,46 @@ export default function TimezoneSearchPanel({
           groupKeys.map((groupKey) => (
             <div key={groupKey}>
               {/* Group Header */}
-              <div className="sticky top-0 z-10 px-4 py-1.5 bg-muted/60 backdrop-blur-sm border-b border-border">
+              <div className="px-3 py-1.5 bg-muted border-b border-border">
                 <span className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">
                   {groupMode === 'region' ? regionLabel(groupKey) : groupKey}
                 </span>
               </div>
 
               {/* Timezone Rows */}
-              <table className="w-full">
-                <tbody>
-                  {grouped[groupKey].map((tz) => {
-                    const isActive = activeTimezones.includes(tz.iana)
-                    return (
-                      <tr
-                        key={tz.iana}
-                        onClick={() => onSelect(tz)}
-                        className={`cursor-pointer transition-colors ${
-                          isActive
-                            ? 'bg-blue-50 dark:bg-blue-950/30 hover:bg-blue-100 dark:hover:bg-blue-950/50'
-                            : 'hover:bg-muted/50'
-                        }`}
+              {grouped[groupKey].map((tz) => {
+                const isActive = activeTimezones.includes(tz.iana)
+                return (
+                  <button
+                    type="button"
+                    key={tz.iana}
+                    onClick={() => onSelect(tz)}
+                    className={`grid w-full min-h-11 grid-cols-2 items-start gap-x-3 gap-y-1 px-3 py-2 text-left sm:grid-cols-[minmax(0,1.2fr)_minmax(0,1fr)_auto_auto] transition-colors focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring ${
+                      isActive ? 'bg-info-subtle hover:bg-info-muted' : 'hover:bg-muted/50'
+                    }`}
+                  >
+                    <span className="flex min-w-0 items-start gap-2">
+                      <Clock
+                        className={`hidden sm:block w-3.5 h-3.5 shrink-0 mt-0.5 ${isActive ? 'text-primary' : 'text-muted-foreground'}`}
+                      />
+                      <span
+                        className={`text-sm font-medium wrap-break-word whitespace-normal ${isActive ? 'text-info' : 'text-foreground'}`}
                       >
-                        <td className="pl-4 pr-2 py-2">
-                          <div className="flex items-center gap-2">
-                            <Clock className={`w-3.5 h-3.5 flex-shrink-0 ${isActive ? 'text-blue-600 dark:text-blue-400' : 'text-muted-foreground'}`} />
-                            <span className={`text-sm font-medium ${isActive ? 'text-blue-700 dark:text-blue-300' : 'text-foreground'}`}>
-                              {tz.city}
-                            </span>
-                          </div>
-                        </td>
-                        <td className="px-2 py-2">
-                          <span className="text-xs text-muted-foreground">{tz.country}</span>
-                        </td>
-                        <td className="px-2 py-2 text-right">
-                          <span className="inline-block px-1.5 py-0.5 text-xs font-mono rounded bg-muted text-muted-foreground">
-                            {tz.abbr}
-                          </span>
-                        </td>
-                        <td className="pr-4 pl-2 py-2 text-right">
-                          <span className="text-xs font-mono text-muted-foreground">
-                            {tz.utcOffset}
-                          </span>
-                        </td>
-                      </tr>
-                    )
-                  })}
-                </tbody>
-              </table>
+                        {tz.city}
+                      </span>
+                    </span>
+                    <span className="text-xs text-muted-foreground wrap-break-word whitespace-normal">
+                      {tz.country}
+                    </span>
+                    <span className="justify-self-start px-1.5 py-0.5 text-xs font-mono rounded bg-muted text-muted-foreground whitespace-nowrap">
+                      {tz.abbr}
+                    </span>
+                    <span className="text-xs font-mono text-muted-foreground whitespace-nowrap">
+                      {tz.utcOffset}
+                    </span>
+                  </button>
+                )
+              })}
             </div>
           ))
         )}

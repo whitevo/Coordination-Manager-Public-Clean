@@ -3,6 +3,7 @@ import { useSearchParams, Link } from 'react-router-dom'
 import { ShieldAlert, CheckCircle2, Loader2, AlertCircle } from 'lucide-react'
 
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:3001'
+const SUPPORT_EMAIL = import.meta.env.VITE_SUPPORT_EMAIL || 'support@example.com'
 
 export default function EmailAbusePage() {
   const [searchParams] = useSearchParams()
@@ -54,7 +55,7 @@ export default function EmailAbusePage() {
 
           {status === 'success' && (
             <>
-              <CheckCircle2 className="w-12 h-12 mx-auto text-green-500 mb-4" />
+              <CheckCircle2 className="w-12 h-12 mx-auto text-success mb-4" />
               <h1 className="text-xl font-bold mb-2">Report Received</h1>
               <p className="text-sm text-muted-foreground mb-4">
                 Thank you for reporting this. Verification emails to your address have been blocked
@@ -62,7 +63,7 @@ export default function EmailAbusePage() {
               </p>
               <p className="text-xs text-muted-foreground mb-6">
                 If you continue to receive unwanted emails after this period, please contact us at{' '}
-                <a href="mailto:coreswarm@gmail.com" className="text-primary hover:underline">coreswarm@gmail.com</a>.
+                <a href={`mailto:${SUPPORT_EMAIL}`} className="text-primary hover:underline">{SUPPORT_EMAIL}</a>.
               </p>
               <div className="pt-4 border-t border-border">
                 <p className="text-xs text-muted-foreground">
@@ -75,14 +76,14 @@ export default function EmailAbusePage() {
 
           {status === 'error' && (
             <>
-              <AlertCircle className="w-12 h-12 mx-auto text-red-500 mb-4" />
+              <AlertCircle className="w-12 h-12 mx-auto text-danger mb-4" />
               <h1 className="text-xl font-bold mb-2">Report Failed</h1>
               <p className="text-sm text-muted-foreground mb-4">
                 {errorMessage || 'The report link may have expired or already been used.'}
               </p>
               <p className="text-xs text-muted-foreground">
                 If you believe your email is being misused, please contact us at{' '}
-                <a href="mailto:coreswarm@gmail.com" className="text-primary hover:underline">coreswarm@gmail.com</a>.
+                <a href={`mailto:${SUPPORT_EMAIL}`} className="text-primary hover:underline">{SUPPORT_EMAIL}</a>.
               </p>
             </>
           )}

@@ -1,8 +1,9 @@
 import dotenv from 'dotenv'
-dotenv.config()
+dotenv.config({ quiet: true })
 
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { isMeaningfulEnvValue } from './services/local-config.js'
+import { getSupabaseSecretKeyName, getSupabaseServerKey } from './services/supabase-key.js'
 
 // ---------------------------------------------------------------------------
 // Lazy / tolerant Supabase clients
@@ -25,7 +26,10 @@ const PLACEHOLDER_KEY =
 
 const supabaseUrl = process.env.SUPABASE_URL || PLACEHOLDER_URL
 const supabaseKey = process.env.SUPABASE_KEY || PLACEHOLDER_KEY
-const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+const serverKey = getSupabaseServerKey()
+if (serverKey.value !== undefined && !serverKey.value.trim()) {
+  throw new Error(`${serverKey.name} is empty; configure the environment-selected secret API key`)
+}
 
 export function isSupabaseConfigured(): boolean {
   return isMeaningfulEnvValue('SUPABASE_URL', process.env.SUPABASE_URL)
@@ -37,9 +41,9 @@ if (!isSupabaseConfigured()) {
     '[supabaseClient] SUPABASE_URL / SUPABASE_KEY not set -- running in UNCONFIGURED mode.\n' +
     '                  DB calls will fail until configured via the Setup Wizard at /setup.'
   )
-} else if (!supabaseServiceRoleKey) {
+} else if (!serverKey.value) {
   console.warn(
-    '[supabaseClient] SUPABASE_SERVICE_ROLE_KEY is not set -- supabaseAdmin will fall back to the anon-key client.\n' +
+    `[supabaseClient] ${getSupabaseSecretKeyName()} is not set -- supabaseAdmin will fall back to the anon-key client.\n` +
     '                  RLS will NOT be bypassed and many admin operations will return empty results.'
   )
 }
@@ -47,7 +51,9 @@ if (!isSupabaseConfigured()) {
 // Public client (uses anon key, respects RLS)
 export const supabase: SupabaseClient = createClient(supabaseUrl, supabaseKey)
 
-// Admin client (uses service role key, bypasses RLS) -- for backend admin operations
-export const supabaseAdmin: SupabaseClient = supabaseServiceRoleKey
-  ? createClient(supabaseUrl, supabaseServiceRoleKey)
+// Admin clients must not retain user sessions.
+export const supabaseAdmin: SupabaseClient = serverKey.value
+  ? createClient(supabaseUrl, serverKey.value, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  })
   : supabase

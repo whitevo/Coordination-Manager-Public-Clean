@@ -12,7 +12,6 @@ import {
   MessageSquare,
   MessageCircle,
   Code2,
-  Map,
   GraduationCap,
   Sparkles,
   Video,
@@ -23,6 +22,17 @@ import {
   FileText,
   Video as VideoIcon,
   Lock,
+  Gauge,
+  Mail,
+  Palette,
+  LayoutGrid,
+  ShieldAlert,
+  ListChecks,
+  Bug,
+  Cookie,
+  FileKey,
+  FileWarning,
+  Wrench,
 } from 'lucide-react'
 import { markdownRoutesBySection } from '../markdown-manifest'
 import { sectionNavigation } from '../docs-content'
@@ -39,15 +49,44 @@ interface NavSection {
   items: { label: string; path: string; icon: React.ReactNode; external?: boolean }[]
 }
 
+function getGuideIcon(path: string): React.ReactNode {
+  const iconClassName = 'w-4 h-4'
+
+  switch (path) {
+    case '/guides/mailbox-architecture':
+      return <Boxes className={iconClassName} />
+    case '/guides/testing':
+      return <ListChecks className={iconClassName} />
+    case '/guides/discord-guardian':
+      return <ShieldAlert className={iconClassName} />
+    case '/guides/security/session-handling':
+      return <Cookie className={iconClassName} />
+    case '/guides/security/oauth-security':
+      return <Key className={iconClassName} />
+    case '/guides/security/mailbox-credential-encryption':
+      return <FileKey className={iconClassName} />
+    case '/guides/security/security-headers':
+      return <ShieldCheck className={iconClassName} />
+    case '/guides/security/vulnerability-reporting':
+      return <FileWarning className={iconClassName} />
+    case '/guides/security/security-tooling':
+      return <Wrench className={iconClassName} />
+    default:
+      return <FileText className={iconClassName} />
+  }
+}
+
 const sections: NavSection[] = [
   {
     title: 'General',
     path: sectionNavigation.find((section) => section.id === 'general')?.path ?? '/section/general',
     items: [
       { label: 'Overview', path: '/overview', icon: <BookOpen className="w-4 h-4" /> },
+      { label: 'Workshops', path: '/workshops', icon: <GraduationCap className="w-4 h-4" /> },
       { label: 'Architecture', path: '/architecture', icon: <Boxes className="w-4 h-4" /> },
       { label: 'Getting Started', path: '/getting-started', icon: <Rocket className="w-4 h-4" /> },
       { label: 'Authentication', path: '/authentication', icon: <Key className="w-4 h-4" /> },
+      { label: 'Limits', path: '/limits', icon: <Gauge className="w-4 h-4" /> },
     ],
   },
   {
@@ -59,6 +98,7 @@ const sections: NavSection[] = [
       { label: 'Meetings', path: '/api/meetings', icon: <Users className="w-4 h-4" /> },
       { label: 'Announcements', path: '/api/announcements', icon: <Megaphone className="w-4 h-4" /> },
       { label: 'Discord', path: '/api/discord', icon: <MessageCircle className="w-4 h-4" /> },
+      { label: 'Mailbox', path: '/api/mailbox', icon: <Mail className="w-4 h-4" /> },
       { label: 'Feedback', path: '/api/feedback', icon: <MessageSquare className="w-4 h-4" /> },
     ],
   },
@@ -67,11 +107,26 @@ const sections: NavSection[] = [
     path: sectionNavigation.find((section) => section.id === 'guides')?.path ?? '/section/guides',
     items: [
       { label: 'Examples', path: '/examples', icon: <Code2 className="w-4 h-4" /> },
-      { label: 'Roadmap', path: '/roadmap', icon: <Map className="w-4 h-4" /> },
-      { label: 'Workshops', path: '/workshops', icon: <GraduationCap className="w-4 h-4" /> },
       { label: 'Zoom Integration', path: '/zoom', icon: <Video className="w-4 h-4" /> },
       { label: 'Zoom Review', path: '/zoom-review', icon: <ClipboardCheck className="w-4 h-4" /> },
       { label: 'Coordination Frameworks', path: '/coordination-frameworks', icon: <Network className="w-4 h-4" /> },
+      ...markdownRoutesBySection.Guides.map((route) => ({
+        label: route.title,
+        path: route.path,
+        icon: getGuideIcon(route.path),
+      })),
+    ],
+  },
+  {
+    title: 'Design',
+    path: sectionNavigation.find((section) => section.id === 'design')?.path ?? '/section/design',
+    items: [
+      ...markdownRoutesBySection.Design.map((route) => ({
+        label: route.title,
+        path: route.path,
+        icon: <Palette className="w-4 h-4" />,
+      })),
+      { label: 'Component Catalog', path: '/design/catalog', icon: <LayoutGrid className="w-4 h-4" /> },
     ],
   },
   {
@@ -90,6 +145,21 @@ const sections: NavSection[] = [
         icon,
       }
     }),
+  },
+  {
+    title: 'Risk & Ethics',
+    path: sectionNavigation.find((section) => section.id === 'risk')?.path ?? '/section/risk',
+    items: [
+      { label: 'AI Risk Framework', path: '/risk/framework', icon: <ShieldAlert className="w-4 h-4" /> },
+      { label: 'Risk Register', path: '/risk/register', icon: <ListChecks className="w-4 h-4" /> },
+    ],
+  },
+  {
+    title: 'Marketing',
+    path: sectionNavigation.find((section) => section.id === 'marketing')?.path ?? '/section/marketing',
+    items: [
+      { label: 'Product Directory Listings', path: '/marketing', icon: <Megaphone className="w-4 h-4" /> },
+    ],
   },
   {
     title: 'Proposals',

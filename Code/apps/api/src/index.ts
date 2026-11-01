@@ -1,5 +1,5 @@
 import dotenv from 'dotenv'
-dotenv.config()
+dotenv.config({ quiet: true })
 
 import express from 'express'
 import cors from 'cors'
@@ -9,6 +9,7 @@ import { errorHandler } from './middleware/error-handler.js'
 import healthRoutes from './routes/health.js'
 import calendarsRoutes from './routes/calendars.js'
 import availabilityRoutes from './routes/availability.js'
+import { flushDueNotifications } from './services/calendar-notifications.js'
 import meetingsRoutes from './routes/meetings.js'
 import authRoutes from './routes/auth.js'
 import walletAuthRoutes from './routes/wallet-auth.js'
@@ -20,13 +21,14 @@ import aiFeedbackRoutes from './routes/ai-feedback.js'
 import aiChatRoutes from './routes/ai-chat.js'
 import agentApiRoutes from './routes/agent-api.js'
 import userEventsRoutes, { runPersistedUserEventAutoSync } from './routes/user-events.js'
+import googleSyncRoutes from './routes/google-sync.js'
+import eventFlagsRoutes from './routes/event-flags.js'
 import timeManagementRoutes from './routes/time-management.js'
 import calendarSubscriptionsRoutes from './routes/calendar-subscriptions.js'
 import adminRoutes from './routes/admin.js'
 import lumaRoutes from './routes/luma.js'
 import zoomRoutes from './routes/zoom.js'
 import guardianRoutes from './routes/guardian.js'
-import figmaRoutes from './routes/figma.js'
 import emailContactsRoutes from './routes/email-contacts.js'
 import privacySettingsRoutes from './routes/privacy-settings.js'
 import notificationPreferencesRoutes from './routes/notification-preferences.js'
@@ -34,15 +36,32 @@ import connectionsRoutes from './routes/connections.js'
 import smtpConfigRoutes from './routes/smtp-config.js'
 import verifiedEmailsRoutes from './routes/verified-emails.js'
 import networkRelationsRoutes from './routes/network-relations.js'
+import mailboxRoutes from './routes/mailbox.js'
+import quickToolsRoutes from './routes/quick-tools.js'
 import setupRoutes from './routes/setup.js'
 import { sendEmail, decryptPassword, getPlatformSmtpConfig } from './services/email.js'
 import { supabaseAdmin, isSupabaseConfigured } from './supabaseClient.js'
 import { printSetupBanner } from './services/local-config.js'
 import { registerRateLimiters } from './config/rate-limiters.js'
+import { getRailwayNodeEnvWarning } from './config/runtime-env.js'
+import { collapseExternalServiceErrorMessage } from './middleware/validation.js'
 import { timingSafeEqual } from 'crypto'
+import { runPersistedMailboxAutoSync } from './services/mailbox-sync.js'
+import { expireOverdueEventFlags } from './services/event-moderation.js'
 
 const app = express()
 const PORT = process.env.PORT || 3001
+
+function backgroundJobErrorMessage(error: unknown, fallback: string): string {
+  const message = collapseExternalServiceErrorMessage(error, fallback) || (error instanceof Error && error.message ? error.message : fallback)
+  return message.replace(/[\r\n]+/g, ' ').slice(0, 500)
+}
+
+// Railway does not set NODE_ENV; warn loudly (behavior unchanged) when it is missing there.
+const railwayNodeEnvWarning = getRailwayNodeEnvWarning()
+if (railwayNodeEnvWarning) {
+  console.warn(railwayNodeEnvWarning)
+}
 
 // Trust the first reverse proxy (Railway / Nixpacks / load-balancer).
 // This ensures req.ip reflects the real client IP from X-Forwarded-For
@@ -112,6 +131,8 @@ app.use(
 // X-Forwarded-For header, which an attacker could set to "127.0.0.1" from
 // the public internet to bypass every limiter.  The socket address is the
 // real transport-layer peer and cannot be spoofed via HTTP headers.
+// (The per-client limiter KEY is different: behind the trusted Railway proxy it
+// uses req.ip, see getRateLimitKey in config/rate-limiters.ts.)
 const skipLocalhost = (req: express.Request): boolean => {
   if (process.env.NODE_ENV === 'production') return false
   const socketAddr = req.socket?.remoteAddress ?? ''
@@ -154,7 +175,14 @@ app.use((req, res, next) => {
 app.use('/api/ai-chat', express.json({ limit: '1mb' }))
 // Announcement schedules can include many targets with body overrides
 app.use('/api/announcements', express.json({ limit: '1mb' }))
-app.use(express.json())
+app.use(express.json({ limit: '12mb' }))
+app.use(express.urlencoded({ extended: false }))
+// Express 5 leaves req.body undefined when no parser matched; keep the Express 4 `{}` default
+// so handlers that destructure req.body return validation errors instead of TypeErrors.
+app.use((req, _res, next) => {
+  if (req.body === undefined) req.body = {}
+  next()
+})
 // Use 'short' format in production to avoid verbose output and potential info leakage.
 // 'dev' format includes colored status codes and response times useful for local debugging.
 app.use(morgan(process.env.NODE_ENV === 'production' ? 'short' : 'dev'))
@@ -177,13 +205,14 @@ app.use('/api/agent', agentApiRoutes)
 app.use('/api/availability', availabilityRoutes)
 app.use('/api/meetings', meetingsRoutes)
 app.use('/api/user-events', userEventsRoutes)
+app.use('/api/google-sync', googleSyncRoutes)
+app.use('/api/event-flags', eventFlagsRoutes)
 app.use('/api/time-management', timeManagementRoutes)
 app.use('/api/calendar-subscriptions', calendarSubscriptionsRoutes)
 app.use('/api/admin', adminRoutes)
 app.use('/api/luma', lumaRoutes)
 app.use('/api/zoom', zoomRoutes)
 app.use('/api/guardian', guardianRoutes)
-app.use('/api/figma', figmaRoutes)
 app.use('/api/email-contacts', emailContactsRoutes)
 app.use('/api/privacy-settings', privacySettingsRoutes)
 app.use('/api/notification-preferences', notificationPreferencesRoutes)
@@ -191,6 +220,8 @@ app.use('/api/connections', connectionsRoutes)
 app.use('/api/smtp-config', smtpConfigRoutes)
 app.use('/api/verified-emails', verifiedEmailsRoutes)
 app.use('/api/network-relations', networkRelationsRoutes)
+app.use('/api/mailbox', mailboxRoutes)
+app.use('/api/quick-tools', quickToolsRoutes)
 
 // ─── Internal email endpoint (called by bot with BOT_API_SECRET) ──────────────
 app.post('/api/internal/send-email', async (req, res) => {
@@ -216,7 +247,7 @@ app.post('/api/internal/send-email', async (req, res) => {
   }
 
   // Validate email format
-  if (typeof to !== 'string' || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(to) || to.length > 320) {
+  if (typeof to !== 'string' || !/^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/.test(to) || to.length > 320) {
     return res.status(400).json({ error: 'Invalid recipient email address' })
   }
 
@@ -338,13 +369,31 @@ if (!process.env.JWT_SECRET) {
 // Error handling
 app.use(errorHandler)
 
-app.listen(PORT, () => {
+app.listen(PORT, async () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`)
   console.log(`📝 Environment: ${process.env.NODE_ENV}`)
   // If the app booted without DB credentials, print the setup banner with
   // the one-time token so the user can complete the wizard.
   if (!isSupabaseConfigured() && process.env.NODE_ENV !== 'production') {
     printSetupBanner()
+  }
+
+  // Reset any accounts stuck in 'syncing' from a previous crashed session
+  if (isSupabaseConfigured()) {
+    try {
+      const { data, error } = await supabaseAdmin
+        .from('mail_accounts')
+        .update({ status: 'connected', updated_at: new Date().toISOString() })
+        .eq('status', 'syncing')
+        .select('id')
+      if (error) {
+        console.error('[startup] Failed to reset orphaned syncing accounts:', error.message)
+      } else if (data && data.length > 0) {
+        console.log(`[startup] Reset ${data.length} orphaned syncing account(s) to connected`)
+      }
+    } catch (e) {
+      console.error('[startup] Error resetting orphaned accounts:', e)
+    }
   }
 
   const autoSyncEnabled = process.env.USER_EVENTS_SERVER_AUTO_SYNC_ENABLED !== 'false'
@@ -371,7 +420,7 @@ app.listen(PORT, () => {
           )
         }
       } catch (err: unknown) {
-        const message = err instanceof Error ? err.message : 'Server auto-sync failed'
+        const message = backgroundJobErrorMessage(err, 'User event sync storage is temporarily unavailable. Please try again later.')
         console.error(`[user-events:auto-sync] ${message}`)
       } finally {
         inFlight = false
@@ -389,5 +438,89 @@ app.listen(PORT, () => {
     console.log(`[user-events:auto-sync] enabled interval=${Math.floor(intervalMs / 1000)}s maxUsers=${maxUsers}`)
   } else {
     console.log('[user-events:auto-sync] disabled by USER_EVENTS_SERVER_AUTO_SYNC_ENABLED=false')
+  }
+
+  if (isSupabaseConfigured()) {
+    let moderationExpiryInFlight = false
+    const runModerationExpiry = async () => {
+      if (moderationExpiryInFlight) return
+      moderationExpiryInFlight = true
+      try {
+        await expireOverdueEventFlags()
+      } catch (err: unknown) {
+        const message = backgroundJobErrorMessage(err, 'Event moderation expiry failed')
+        console.error(`[event-moderation:expiry] ${message}`)
+      } finally {
+        moderationExpiryInFlight = false
+      }
+    }
+
+    setTimeout(() => { void runModerationExpiry() }, 25_000)
+    setInterval(() => { void runModerationExpiry() }, 15 * 60 * 1000)
+    console.log('[event-moderation:expiry] enabled interval=900s')
+  }
+
+  if (isSupabaseConfigured() && process.env.CALENDAR_CHANGE_NOTIFICATIONS_ENABLED !== 'false') {
+    let calendarNotificationsInFlight = false
+    const runCalendarNotifications = async () => {
+      if (calendarNotificationsInFlight) return
+      calendarNotificationsInFlight = true
+      try {
+        const summary = await flushDueNotifications()
+        if (summary.emailsSent > 0 || summary.emailsFailed > 0) {
+          console.log(`[calendar-notifications] recipients=${summary.recipients} sent=${summary.emailsSent} failed=${summary.emailsFailed} events=${summary.eventsProcessed}`)
+        }
+      } catch (err: unknown) {
+        const message = backgroundJobErrorMessage(err, 'Calendar change notification dispatch failed')
+        console.error(`[calendar-notifications] ${message}`)
+      } finally {
+        calendarNotificationsInFlight = false
+      }
+    }
+
+    setInterval(() => { void runCalendarNotifications() }, 30_000)
+    console.log('[calendar-notifications] enabled interval=30s')
+  }
+
+  const mailboxAutoSyncEnabled = process.env.MAILBOX_SERVER_AUTO_SYNC_ENABLED !== 'false'
+  if (mailboxAutoSyncEnabled) {
+    const intervalMsRaw = Number(process.env.MAILBOX_SERVER_AUTO_SYNC_INTERVAL_MS)
+    const intervalMs = Number.isFinite(intervalMsRaw)
+      ? Math.max(60_000, Math.floor(intervalMsRaw))
+      : 10 * 60 * 1000
+
+    const maxAccountsRaw = Number(process.env.MAILBOX_SERVER_AUTO_SYNC_MAX_ACCOUNTS)
+    const maxAccounts = Number.isFinite(maxAccountsRaw)
+      ? Math.max(1, Math.floor(maxAccountsRaw))
+      : 100
+
+    let mailboxSyncInFlight = false
+    const runMailboxPass = async () => {
+      if (mailboxSyncInFlight) return
+      mailboxSyncInFlight = true
+      try {
+        const summary = await runPersistedMailboxAutoSync({ maxAccounts })
+        if (summary.synced > 0 || summary.failed > 0) {
+          console.log(`[mailbox:auto-sync] synced=${summary.synced} failed=${summary.failed}`)
+        }
+      } catch (err: unknown) {
+        const message = err instanceof Error ? err.message : 'Mailbox auto-sync failed'
+        console.error(`[mailbox:auto-sync] ${message}`)
+      } finally {
+        mailboxSyncInFlight = false
+      }
+    }
+
+    setTimeout(() => {
+      void runMailboxPass()
+    }, 30_000)
+
+    setInterval(() => {
+      void runMailboxPass()
+    }, intervalMs)
+
+    console.log(`[mailbox:auto-sync] enabled interval=${Math.floor(intervalMs / 1000)}s maxAccounts=${maxAccounts}`)
+  } else {
+    console.log('[mailbox:auto-sync] disabled by MAILBOX_SERVER_AUTO_SYNC_ENABLED=false')
   }
 })

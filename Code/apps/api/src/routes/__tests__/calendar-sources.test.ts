@@ -954,6 +954,100 @@ describe('Calendar Sources API', () => {
     })
   })
 
+  // ─── POST /api/calendar-sources/add-event ─────────────────
+
+  describe('POST /add-event — Add an event to Google Calendar', () => {
+    const event = {
+      title: 'Mailbox invite',
+      description: 'Bring the agenda',
+      start_time: '2026-11-01T10:00:00.000Z',
+      end_time: '2026-11-01T11:00:00.000Z',
+      location: 'Room 2',
+    }
+    const idempotencyKey = '20000000-0000-4000-8000-000000000001'
+
+    function setupGoogleSource() {
+      const chain = createChain()
+      mockFrom.mockReturnValue(chain)
+      mockSelect.mockReturnValue(chain)
+      mockEq.mockReturnValue(chain)
+      mockIn.mockResolvedValue({
+        data: [
+          {
+            id: 'src-1',
+            source_type: 'google_oauth',
+            google_email: 'user@gmail.com',
+            google_access_token: 'valid-token',
+            google_refresh_token: 'refresh-token',
+            token_expires_at: new Date(Date.now() + 60 * 60 * 1000).toISOString(),
+          },
+        ],
+        error: null,
+      })
+    }
+
+    it('confirms an existing Google event after an idempotent retry', async () => {
+      setupGoogleSource()
+      mockFetch
+        .mockResolvedValueOnce({
+          ok: false,
+          status: 409,
+          json: async () => ({ error: { code: 409, message: 'Already exists' } }),
+        })
+        .mockImplementationOnce(async (url: string) => {
+          const eventId = JSON.parse(mockFetch.mock.calls[0][1].body).id
+          expect(url).toBe(
+            `https://www.googleapis.com/calendar/v3/calendars/primary/events/${eventId}`
+          )
+          return {
+            ok: true,
+            status: 200,
+            json: async () => ({
+              id: eventId,
+              htmlLink: 'https://calendar.google.com/event?eid=existing',
+              summary: event.title,
+              description: event.description,
+              location: event.location,
+              start: { dateTime: event.start_time },
+              end: { dateTime: event.end_time },
+            }),
+          }
+        })
+
+      const response = await request(app)
+        .post('/api/calendar-sources/add-event')
+        .set('Authorization', '******')
+        .send({ event, targetSourceIds: ['src-1'], idempotencyKey })
+
+      expect(response.status).toBe(200)
+      expect(response.body).toMatchObject({ succeeded: 1, failed: 0 })
+      expect(response.body.results[0].success).toBe(true)
+      const sentEvent = JSON.parse(mockFetch.mock.calls[0][1].body)
+      expect(sentEvent.id).toMatch(/^[0-9a-f]{64}$/)
+    })
+
+    it('marks provider rate limits as retryable per destination', async () => {
+      setupGoogleSource()
+      mockFetch.mockResolvedValueOnce({
+        ok: false,
+        status: 429,
+        json: async () => ({ error: { code: 429, message: 'Rate limited' } }),
+      })
+
+      const response = await request(app)
+        .post('/api/calendar-sources/add-event')
+        .set('Authorization', '******')
+        .send({ event, targetSourceIds: ['src-1'], idempotencyKey })
+
+      expect(response.status).toBe(200)
+      expect(response.body.results[0]).toMatchObject({
+        success: false,
+        error: 'Rate limited',
+        retryable: true,
+      })
+    })
+  })
+
   // ─────────────────────────────────────────────────────────
   // POST /busy — Fetch Google Calendar busy times
   // ─────────────────────────────────────────────────────────

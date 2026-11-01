@@ -1,55 +1,83 @@
 import { useState, useCallback, useRef } from 'react'
-import { Globe, Plus, X, Pencil } from 'lucide-react'
-import { findTimezone, formatTimezoneShort, MAX_TIMEZONES, type TimezoneEntry } from '../lib/timezone-data'
+import { ArrowLeft, Globe, Plus, X, Pencil } from 'lucide-react'
+import {
+  findTimezone,
+  formatTimezoneShort,
+  detectLocalTimezone,
+  MAX_TIMEZONES,
+  type TimezoneEntry,
+} from '../lib/timezone-data'
 import type { UseTimezonesReturn } from '../lib/use-timezones'
 import TimezoneSearchPanel from './TimezoneSearchPanel'
+import { Button, Dialog, IconButton } from './ui'
 
 interface TimezoneSelectorProps {
   /** Timezones hook return value */
   timezones: UseTimezonesReturn
   /** Show in compact mode (visitor view) */
   compact?: boolean
+  /** Hide label text and show just the icon */
+  iconOnly?: boolean
 }
 
 type PanelTarget = 'primary' | 'add' | number // number = additional slot index
 
-export default function TimezoneSelector({ timezones, compact: _compact }: TimezoneSelectorProps) {
+export default function TimezoneSelector({
+  timezones,
+  compact: _compact,
+  iconOnly: _iconOnly,
+}: TimezoneSelectorProps) {
   const compact = _compact ?? false
+  const iconOnly = _iconOnly ?? false
   const [expanded, setExpanded] = useState(false)
   const [searchTarget, setSearchTarget] = useState<PanelTarget | null>(null)
-  const containerRef = useRef<HTMLDivElement>(null)
+  const settingsRef = useRef<HTMLDivElement>(null)
+  const returnTargetRef = useRef<PanelTarget>('primary')
 
   const primaryEntry = findTimezone(timezones.primary)
   const primaryLabel = primaryEntry ? formatTimezoneShort(primaryEntry) : timezones.primary
 
-  const handleToggle = useCallback(() => {
-    setExpanded((prev) => {
-      if (prev) setSearchTarget(null)
-      return !prev
-    })
+  const closeSettings = useCallback(() => {
+    setExpanded(false)
+    setSearchTarget(null)
   }, [])
 
   const openSearch = useCallback((target: PanelTarget) => {
+    returnTargetRef.current = target
     setSearchTarget(target)
   }, [])
 
   const closeSearch = useCallback(() => {
     setSearchTarget(null)
+    requestAnimationFrame(() => {
+      const settings = settingsRef.current
+      const target =
+        settings?.querySelector<HTMLButtonElement>(
+          `[data-timezone-target="${returnTargetRef.current}"]`
+        ) ?? settings?.querySelector<HTMLButtonElement>('button')
+      target?.focus()
+    })
   }, [])
 
-  const handleSelect = useCallback(
-    (entry: TimezoneEntry) => {
+  const applyIana = useCallback(
+    (iana: string) => {
       if (searchTarget === 'primary') {
-        timezones.setPrimary(entry.iana)
+        timezones.setPrimary(iana)
       } else if (searchTarget === 'add') {
-        timezones.addTimezone(entry.iana)
+        timezones.addTimezone(iana)
       } else if (typeof searchTarget === 'number') {
-        timezones.replaceTimezone(searchTarget + 1, entry.iana)
+        timezones.replaceTimezone(searchTarget + 1, iana)
       }
-      setSearchTarget(null)
+      closeSearch()
     },
-    [searchTarget, timezones]
+    [searchTarget, timezones, closeSearch]
   )
+
+  const handleSelect = useCallback((entry: TimezoneEntry) => applyIana(entry.iana), [applyIana])
+
+  const handleApplyBrowserTimezone = useCallback(() => {
+    applyIana(detectLocalTimezone())
+  }, [applyIana])
 
   const searchTitle =
     searchTarget === 'primary'
@@ -59,114 +87,131 @@ export default function TimezoneSelector({ timezones, compact: _compact }: Timez
         : 'Change Timezone'
 
   return (
-    <div ref={containerRef} className="relative">
-      {/* Main timezone button -- click to expand options below */}
-      <button
-        type="button"
-        onClick={handleToggle}
-        className={`
-          group flex items-center text-sm transition-all duration-200
-          rounded-lg border-2 font-semibold
-          ${compact ? 'gap-1 px-2 py-1 text-xs' : 'gap-2 px-4 py-1.5'}
-          ${expanded
-            ? 'bg-blue-600 dark:bg-blue-500 border-blue-600 dark:border-blue-500 text-white shadow-md shadow-blue-500/25'
-            : 'bg-blue-600/10 dark:bg-blue-500/15 border-blue-500/40 dark:border-blue-400/30 text-blue-700 dark:text-blue-300 hover:bg-blue-600/20 dark:hover:bg-blue-500/25 hover:border-blue-500/60 hover:shadow-sm hover:shadow-blue-500/15'
-          }
-          cursor-pointer
-        `}
+    <div>
+      <Button
+        emphasis={expanded ? 'solid' : 'outline'}
+        intent="info"
+        size={iconOnly || compact ? 'compact' : 'standard'}
+        onClick={() => setExpanded(true)}
+        aria-expanded={expanded}
+        aria-haspopup="dialog"
+        className="group"
+        title={iconOnly ? 'Change timezone' : `Timezone: ${primaryLabel}`}
+        aria-label={iconOnly ? 'Change timezone' : `Timezone: ${primaryLabel}`}
       >
-        <Globe className={`${compact ? 'w-3.5 h-3.5' : 'w-4 h-4'} flex-shrink-0 transition-transform duration-500 ${expanded ? 'animate-spin-once' : 'group-hover:rotate-12'}`} />
-        <span>{compact ? primaryLabel : `Timezone: ${primaryLabel}`}</span>
-        {timezones.additional.length > 0 && (
-          <span className={`px-1.5 py-0.5 text-xs rounded-full font-medium ${
-            expanded
-              ? 'bg-blue-500/40 text-white'
-              : 'bg-blue-100 text-blue-700 dark:bg-blue-900/50 dark:text-blue-300'
-          }`}>
+        <Globe
+          className={`${compact ? 'w-3.5 h-3.5' : 'w-4 h-4'} shrink-0 transition-transform duration-500 motion-reduce:transition-none ${expanded ? 'animate-spin-once motion-reduce:animate-none' : 'group-hover:rotate-12 motion-reduce:transform-none'}`}
+        />
+        {!iconOnly && <span>{compact ? primaryLabel : `Timezone: ${primaryLabel}`}</span>}
+        {!iconOnly && timezones.additional.length > 0 && (
+          <span
+            className={`px-1.5 py-0.5 text-xs rounded-full font-medium ${
+              expanded ? 'bg-info-foreground/25 text-info-foreground' : 'bg-info-muted text-info'
+            }`}
+          >
             +{timezones.additional.length}
           </span>
         )}
-      </button>
+      </Button>
 
-      {/* Expanded options panel -- slides down below the button */}
-      <div
-        className={`
-          overflow-hidden transition-all duration-300 ease-out
-          ${expanded ? 'max-h-[500px] opacity-100 mt-2' : 'max-h-0 opacity-0'}
-        `}
+      <Dialog
+        open={expanded}
+        onClose={closeSettings}
+        title={searchTarget === null ? 'Timezone settings' : searchTitle}
+        kind="focusModal"
+        size="md"
+        scrollBody
+        showCloseButton
+        closeOnScrimClick={false}
+        className="[&_[data-dialog-chrome=close]]:min-h-11 [&_[data-dialog-chrome=close]]:min-w-11"
+        headerActions={
+          searchTarget !== null ? (
+            <IconButton
+              label="Back to timezone settings"
+              icon={<ArrowLeft />}
+              onClick={closeSearch}
+              className="min-h-11 min-w-11 sm:min-h-0 sm:min-w-0"
+            />
+          ) : undefined
+        }
       >
-        <div className="bg-card border border-border rounded-lg shadow-md p-3 space-y-2.5">
-          {/* Primary Timezone row */}
-          <div className="flex items-center justify-between">
-            <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-              Primary
-            </span>
-            <button
-              type="button"
-              onClick={() => openSearch('primary')}
-              className="flex items-center gap-1.5 px-2.5 py-1 text-sm rounded-md bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900/40 text-blue-700 dark:text-blue-300 transition-colors font-medium"
-            >
-              <Globe className="w-3.5 h-3.5" />
-              {primaryLabel}
-              <Pencil className="w-3 h-3 opacity-50" />
-            </button>
-          </div>
+        {searchTarget === null && (
+          <div ref={settingsRef} className="space-y-3">
+            {/* Primary Timezone row */}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                Primary
+              </span>
+              <Button
+                emphasis="outline"
+                size="compact"
+                icon={<Globe className="w-3.5 h-3.5" />}
+                onClick={() => openSearch('primary')}
+                data-timezone-target="primary"
+                className="min-h-11 sm:min-h-0"
+              >
+                {primaryLabel}
+                <Pencil className="w-3 h-3 opacity-50" />
+              </Button>
+            </div>
 
-          {/* Additional Timezones */}
-          {timezones.additional.map((iana, idx) => {
-            const entry = findTimezone(iana)
-            const label = entry ? formatTimezoneShort(entry) : iana
-            return (
-              <div key={iana} className="flex items-center justify-between">
-                <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
-                  Display {idx + 2}
-                </span>
-                <div className="flex items-center gap-1">
-                  <button
-                    type="button"
-                    onClick={() => openSearch(idx)}
-                    className="flex items-center gap-1.5 px-2.5 py-1 text-sm rounded-md bg-muted hover:bg-muted/80 text-foreground transition-colors"
-                  >
-                    <Globe className="w-3.5 h-3.5 text-muted-foreground" />
-                    {label}
-                    <Pencil className="w-3 h-3 opacity-40" />
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => timezones.removeTimezone(iana)}
-                    className="p-1 rounded-md hover:bg-red-100 dark:hover:bg-red-900/30 text-muted-foreground hover:text-red-600 transition-colors"
-                    title="Remove timezone"
-                  >
-                    <X className="w-3.5 h-3.5" />
-                  </button>
+            {/* Additional Timezones */}
+            {timezones.additional.map((iana, idx) => {
+              const entry = findTimezone(iana)
+              const label = entry ? formatTimezoneShort(entry) : iana
+              return (
+                <div key={iana} className="flex flex-wrap items-center justify-between gap-2">
+                  <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider">
+                    Display {idx + 2}
+                  </span>
+                  <div className="flex items-center gap-1">
+                    <Button
+                      emphasis="ghost"
+                      size="compact"
+                      icon={<Globe className="w-3.5 h-3.5" />}
+                      onClick={() => openSearch(idx)}
+                      data-timezone-target={idx}
+                      className="min-h-11 sm:min-h-0"
+                    >
+                      {label}
+                      <Pencil className="w-3 h-3 opacity-40" />
+                    </Button>
+                    <IconButton
+                      label="Remove timezone"
+                      intent="danger"
+                      icon={<X />}
+                      onClick={() => timezones.removeTimezone(iana)}
+                      className="min-h-11 min-w-11 sm:min-h-0 sm:min-w-0"
+                    />
+                  </div>
                 </div>
-              </div>
-            )
-          })}
+              )
+            })}
 
-          {/* Add More Button */}
-          {timezones.canAddMore && (
-            <button
-              type="button"
-              onClick={() => openSearch('add')}
-              className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-dashed border-border text-muted-foreground hover:text-foreground hover:border-foreground/30 hover:bg-muted/30 transition-colors"
-            >
-              <Plus className="w-3.5 h-3.5" />
-              Add Timezone ({timezones.additional.length + 1}/{MAX_TIMEZONES})
-            </button>
-          )}
-        </div>
-      </div>
-
-      {/* Search Panel (overlay below) */}
-      {searchTarget !== null && (
-        <TimezoneSearchPanel
-          title={searchTitle}
-          onSelect={handleSelect}
-          onClose={closeSearch}
-          activeTimezones={timezones.all}
-        />
-      )}
+            {/* Add More Button */}
+            {timezones.canAddMore && (
+              <Button
+                emphasis="outline"
+                size="compact"
+                fullWidth
+                icon={<Plus className="w-3.5 h-3.5" />}
+                onClick={() => openSearch('add')}
+                data-timezone-target="add"
+                className="min-h-11 sm:min-h-0"
+              >
+                Add Timezone ({timezones.additional.length + 1}/{MAX_TIMEZONES})
+              </Button>
+            )}
+          </div>
+        )}
+        {searchTarget !== null && (
+          <TimezoneSearchPanel
+            onSelect={handleSelect}
+            onApplyBrowserTimezone={handleApplyBrowserTimezone}
+            activeTimezones={timezones.all}
+          />
+        )}
+      </Dialog>
     </div>
   )
 }

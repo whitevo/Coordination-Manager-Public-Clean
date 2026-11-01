@@ -1,5 +1,8 @@
 [phases.setup]
-nixPkgs = ["nodejs_20", "pnpm"]
+# Node 26 (current). Check the build log shows >= 26.12.1. Node 26 no longer bundles
+# corepack, so pnpm is pinned via npm to match packageManager in Code/package.json.
+nixPkgs = ["nodejs_26"]
+cmds = ["npm install -g pnpm@12.15.0"]
 
 [phases.install]
 cmds = ["pnpm install --frozen-lockfile"]

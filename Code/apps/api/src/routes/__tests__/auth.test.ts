@@ -2,6 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import express from 'express'
 import request from 'supertest'
 import { errorHandler } from '../../middleware/error-handler.js'
+import { consumeMergeToken, createMergeToken, mergeAccounts } from '../../services/account-merge.js'
 
 // ─── Mock Supabase ──────────────────────────────────────────
 
@@ -72,6 +73,11 @@ vi.mock('../../middleware/auth.js', () => ({
     req.accessToken = 'mock.jwt.token'
     next()
   },
+  createIsolatedAuthClient: () => ({
+    auth: {
+      signInWithPassword: (...args: unknown[]) => mockSignInWithPassword(...args),
+    },
+  }),
   AuthenticatedRequest: {},
 }))
 
@@ -88,8 +94,8 @@ vi.mock('../../services/signup-rate-tracker.js', () => ({
 }))
 
 vi.mock('../../services/account-merge.js', () => ({
-  createMergeToken: vi.fn().mockReturnValue('merge-token-123'),
-  mergeTokenStore: new Map(),
+  createMergeToken: vi.fn().mockResolvedValue('merge-token-123'),
+  consumeMergeToken: vi.fn(),
   mergeAccounts: vi.fn().mockResolvedValue(undefined),
 }))
 
@@ -97,7 +103,7 @@ vi.mock('../../services/account-merge.js', () => ({
 
 vi.stubEnv('SUPABASE_URL', 'https://test.supabase.co')
 vi.stubEnv('SUPABASE_KEY', 'test-anon-key')
-vi.stubEnv('SUPABASE_SERVICE_ROLE_KEY', 'test-service-key')
+vi.stubEnv('SUPABASE_SECRET_KEY_LOCALHOST', 'sb_secret_offline-auth-credential')
 
 // ─── Test setup ─────────────────────────────────────────────
 
@@ -166,6 +172,14 @@ describe('Auth Routes', () => {
       expect(res.body.user.accountType).toBe('traveler')
       expect(res.body.user.displayName).toBeDefined()
       expect(res.body.user.roles).toEqual(['traveler'])
+
+      // Password is random (not derived from the traveler id or timestamp)
+      const createArgs = mockCreateUser.mock.calls[0][0] as { email: string; password: string }
+      expect(createArgs.password).toMatch(/^[0-9a-f]{64}$/)
+      expect(mockSignInWithPassword).toHaveBeenCalledWith({
+        email: createArgs.email,
+        password: createArgs.password,
+      })
     })
 
     it('returns 503 when user creation fails', async () => {
@@ -237,7 +251,7 @@ describe('Auth Routes', () => {
   // ─── PUT /api/auth/profile ────────────────────────────────
 
   describe('PUT /profile', () => {
-    it('updates display name', async () => {
+    it('updates safe profile fields through the service client and ignores role changes', async () => {
       mockSingle.mockResolvedValue({
         data: {
           id: MOCK_USER_ID,
@@ -249,10 +263,16 @@ describe('Auth Routes', () => {
 
       const res = await request(app)
         .put('/api/auth/profile')
-        .send({ displayName: 'New Name' })
+        .send({ displayName: 'New Name', roles: ['admin'], role: 'admin' })
 
       expect(res.status).toBe(200)
       expect(res.body.success).toBe(true)
+      expect(mockFrom).toHaveBeenCalledWith('users')
+      expect(mockUpdate).toHaveBeenCalledWith(expect.objectContaining({ display_name: 'New Name' }))
+      const updatePayload = mockUpdate.mock.calls[0]?.[0] as Record<string, unknown>
+      expect(updatePayload).not.toHaveProperty('roles')
+      expect(updatePayload).not.toHaveProperty('role')
+      expect(mockEq).toHaveBeenCalledWith('id', MOCK_USER_ID)
     })
 
     it('rejects empty display name', async () => {
@@ -365,6 +385,82 @@ describe('Auth Routes', () => {
       expect(res.status).toBe(200)
       expect(res.body.success).toBe(true)
       expect(mockDeleteUser).toHaveBeenCalledWith(MOCK_USER_ID)
+    })
+  })
+
+  // ─── Account linking (merge tokens) ───────────────────────
+
+  describe('POST /account/prepare-link', () => {
+    it('creates a merge token for the authenticated user', async () => {
+      mockSingle.mockResolvedValueOnce({ data: { account_type: 'google' }, error: null })
+
+      const res = await request(app).post('/api/auth/account/prepare-link')
+
+      expect(res.status).toBe(200)
+      expect(res.body.mergeToken).toBe('merge-token-123')
+      expect(createMergeToken).toHaveBeenCalledWith(MOCK_USER_ID, 'google')
+    })
+  })
+
+  describe('POST /account/complete-link', () => {
+    it('rejects a missing merge token', async () => {
+      const res = await request(app).post('/api/auth/account/complete-link').send({})
+
+      expect(res.status).toBe(400)
+      expect(consumeMergeToken).not.toHaveBeenCalled()
+    })
+
+    it('rejects an unknown or already-used token', async () => {
+      vi.mocked(consumeMergeToken).mockResolvedValueOnce(null)
+
+      const res = await request(app).post('/api/auth/account/complete-link').send({ mergeToken: 'nope' })
+
+      expect(res.status).toBe(401)
+      expect(mergeAccounts).not.toHaveBeenCalled()
+    })
+
+    it('rejects an expired token', async () => {
+      vi.mocked(consumeMergeToken).mockResolvedValueOnce({
+        sourceUserId: 'source-id',
+        sourceAccountType: 'google',
+        expiresAt: Date.now() - 1000,
+        expired: true,
+      })
+
+      const res = await request(app).post('/api/auth/account/complete-link').send({ mergeToken: 'old' })
+
+      expect(res.status).toBe(401)
+      expect(mergeAccounts).not.toHaveBeenCalled()
+    })
+
+    it('rejects merging an account with itself', async () => {
+      vi.mocked(consumeMergeToken).mockResolvedValueOnce({
+        sourceUserId: MOCK_USER_ID,
+        sourceAccountType: 'google',
+        expiresAt: Date.now() + 60_000,
+        expired: false,
+      })
+
+      const res = await request(app).post('/api/auth/account/complete-link').send({ mergeToken: 'self' })
+
+      expect(res.status).toBe(400)
+      expect(mergeAccounts).not.toHaveBeenCalled()
+    })
+
+    it('merges the source account into the caller with a valid token', async () => {
+      vi.mocked(consumeMergeToken).mockResolvedValueOnce({
+        sourceUserId: 'source-id',
+        sourceAccountType: 'cardano',
+        expiresAt: Date.now() + 60_000,
+        expired: false,
+      })
+      mockSingle.mockResolvedValueOnce({ data: { id: MOCK_USER_ID, account_type: 'google' }, error: null })
+
+      const res = await request(app).post('/api/auth/account/complete-link').send({ mergeToken: 'good' })
+
+      expect(res.status).toBe(200)
+      expect(res.body.success).toBe(true)
+      expect(mergeAccounts).toHaveBeenCalledWith('source-id', MOCK_USER_ID, true)
     })
   })
 })

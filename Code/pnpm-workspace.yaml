@@ -1,6 +1,56 @@
 packages:
   - apps/*
   - packages/database
-  - figma-plugin
 
-onlyBuiltDependencies: '[''esbuild'', ''chacha-native'']'
+# Ignore versions published less than 3 days ago (supply-chain worm defense)
+minimumReleaseAge: 4320
+
+# Temporary security exception, approved 2026-10-24; review/remove by 2026-10-27.
+minimumReleaseAgeExclude:
+  - body-parser
+  - undici
+  # Temporary security exception for GHSA-mrwp-f3q8-3g9p; remove once the patched release clears the 72-hour maturity window.
+  - follow-redirects
+
+blockExoticSubdeps: true
+
+# pnpm 11+ replaced onlyBuiltDependencies with allowBuilds (deny-by-default).
+allowBuilds:
+  esbuild: true
+
+# Security overrides; rationale in docs/private/DEPENDENCY_OVERRIDE_RATIONALE.md.
+# pnpm 11+ no longer reads the "pnpm" field of package.json.
+overrides:
+  "chacha@2.1.0>chacha-native": "-"
+  "browserslist": "4.28.8"
+  "shell-quote": "1.11.0"
+  "proxy-addr@<2.0.8": "2.0.8"
+  "source-map-js@>=1.0.0 <1.2.2": "1.2.2"
+  "axios@<1.20.0": "1.20.0"
+  "follow-redirects": ">=1.16.2"
+  "undici": "8.12.2"
+  "discord.js>undici": "6.29.1"
+  "@discordjs/rest>undici": "6.29.1"
+  "nodemailer@<10.1.4": "10.1.4"
+  "lodash": ">=4.18.1"
+  "flatted": ">=3.4.2"
+  "picomatch": ">=4.0.4"
+  "rollup": ">=4.59.0"
+  "qs@<6.16.0": ">=6.16.0"
+  "brace-expansion@<2.0.2": "5.0.12"
+  "brace-expansion@^2.0.0": "5.0.12"
+  "brace-expansion@^5.0.0": "5.0.12"
+  "postcss@<=8.5.17": ">=8.5.18"
+  "caniuse-lite": "1.0.30001793"
+  "baseline-browser-mapping": "2.11.29"
+  "esbuild@<=0.24.2": ">=0.25.0"
+  "ip-address@<10.7.4": ">=10.7.4"
+  "ws@>=8.0.0 <8.21.0": ">=8.21.0"
+  "ws@>=7.0.0 <7.5.11": ">=7.5.11"
+  "@cardano-ogmios/client>ws": ">=8.21.0"
+  "form-data@>=4.0.0 <4.0.6": ">=4.0.6"
+  "js-yaml@<4.3.2": "4.3.2"
+  "pbkdf2@<3.1.7": ">=3.1.7"
+  "@humanfs/node@<0.16.8": ">=0.16.8"
+  "nanoid@^3.0.0": ">=3.3.18"
+  "nanoid@^5.0.0": ">=5.1.16"

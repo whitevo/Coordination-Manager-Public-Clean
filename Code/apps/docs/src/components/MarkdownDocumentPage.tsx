@@ -3,8 +3,10 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import fallbackLicenseText from '../../../../../LICENSE?raw'
 
-const LICENSE_SOURCE_URL = 'https://github.com/whitevo/Coordination-Manager/blob/main/LICENSE'
-const LICENSE_RAW_URL = 'https://raw.githubusercontent.com/whitevo/Coordination-Manager/main/LICENSE'
+const LICENSE_SOURCE_URL = 'https://github.com/whitevo/Coordination-Manager-Public-Clean/blob/main/LICENSE'
+const LICENSE_RAW_URL = 'https://raw.githubusercontent.com/whitevo/Coordination-Manager-Public-Clean/main/LICENSE'
+const PRIVATE_REPO_URL = 'https://github.com/whitevo/Coordination-Manager'
+const PUBLIC_REPO_URL = 'https://github.com/whitevo/Coordination-Manager-Public-Clean'
 const LEGAL_FILE_REDIRECTS: Record<string, string> = {
   'privacy_policy.md': '/legal/privacy-policy',
   'terms_of_service.md': '/legal/terms-of-service',
@@ -14,6 +16,9 @@ const LEGAL_FILE_REDIRECTS: Record<string, string> = {
   'code_of_conduct.md': '/legal/code-of-conduct',
   'license': '/legal/license',
   'license.md': '/legal/license',
+  'ui_state_reconciliation.md': '/guides/ui-state-reconciliation',
+  'testing_guide.md': '/guides/testing',
+  'mailbox_architecture.md': '/guides/mailbox-architecture',
 }
 
 function isInternalLicenseHref(href: string): boolean {
@@ -29,6 +34,32 @@ function mapKnownMarkdownLink(href: string): string {
   const normalized = href.trim().toLowerCase()
   const withoutPrefix = normalized.replace(/^\.\//, '')
   return LEGAL_FILE_REDIRECTS[withoutPrefix] ?? href
+}
+
+function shouldUsePrivateRepositoryLinks(): boolean {
+  if (typeof window === 'undefined') return false
+  return ['localhost', '127.0.0.1', '[::1]'].includes(window.location.hostname)
+}
+
+function mapRepositoryLinkForEnvironment(href: string): string {
+  const repoPattern = /^https:\/\/github\.com\/whitevo\/(Coordination-Manager|Coordination-Manager-Public-Clean)(\/.*)?$/
+  const match = href.match(repoPattern)
+  if (!match) return href
+
+  const suffix = match[2] ?? ''
+  const targetRepo = shouldUsePrivateRepositoryLinks() ? PRIVATE_REPO_URL : PUBLIC_REPO_URL
+  return `${targetRepo}${suffix}`
+}
+
+function withDocsBase(href: string): string {
+  if (!href.startsWith('/')) return href
+  if (href.startsWith('/docs')) return href
+  return `/docs${href}`
+}
+
+function resolveMarkdownHref(href: string): string {
+  const mapped = mapRepositoryLinkForEnvironment(mapKnownMarkdownLink(href))
+  return mapped.startsWith('/') ? withDocsBase(mapped) : mapped
 }
 
 interface MarkdownDocumentPageProps {
@@ -134,7 +165,7 @@ export function MarkdownDocumentPage({ markdown }: MarkdownDocumentPageProps) {
           components={{
             a: ({ href, children }) => {
               const isHrefString = typeof href === 'string'
-              const resolvedHref = isHrefString ? mapKnownMarkdownLink(href) : href
+              const resolvedHref = isHrefString ? resolveMarkdownHref(href) : href
               const isInternal = typeof resolvedHref === 'string' && resolvedHref.startsWith('/')
               const isLicenseLink =
                 isHrefString &&
@@ -179,7 +210,7 @@ export function MarkdownDocumentPage({ markdown }: MarkdownDocumentPageProps) {
 
       {licenseModalOpen && (
         <div
-          className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center px-4"
+          className="fixed inset-0 z-50 bg-black/70 backdrop-blur-xs flex items-center justify-center px-4"
           onClick={() => setLicenseModalOpen(false)}
         >
           <div

@@ -1,6 +1,7 @@
 import { randomUUID } from 'crypto'
 import { hostname as osHostname } from 'os'
 import { supabase } from './supabase.js'
+import { RetryBackoff } from './retry-backoff.js'
 
 // ─── Config ───────────────────────────────────────────────────────────
 
@@ -37,6 +38,8 @@ const FORCE_TAKEOVER =
 let leaderState = false
 let lastTransitionLog: 'leader' | 'follower' | null = null
 let heartbeatTimer: NodeJS.Timeout | null = null
+let tickInProgress = false
+const retryBackoff = new RetryBackoff({ baseDelayMs: 5_000, maxDelayMs: 60_000 })
 
 /** Returns true if this process currently holds the lease. */
 export function isLeader(): boolean {
@@ -81,9 +84,11 @@ async function acquireOrRenew(): Promise<boolean> {
 
     if (error) {
       console.error('[lock] heartbeat failed:', error.message)
+      retryBackoff.recordFailure()
       // Don't drop leadership on a transient DB error; retry next tick.
       return true
     }
+    retryBackoff.recordSuccess()
     if (!data || data.length === 0) {
       // Someone else has taken over (force takeover from another instance).
       return false
@@ -101,8 +106,10 @@ async function acquireOrRenew(): Promise<boolean> {
 
   if (readError) {
     console.error('[lock] read failed:', readError.message)
+    retryBackoff.recordFailure()
     return false
   }
+  retryBackoff.recordSuccess()
 
   // No row yet -- try to insert one for ourselves.
   if (!existing) {
@@ -118,8 +125,10 @@ async function acquireOrRenew(): Promise<boolean> {
     if (insertError) {
       // Likely a race with another instance inserting first; fall through
       // to the update-takeover path on the next tick.
+      retryBackoff.recordFailure()
       return false
     }
+    retryBackoff.recordSuccess()
     return true
   }
 
@@ -148,8 +157,10 @@ async function acquireOrRenew(): Promise<boolean> {
 
   if (updateError) {
     console.error('[lock] takeover failed:', updateError.message)
+    retryBackoff.recordFailure()
     return false
   }
+  retryBackoff.recordSuccess()
 
   if (!updated || updated.length === 0) {
     // Lost the race to another follower; will retry next tick.
@@ -185,6 +196,8 @@ export async function startInstanceLock(): Promise<void> {
 }
 
 async function tick(): Promise<void> {
+  if (tickInProgress || !retryBackoff.canAttempt()) return
+  tickInProgress = true
   try {
     const nowLeader = await acquireOrRenew()
     const wasLeader = leaderState
@@ -203,6 +216,9 @@ async function tick(): Promise<void> {
     }
   } catch (err) {
     console.error('[lock] tick failed:', err)
+    retryBackoff.recordFailure()
+  } finally {
+    tickInProgress = false
   }
 }
 

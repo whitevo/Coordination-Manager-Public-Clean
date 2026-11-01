@@ -7,8 +7,8 @@
   then 'vercel deploy --prebuilt --prod' to upload it. This avoids consuming
   Vercel's free-tier build minutes.
 
-  Must be run from the repo root (C:\Project Folders\Coordination Manager)
-  where the .vercel project link resides.
+  Runs from the repo root (the parent of this scripts folder), where the
+  .vercel project link resides.
 
 .PARAMETER SkipBuild
   Skip the build step and deploy existing .vercel/output (useful for retrying
@@ -28,7 +28,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$repoRoot = "C:\Project Folders\Coordination Manager"
+$repoRoot = Split-Path -Parent $PSScriptRoot
 
 # Ensure we are in the repo root
 Set-Location $repoRoot

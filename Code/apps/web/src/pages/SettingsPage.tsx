@@ -1,10 +1,12 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
-import { useNavigate, useSearchParams } from 'react-router-dom'
+import { useLocation, useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { useTheme } from '../contexts/ThemeContext'
 import { apiClient } from '../lib/api-client'
 import { signInWithGoogle } from '../lib/auth-service'
 import ThemeCreator from '../components/ThemeCreator'
+import QuickPinButton from '../components/QuickPinButton'
+import { Button, Dialog, Disclosure, IconButton, Switch, ToggleButton } from '../components/ui'
 import { 
   User, 
   Bell, 
@@ -23,8 +25,6 @@ import {
   HelpCircle,
   Globe,
   Mail,
-  ToggleLeft,
-  ToggleRight,
   AlertCircle,
   ExternalLink,
   FileText,
@@ -32,7 +32,6 @@ import {
   Check as CheckIcon,
   X,
   Palette,
-  Monitor,
   Wallet,
   Unlink,
   CreditCard,
@@ -70,11 +69,21 @@ import {
 } from '../lib/managed-wallet'
 import { AI_MODEL_OPTIONS } from '../lib/theme-types'
 import type { AiSettings } from '../lib/theme-types'
+import {
+  DEFAULT_TIME_MANAGEMENT_AI_ACCESS,
+  TIME_MANAGEMENT_AI_ACCESS_ENTRIES,
+  normalizeTimeManagementAiAccess,
+  type TimeManagementAiAccessConfig,
+  type TimeManagementAiAccessId,
+} from './time-management-ai-access'
 import { useLearnerMode } from '../contexts/LearnerModeContext'
 import { useTimezones } from '../lib/use-timezones'
 import type { UseTimezonesReturn } from '../lib/use-timezones'
 import { getPrimaryTimezone, formatDateInTimezone } from '../lib/timezone-data'
+import { normalizeUserDateFormat } from '../lib/date-format-preferences'
+import type { UserDateFormat } from '../lib/date-format-preferences'
 import TimezoneSelector from '../components/TimezoneSelector'
+import { PENDING_RETRY_KEY } from '../components/AiGuideSidePanel'
 
 type SettingsTab = 'profile' | 'notifications' | 'calendar' | 'ai' | 'privacy'
 
@@ -101,6 +110,7 @@ const TAB_SUBCATEGORIES: Record<SettingsTab, SubcategoryLink[]> = {
   ],
   ai: [
     { id: 'ai-model', label: 'AI Model' },
+    { id: 'time-management-ai-access', label: 'Time Management Access' },
     { id: 'ai-usage', label: 'Usage & Costs' },
     { id: 'agent-api-keys', label: 'Agent API Keys' },
   ],
@@ -136,6 +146,14 @@ interface CalendarSettings {
   endHour: number
   weekStartsOn: 0 | 1 // 0 = Sunday, 1 = Monday
   showWeekNumbers: boolean
+  dateFormat: UserDateFormat
+}
+
+function normalizeCalendarSettings(settings: Partial<CalendarSettings>): Partial<CalendarSettings> {
+  return {
+    ...settings,
+    dateFormat: normalizeUserDateFormat(settings.dateFormat),
+  }
 }
 
 interface PrivacySettings {
@@ -200,13 +218,18 @@ const SOURCE_COLORS = [
 export default function SettingsPage() {
   const navigate = useNavigate()
   const [searchParams] = useSearchParams()
+  const location = useLocation()
   const { user, session, logout, isTraveler, isCardano, isAuthenticated, refreshProfile } = useAuth()
-  const { isDark, mode, setMode, activeThemeId, customThemes, applyTheme, saveCustomTheme, deleteCustomTheme, reloadThemeFromBackend } = useTheme()
+  const { isDark, mode, setMode, activeThemeId, customThemes, applyTheme, saveCustomTheme, deleteCustomTheme, reloadThemeFromBackend, showNavThemeToggle, setShowNavThemeToggle } = useTheme()
   const { learnerMode, setLearnerMode } = useLearnerMode()
   const initialTab = (searchParams.get('tab') as SettingsTab) || 'profile'
   const _initialSection = searchParams.get('section') || null
   const [activeTab, setActiveTab] = useState<SettingsTab>(initialTab)
   const sectionScrolledRef = useRef(false)
+  const suggestedTimeManagementAccess = searchParams
+    .get('suggestAccess')
+    ?.split(',')
+    .filter((id): id is TimeManagementAiAccessId => TIME_MANAGEMENT_AI_ACCESS_ENTRIES.some((entry) => entry.id === id)) || []
 
   // Sync activeTab when searchParams change (e.g. navigating from user menu shortcuts)
   useEffect(() => {
@@ -219,8 +242,8 @@ export default function SettingsPage() {
     if (section) {
       sectionScrolledRef.current = false
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: sync activeTab FROM the URL only when search params change; adding activeTab would revert user tab clicks that do not alter the URL
-  }, [searchParams])
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- intentional: sync activeTab FROM the URL only on a new navigation (location.key also changes when the same deep link is opened again); adding activeTab would revert user tab clicks that do not alter the URL
+  }, [searchParams, location.key])
   const [hasUnsavedChanges, setHasUnsavedChanges] = useState(false)
   const [oversightInfoExpanded, setOversightInfoExpanded] = useState(false)
   const [adminPowersExpanded, setAdminPowersExpanded] = useState(false)
@@ -334,6 +357,7 @@ export default function SettingsPage() {
     endHour: 18,
     weekStartsOn: 1,
     showWeekNumbers: false,
+    dateFormat: 'dd.mm.yyyy',
   })
   
   const [_privacy, setPrivacy] = useState<PrivacySettings>({
@@ -344,6 +368,7 @@ export default function SettingsPage() {
 
   const [aiSettings, setAiSettings] = useState<AiSettings>({
     preferredModel: 'openai',
+    timeManagementAiAccess: DEFAULT_TIME_MANAGEMENT_AI_ACCESS,
   })
 
   // Notification preferences state
@@ -584,19 +609,19 @@ export default function SettingsPage() {
         if (cipErr && typeof cipErr === 'object' && 'code' in cipErr) {
           const code = cipErr.code as number
           const info = ((cipErr.info as string) || '').trim()
-          if (code === 3) throw new Error('Signing was cancelled. If the wallet prompt looked broken or frozen, close all open wallet windows and try again.')
-          if (code === 2) throw new Error('This address cannot sign data. Try reconnecting your wallet.')
-          if (code === 1) throw new Error(`Wallet could not generate a proof.${info ? ' ' + info : ''}`)
-          throw new Error(`Wallet signing error (code ${code})${info ? ': ' + info : ''}`)
+          if (code === 3) throw new Error('Signing was cancelled. If the wallet prompt looked broken or frozen, close all open wallet windows and try again.', { cause: signErr })
+          if (code === 2) throw new Error('This address cannot sign data. Try reconnecting your wallet.', { cause: signErr })
+          if (code === 1) throw new Error(`Wallet could not generate a proof.${info ? ' ' + info : ''}`, { cause: signErr })
+          throw new Error(`Wallet signing error (code ${code})${info ? ': ' + info : ''}`, { cause: signErr })
         }
         if (signErr instanceof Error) {
           const m = signErr.message.toLowerCase()
           if (m.includes('declined') || m.includes('rejected') || m.includes('cancel')) {
-            throw new Error('Signing was cancelled. If the wallet prompt looked broken or frozen, close all open wallet windows and try again.')
+            throw new Error('Signing was cancelled. If the wallet prompt looked broken or frozen, close all open wallet windows and try again.', { cause: signErr })
           }
-          throw new Error(`Failed to sign: ${signErr.message}`)
+          throw new Error(`Failed to sign: ${signErr.message}`, { cause: signErr })
         }
-        throw new Error(`Failed to sign: ${JSON.stringify(signErr) || 'Wallet returned an unexpected error'}`)
+        throw new Error(`Failed to sign: ${JSON.stringify(signErr) || 'Wallet returned an unexpected error'}`, { cause: signErr })
       }
 
       // Step 6: Submit to link endpoint
@@ -881,21 +906,29 @@ export default function SettingsPage() {
       setNotifications(themePrefs.notificationSettings)
     }
     if (themePrefs?.calendarSettings) {
-      setCalendarSettings(prev => ({ ...prev, ...themePrefs.calendarSettings }))
+      setCalendarSettings(prev => ({
+        ...prev,
+        ...normalizeCalendarSettings(themePrefs.calendarSettings as Partial<CalendarSettings>),
+      }))
     } else {
       // Fallback: read from localStorage (pre-persistence compatibility)
       const saved = localStorage.getItem('userCalendarSettings')
       if (saved) {
         try {
-          const parsed = JSON.parse(saved)
-          setCalendarSettings(prev => ({ ...prev, ...parsed }))
+          const parsed = JSON.parse(saved) as Partial<CalendarSettings>
+          setCalendarSettings(prev => ({ ...prev, ...normalizeCalendarSettings(parsed) }))
         } catch (e) {
           console.warn('Failed to load saved calendar settings:', e)
         }
       }
     }
     if (themePrefs?.aiSettings) {
-      setAiSettings(prev => ({ ...prev, ...themePrefs.aiSettings }))
+      const savedAiSettings = themePrefs.aiSettings
+      setAiSettings(prev => ({
+        ...prev,
+        ...savedAiSettings,
+        timeManagementAiAccess: normalizeTimeManagementAiAccess(savedAiSettings.timeManagementAiAccess),
+      }))
     }
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.id])
@@ -956,15 +989,24 @@ export default function SettingsPage() {
     if (section && !sectionScrolledRef.current) {
       // Wait for DOM to render the section (tab switch may still be pending)
       const timer = setTimeout(() => {
-        const el = document.getElementById(`settings-${section}`)
+        const directTarget = section === 'role-learner' ? document.getElementById('settings-role-learner') : null
+        const el = directTarget ?? document.getElementById(`settings-${section}`)
         if (el) {
           sectionScrolledRef.current = true
           const y = el.getBoundingClientRect().top + window.scrollY - 80
           window.scrollTo({ top: y, behavior: 'smooth' })
-          const heading = el.querySelector('h2, h3') as HTMLElement | null
-          if (heading) {
-            heading.style.position = 'relative'
-            heading.classList.add('section-highlight')
+          // Focusable targets (tabIndex -1, e.g. theme-mode) also take keyboard focus
+          if (el.hasAttribute('tabindex')) el.focus({ preventScroll: true })
+          // The shine effect is a text gradient (transparent text fill), so it must only ever land
+          // on a heading: applied to a whole block it clips buttons and icons inside it.
+          const heading = (el.querySelector('[data-section-heading]') ?? el.querySelector('h2, h3')) as HTMLElement | null
+          const highlightTarget = heading
+          if (highlightTarget) {
+            highlightTarget.style.position = 'relative'
+            highlightTarget.classList.remove('section-highlight')
+            highlightTarget.querySelectorAll('.section-spark').forEach(s => s.remove())
+            void highlightTarget.offsetWidth
+            highlightTarget.classList.add('section-highlight')
             const sparks = ['\u2726', '\u2728', '\u269D'].map((char, i) => {
               const spark = document.createElement('span')
               spark.className = `section-spark section-spark-${i + 1}`
@@ -972,17 +1014,17 @@ export default function SettingsPage() {
               spark.setAttribute('aria-hidden', 'true')
               return spark
             })
-            sparks.forEach(s => heading.appendChild(s))
+            sparks.forEach(s => highlightTarget.appendChild(s))
             setTimeout(() => {
-              heading.classList.remove('section-highlight')
-              heading.querySelectorAll('.section-spark').forEach(s => s.remove())
+              highlightTarget.classList.remove('section-highlight')
+              highlightTarget.querySelectorAll('.section-spark').forEach(s => s.remove())
             }, 6500)
           }
         }
       }, 200)
       return () => clearTimeout(timer)
     }
-  }, [searchParams, activeTab])
+  }, [searchParams, activeTab, location.key])
 
   // ─── Track active section via IntersectionObserver ─────────
   useEffect(() => {
@@ -1522,12 +1564,58 @@ export default function SettingsPage() {
     setPrivacy(prev => ({ ...prev, ...updates }))
   }
 
-  const updateAiSettings = (updates: Partial<AiSettings>) => {
-    setAiSettings(prev => {
-      const next = { ...prev, ...updates }
-      saveProfileNow({ ai: next })
-      return next
+  const updateAiSettings = async (updates: Partial<AiSettings>) => {
+    const next = { ...aiSettings, ...updates }
+    setAiSettings(next)
+    await saveProfileNow({ ai: next })
+    // Refresh the AuthContext user so pages reading user.themePreferences.aiSettings
+    // (e.g. the Time Management AI retry flow) see the change immediately, not
+    // after a full reload.
+    await refreshProfile()
+  }
+
+  // Surfaces a follow-up assistant message with a retry CTA once the user has
+  // enabled the access the assistant suggested, so "retry" only appears after
+  // the config change actually happened (not alongside the original request).
+  const notifyTimeManagementAccessEnabled = () => {
+    try {
+      const raw = sessionStorage.getItem(PENDING_RETRY_KEY)
+      if (!raw) return
+      const pending = JSON.parse(raw) as { path?: string; prompt?: string }
+      if (pending.path !== '/settings' || !pending.prompt) return
+      sessionStorage.removeItem(PENDING_RETRY_KEY)
+      window.dispatchEvent(new CustomEvent('aiAssistantMessage', {
+        detail: {
+          content: 'Time Management AI access updated. You can go back and retry your request.',
+          ctas: [{ label: 'Back to Time Management and retry', to: '/time-management', retryPrompt: pending.prompt }],
+        },
+      }))
+    } catch {
+      sessionStorage.removeItem(PENDING_RETRY_KEY)
+    }
+  }
+
+  const updateTimeManagementAiAccess = async (id: keyof TimeManagementAiAccessConfig, enabled: boolean) => {
+    const nextAccess = {
+      ...normalizeTimeManagementAiAccess(aiSettings.timeManagementAiAccess),
+      [id]: enabled,
+    }
+    await updateAiSettings({ timeManagementAiAccess: nextAccess })
+    if (enabled && suggestedTimeManagementAccess.includes(id)) {
+      notifyTimeManagementAccessEnabled()
+    }
+  }
+
+  const enableSuggestedTimeManagementAccess = async () => {
+    if (suggestedTimeManagementAccess.length === 0) return
+    const nextAccess = {
+      ...normalizeTimeManagementAiAccess(aiSettings.timeManagementAiAccess),
+    }
+    suggestedTimeManagementAccess.forEach((id) => {
+      nextAccess[id] = true
     })
+    await updateAiSettings({ timeManagementAiAccess: nextAccess })
+    notifyTimeManagementAccessEnabled()
   }
 
   const toggleReminderTime = (time: string) => {
@@ -1590,16 +1678,16 @@ export default function SettingsPage() {
         
         {/* Avatar */}
         <div className="flex items-center gap-4 mb-6">
-          <div className="w-20 h-20 rounded-full bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center text-white text-2xl font-bold overflow-hidden">
+          <div className="w-20 h-20 rounded-full bg-primary flex items-center justify-center text-primary-foreground text-2xl font-bold overflow-hidden">
             {user?.avatarUrl ? (
               <img src={user.avatarUrl} alt={profile.displayName || ''} className="w-full h-full object-cover" referrerPolicy="no-referrer" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }} />
             ) : null}
             {!user?.avatarUrl && profile.displayName.charAt(0).toUpperCase()}
           </div>
           <div>
-            <button className="px-4 py-2 text-sm font-medium text-primary border border-primary rounded-lg hover:bg-primary/10 transition-colors">
+            <Button emphasis="outline">
               Change avatar
-            </button>
+            </Button>
             <p className="mt-1 text-xs text-muted-foreground">JPG, PNG or GIF. Max 2MB.</p>
           </div>
         </div>
@@ -1611,7 +1699,7 @@ export default function SettingsPage() {
               type="text"
               value={profile.displayName}
               onChange={(e) => updateProfile({ displayName: e.target.value })}
-              className="w-full px-4 py-2.5 border border-input rounded-lg focus:ring-2 focus:ring-ring focus:border-ring outline-none bg-background text-foreground"
+              className="w-full px-4 py-2.5 border border-input rounded-lg focus:ring-2 focus:ring-ring focus:border-ring outline-hidden bg-background text-foreground"
             />
           </div>
           
@@ -1625,14 +1713,14 @@ export default function SettingsPage() {
 
           {/* Inline Save — only for display name + timezone changes */}
           <div className={`transition-all duration-300 overflow-hidden ${hasUnsavedChanges ? 'max-h-16 opacity-100' : 'max-h-0 opacity-0'}`}>
-            <button
+            <Button
+              intent="primary"
               onClick={handleSave}
               disabled={isSaving}
-              className="flex items-center gap-2 px-4 py-2 bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium rounded-lg transition-all disabled:opacity-50"
+              icon={<Save className={`h-4 w-4 ${isSaving ? 'animate-spin' : ''}`} />}
             >
-              <Save className={`h-4 w-4 ${isSaving ? 'animate-spin' : ''}`} />
               {isSaving ? 'Saving...' : 'Save profile'}
-            </button>
+            </Button>
           </div>
         </div>
       </div>
@@ -1667,16 +1755,16 @@ export default function SettingsPage() {
               return displayRoles.map((r: string) => (
                 <span key={r} className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-sm font-medium transition-all ${
                   r === 'admin'
-                    ? 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-300'
+                    ? 'bg-danger-subtle text-danger'
                     : r === 'moderator'
-                    ? 'bg-orange-100 text-orange-800 dark:bg-orange-900/30 dark:text-orange-300'
+                    ? 'bg-primary-subtle text-primary'
                     : r === 'oversight'
-                    ? 'bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300'
+                    ? 'bg-warning-subtle text-warning'
                     : r === 'learner'
-                    ? 'bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-300'
+                    ? 'bg-info-subtle text-info'
                     : r === 'traveler'
-                    ? 'bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-300'
-                    : 'bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300'
+                    ? 'bg-info-subtle text-info'
+                    : 'bg-success-subtle text-success'
                 }`}>
                   {r === 'admin' && <Shield className="h-3.5 w-3.5" />}
                   {r === 'moderator' && <ShieldCheck className="h-3.5 w-3.5" />}
@@ -1709,25 +1797,24 @@ export default function SettingsPage() {
         <div className="space-y-3">
           <h4 className="text-sm font-medium text-muted-foreground">Platform Roles</h4>
 
-          <div className={`p-3 rounded-lg border ${user?.roles?.includes('admin') ? 'border-rose-200 dark:border-rose-800 bg-rose-50/50 dark:bg-rose-950/20' : 'border-border'}`}>
+          <div className={`p-3 rounded-lg border ${user?.roles?.includes('admin') ? 'border-danger-muted bg-danger-subtle' : 'border-border'}`}>
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 mb-1">
-                <Shield className="h-4 w-4 text-rose-500" />
+                <Shield className="h-4 w-4 text-danger" />
                 <span className="text-sm font-medium">Admin</span>
                 {isAdmin && (adminDeletePower || adminBlockPower) && (
-                  <span className="ml-1 px-2 py-0.5 text-xs font-medium bg-rose-100 text-rose-600 dark:bg-rose-900/30 dark:text-rose-300 rounded-full">
+                  <span className="ml-1 px-2 py-0.5 text-xs font-medium bg-danger-subtle text-danger rounded-full">
                     {[adminDeletePower && 'Delete', adminBlockPower && 'Block'].filter(Boolean).join(' + ')} Active
                   </span>
                 )}
               </div>
               {isAdmin && (
-                <button
-                  type="button"
+                <IconButton
+                  label={adminPowersExpanded ? 'Hide admin powers' : 'Show admin powers'}
+                  aria-expanded={adminPowersExpanded}
                   onClick={() => setAdminPowersExpanded(prev => !prev)}
-                  className="text-muted-foreground hover:text-foreground transition-colors"
-                >
-                  <ChevronDown className={`h-4 w-4 transition-transform ${adminPowersExpanded ? 'rotate-0' : '-rotate-90'}`} />
-                </button>
+                  icon={<ChevronDown className={`h-4 w-4 transition-transform motion-reduce:transition-none ${adminPowersExpanded ? 'rotate-0' : '-rotate-90'}`} />}
+                />
               )}
             </div>
             <p className="text-xs text-muted-foreground">
@@ -1742,11 +1829,11 @@ export default function SettingsPage() {
                 </p>
 
                 {/* Delete Content Power */}
-                <div className={`p-4 rounded-lg border transition-colors ${adminDeletePower ? 'border-rose-200 dark:border-rose-800 bg-rose-50/50 dark:bg-rose-950/20' : 'border-border'}`}>
+                <div className={`p-4 rounded-lg border transition-colors ${adminDeletePower ? 'border-danger-muted bg-danger-subtle' : 'border-border'}`}>
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
-                      <div className={`p-2 rounded-lg ${adminDeletePower ? 'bg-rose-100 dark:bg-rose-900/40' : 'bg-muted'}`}>
-                        <Trash2 className={`h-4 w-4 ${adminDeletePower ? 'text-rose-500 dark:text-rose-400' : 'text-muted-foreground'}`} />
+                      <div className={`p-2 rounded-lg ${adminDeletePower ? 'bg-danger-subtle' : 'bg-muted'}`}>
+                        <Trash2 className={`h-4 w-4 ${adminDeletePower ? 'text-danger' : 'text-muted-foreground'}`} />
                       </div>
                       <div>
                         <p className="text-sm font-medium">Delete Content</p>
@@ -1755,26 +1842,20 @@ export default function SettingsPage() {
                         </p>
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => toggleAdminPower('deletePower')}
-                      className="text-muted-foreground hover:text-foreground transition-colors"
-                    >
-                      {adminDeletePower ? (
-                        <ToggleRight className="h-7 w-7 text-rose-500" />
-                      ) : (
-                        <ToggleLeft className="h-7 w-7" />
-                      )}
-                    </button>
+                    <Switch
+                      checked={adminDeletePower}
+                      onCheckedChange={() => toggleAdminPower('deletePower')}
+                      label="Delete Content power"
+                    />
                   </div>
                 </div>
 
                 {/* Block Users Power */}
-                <div className={`p-4 rounded-lg border transition-colors ${adminBlockPower ? 'border-rose-200 dark:border-rose-800 bg-rose-50/50 dark:bg-rose-950/20' : 'border-border'}`}>
+                <div className={`p-4 rounded-lg border transition-colors ${adminBlockPower ? 'border-danger-muted bg-danger-subtle' : 'border-border'}`}>
                   <div className="flex items-center justify-between">
                     <div className="flex items-center gap-3">
-                      <div className={`p-2 rounded-lg ${adminBlockPower ? 'bg-rose-100 dark:bg-rose-900/40' : 'bg-muted'}`}>
-                        <UserX className={`h-4 w-4 ${adminBlockPower ? 'text-rose-500 dark:text-rose-400' : 'text-muted-foreground'}`} />
+                      <div className={`p-2 rounded-lg ${adminBlockPower ? 'bg-danger-subtle' : 'bg-muted'}`}>
+                        <UserX className={`h-4 w-4 ${adminBlockPower ? 'text-danger' : 'text-muted-foreground'}`} />
                       </div>
                       <div>
                         <p className="text-sm font-medium">Block Users</p>
@@ -1783,17 +1864,11 @@ export default function SettingsPage() {
                         </p>
                       </div>
                     </div>
-                    <button
-                      type="button"
-                      onClick={() => toggleAdminPower('blockPower')}
-                      className="text-muted-foreground hover:text-foreground transition-colors"
-                    >
-                      {adminBlockPower ? (
-                        <ToggleRight className="h-7 w-7 text-rose-500" />
-                      ) : (
-                        <ToggleLeft className="h-7 w-7" />
-                      )}
-                    </button>
+                    <Switch
+                      checked={adminBlockPower}
+                      onCheckedChange={() => toggleAdminPower('blockPower')}
+                      label="Block Users power"
+                    />
                   </div>
                 </div>
 
@@ -1813,37 +1888,31 @@ export default function SettingsPage() {
             )}
           </div>
 
-          <div className={`p-3 rounded-lg border ${user?.roles?.includes('moderator') ? 'border-orange-200 dark:border-orange-800 bg-orange-50/50 dark:bg-orange-950/20' : 'border-border'}`}>
+          <div className={`p-3 rounded-lg border ${user?.roles?.includes('moderator') ? 'border-primary-muted bg-primary-subtle' : 'border-border'}`}>
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 mb-1">
-                <ShieldCheck className="h-4 w-4 text-orange-500" />
+                <ShieldCheck className="h-4 w-4 text-primary" />
                 <span className="text-sm font-medium">Moderator</span>
                 {user?.roles?.includes('moderator') && (
-                  <span className="ml-1 px-2 py-0.5 text-xs font-medium bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300 rounded-full">
+                  <span className="ml-1 px-2 py-0.5 text-xs font-medium bg-primary-subtle text-primary rounded-full">
                     Active
                   </span>
                 )}
               </div>
               {/* Toggle — only admins can self-toggle, moderators (non-admin) cannot remove it */}
               {isAdmin && (
-                <button
-                  type="button"
-                  onClick={async () => {
+                <Switch
+                  checked={Boolean(user?.roles?.includes('moderator'))}
+                  onCheckedChange={async () => {
                     try {
                       const newVal = !user?.roles?.includes('moderator')
                       await apiClient.post('/api/admin/moderator-overlay', { enabled: newVal })
                       await refreshProfile()
                     } catch { /* ignore */ }
                   }}
-                  className="text-muted-foreground hover:text-foreground transition-colors"
+                  label="Moderator overlay"
                   title={user?.roles?.includes('moderator') ? 'Remove Moderator Overlay' : 'Enable Moderator Overlay'}
-                >
-                  {user?.roles?.includes('moderator') ? (
-                    <ToggleRight className="h-7 w-7 text-orange-500" />
-                  ) : (
-                    <ToggleLeft className="h-7 w-7" />
-                  )}
-                </button>
+                />
               )}
             </div>
             <p className="text-xs text-muted-foreground">
@@ -1854,31 +1923,25 @@ export default function SettingsPage() {
             </p>
           </div>
 
-          <div className={`p-3 rounded-lg border ${(user?.roles?.includes('oversight') || aiSettings.sentimentToolEnabled) ? 'border-amber-200 dark:border-amber-800 bg-amber-50/50 dark:bg-amber-950/20' : 'border-border'}`}>
+          <div className={`p-3 rounded-lg border ${(user?.roles?.includes('oversight') || aiSettings.sentimentToolEnabled) ? 'border-warning-muted bg-warning-subtle' : 'border-border'}`}>
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 mb-1">
-                <Eye className="h-4 w-4 text-amber-500" />
+                <Eye className="h-4 w-4 text-warning" />
                 <span className="text-sm font-medium">Oversight</span>
               </div>
               {/* Toggle — inline in card, visible to all non-traveler authenticated users */}
               {isAuthenticated && !isTraveler && (
-                <button
-                  type="button"
-                  onClick={() => {
+                <Switch
+                  checked={Boolean(aiSettings.sentimentToolEnabled)}
+                  onCheckedChange={() => {
                     const newVal = !aiSettings.sentimentToolEnabled
                     const next = { ...aiSettings, sentimentToolEnabled: newVal }
                     setAiSettings(next)
                     saveProfileNow({ ai: next })
                   }}
-                  className="text-muted-foreground hover:text-foreground transition-colors"
+                  label="Oversight role"
                   title={aiSettings.sentimentToolEnabled ? 'Disable Oversight role' : 'Enable Oversight role'}
-                >
-                  {aiSettings.sentimentToolEnabled ? (
-                    <ToggleRight className="h-7 w-7 text-amber-500" />
-                  ) : (
-                    <ToggleLeft className="h-7 w-7" />
-                  )}
-                </button>
+                />
               )}
             </div>
             <p className="text-xs text-muted-foreground">
@@ -1893,7 +1956,7 @@ export default function SettingsPage() {
                 <button
                   type="button"
                   onClick={() => setOversightInfoExpanded(prev => !prev)}
-                  className="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-400 hover:underline"
+                  className="flex items-center gap-1 text-xs text-warning hover:underline"
                 >
                   <Info className="h-3 w-3" />
                   {oversightInfoExpanded ? 'Hide details' : 'Learn more'}
@@ -1907,19 +1970,19 @@ export default function SettingsPage() {
                       <h5 className="text-xs font-medium mb-1.5">What Oversight users can do:</h5>
                       <ul className="text-xs text-muted-foreground space-y-1">
                         <li className="flex items-start gap-1.5">
-                          <Sparkles className="h-3 w-3 mt-0.5 text-amber-500 shrink-0" />
+                          <Sparkles className="h-3 w-3 mt-0.5 text-warning shrink-0" />
                           Rate AI responses using a 2D sentiment grid (valence + trust)
                         </li>
                         <li className="flex items-start gap-1.5">
-                          <MessageSquare className="h-3 w-3 mt-0.5 text-amber-500 shrink-0" />
+                          <MessageSquare className="h-3 w-3 mt-0.5 text-warning shrink-0" />
                           Add written feedback alongside sentiment ratings
                         </li>
                         <li className="flex items-start gap-1.5">
-                          <Eye className="h-3 w-3 mt-0.5 text-amber-500 shrink-0" />
+                          <Eye className="h-3 w-3 mt-0.5 text-warning shrink-0" />
                           Review your own submitted feedback on the Feedback page (AI Feedback tab)
                         </li>
                         <li className="flex items-start gap-1.5">
-                          <Eye className="h-3 w-3 mt-0.5 text-amber-500 shrink-0" />
+                          <Eye className="h-3 w-3 mt-0.5 text-warning shrink-0" />
                           View the full system prompt sent to the AI model in an expandable "System" bubble on every AI Assistant response
                         </li>
                       </ul>
@@ -1930,7 +1993,7 @@ export default function SettingsPage() {
                       <h5 className="text-xs font-medium mb-1.5">Where sentiment tools are available:</h5>
                       <ul className="text-xs text-muted-foreground space-y-1">
                         <li className="flex items-center gap-1.5">
-                          <Bot className="h-3 w-3 text-amber-500 shrink-0" />
+                          <Bot className="h-3 w-3 text-warning shrink-0" />
                           <span><strong>AI Chat</strong> — sentiment grid appears on each AI response</span>
                         </li>
                       </ul>
@@ -1952,25 +2015,19 @@ export default function SettingsPage() {
             )}
           </div>
 
-          <div className={`p-3 rounded-lg border ${learnerMode ? 'border-purple-200 dark:border-purple-800 bg-purple-50/50 dark:bg-purple-950/20' : 'border-border'}`}>
+          <div id="settings-role-learner" className={`p-3 rounded-lg border ${learnerMode ? 'border-info-muted bg-info-subtle' : 'border-border'}`}>
             <div className="flex items-center justify-between">
               <div className="flex items-center gap-2 mb-1">
-                <BookOpen className="h-4 w-4 text-purple-500" />
+                <BookOpen className="h-4 w-4 text-info" />
                 <span className="text-sm font-medium">Learner</span>
               </div>
               {isAuthenticated && !isTraveler && (
-                <button
-                  type="button"
-                  onClick={() => setLearnerMode(!learnerMode)}
-                  className="text-muted-foreground hover:text-foreground transition-colors"
+                <Switch
+                  checked={learnerMode}
+                  onCheckedChange={() => setLearnerMode(!learnerMode)}
+                  label="Learner mode"
                   title={learnerMode ? 'Disable Learner mode' : 'Enable Learner mode'}
-                >
-                  {learnerMode ? (
-                    <ToggleRight className="h-7 w-7 text-purple-500" />
-                  ) : (
-                    <ToggleLeft className="h-7 w-7" />
-                  )}
-                </button>
+                />
               )}
             </div>
             <p className="text-xs text-muted-foreground">
@@ -1978,9 +2035,9 @@ export default function SettingsPage() {
             </p>
           </div>
 
-          <div className={`p-3 rounded-lg border ${user?.roles?.includes('user') || (!user?.roles?.length) ? 'border-green-200 dark:border-green-800 bg-green-50/50 dark:bg-green-950/20' : 'border-border'}`}>
+          <div className={`p-3 rounded-lg border ${user?.roles?.includes('user') || (!user?.roles?.length) ? 'border-success-muted bg-success-subtle' : 'border-border'}`}>
             <div className="flex items-center gap-2 mb-1">
-              <UserCircle className="h-4 w-4 text-green-500" />
+              <UserCircle className="h-4 w-4 text-success" />
               <span className="text-sm font-medium">User</span>
             </div>
             <p className="text-xs text-muted-foreground">
@@ -2000,35 +2057,55 @@ export default function SettingsPage() {
       <div id="settings-appearance" className="pt-6 border-t border-border">
         <h3 className="text-lg font-medium mb-4">Appearance</h3>
         
-        {/* Theme mode selector */}
-        <div className="mb-6">
-          <p className="text-sm font-medium mb-2">Theme Mode</p>
+        {/* Theme mode selector (deep-link target of the nav Theme button: ?tab=profile&section=theme-mode) */}
+        <div
+          id="settings-theme-mode"
+          tabIndex={-1}
+          aria-labelledby="settings-theme-mode-label"
+          className="mb-6 rounded-lg outline-none"
+        >
+          <p className="mb-2">
+            <span id="settings-theme-mode-label" data-section-heading className="text-sm font-medium">Theme Mode</span>
+          </p>
           <div className="flex gap-2">
             {[
-              { value: 'light' as const, icon: Sun, label: 'Light' },
               { value: 'dark' as const, icon: Moon, label: 'Dark' },
-              { value: 'system' as const, icon: Monitor, label: 'System' },
+              { value: 'light' as const, icon: Sun, label: 'Light' },
             ].map(opt => {
               const Icon = opt.icon
               return (
-                <button
+                <ToggleButton
                   key={opt.value}
-                  onClick={() => setMode(opt.value)}
-                  className={`flex items-center gap-2 px-4 py-2.5 rounded-lg text-sm font-medium transition-colors border ${
-                    mode === opt.value
-                      ? 'bg-primary text-primary-foreground border-primary'
-                      : 'bg-muted/50 text-muted-foreground border-border hover:bg-muted'
-                  }`}
+                  pressed={mode === opt.value}
+                  onPressedChange={() => setMode(opt.value)}
+                  icon={<Icon className="h-4 w-4" />}
                 >
-                  <Icon className="h-4 w-4" />
                   {opt.label}
-                </button>
+                </ToggleButton>
               )
             })}
           </div>
           <p className="mt-2 text-xs text-muted-foreground">
-            {mode === 'system' ? `System preference detected: ${isDark ? 'dark' : 'light'}` : `Currently using ${mode} theme`}
+            {`Currently using ${mode} theme`}
           </p>
+
+          <div className="mt-4 flex items-start gap-2.5 p-3 rounded-lg border border-border bg-muted/30">
+            <QuickPinButton
+              pinned={showNavThemeToggle}
+              onToggle={() => setShowNavThemeToggle(!showNavThemeToggle)}
+              label="theme icon"
+              className="mt-0.5 shrink-0"
+            />
+            <div>
+              <p className="text-sm font-medium">Theme icon in menu bar</p>
+              <p className="text-xs text-muted-foreground">
+                {showNavThemeToggle
+                  ? 'Currently shown in the top menu bar and opens this section. Click the pin to remove it -- you can still change the theme here in Settings at any time.'
+                  : 'Currently hidden from the top menu bar. Click the pin to add it back.'}
+                {' '}Synced to your account, so this preference follows you across devices.
+              </p>
+            </div>
+          </div>
         </div>
 
         {/* Color Theme Creator — comprehensive, Discord-style */}
@@ -2053,8 +2130,8 @@ export default function SettingsPage() {
         )}
 
         {isAuthenticated && isTraveler && (
-          <div className="mt-4 p-3 bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 rounded-lg">
-            <p className="text-sm text-amber-700 dark:text-amber-300">
+          <div className="mt-4 p-3 bg-warning-subtle border border-warning-muted rounded-lg">
+            <p className="text-sm text-warning">
               Color themes are available for registered accounts. Sign in with Google to unlock this feature.
             </p>
           </div>
@@ -2071,12 +2148,12 @@ export default function SettingsPage() {
     <div className="space-y-6">
 
       {/* ─── Facilitator note ────────────────────────────────── */}
-      <div className="p-3 rounded-lg bg-blue-50 dark:bg-blue-950/50 border border-blue-200 dark:border-blue-800">
+      <div className="p-3 rounded-lg bg-info-subtle border border-info-muted">
         <div className="flex items-start gap-2">
-          <Info className="w-4 h-4 text-blue-500 mt-0.5 shrink-0" />
-          <div className="text-sm text-blue-800 dark:text-blue-200 space-y-1">
+          <Info className="w-4 h-4 text-info mt-0.5 shrink-0" />
+          <div className="text-sm text-info space-y-1">
             <p>Even if notifications are disabled, facilitators can still contact you directly.</p>
-            <p className="text-xs text-blue-600 dark:text-blue-400">
+            <p className="text-xs text-primary">
               Disabling notifications stops emails for event invites and updates. Some emails may still come through -- for example if the privacy policy changes or core components change that affect your experience going forward.
             </p>
           </div>
@@ -2092,7 +2169,7 @@ export default function SettingsPage() {
         </p>
 
         <div className="space-y-3">
-          <div className={`flex flex-col gap-3 p-4 bg-card rounded-lg border-2 transition-colors sm:flex-row sm:items-center sm:justify-between ${notifChannelEmail ? 'border-blue-400 dark:border-blue-500' : 'border-rose-300 dark:border-rose-500/60'}`}>
+          <div className={`flex flex-col gap-3 p-4 bg-card rounded-lg border-2 transition-colors sm:flex-row sm:items-center sm:justify-between ${notifChannelEmail ? 'border-info-muted' : 'border-danger-muted'}`}>
             <div className="flex items-center gap-3 min-w-0">
               <Mail className="w-5 h-5 text-muted-foreground" />
               <div className="min-w-0">
@@ -2101,21 +2178,18 @@ export default function SettingsPage() {
               </div>
             </div>
             <div className="flex items-center gap-2 self-start sm:self-auto">
-              <span className={`text-xs font-medium ${notifChannelEmail ? 'text-blue-600 dark:text-blue-400' : 'text-rose-500 dark:text-rose-400'}`}>
+              <span className={`text-xs font-medium ${notifChannelEmail ? 'text-primary' : 'text-muted-foreground'}`}>
                 {notifChannelEmail ? 'On' : 'Off'}
               </span>
-              <button
-                onClick={() => { const next = !notifChannelEmail; setNotifChannelEmail(next); saveNotifPrefsNow({ channelEmail: next }) }}
-                aria-label="Toggle email notifications"
-                aria-pressed={notifChannelEmail}
-                className={`relative w-12 h-6 rounded-full transition-colors ${notifChannelEmail ? 'bg-blue-500' : 'bg-rose-300 dark:bg-rose-500/60'}`}
-              >
-                <span className={`absolute top-1 w-4 h-4 rounded-full transition-all shadow-[0_1px_3px_rgba(0,0,0,0.3)] ${notifChannelEmail ? 'left-7 bg-white' : 'left-1 bg-white dark:bg-gray-200'}`} />
-              </button>
+              <Switch
+                checked={notifChannelEmail}
+                onCheckedChange={next => { setNotifChannelEmail(next); saveNotifPrefsNow({ channelEmail: next }) }}
+                label="Email notifications"
+              />
             </div>
           </div>
 
-          <div className={`flex flex-col gap-3 p-4 bg-card rounded-lg border-2 transition-colors sm:flex-row sm:items-center sm:justify-between ${notifChannelDiscord ? 'border-blue-400 dark:border-blue-500' : 'border-rose-300 dark:border-rose-500/60'}`}>
+          <div className={`flex flex-col gap-3 p-4 bg-card rounded-lg border-2 transition-colors sm:flex-row sm:items-center sm:justify-between ${notifChannelDiscord ? 'border-primary-muted' : 'border-border'}`}>
             <div className="flex items-center gap-3 min-w-0">
               <MessageSquare className="w-5 h-5 text-muted-foreground" />
               <div className="min-w-0">
@@ -2124,42 +2198,33 @@ export default function SettingsPage() {
               </div>
             </div>
             <div className="flex items-center gap-2 self-start sm:self-auto">
-              <span className={`text-xs font-medium ${notifChannelDiscord ? 'text-blue-600 dark:text-blue-400' : 'text-rose-500 dark:text-rose-400'}`}>
+              <span className={`text-xs font-medium ${notifChannelDiscord ? 'text-primary' : 'text-muted-foreground'}`}>
                 {notifChannelDiscord ? 'On' : 'Off'}
               </span>
-              <button
-                onClick={() => { const next = !notifChannelDiscord; setNotifChannelDiscord(next); saveNotifPrefsNow({ channelDiscord: next }) }}
-                aria-label="Toggle discord notifications"
-                aria-pressed={notifChannelDiscord}
-                className={`relative w-12 h-6 rounded-full transition-colors ${notifChannelDiscord ? 'bg-blue-500' : 'bg-rose-300 dark:bg-rose-500/60'}`}
-              >
-                <span className={`absolute top-1 w-4 h-4 rounded-full transition-all shadow-[0_1px_3px_rgba(0,0,0,0.3)] ${notifChannelDiscord ? 'left-7 bg-white' : 'left-1 bg-white dark:bg-gray-200'}`} />
-              </button>
+              <Switch
+                checked={notifChannelDiscord}
+                onCheckedChange={next => { setNotifChannelDiscord(next); saveNotifPrefsNow({ channelDiscord: next }) }}
+                label="Discord notifications"
+              />
             </div>
           </div>
         </div>
 
         {/* ── Notification Preferences (expandable) ── */}
         <div id="settings-notification-preferences" className="mt-4 border border-border rounded-lg overflow-hidden">
-          <button
-            type="button"
-            onClick={() => setNotifPrefsExpanded(!notifPrefsExpanded)}
-            className="w-full flex items-center justify-between px-4 py-3 hover:bg-muted/50 transition-colors"
+          <Disclosure
+            title="Notification Preferences"
+            icon={<MessageSquare className="w-4 h-4" />}
+            expanded={notifPrefsExpanded}
+            onToggle={setNotifPrefsExpanded}
+            panelClassName="border-t border-border px-4 py-4 space-y-4"
           >
-            <div className="flex items-center gap-2">
-              <MessageSquare className="w-4 h-4 text-primary" />
-              <span className="text-sm font-medium">Notification Preferences</span>
-            </div>
-            {notifPrefsExpanded ? <ChevronDown className="w-4 h-4 text-muted-foreground" /> : <ChevronRight className="w-4 h-4 text-muted-foreground" />}
-          </button>
-
-          {notifPrefsExpanded && (
-            <div className="border-t border-border px-4 py-4 space-y-4">
+            <>
               {!notifPrefsEnabledInPrivacy ? (
                 /* Privacy gate: prefs are not visible to anyone */
                 <div className="text-center py-4 space-y-3">
-                  <div className="w-12 h-12 rounded-full mx-auto flex items-center justify-center bg-amber-100 dark:bg-amber-900/50">
-                    <Shield className="w-6 h-6 text-amber-600 dark:text-amber-400" />
+                  <div className="w-12 h-12 rounded-full mx-auto flex items-center justify-center bg-warning-subtle">
+                    <Shield className="w-6 h-6 text-warning" />
                   </div>
                   <div>
                     <p className="text-sm font-medium">Notification Preferences are hidden</p>
@@ -2167,13 +2232,13 @@ export default function SettingsPage() {
                       Enable "Show notification preferences" in the Privacy tab first so others can see how you prefer to be contacted.
                     </p>
                   </div>
-                  <button
+                  <Button
+                    intent="primary"
                     onClick={() => navigate('/settings?tab=privacy&section=visibility')}
-                    className="inline-flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+                    icon={<Shield className="w-4 h-4" />}
                   >
-                    <Shield className="w-4 h-4" />
                     Go to Privacy Settings
-                  </button>
+                  </Button>
                 </div>
               ) : (
                 /* Normal content: channel priority + visibility notice */
@@ -2197,7 +2262,9 @@ export default function SettingsPage() {
                       <span className="text-xs font-mono text-muted-foreground w-5 text-center">{index + 1}</span>
                       <span className="text-sm flex-1">{channel}</span>
                       <div className="flex gap-0.5">
-                        <button
+                        <IconButton
+                          size="micro"
+                          label={`Move ${channel} up`}
                           onClick={() => {
                             if (index === 0) return
                             const newOrder = [...notifChannelPriority]
@@ -2206,11 +2273,11 @@ export default function SettingsPage() {
                             saveNotifPrefsNow({ priority: newOrder })
                           }}
                           disabled={index === 0}
-                          className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-30"
-                        >
-                          <ArrowUp className="w-3.5 h-3.5" />
-                        </button>
-                        <button
+                          icon={<ArrowUp />}
+                        />
+                        <IconButton
+                          size="micro"
+                          label={`Move ${channel} down`}
                           onClick={() => {
                             if (index === notifChannelPriority.length - 1) return
                             const newOrder = [...notifChannelPriority]
@@ -2219,10 +2286,8 @@ export default function SettingsPage() {
                             saveNotifPrefsNow({ priority: newOrder })
                           }}
                           disabled={index === notifChannelPriority.length - 1}
-                          className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-30"
-                        >
-                          <ArrowDown className="w-3.5 h-3.5" />
-                        </button>
+                          icon={<ArrowDown />}
+                        />
                       </div>
                     </div>
                   ))}
@@ -2231,48 +2296,51 @@ export default function SettingsPage() {
 
               {/* Visibility notice when preferences are private */}
               {showPrefVisibilityNotice && notifPrefVisibility === 'private' && (
-                <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 space-y-2">
+                <div className="p-3 rounded-lg bg-warning-subtle border border-warning-muted space-y-2">
                   <div className="flex items-start gap-2">
-                    <Info className="w-4 h-4 text-amber-500 mt-0.5 shrink-0" />
-                    <div className="text-sm text-amber-800 dark:text-amber-200">
+                    <Info className="w-4 h-4 text-warning mt-0.5 shrink-0" />
+                    <div className="text-sm text-warning">
                       <p>Your notification preferences are currently <strong>private</strong>. Nobody other than you can see these preferences.</p>
                     </div>
                   </div>
                   <div className="flex flex-wrap gap-2 ml-6">
-                    <button
+                    <Button
+                      intent="primary"
+                      size="compact"
                       onClick={() => {
                         setNotifPrefVisibility('followers')
                         setShowPrefVisibilityNotice(false)
                         saveNotifPrefsNow({ visibility: 'followers' })
                       }}
-                      className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+                      icon={<Eye className="w-3.5 h-3.5" />}
                     >
-                      <Eye className="w-3.5 h-3.5" />
                       Show to Calendar Followers
-                    </button>
-                    <button
+                    </Button>
+                    <Button
+                      emphasis="outline"
+                      size="compact"
                       onClick={() => {
                         navigate('/settings?tab=privacy&section=visibility')
                         setShowPrefVisibilityNotice(false)
                       }}
-                      className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-border hover:bg-muted transition-colors"
+                      icon={<Shield className="w-3.5 h-3.5" />}
                     >
-                      <Shield className="w-3.5 h-3.5" />
                       Profile Visibility Options
-                    </button>
-                    <button
+                    </Button>
+                    <Button
+                      emphasis="ghost"
+                      size="compact"
                       onClick={() => setShowPrefVisibilityNotice(false)}
-                      className="text-xs text-muted-foreground hover:text-foreground ml-1"
                     >
                       Dismiss
-                    </button>
+                    </Button>
                   </div>
                 </div>
               )}
                 </>
               )}
-            </div>
-          )}
+            </>
+          </Disclosure>
         </div>
       </div>
 
@@ -2293,20 +2361,17 @@ export default function SettingsPage() {
         </p>
 
         <div className="flex flex-wrap gap-2">
-          <button
-            onClick={() => {
+          <ToggleButton
+            intent="neutral"
+            pressed={notifications.reminderTimes.length === 0}
+            onPressedChange={() => {
               if (notifications.reminderTimes.length > 0) {
                 updateNotifications({ reminderTimes: [] })
               }
             }}
-            className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-              notifications.reminderTimes.length === 0
-                ? 'bg-foreground text-background'
-                : 'bg-muted text-muted-foreground hover:bg-muted/80'
-            }`}
           >
             Not interested
-          </button>
+          </ToggleButton>
           {[
             { value: '0', label: 'At start' },
             { value: '15', label: '15 min before' },
@@ -2314,17 +2379,13 @@ export default function SettingsPage() {
             { value: '60', label: '1 hour before' },
             { value: '1440', label: '1 day before' },
           ].map(option => (
-            <button
+            <ToggleButton
               key={option.value}
-              onClick={() => toggleReminderTime(option.value)}
-              className={`px-4 py-2 rounded-lg text-sm font-medium transition-colors ${
-                notifications.reminderTimes.includes(option.value)
-                  ? 'bg-primary text-primary-foreground'
-                  : 'bg-muted text-muted-foreground hover:bg-muted/80'
-              }`}
+              pressed={notifications.reminderTimes.includes(option.value)}
+              onPressedChange={() => toggleReminderTime(option.value)}
             >
               {option.label}
-            </button>
+            </ToggleButton>
           ))}
         </div>
 
@@ -2346,25 +2407,26 @@ export default function SettingsPage() {
       {oauthMessage && (
         <div className={`p-4 rounded-lg border flex items-start justify-between ${
           oauthMessage.type === 'success'
-            ? 'bg-green-50 border-green-200 text-green-800'
-            : 'bg-rose-50 border-rose-200 text-rose-700'
+            ? 'bg-success-subtle border-success-muted text-success'
+            : 'bg-danger-subtle border-danger-muted text-danger'
         }`}>
           <div className="flex items-center gap-2">
             {oauthMessage.type === 'success' ? (
-              <svg className="h-5 w-5 text-green-600 flex-shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+              <svg className="h-5 w-5 text-success shrink-0" fill="none" viewBox="0 0 24 24" stroke="currentColor">
                 <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
               </svg>
             ) : (
-              <AlertCircle className="h-5 w-5 text-rose-500 flex-shrink-0" />
+              <AlertCircle className="h-5 w-5 text-danger shrink-0" />
             )}
             <p className="text-sm font-medium">{oauthMessage.text}</p>
           </div>
-          <button
+          <IconButton
+            label="Dismiss"
+            size="micro"
             onClick={() => setOauthMessage(null)}
-            className="text-muted-foreground hover:text-foreground ml-4"
-          >
-            &times;
-          </button>
+            className="ml-4"
+            icon={<X />}
+          />
         </div>
       )}
 
@@ -2391,10 +2453,10 @@ export default function SettingsPage() {
         </div>
 
         {/* Info banner */}
-        <div className="p-3 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-lg mb-4">
+        <div className="p-3 bg-info-subtle border border-info-muted rounded-lg mb-4">
           <div className="flex gap-2">
-            <HelpCircle className="h-4 w-4 text-blue-600 mt-0.5 flex-shrink-0" />
-            <p className="text-sm text-blue-800 dark:text-blue-200">
+            <HelpCircle className="h-4 w-4 text-info mt-0.5 shrink-0" />
+            <p className="text-sm text-info">
               <strong>Multiple accounts?</strong> You can connect calendars from different Google accounts — 
               for example your personal Gmail and a work Google Workspace account. Each connection is listed separately.
             </p>
@@ -2413,7 +2475,7 @@ export default function SettingsPage() {
               <div key={source.id}>
                 <div className="flex items-center justify-between p-4 bg-card rounded-lg border border-border">
                 <div className="flex items-center gap-3 min-w-0">
-                  <div className="w-10 h-10 bg-white rounded-lg flex items-center justify-center shadow-sm border border-border">
+                  <div className="w-10 h-10 bg-white rounded-lg flex items-center justify-center shadow-xs border border-border">
                     <svg className="w-6 h-6" viewBox="0 0 24 24">
                       <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" />
                       <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" />
@@ -2432,34 +2494,33 @@ export default function SettingsPage() {
                             if (e.key === 'Enter') updateSourceLabel(source, editingSourceName)
                             if (e.key === 'Escape') { setEditingSourceId(null); setEditingSourceName('') }
                           }}
-                          className="px-2 py-0.5 border border-ring rounded text-sm focus:ring-2 focus:ring-ring focus:border-ring outline-none w-40 bg-background text-foreground"
+                          className="px-2 py-0.5 border border-ring rounded text-sm focus:ring-2 focus:ring-ring focus:border-ring outline-hidden w-40 bg-background text-foreground"
                           autoFocus
                         />
-                        <button
+                        <IconButton
+                          size="micro"
+                          intent="primary"
+                          label="Save"
                           onClick={() => updateSourceLabel(source, editingSourceName)}
-                          className="text-green-600 hover:text-green-700 p-0.5"
-                          title="Save"
-                        >
-                          <CheckIcon className="h-4 w-4" />
-                        </button>
-                        <button
+                          icon={<CheckIcon />}
+                        />
+                        <IconButton
+                          size="micro"
+                          label="Cancel"
                           onClick={() => { setEditingSourceId(null); setEditingSourceName('') }}
-                          className="text-muted-foreground hover:text-foreground p-0.5"
-                          title="Cancel"
-                        >
-                          <X className="h-4 w-4" />
-                        </button>
+                          icon={<X />}
+                        />
                       </div>
                     ) : (
                       <div className="flex items-center gap-1 group">
                         <p className="font-medium truncate">{source.display_name}</p>
-                        <button
+                        <IconButton
+                          size="micro"
+                          label="Edit label"
                           onClick={() => { setEditingSourceId(source.id); setEditingSourceName(source.display_name) }}
-                          className="text-muted-foreground/30 hover:text-muted-foreground opacity-0 group-hover:opacity-100 transition-opacity p-0.5"
-                          title="Edit label"
-                        >
-                          <Pencil className="h-3.5 w-3.5" />
-                        </button>
+                          className="opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
+                          icon={<Pencil />}
+                        />
                       </div>
                     )}
                     <div className="flex items-center gap-2 text-sm text-muted-foreground">
@@ -2468,64 +2529,63 @@ export default function SettingsPage() {
                     </div>
                   </div>
                   <span
-                    className="w-3 h-3 rounded-full flex-shrink-0"
+                    className="w-3 h-3 rounded-full shrink-0"
                     style={{ backgroundColor: source.color }}
                   />
                 </div>
                 <div className="flex items-center gap-2 ml-4">
                   {source.sync_error && (
                     <span title={source.sync_error}>
-                      <AlertCircle className="h-4 w-4 text-rose-400" />
+                      <AlertCircle className="h-4 w-4 text-danger" />
                     </span>
                   )}
-                  <button
-                    onClick={() => toggleSourceActive(source)}
+                  <Switch
+                    size="compact"
+                    checked={Boolean(source.is_active)}
+                    onCheckedChange={() => toggleSourceActive(source)}
                     disabled={sourceActionLoading === source.id}
-                    className="text-muted-foreground hover:text-foreground"
+                    label={`${source.display_name} sync`}
                     title={source.is_active ? 'Disable' : 'Enable'}
-                  >
-                    {source.is_active
-                      ? <ToggleRight className="h-6 w-6 text-primary" />
-                      : <ToggleLeft className="h-6 w-6" />
-                    }
-                  </button>
+                  />
                   {pendingRemoveSourceId === source.id ? (
                     <>
-                      <button
+                      <Button
+                        emphasis="outline"
+                        intent="danger"
+                        size="micro"
                         onClick={() => removeSource(source, true)}
                         disabled={sourceActionLoading === source.id}
-                        className="px-2 py-1 text-xs font-medium text-rose-700 dark:text-rose-300 bg-rose-100 dark:bg-rose-900/30 border border-rose-200 dark:border-rose-800 rounded hover:bg-rose-200 dark:hover:bg-rose-900/50 transition-colors disabled:opacity-50"
                         title="Confirm remove"
                       >
                         Confirm
-                      </button>
-                      <button
+                      </Button>
+                      <Button
+                        emphasis="outline"
+                        size="micro"
                         onClick={() => setPendingRemoveSourceId(null)}
                         disabled={sourceActionLoading === source.id}
-                        className="px-2 py-1 text-xs font-medium text-muted-foreground bg-background border border-border rounded hover:bg-muted transition-colors disabled:opacity-50"
                         title="Cancel"
                       >
                         Cancel
-                      </button>
+                      </Button>
                     </>
                   ) : (
-                    <button
+                    <IconButton
+                      intent="danger"
+                      label="Remove"
                       onClick={() => removeSource(source)}
                       disabled={sourceActionLoading === source.id}
-                      className="text-muted-foreground hover:text-rose-500 dark:hover:text-rose-400 transition-colors"
-                      title="Remove"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </button>
+                      icon={<Trash2 />}
+                    />
                   )}
                 </div>
               </div>
               {source.sync_error && (
-                <div className="mx-4 -mt-1 mb-2 p-2 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-b-lg">
-                  <p className="text-xs text-rose-600 dark:text-rose-300">
+                <div className="mx-4 -mt-1 mb-2 p-2 bg-danger-subtle border border-danger-muted rounded-b-lg">
+                  <p className="text-xs text-danger">
                     <strong>Sync issue:</strong> {source.sync_error}
                   </p>
-                  <p className="text-[10px] text-rose-500 dark:text-rose-400 mt-0.5">
+                  <p className="text-[10px] text-danger mt-0.5">
                     Try removing and re-adding this connection to fix the issue.
                   </p>
                 </div>
@@ -2544,7 +2604,7 @@ export default function SettingsPage() {
 
         {/* Add Google account form */}
         {showAddGoogle ? (
-          <div className="mt-4 p-4 border-2 border-blue-200 dark:border-blue-800 rounded-lg bg-blue-50/50 dark:bg-blue-950/50">
+          <div className="mt-4 p-4 border-2 border-info-muted rounded-lg bg-info-subtle">
             <h4 className="font-medium mb-3">Connect a Google Calendar</h4>
             <p className="text-sm text-muted-foreground mb-3">
               You'll be redirected to Google to sign in and grant calendar permissions.
@@ -2555,17 +2615,14 @@ export default function SettingsPage() {
                 <label className="block text-sm font-medium mb-1">Label</label>
                 <div className="flex flex-wrap gap-1.5 mb-2">
                   {['Work', 'Personal', 'School', 'Freelance', 'Other'].map(label => (
-                    <button
+                    <ToggleButton
                       key={label}
-                      onClick={() => setNewGoogleName(label)}
-                      className={`px-3 py-1 text-xs font-medium rounded-full border transition-colors ${
-                        newGoogleName === label
-                          ? 'bg-primary/10 border-primary text-primary'
-                          : 'bg-background border-border text-muted-foreground hover:bg-muted hover:border-border'
-                      }`}
+                      size="micro"
+                      pressed={newGoogleName === label}
+                      onPressedChange={() => setNewGoogleName(label)}
                     >
                       {label}
-                    </button>
+                    </ToggleButton>
                   ))}
                 </div>
                 <input
@@ -2573,7 +2630,7 @@ export default function SettingsPage() {
                   value={newGoogleName}
                   onChange={(e) => setNewGoogleName(e.target.value)}
                   placeholder="or create custom label e.g. Connection or Network Name"
-                  className="w-full px-3 py-2 border border-input rounded-lg focus:ring-2 focus:ring-ring focus:border-ring outline-none text-sm bg-background text-foreground"
+                  className="w-full px-3 py-2 border border-input rounded-lg focus:ring-2 focus:ring-ring focus:border-ring outline-hidden text-sm bg-background text-foreground"
                 />
               </div>
               <div>
@@ -2591,10 +2648,10 @@ export default function SettingsPage() {
                 </div>
               </div>
               <div className="flex gap-2 pt-1">
-                <button
+                <Button
+                  intent="primary"
                   onClick={addGoogleSource}
                   disabled={!newGoogleName.trim() || sourceActionLoading === 'add-google'}
-                  className="px-4 py-2 text-sm font-medium bg-blue-600 text-white rounded-lg hover:bg-blue-700 disabled:opacity-50 transition-colors flex items-center gap-2"
                 >
                   {sourceActionLoading === 'add-google' ? (
                     <>
@@ -2612,28 +2669,30 @@ export default function SettingsPage() {
                       Sign in with Google
                     </>
                   )}
-                </button>
-                <button
+                </Button>
+                <Button
+                  emphasis="outline"
                   onClick={() => { setShowAddGoogle(false); setNewGoogleName(''); }}
-                  className="px-4 py-2 text-sm font-medium text-muted-foreground bg-background border border-border rounded-lg hover:bg-muted transition-colors"
                 >
                   Cancel
-                </button>
+                </Button>
               </div>
             </div>
           </div>
         ) : (
-          <button
+          <Button
+            emphasis="outline"
+            fullWidth
             onClick={() => setShowAddGoogle(true)}
             disabled={isTraveler}
-            className="mt-4 w-full flex items-center justify-center gap-2 px-4 py-3 text-sm font-medium text-blue-600 border-2 border-dashed border-blue-300 rounded-lg hover:bg-blue-50 hover:border-blue-400 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+            className="mt-4"
+            icon={<Plus className="h-4 w-4" />}
           >
-            <Plus className="h-4 w-4" />
             Connect a Google Calendar Account
-          </button>
+          </Button>
         )}
         {isTraveler && (
-          <p className="mt-2 text-xs text-amber-600">
+          <p className="mt-2 text-xs text-warning">
             Traveler accounts cannot connect Google Calendars. Sign in to use this feature.
           </p>
         )}
@@ -2643,7 +2702,7 @@ export default function SettingsPage() {
       {isTraveler ? (
         <div className="pt-6 border-t border-border">
           <h3 className="text-lg font-medium mb-2">Public Calendar URLs</h3>
-          <p className="text-sm text-amber-600 dark:text-amber-400">Public calendar URLs are not available for Traveler accounts. Sign in with Google or a Cardano wallet to add external calendars.</p>
+          <p className="text-sm text-warning">Public calendar URLs are not available for Traveler accounts. Sign in with Google or a Cardano wallet to add external calendars.</p>
         </div>
       ) : (
       <div className="pt-6 border-t border-border">
@@ -2658,19 +2717,17 @@ export default function SettingsPage() {
         </div>
 
         {/* Expandable guidance ribbon */}
-        <button
-          onClick={() => setShowUrlGuide(!showUrlGuide)}
-          className="w-full flex items-center justify-between p-3 bg-amber-50 border border-amber-200 rounded-lg hover:bg-amber-100 transition-colors mb-4"
-        >
-          <div className="flex items-center gap-2">
-            <HelpCircle className="h-4 w-4 text-amber-600" />
-            <span className="text-sm font-medium text-amber-800">How do I find a public iCal calendar URL?</span>
-          </div>
-          <ChevronDown className={`h-4 w-4 text-amber-600 transition-transform ${showUrlGuide ? 'rotate-180' : ''}`} />
-        </button>
+        <Disclosure
+          title="How do I find a public iCal calendar URL?"
+          icon={<HelpCircle className="h-4 w-4" />}
+          expanded={showUrlGuide}
+          onToggle={setShowUrlGuide}
+          panelId="settings-url-guide"
+          className="mb-4 rounded-lg border border-warning-muted bg-warning-subtle p-1"
+        />
 
         {showUrlGuide && (
-          <div className="mb-4 p-4 bg-amber-50/50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 rounded-lg text-sm text-foreground space-y-4">
+          <div id="settings-url-guide" className="mb-4 p-4 bg-warning-subtle border border-warning-muted rounded-lg text-sm text-foreground space-y-4">
             <div>
               <p className="font-semibold mb-2">Use the iCal address</p>
               <ol className="list-decimal ml-5 space-y-1.5">
@@ -2678,7 +2735,7 @@ export default function SettingsPage() {
                 <li>Select <strong>"Settings and sharing"</strong></li>
                 <li>Scroll to <strong>"Integrate calendar"</strong></li>
                 <li>Copy the <strong>"Public address in iCal format"</strong> — it looks like:<br />
-                  <code className="text-xs bg-white text-slate-900 px-2 py-1 rounded border mt-1 inline-block break-all">
+                  <code className="text-xs bg-background text-foreground px-2 py-1 rounded border mt-1 inline-block break-all">
                     https://calendar.google.com/calendar/ical/...%40group.calendar.google.com/public/basic.ics
                   </code>
                 </li>
@@ -2686,9 +2743,9 @@ export default function SettingsPage() {
               </ol>
             </div>
 
-            <div className="pt-2 border-t border-amber-200">
-              <p className="text-xs text-amber-700">
-                <strong>Tip:</strong> Use a public iCalendar feed URL that ends in <code className="bg-white text-slate-900 px-1 rounded">.ics</code>. Regular Google Calendar page links (for example with <code className="bg-white text-slate-900 px-1 rounded">?cid=</code>) are not direct feeds.
+            <div className="pt-2 border-t border-warning-muted">
+              <p className="text-xs text-warning">
+                <strong>Tip:</strong> Use a public iCalendar feed URL that ends in <code className="bg-background text-foreground px-1 rounded">.ics</code>. Regular Google Calendar page links (for example with <code className="bg-background text-foreground px-1 rounded">?cid=</code>) are not direct feeds.
               </p>
             </div>
           </div>
@@ -2699,7 +2756,7 @@ export default function SettingsPage() {
           {urlSources.map(source => (
             <div key={source.id} className="flex items-center justify-between p-4 bg-card rounded-lg border border-border">
               <div className="flex items-center gap-3 min-w-0">
-                <div className="w-10 h-10 bg-background rounded-lg flex items-center justify-center shadow-sm border border-border">
+                <div className="w-10 h-10 bg-background rounded-lg flex items-center justify-center shadow-xs border border-border">
                   <Globe className="h-5 w-5 text-muted-foreground" />
                 </div>
                 <div className="min-w-0">
@@ -2710,55 +2767,54 @@ export default function SettingsPage() {
                   </div>
                 </div>
                 <span
-                  className="w-3 h-3 rounded-full flex-shrink-0"
+                  className="w-3 h-3 rounded-full shrink-0"
                   style={{ backgroundColor: source.color }}
                 />
               </div>
               <div className="flex items-center gap-2 ml-4">
                 {source.sync_error && (
                   <span title={source.sync_error}>
-                    <AlertCircle className="h-4 w-4 text-rose-400" />
+                    <AlertCircle className="h-4 w-4 text-danger" />
                   </span>
                 )}
-                <button
-                  onClick={() => toggleSourceActive(source)}
+                <Switch
+                  size="compact"
+                  checked={Boolean(source.is_active)}
+                  onCheckedChange={() => toggleSourceActive(source)}
                   disabled={sourceActionLoading === source.id}
-                  className="text-muted-foreground hover:text-foreground"
+                  label={`${source.display_name} sync`}
                   title={source.is_active ? 'Disable' : 'Enable'}
-                >
-                  {source.is_active
-                    ? <ToggleRight className="h-6 w-6 text-green-600 dark:text-green-400" />
-                    : <ToggleLeft className="h-6 w-6" />
-                  }
-                </button>
+                />
                 {pendingRemoveSourceId === source.id ? (
                   <>
-                    <button
+                    <Button
+                      emphasis="outline"
+                      intent="danger"
+                      size="micro"
                       onClick={() => removeSource(source, true)}
                       disabled={sourceActionLoading === source.id}
-                      className="px-2 py-1 text-xs font-medium text-rose-700 dark:text-rose-300 bg-rose-100 dark:bg-rose-900/30 border border-rose-200 dark:border-rose-800 rounded hover:bg-rose-200 dark:hover:bg-rose-900/50 transition-colors disabled:opacity-50"
                       title="Confirm remove"
                     >
                       Confirm
-                    </button>
-                    <button
+                    </Button>
+                    <Button
+                      emphasis="outline"
+                      size="micro"
                       onClick={() => setPendingRemoveSourceId(null)}
                       disabled={sourceActionLoading === source.id}
-                      className="px-2 py-1 text-xs font-medium text-muted-foreground bg-background border border-border rounded hover:bg-muted transition-colors disabled:opacity-50"
                       title="Cancel"
                     >
                       Cancel
-                    </button>
+                    </Button>
                   </>
                 ) : (
-                  <button
+                  <IconButton
+                    intent="danger"
+                    label="Remove"
                     onClick={() => removeSource(source)}
                     disabled={sourceActionLoading === source.id}
-                    className="text-muted-foreground hover:text-rose-500 dark:hover:text-rose-400 transition-colors"
-                    title="Remove"
-                  >
-                    <Trash2 className="h-4 w-4" />
-                  </button>
+                    icon={<Trash2 />}
+                  />
                 )}
               </div>
             </div>
@@ -2774,7 +2830,7 @@ export default function SettingsPage() {
 
         {/* Add public URL form */}
         {showAddPublicUrl ? (
-          <div className="mt-4 p-4 border-2 border-green-200 dark:border-green-800 rounded-lg bg-green-50/50 dark:bg-green-950/50">
+          <div className="mt-4 p-4 border-2 border-success-muted rounded-lg bg-success-subtle">
             <h4 className="font-medium mb-3">Add a Public Calendar URL</h4>
             <div className="space-y-3">
               <div>
@@ -2784,7 +2840,7 @@ export default function SettingsPage() {
                   value={newUrlName}
                   onChange={(e) => setNewUrlName(e.target.value)}
                   placeholder="e.g. Team Events, Finland Holidays"
-                  className="w-full px-3 py-2 border border-input rounded-lg focus:ring-2 focus:ring-ring focus:border-ring outline-none text-sm bg-background text-foreground"
+                  className="w-full px-3 py-2 border border-input rounded-lg focus:ring-2 focus:ring-ring focus:border-ring outline-hidden text-sm bg-background text-foreground"
                 />
               </div>
               <div>
@@ -2794,7 +2850,7 @@ export default function SettingsPage() {
                   value={newUrlValue}
                   onChange={(e) => setNewUrlValue(e.target.value)}
                   placeholder="https://calendar.google.com/calendar/ical/.../public/basic.ics"
-                  className="w-full px-3 py-2 border border-input rounded-lg focus:ring-2 focus:ring-ring focus:border-ring outline-none text-sm font-mono bg-background text-foreground"
+                  className="w-full px-3 py-2 border border-input rounded-lg focus:ring-2 focus:ring-ring focus:border-ring outline-hidden text-sm font-mono bg-background text-foreground"
                 />
               </div>
               <div>
@@ -2812,30 +2868,32 @@ export default function SettingsPage() {
                 </div>
               </div>
               <div className="flex gap-2 pt-1">
-                <button
+                <Button
+                  intent="primary"
                   onClick={addPublicUrlSource}
                   disabled={!newUrlName.trim() || !newUrlValue.trim() || sourceActionLoading === 'add-url'}
-                  className="px-4 py-2 text-sm font-medium bg-green-600 text-white rounded-lg hover:bg-green-700 disabled:opacity-50 transition-colors"
                 >
                   {sourceActionLoading === 'add-url' ? 'Adding...' : 'Add Calendar URL'}
-                </button>
-                <button
+                </Button>
+                <Button
+                  emphasis="outline"
                   onClick={() => { setShowAddPublicUrl(false); setNewUrlName(''); setNewUrlValue(''); }}
-                  className="px-4 py-2 text-sm font-medium text-muted-foreground bg-background border border-border rounded-lg hover:bg-muted transition-colors"
                 >
                   Cancel
-                </button>
+                </Button>
               </div>
             </div>
           </div>
         ) : (
-          <button
+          <Button
+            emphasis="outline"
+            fullWidth
             onClick={() => setShowAddPublicUrl(true)}
-            className="mt-4 w-full flex items-center justify-center gap-2 px-4 py-3 text-sm font-medium text-green-600 border-2 border-dashed border-green-300 rounded-lg hover:bg-green-50 hover:border-green-400 transition-colors"
+            className="mt-4"
+            icon={<Plus className="h-4 w-4" />}
           >
-            <Plus className="h-4 w-4" />
             Add a Public Calendar URL
-          </button>
+          </Button>
         )}
       </div>
       )}
@@ -2852,15 +2910,15 @@ export default function SettingsPage() {
         {/* ─── Zoom Integration ────────────────────────────── */}
         <div className="mb-6 p-4 border border-border rounded-xl bg-card">
           <div className="flex items-center gap-3 mb-3">
-            <div className="w-10 h-10 bg-blue-100 dark:bg-blue-900/50 rounded-lg flex items-center justify-center">
-              <Video className="w-5 h-5 text-blue-600 dark:text-blue-400" />
+            <div className="w-10 h-10 bg-info-subtle rounded-lg flex items-center justify-center">
+              <Video className="w-5 h-5 text-primary" />
             </div>
             <div className="flex-1">
               <h3 className="font-medium text-foreground">Zoom</h3>
               <p className="text-xs text-muted-foreground">Create Zoom meetings directly from calendar events</p>
             </div>
             {zoomIntegration?.is_active && (
-              <span className="px-2 py-1 text-xs font-medium bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 rounded-full">
+              <span className="px-2 py-1 text-xs font-medium bg-success-subtle text-success rounded-full">
                 Connected
               </span>
             )}
@@ -2873,16 +2931,19 @@ export default function SettingsPage() {
             </div>
           ) : zoomIntegration?.is_active ? (
             <div className="space-y-3">
-              <div className="p-3 bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded-lg">
-                <p className="text-sm text-green-800 dark:text-green-200">
+              <div className="p-3 bg-success-subtle border border-success-muted rounded-lg">
+                <p className="text-sm text-success">
                   <CheckIcon className="w-4 h-4 inline mr-1" />
                   Connected as <strong>{zoomIntegration.zoom_display_name || zoomIntegration.zoom_email || 'Zoom User'}</strong>
                 </p>
-                <p className="text-xs text-green-600 dark:text-green-400 mt-1">
+                <p className="text-xs text-success mt-1">
                   Zoom meeting links will be generated automatically when you create calendar events.
                 </p>
               </div>
-              <button
+              <Button
+                emphasis="outline"
+                intent="danger"
+                size="compact"
                 onClick={async () => {
                   try {
                     await apiClient.delete('/api/zoom/disconnect')
@@ -2892,29 +2953,24 @@ export default function SettingsPage() {
                     setZoomError('Failed to disconnect Zoom.')
                   }
                 }}
-                className="flex items-center gap-2 px-3 py-2 text-xs font-medium text-rose-500 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-800 rounded-lg hover:bg-rose-100 dark:hover:bg-rose-900/30 transition-colors"
+                icon={<Unlink className="w-3.5 h-3.5" />}
               >
-                <Unlink className="w-3.5 h-3.5" />
                 Disconnect Zoom
-              </button>
+              </Button>
             </div>
           ) : window.location.hostname === 'localhost' ? (
             <div className="space-y-3">
-              <div className="p-3 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-lg">
-                <p className="text-sm text-amber-800 dark:text-amber-200 font-medium">
+              <div className="p-3 bg-warning-subtle border border-warning-muted rounded-lg">
+                <p className="text-sm text-warning font-medium">
                   Zoom integration is disabled on localhost
                 </p>
-                <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
+                <p className="text-xs text-warning mt-1">
                   Zoom requires a fully qualified domain name (FQDN) for OAuth. Please use the deployed production version to connect your Zoom account.
                 </p>
               </div>
-              <button
-                disabled
-                className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 rounded-lg opacity-50 cursor-not-allowed"
-              >
-                <Video className="w-4 h-4" />
+              <Button disabled icon={<Video className="w-4 h-4" />}>
                 Connect Zoom
-              </button>
+              </Button>
             </div>
           ) : (
             <div className="space-y-3">
@@ -2923,8 +2979,13 @@ export default function SettingsPage() {
                   Connect your Zoom account to generate meeting links automatically when scheduling events.
                 </p>
               </div>
-              <button
+              <Button
                 disabled={zoomConnecting}
+                icon={zoomConnecting ? (
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                ) : (
+                  <Video className="w-4 h-4" />
+                )}
                 onClick={async () => {
                   setZoomConnecting(true)
                   setZoomError(null)
@@ -2941,25 +3002,19 @@ export default function SettingsPage() {
                     setZoomConnecting(false)
                   }
                 }}
-                className="flex items-center gap-2 px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               >
-                {zoomConnecting ? (
-                  <Loader2 className="w-4 h-4 animate-spin" />
-                ) : (
-                  <Video className="w-4 h-4" />
-                )}
                 Connect Zoom
-              </button>
+              </Button>
             </div>
           )}
           {zoomError && (
-            <div className="mt-3 p-3 bg-rose-50 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-800 rounded-lg text-sm text-rose-600 dark:text-rose-300">
+            <div className="mt-3 p-3 bg-danger-subtle border border-danger-muted rounded-lg text-sm text-danger">
               <AlertCircle className="w-4 h-4 inline mr-1" />
               {zoomError}
             </div>
           )}
           {zoomSuccess && (
-            <div className="mt-3 p-3 bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded-lg text-sm text-green-700 dark:text-green-300">
+            <div className="mt-3 p-3 bg-success-subtle border border-success-muted rounded-lg text-sm text-success">
               <CheckIcon className="w-4 h-4 inline mr-1" />
               {zoomSuccess}
             </div>
@@ -2970,22 +3025,22 @@ export default function SettingsPage() {
         {isTraveler ? (
           <div className="mb-6 p-4 border border-border rounded-xl bg-card">
             <div className="flex items-center gap-3">
-              <div className="w-10 h-10 bg-gradient-to-br from-orange-100 to-pink-100 dark:from-orange-950 dark:to-pink-950 rounded-lg flex items-center justify-center">
-                <span className="w-6 h-6 bg-gradient-to-br from-orange-400 to-pink-500 rounded flex items-center justify-center">
+              <div className="w-10 h-10 bg-linear-to-br from-orange-100 to-pink-100 dark:from-orange-950 dark:to-pink-950 rounded-lg flex items-center justify-center">
+                <span className="w-6 h-6 bg-linear-to-br from-orange-400 to-pink-500 rounded flex items-center justify-center">
                   <span className="text-white text-[9px] font-bold">Lu</span>
                 </span>
               </div>
               <div>
                 <h3 className="font-medium text-foreground">Luma</h3>
-                <p className="text-xs text-amber-600 dark:text-amber-400">Luma integration is not available for Traveler accounts.</p>
+                <p className="text-xs text-warning">Luma integration is not available for Traveler accounts.</p>
               </div>
             </div>
           </div>
         ) : (
         <div className="mb-6 p-4 border border-border rounded-xl bg-card">
           <div className="flex items-center gap-3 mb-3">
-            <div className="w-10 h-10 bg-gradient-to-br from-orange-100 to-pink-100 dark:from-orange-950 dark:to-pink-950 rounded-lg flex items-center justify-center">
-              <span className="w-6 h-6 bg-gradient-to-br from-orange-400 to-pink-500 rounded flex items-center justify-center">
+            <div className="w-10 h-10 bg-linear-to-br from-orange-100 to-pink-100 dark:from-orange-950 dark:to-pink-950 rounded-lg flex items-center justify-center">
+              <span className="w-6 h-6 bg-linear-to-br from-orange-400 to-pink-500 rounded flex items-center justify-center">
                 <span className="text-white text-[9px] font-bold">Lu</span>
               </span>
             </div>
@@ -2994,7 +3049,7 @@ export default function SettingsPage() {
               <p className="text-xs text-muted-foreground">Publish meetings as Luma events with registration pages</p>
             </div>
             {lumaIntegration?.is_active && (
-              <span className="px-2 py-1 text-xs font-medium bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 rounded-full">
+              <span className="px-2 py-1 text-xs font-medium bg-success-subtle text-success rounded-full">
                 Connected
               </span>
             )}
@@ -3007,16 +3062,19 @@ export default function SettingsPage() {
             </div>
           ) : lumaIntegration?.is_active ? (
             <div className="space-y-3">
-              <div className="p-3 bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded-lg">
-                <p className="text-sm text-green-800 dark:text-green-200">
+              <div className="p-3 bg-success-subtle border border-success-muted rounded-lg">
+                <p className="text-sm text-success">
                   <CheckIcon className="w-4 h-4 inline mr-1" />
                   Connected as <strong>{lumaIntegration.luma_user_name || lumaIntegration.luma_user_email || 'Luma User'}</strong>
                 </p>
-                <p className="text-xs text-green-600 dark:text-green-400 mt-1">
+                <p className="text-xs text-success mt-1">
                   You can now publish meetings as Luma events from the meeting panel.
                 </p>
               </div>
-              <button
+              <Button
+                emphasis="outline"
+                intent="danger"
+                size="compact"
                 onClick={async () => {
                   try {
                     await apiClient.delete('/api/luma/disconnect')
@@ -3026,11 +3084,10 @@ export default function SettingsPage() {
                     setLumaError('Failed to disconnect Luma.')
                   }
                 }}
-                className="flex items-center gap-2 px-3 py-2 text-xs font-medium text-rose-500 dark:text-rose-400 bg-rose-50 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-800 rounded-lg hover:bg-rose-100 dark:hover:bg-rose-900/30 transition-colors"
+                icon={<Unlink className="w-3.5 h-3.5" />}
               >
-                <Unlink className="w-3.5 h-3.5" />
                 Disconnect Luma
-              </button>
+              </Button>
             </div>
           ) : (
             <div className="space-y-3">
@@ -3040,12 +3097,12 @@ export default function SettingsPage() {
                 </p>
                 <p className="text-xs text-muted-foreground">
                   Get your API key from{' '}
-                  <a href="https://luma.com/settings/api" target="_blank" rel="noopener noreferrer" className="text-blue-600 dark:text-blue-400 hover:underline">
+                  <a href="https://luma.com/settings/api" target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
                     luma.com/settings/api <ExternalLink className="w-3 h-3 inline" />
                   </a>
                 </p>
-                <p className="text-xs text-amber-600 dark:text-amber-400 mt-2 flex items-start gap-1.5">
-                  <AlertCircle className="w-3.5 h-3.5 mt-0.5 flex-shrink-0" />
+                <p className="text-xs text-warning mt-2 flex items-start gap-1.5">
+                  <AlertCircle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
                   <span>The Luma API requires a <strong>Luma Plus</strong> (paid) subscription. The API settings page will not appear for free accounts.</span>
                 </p>
               </div>
@@ -3055,7 +3112,7 @@ export default function SettingsPage() {
                   value={lumaApiKey}
                   onChange={(e) => setLumaApiKey(e.target.value)}
                   placeholder="Paste your Luma API key"
-                  className="flex-1 px-3 py-2 text-sm border border-border rounded-lg bg-background text-foreground focus:ring-2 focus:ring-ring focus:border-ring outline-none"
+                  className="flex-1 px-3 py-2 text-sm border border-border rounded-lg bg-background text-foreground focus:ring-2 focus:ring-ring focus:border-ring outline-hidden"
                 />
                 <button
                   disabled={lumaConnecting || !lumaApiKey.trim() || isTraveler}
@@ -3073,7 +3130,7 @@ export default function SettingsPage() {
                       setLumaConnecting(false)
                     }
                   }}
-                  className="flex w-full sm:w-auto items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-gradient-to-r from-orange-500 to-pink-500 hover:from-orange-600 hover:to-pink-600 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                  className="flex w-full sm:w-auto items-center justify-center gap-2 px-4 py-2 text-sm font-medium text-white bg-linear-to-r from-orange-500 to-pink-500 hover:from-orange-600 hover:to-pink-600 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
                 >
                   {lumaConnecting ? (
                     <Loader2 className="w-4 h-4 animate-spin" />
@@ -3089,13 +3146,13 @@ export default function SettingsPage() {
             </div>
           )}
           {lumaError && (
-            <div className="mt-3 p-3 bg-rose-50 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-800 rounded-lg text-sm text-rose-600 dark:text-rose-300">
+            <div className="mt-3 p-3 bg-danger-subtle border border-danger-muted rounded-lg text-sm text-danger">
               <AlertCircle className="w-4 h-4 inline mr-1" />
               {lumaError}
             </div>
           )}
           {lumaSuccess && (
-            <div className="mt-3 p-3 bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 rounded-lg text-sm text-green-700 dark:text-green-300">
+            <div className="mt-3 p-3 bg-success-subtle border border-success-muted rounded-lg text-sm text-success">
               <CheckIcon className="w-4 h-4 inline mr-1" />
               {lumaSuccess}
             </div>
@@ -3124,7 +3181,7 @@ export default function SettingsPage() {
             <select
               value={calendarSettings.defaultTimeInterval}
               onChange={(e) => updateCalendarSettings({ defaultTimeInterval: parseInt(e.target.value) as 15 | 30 | 60 })}
-              className="w-full px-4 py-2.5 border border-input rounded-lg focus:ring-2 focus:ring-ring focus:border-ring outline-none bg-background text-foreground"
+              className="w-full px-4 py-2.5 border border-input rounded-lg focus:ring-2 focus:ring-ring focus:border-ring outline-hidden bg-background text-foreground"
             >
               <option value="15">15 minutes</option>
               <option value="30">30 minutes</option>
@@ -3146,7 +3203,7 @@ export default function SettingsPage() {
             <select
               value={calendarSettings.startHour}
               onChange={(e) => updateCalendarSettings({ startHour: parseInt(e.target.value) })}
-              className="w-full px-4 py-2.5 border border-input rounded-lg focus:ring-2 focus:ring-ring focus:border-ring outline-none bg-background text-foreground"
+              className="w-full px-4 py-2.5 border border-input rounded-lg focus:ring-2 focus:ring-ring focus:border-ring outline-hidden bg-background text-foreground"
             >
               {Array.from({ length: 24 }, (_, i) => (
                 <option key={i} value={i}>{i.toString().padStart(2, '0')}:00</option>
@@ -3159,7 +3216,7 @@ export default function SettingsPage() {
             <select
               value={calendarSettings.endHour}
               onChange={(e) => updateCalendarSettings({ endHour: parseInt(e.target.value) })}
-              className="w-full px-4 py-2.5 border border-input rounded-lg focus:ring-2 focus:ring-ring focus:border-ring outline-none bg-background text-foreground"
+              className="w-full px-4 py-2.5 border border-input rounded-lg focus:ring-2 focus:ring-ring focus:border-ring outline-hidden bg-background text-foreground"
             >
               {Array.from({ length: 24 }, (_, i) => (
                 <option key={i + 1} value={i + 1}>{(i + 1).toString().padStart(2, '0')}:00</option>
@@ -3171,6 +3228,24 @@ export default function SettingsPage() {
       
       {/* ─── Display Options ─────────────────────────────────── */}
       <div className="pt-6 border-t border-border">
+        <h3 className="text-lg font-medium mb-4">Date Format</h3>
+
+        <div>
+          <label className="block text-sm font-medium mb-1">Date display style</label>
+          <select
+            value={calendarSettings.dateFormat}
+            onChange={(e) => updateCalendarSettings({ dateFormat: normalizeUserDateFormat(e.target.value) })}
+            className="w-full px-4 py-2.5 border border-input rounded-lg focus:ring-2 focus:ring-ring focus:border-ring outline-hidden bg-background text-foreground"
+          >
+            <option value="dd.mm.yyyy">dd.mm.yyyy (default)</option>
+            <option value="mm/dd/yyyy">mm/dd/yyyy</option>
+            <option value="yyyy-mm-dd">yyyy-mm-dd</option>
+          </select>
+          <p className="mt-1 text-xs text-muted-foreground">Used in calendar views and mailbox timestamps.</p>
+        </div>
+      </div>
+
+      <div className="pt-6 border-t border-border">
         <h3 className="text-lg font-medium mb-4">Display Options</h3>
         
         <div className="flex items-center justify-between p-4 bg-muted rounded-lg opacity-60">
@@ -3181,12 +3256,12 @@ export default function SettingsPage() {
             </div>
             <p className="text-sm text-muted-foreground">Display ISO week numbers (1-52) in the calendar sidebar. Useful for scheduling across international teams.</p>
           </div>
-          <button
+          <Switch
+            checked={false}
+            onCheckedChange={() => {}}
             disabled
-            className="relative w-12 h-6 rounded-full bg-muted-foreground/30 cursor-not-allowed"
-          >
-            <span className="absolute top-1 left-1 w-4 h-4 bg-white rounded-full" />
-          </button>
+            label="Show week numbers"
+          />
         </div>
       </div>
     </div>
@@ -3223,7 +3298,7 @@ export default function SettingsPage() {
               >
                 <div className="flex flex-col gap-2 sm:flex-row sm:items-start sm:justify-between">
                   <div className="flex items-start gap-3">
-                    <div className={`mt-0.5 w-5 h-5 rounded-full border-2 flex items-center justify-center flex-shrink-0 ${
+                    <div className={`mt-0.5 w-5 h-5 rounded-full border-2 flex items-center justify-center shrink-0 ${
                       !isAvailable ? 'border-muted-foreground/20' : isSelected ? 'border-primary' : 'border-muted-foreground/40'
                     }`}>
                       {isSelected && isAvailable && (
@@ -3237,17 +3312,17 @@ export default function SettingsPage() {
                           {model.provider}
                         </span>
                         {model.id === 'openai' && isAvailable && (
-                          <span className="text-xs text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950 px-2 py-0.5 rounded-full">
+                          <span className="text-xs text-primary bg-info-subtle px-2 py-0.5 rounded-full">
                             Default
                           </span>
                         )}
                         {model.id === 'asi1-mini' && isAvailable && (
-                          <span className="text-xs text-emerald-600 dark:text-emerald-400 bg-emerald-50 dark:bg-emerald-950 px-2 py-0.5 rounded-full">
+                          <span className="text-xs text-success bg-success-subtle px-2 py-0.5 rounded-full">
                             Lower cost
                           </span>
                         )}
                         {!isAvailable && (
-                          <span className="text-xs text-amber-600 dark:text-amber-400 bg-amber-50 dark:bg-amber-950 px-2 py-0.5 rounded-full">
+                          <span className="text-xs text-warning bg-warning-subtle px-2 py-0.5 rounded-full">
                             Not configured
                           </span>
                         )}
@@ -3268,18 +3343,89 @@ export default function SettingsPage() {
         </div>
       </div>
 
+      <div id="settings-time-management-ai-access" className="pt-6 border-t border-border">
+        <h3 className="text-lg font-medium mb-2">Time Management AI Access</h3>
+        <p className="text-sm text-muted-foreground mb-4">
+          Choose what Time Management data the AI Assistant can inspect when you ask it to search or summarize your schedule.
+          These permissions are off by default.
+        </p>
+
+        {suggestedTimeManagementAccess.length > 0 && (
+          <div className="mb-4 rounded-lg border border-success-muted bg-success-subtle p-3">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div>
+                <p className="text-sm font-medium text-success">Suggested for your last AI request</p>
+                <p className="mt-1 text-xs text-success">
+                  Enable {suggestedTimeManagementAccess.map((id) => TIME_MANAGEMENT_AI_ACCESS_ENTRIES.find((entry) => entry.id === id)?.label).filter(Boolean).join(', ')}.
+                </p>
+              </div>
+              <Button
+                intent="primary"
+                size="compact"
+                onClick={enableSuggestedTimeManagementAccess}
+              >
+                Enable suggested access
+              </Button>
+            </div>
+          </div>
+        )}
+
+        <div className="space-y-3">
+          {TIME_MANAGEMENT_AI_ACCESS_ENTRIES.map((entry) => {
+            const enabled = normalizeTimeManagementAiAccess(aiSettings.timeManagementAiAccess)[entry.id]
+            const isSuggested = suggestedTimeManagementAccess.includes(entry.id)
+            return (
+              <div key={entry.id} className={`rounded-lg border p-4 ${isSuggested ? 'border-success-muted bg-success-subtle' : 'border-border bg-muted/20'}`}>
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <p className="font-medium">{entry.label}</p>
+                      {isSuggested && (
+                        <span className="rounded-full bg-success-subtle px-2 py-0.5 text-xs font-medium text-success">
+                          Suggested
+                        </span>
+                      )}
+                      {entry.status === 'planned' && (
+                        <span className="rounded-full bg-warning-subtle px-2 py-0.5 text-xs font-medium text-warning">
+                          Planned
+                        </span>
+                      )}
+                    </div>
+                    <p className="mt-1 text-xs text-muted-foreground">Data: {entry.data.join(', ')}</p>
+                  </div>
+                  <Switch
+                    checked={Boolean(enabled)}
+                    onCheckedChange={() => updateTimeManagementAiAccess(entry.id, !enabled)}
+                    label={entry.label}
+                    title={enabled ? `Disable ${entry.label}` : `Enable ${entry.label}`}
+                  />
+                </div>
+                <ul className="mt-3 space-y-1 text-xs text-muted-foreground">
+                  {entry.abilities.map((ability) => (
+                    <li key={ability} className="flex items-start gap-1.5">
+                      <Sparkles className="mt-0.5 h-3 w-3 shrink-0 text-success" />
+                      <span>{ability}</span>
+                    </li>
+                  ))}
+                </ul>
+              </div>
+            )
+          })}
+        </div>
+      </div>
+
       {/* ─── Usage & Costs ──────────────────────────────────── */}
       <div id="settings-ai-usage" className="pt-6 border-t border-border">
         <h3 className="text-lg font-medium mb-2">Usage & Costs</h3>
 
-        <div className="p-4 bg-emerald-50 dark:bg-emerald-950 border border-emerald-200 dark:border-emerald-800 rounded-lg mb-4">
+        <div className="p-4 bg-success-subtle border border-success-muted rounded-lg mb-4">
           <div className="flex items-start gap-3">
-            <Info className="h-5 w-5 text-emerald-600 dark:text-emerald-400 mt-0.5 flex-shrink-0" />
+            <Info className="h-5 w-5 text-success mt-0.5 shrink-0" />
             <div>
-              <p className="text-sm font-medium text-emerald-800 dark:text-emerald-200">
+              <p className="text-sm font-medium text-success">
                 Costs covered by Voltaire Swarm
               </p>
-              <p className="text-sm text-emerald-700 dark:text-emerald-300 mt-1">
+              <p className="text-sm text-success mt-1">
                 All AI inference costs are currently sponsored by the Voltaire Swarm initiative.
                 You won't be charged for using any AI features in this application.
               </p>
@@ -3316,52 +3462,53 @@ export default function SettingsPage() {
       {isTraveler ? (
         <div id="settings-agent-api-keys" className="pt-6 border-t border-border">
           <h3 className="text-lg font-medium mb-2">Agent API Keys</h3>
-          <p className="text-sm text-amber-600 dark:text-amber-400">API keys are not available for Traveler accounts. Sign in with Google or a Cardano wallet to create agent integrations.</p>
+          <p className="text-sm text-warning">API keys are not available for Traveler accounts. Sign in with Google or a Cardano wallet to create agent integrations.</p>
         </div>
       ) : (
       <div id="settings-agent-api-keys" className="pt-6 border-t border-border">
         <h3 className="text-lg font-medium mb-4">Agent API Keys</h3>
         
-        <div className="p-4 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-lg mb-4">
+        <div className="p-4 bg-info-subtle border border-info-muted rounded-lg mb-4">
           <div className="flex items-start gap-2">
-            <Info className="h-4 w-4 text-blue-600 dark:text-blue-400 mt-0.5 flex-shrink-0" />
-            <p className="text-sm text-blue-800 dark:text-blue-200">
+            <Info className="h-4 w-4 text-primary mt-0.5 shrink-0" />
+            <p className="text-sm text-info">
               API keys allow AI agents (like ASI:One uAgents) to access your coordination data programmatically. Keys are shown only once when created.
             </p>
           </div>
         </div>
 
         {/* ─── Agent Setup Guide ──────────────────────────────── */}
-        <div className="p-4 bg-emerald-50 dark:bg-emerald-950 border border-emerald-200 dark:border-emerald-800 rounded-lg mb-4">
+        <div className="p-4 bg-success-subtle border border-success-muted rounded-lg mb-4">
           <div className="flex items-start gap-3">
-            <Bot className="h-5 w-5 text-emerald-600 dark:text-emerald-400 mt-0.5 flex-shrink-0" />
+            <Bot className="h-5 w-5 text-success mt-0.5 shrink-0" />
             <div className="space-y-2">
-              <p className="text-sm font-medium text-emerald-900 dark:text-emerald-100">
+              <p className="text-sm font-medium text-foreground">
                 Connect your AI Agent to Coordination Manager
               </p>
-              <ol className="text-sm text-emerald-800 dark:text-emerald-200 list-decimal list-inside space-y-1">
+              <ol className="text-sm text-success list-decimal list-inside space-y-1">
                 <li>Copy the <strong>Docs URL</strong> below and provide it to your AI agent so it can learn the API.</li>
-                <li>Create an <strong>API Key</strong> with the scopes your agent needs (e.g. <code className="px-1 py-0.5 bg-emerald-100 dark:bg-emerald-900 rounded text-xs">read</code>, <code className="px-1 py-0.5 bg-emerald-100 dark:bg-emerald-900 rounded text-xs">write:meetings</code>).</li>
+                <li>Create an <strong>API Key</strong> with the scopes your agent needs (e.g. <code className="px-1 py-0.5 bg-success-subtle rounded text-xs">read</code>, <code className="px-1 py-0.5 bg-success-subtle rounded text-xs">write:meetings</code>).</li>
                 <li>Give both the <strong>Docs URL</strong> and the <strong>API Key</strong> to your agent — it can then read and update your Coordination Manager data.</li>
               </ol>
               <div className="flex flex-wrap items-center gap-2 pt-1">
-                <button
+                <Button
+                  emphasis="outline"
+                  size="compact"
                   onClick={() => {
                     const docsBase = import.meta.env.DEV ? 'http://localhost:5174/docs/overview' : window.location.origin + '/docs/overview'
                     navigator.clipboard.writeText(docsBase)
                     setDocsUrlCopied(true)
                     setTimeout(() => setDocsUrlCopied(false), 2000)
                   }}
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-emerald-100 dark:bg-emerald-900 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-200 dark:hover:bg-emerald-800 transition-colors"
+                  icon={docsUrlCopied ? <CheckIcon className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
                 >
-                  {docsUrlCopied ? <CheckIcon className="h-3.5 w-3.5" /> : <Copy className="h-3.5 w-3.5" />}
                   {docsUrlCopied ? 'Copied!' : 'Copy Docs URL'}
-                </button>
+                </Button>
                 <a
                   href={import.meta.env.DEV ? 'http://localhost:5174/docs/overview' : '/docs/overview'}
                   target="_blank"
                   rel="noopener noreferrer"
-                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-emerald-100 dark:bg-emerald-900 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-200 dark:hover:bg-emerald-800 transition-colors"
+                  className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md bg-success-subtle text-success hover:bg-success-muted transition-colors"
                 >
                   <BookOpen className="h-3.5 w-3.5" />
                   View API Docs
@@ -3388,18 +3535,17 @@ export default function SettingsPage() {
                         <Key className="h-4 w-4 text-muted-foreground" />
                         <span className="font-medium">{key.name}</span>
                         {!key.is_active && (
-                          <span className="px-2 py-0.5 text-xs font-medium bg-rose-100 dark:bg-rose-900 text-rose-600 dark:text-rose-300 rounded">
+                          <span className="px-2 py-0.5 text-xs font-medium bg-danger-subtle text-danger rounded">
                             Inactive
                           </span>
                         )}
                       </div>
-                      <button
+                      <IconButton
+                        intent="danger"
+                        label="Delete key"
                         onClick={() => handleDeleteAgentKey(key.id)}
-                        className="p-1.5 text-muted-foreground hover:text-rose-500 transition-colors"
-                        title="Delete key"
-                      >
-                        <Trash2 className="h-4 w-4" />
-                      </button>
+                        icon={<Trash2 />}
+                      />
                     </div>
                     <div className="flex flex-wrap gap-1 mb-2">
                       {key.scopes.map(scope => {
@@ -3411,7 +3557,7 @@ export default function SettingsPage() {
                             key={scope}
                             className={`px-2 py-0.5 text-xs rounded ${
                               downgraded
-                                ? 'bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 line-through'
+                                ? 'bg-warning-subtle text-warning line-through'
                                 : 'bg-primary/10 text-primary'
                             }`}
                             title={downgraded ? 'Write access not acknowledged -- request is treated as read-only' : undefined}
@@ -3421,7 +3567,7 @@ export default function SettingsPage() {
                         )
                       })}
                       {scopesIncludeWrite(key.scopes) && !key.ack_writes_at && (
-                        <span className="px-2 py-0.5 text-xs bg-amber-100 dark:bg-amber-900/40 text-amber-700 dark:text-amber-300 rounded">
+                        <span className="px-2 py-0.5 text-xs bg-warning-subtle text-warning rounded">
                           Read-only (write not acknowledged)
                         </span>
                       )}
@@ -3447,34 +3593,34 @@ export default function SettingsPage() {
 
             {/* Show newly created key */}
             {newlyCreatedKey && (
-              <div className="p-4 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-lg">
+              <div className="p-4 bg-danger-subtle border border-danger-muted rounded-lg">
                 <div className="flex items-start gap-2 mb-3">
-                  <CheckIcon className="h-4 w-4 text-rose-500 dark:text-rose-400 mt-0.5" />
+                  <CheckIcon className="h-4 w-4 text-danger mt-0.5" />
                   <div>
-                    <p className="font-medium text-rose-700 dark:text-rose-200">API Key Created!</p>
-                    <p className="text-sm text-rose-600 dark:text-rose-300">
+                    <p className="font-medium text-danger">API Key Created!</p>
+                    <p className="text-sm text-danger">
                       Copy this key now -- you won't be able to see it again.
                     </p>
                   </div>
                 </div>
                 <div className="flex items-center gap-2">
-                  <code className="flex-1 p-2 bg-background border border-rose-200 dark:border-rose-800 rounded text-sm font-mono break-all">
+                  <code className="flex-1 p-2 bg-background border border-danger-muted rounded text-sm font-mono break-all">
                     {newlyCreatedKey}
                   </code>
-                  <button
+                  <IconButton
+                    emphasis="outline"
+                    size="standard"
+                    label="Copy to clipboard"
                     onClick={() => handleCopyAgentKey(newlyCreatedKey)}
-                    className="p-2 bg-primary text-primary-foreground rounded hover:bg-primary/90 transition-colors"
-                    title="Copy to clipboard"
-                  >
-                    {agentKeyCopied ? <CheckIcon className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-                  </button>
+                    icon={agentKeyCopied ? <CheckIcon /> : <Copy />}
+                  />
                 </div>
                 <button
                   onClick={() => {
                     setNewlyCreatedKey(null)
                     setShowCreateAgentKey(false)
                   }}
-                  className="mt-3 text-sm text-green-700 dark:text-green-300 hover:underline"
+                  className="mt-3 text-sm text-success hover:underline"
                 >
                   I've copied the key, dismiss this
                 </button>
@@ -3525,7 +3671,7 @@ export default function SettingsPage() {
                     Every new key starts read-only so users can explore the API safely
                     before any code path can modify, delete, or create data on their behalf. */}
                 {scopesIncludeWrite(newAgentKeyScopes) && (
-                  <div className="p-3 border border-amber-300 dark:border-amber-700 bg-amber-50 dark:bg-amber-950/40 rounded-lg">
+                  <div className="p-3 border border-warning-muted bg-warning-subtle rounded-lg">
                     <label className="flex items-start gap-2 cursor-pointer">
                       <input
                         type="checkbox"
@@ -3533,9 +3679,9 @@ export default function SettingsPage() {
                         onChange={e => setConfirmWriteAccess(e.target.checked)}
                         className="mt-1"
                       />
-                      <div className="text-sm text-amber-900 dark:text-amber-100">
+                      <div className="text-sm text-foreground">
                         <span className="font-medium">I understand this key can modify, delete, or create data on my account.</span>
-                        <p className="text-xs mt-1 text-amber-800 dark:text-amber-200">
+                        <p className="text-xs mt-1 text-warning">
                           Every new key starts read-only by default. Tick this box to grant the write scopes selected above.
                           You can revoke or downgrade scopes at any time.
                         </p>
@@ -3545,41 +3691,42 @@ export default function SettingsPage() {
                 )}
 
                 {agentKeyError && (
-                  <div className="p-3 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-lg">
-                    <p className="text-sm text-rose-700 dark:text-rose-200">{agentKeyError}</p>
+                  <div className="p-3 bg-danger-subtle border border-danger-muted rounded-lg">
+                    <p className="text-sm text-danger">{agentKeyError}</p>
                   </div>
                 )}
 
                 <div className="flex gap-2">
-                  <button
+                  <Button
+                    emphasis="outline"
                     onClick={() => {
                       setShowCreateAgentKey(false)
                       setNewAgentKeyName('')
                       setNewAgentKeyScopes(['read'])
                       setAgentKeyError(null)
                     }}
-                    className="px-4 py-2 border border-border rounded-lg hover:bg-muted transition-colors"
                   >
                     Cancel
-                  </button>
-                  <button
+                  </Button>
+                  <Button
+                    intent="primary"
                     onClick={handleCreateAgentKey}
                     disabled={agentKeyCreating || !newAgentKeyName.trim()}
-                    className="flex items-center gap-2 px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors disabled:opacity-50"
+                    icon={agentKeyCreating ? <Loader2 className="h-4 w-4 animate-spin" /> : undefined}
                   >
-                    {agentKeyCreating && <Loader2 className="h-4 w-4 animate-spin" />}
                     Create Key
-                  </button>
+                  </Button>
                 </div>
               </div>
             ) : !newlyCreatedKey && (
-              <button
+              <Button
+                emphasis="outline"
+                fullWidth
                 onClick={() => setShowCreateAgentKey(true)}
-                className="flex items-center gap-2 px-4 py-2 border border-dashed border-border rounded-lg hover:bg-muted/50 transition-colors w-full justify-center"
+                icon={<Plus className="h-4 w-4" />}
               >
-                <Plus className="h-4 w-4" />
                 Create New API Key
-              </button>
+              </Button>
             )}
           </div>
         )}
@@ -3595,7 +3742,7 @@ export default function SettingsPage() {
       {isTraveler ? (
         <div id="settings-email-contact">
           <h3 className="text-lg font-medium mb-2">Email Addresses</h3>
-          <p className="text-sm text-amber-600 dark:text-amber-400">Email verification is not available for Traveler accounts. Sign in with Google or a Cardano wallet to add and verify email addresses.</p>
+          <p className="text-sm text-warning">Email verification is not available for Traveler accounts. Sign in with Google or a Cardano wallet to add and verify email addresses.</p>
         </div>
       ) : (
       <div id="settings-email-contact">
@@ -3606,20 +3753,19 @@ export default function SettingsPage() {
 
           {/* Warning when email notifications are disabled */}
           {!notifChannelEmail && (
-            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between p-3 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-lg">
+            <div className="mb-4 flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between p-3 bg-warning-subtle border border-warning-muted rounded-lg">
               <div className="flex items-center gap-2">
-                <AlertCircle className="w-4 h-4 flex-shrink-0 text-amber-600 dark:text-amber-400" />
-                <p className="text-xs text-amber-700 dark:text-amber-400">
+                <AlertCircle className="w-4 h-4 shrink-0 text-warning" />
+                <p className="text-xs text-warning">
                   Email notifications are disabled. You won't receive any emails until you enable them in Notification settings.
                 </p>
               </div>
-              <button
-                onClick={() => { setNotifChannelEmail(true); saveNotifPrefsNow({ channelEmail: true }) }}
-                className="ml-3 flex-shrink-0 relative w-12 h-6 rounded-full transition-colors bg-rose-300 dark:bg-rose-500/60"
-                title="Enable email notifications"
-              >
-                <span className="absolute top-1 left-1 w-4 h-4 rounded-full bg-white dark:bg-gray-200 shadow-[0_1px_3px_rgba(0,0,0,0.3)] transition-all" />
-              </button>
+              <Switch
+                checked={false}
+                onCheckedChange={() => { setNotifChannelEmail(true); saveNotifPrefsNow({ channelEmail: true }) }}
+                label="Enable email notifications"
+                className="ml-3"
+              />
             </div>
           )}
 
@@ -3639,9 +3785,9 @@ export default function SettingsPage() {
                       <p className="text-sm font-medium break-all">{ve.email}</p>
                       <div className="mt-1 flex flex-wrap items-center gap-1.5">
                         {ve.is_primary && (
-                          <span className="px-1.5 py-0.5 bg-green-100 dark:bg-green-950/40 text-green-700 dark:text-green-400 text-[10px] font-medium rounded">Primary</span>
+                          <span className="px-1.5 py-0.5 bg-success-subtle text-success text-[10px] font-medium rounded">Primary</span>
                         )}
-                        <span className="px-1.5 py-0.5 bg-blue-100 dark:bg-blue-950/40 text-blue-700 dark:text-blue-400 text-[10px] font-medium rounded">
+                        <span className="px-1.5 py-0.5 bg-info-subtle text-info text-[10px] font-medium rounded">
                           {ve.verification_method === 'google_oauth' ? 'Google' : 'Code'}
                         </span>
                       </div>
@@ -3658,7 +3804,7 @@ export default function SettingsPage() {
                     )}
                     <button
                       onClick={() => handleRemoveVerifiedEmail(ve.id)}
-                      className="text-xs text-rose-500 hover:underline"
+                      className="text-xs text-danger hover:underline"
                     >
                       Remove
                     </button>
@@ -3667,9 +3813,9 @@ export default function SettingsPage() {
               ))}
             </div>
           ) : (
-            <div className="mb-4 p-3 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-lg">
-              <p className="text-xs text-amber-700 dark:text-amber-400 flex items-center gap-2">
-                <AlertCircle className="w-4 h-4 flex-shrink-0" />
+            <div className="mb-4 p-3 bg-warning-subtle border border-warning-muted rounded-lg">
+              <p className="text-xs text-warning flex items-center gap-2">
+                <AlertCircle className="w-4 h-4 shrink-0" />
                 No verified emails yet. Verify an email below to receive notifications and use it as your sender identity.
               </p>
             </div>
@@ -3680,15 +3826,17 @@ export default function SettingsPage() {
             <div className="mb-4 p-3 border border-border rounded-lg bg-card">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex items-center gap-2 min-w-0">
-                  <ShieldCheck className="w-4 h-4 text-green-500" />
+                  <ShieldCheck className="w-4 h-4 text-success" />
                   <span className="text-sm break-all">Verify your Google email: <strong>{user.email}</strong></span>
                 </div>
-                <button
+                <Button
+                  emphasis="outline"
+                  intent="primary"
+                  size="compact"
                   onClick={handleVerifyGoogleEmail}
-                  className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition-colors"
                 >
                   Verify with Google
-                </button>
+                </Button>
               </div>
             </div>
           )}
@@ -3703,17 +3851,17 @@ export default function SettingsPage() {
                   value={verifyEmailInput}
                   onChange={e => setVerifyEmailInput(e.target.value)}
                   placeholder="your@email.com"
-                  className="flex-1 px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+                  className="flex-1 px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
                   disabled={verifyStep === 'sending'}
                 />
-                <button
+                <Button
+                  intent="primary"
                   onClick={handleSendVerificationCode}
                   disabled={!verifyEmailInput.trim() || verifyStep === 'sending'}
-                  className="flex items-center justify-center gap-1.5 px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition-colors disabled:opacity-50"
+                  icon={verifyStep === 'sending' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Mail className="w-3.5 h-3.5" />}
                 >
-                  {verifyStep === 'sending' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Mail className="w-3.5 h-3.5" />}
                   Send Code
-                </button>
+                </Button>
               </div>
             ) : (
               <div className="space-y-2">
@@ -3727,23 +3875,23 @@ export default function SettingsPage() {
                     onChange={e => setVerifyCodeInput(e.target.value.replace(/\D/g, '').slice(0, 6))}
                     placeholder="123456"
                     maxLength={6}
-                    className="w-full sm:w-32 px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground text-center tracking-widest font-mono focus:ring-2 focus:ring-ring outline-none"
+                    className="w-full sm:w-32 px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground text-center tracking-widest font-mono focus:ring-2 focus:ring-ring outline-hidden"
                     disabled={verifyStep === 'verifying'}
                   />
-                  <button
+                  <Button
+                    intent="primary"
                     onClick={handleVerifyCode}
                     disabled={verifyCodeInput.length !== 6 || verifyStep === 'verifying'}
-                    className="flex items-center justify-center gap-1.5 px-3 py-2 bg-green-600 hover:bg-green-700 text-white text-xs font-medium rounded-lg transition-colors disabled:opacity-50"
+                    icon={verifyStep === 'verifying' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckIcon className="w-3.5 h-3.5" />}
                   >
-                    {verifyStep === 'verifying' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <CheckIcon className="w-3.5 h-3.5" />}
                     Verify
-                  </button>
-                  <button
+                  </Button>
+                  <Button
+                    emphasis="ghost"
                     onClick={() => { setVerifyStep('idle'); setVerifyCodeInput(''); setVerifyPendingEmail(''); setVerifyResult(null) }}
-                    className="px-3 py-2 text-xs text-muted-foreground hover:text-foreground transition-colors"
                   >
                     Cancel
-                  </button>
+                  </Button>
                 </div>
                 <button
                   onClick={handleSendVerificationCode}
@@ -3759,8 +3907,8 @@ export default function SettingsPage() {
           {verifyResult && (
             <div className={`mt-2 p-2.5 rounded-lg text-xs flex items-center gap-2 ${
               verifyResult.type === 'success'
-                ? 'bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 text-green-700 dark:text-green-400'
-                : 'bg-rose-50 dark:bg-rose-950/30 border border-rose-200 dark:border-rose-800 text-rose-600 dark:text-rose-400'
+                ? 'bg-success-subtle border border-success-muted text-success'
+                : 'bg-danger-subtle border border-danger-muted text-danger'
             }`}>
               {verifyResult.type === 'success' ? <CheckIcon className="w-3.5 h-3.5" /> : <AlertCircle className="w-3.5 h-3.5" />}
               {verifyResult.message}
@@ -3778,17 +3926,17 @@ export default function SettingsPage() {
 
         {/* Status messages (shared) */}
         {(managedWalletError || walletError) && (
-          <div className="mb-4 p-3 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-lg">
-            <p className="text-sm text-rose-700 dark:text-rose-200 flex items-center gap-2">
-              <AlertCircle className="h-4 w-4 flex-shrink-0" />
+          <div className="mb-4 p-3 bg-danger-subtle border border-danger-muted rounded-lg">
+            <p className="text-sm text-danger flex items-center gap-2">
+              <AlertCircle className="h-4 w-4 shrink-0" />
               {managedWalletError || walletError}
             </p>
           </div>
         )}
         {(managedWalletSuccess || walletSuccess) && (
-          <div className="mb-4 p-3 bg-green-50 dark:bg-green-950 border border-green-200 dark:border-green-800 rounded-lg">
-            <p className="text-sm text-green-800 dark:text-green-200 flex items-center gap-2">
-              <CheckIcon className="h-4 w-4 flex-shrink-0" />
+          <div className="mb-4 p-3 bg-success-subtle border border-success-muted rounded-lg">
+            <p className="text-sm text-success flex items-center gap-2">
+              <CheckIcon className="h-4 w-4 shrink-0" />
               {managedWalletSuccess || walletSuccess}
             </p>
           </div>
@@ -3801,51 +3949,49 @@ export default function SettingsPage() {
         ) : walletStatus.linked && walletStatus.walletAddress ? (
           /* ── Linked wallet display ── */
           <div className="space-y-4">
-            <div className="p-4 bg-green-50 dark:bg-green-950 border border-green-200 dark:border-green-800 rounded-lg">
+            <div className="p-4 bg-success-subtle border border-success-muted rounded-lg">
               <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
                 <div className="flex items-center gap-3 min-w-0">
-                  <Wallet className="h-5 w-5 text-green-600 dark:text-green-400 flex-shrink-0" />
+                  <Wallet className="h-5 w-5 text-success shrink-0" />
                   <div className="min-w-0">
-                    <p className="text-sm font-medium text-green-900 dark:text-green-100">
+                    <p className="text-sm font-medium text-foreground">
                       {isManagedAddress(walletStatus.walletAddress) ? 'Managed Wallet' : 'Linked Wallet'}
                     </p>
                     {isManagedAddress(walletStatus.walletAddress) ? (
-                      <p className="text-xs text-green-700 dark:text-green-300 font-mono">
+                      <p className="text-xs text-success font-mono">
                         {formatManagedAddress(walletStatus.walletAddress)}
                       </p>
                     ) : (
-                      <p className="text-xs text-green-700 dark:text-green-300 font-mono truncate">
+                      <p className="text-xs text-success font-mono truncate">
                         {walletStatus.walletAddress}
                       </p>
                     )}
                   </div>
                 </div>
-                <div className="flex items-center gap-2 self-start sm:self-auto flex-shrink-0">
-                  <button
+                <div className="flex items-center gap-2 self-start sm:self-auto shrink-0">
+                  <IconButton
+                    intent="success"
+                    size="standard"
+                    label="Copy address"
                     onClick={copyWalletAddress}
-                    className="p-2 rounded-lg hover:bg-green-100 dark:hover:bg-green-900 transition-colors"
-                    title="Copy address"
-                  >
-                    {walletCopied ? (
-                      <CheckIcon className="h-4 w-4 text-green-600" />
-                    ) : (
-                      <Copy className="h-4 w-4 text-green-600 dark:text-green-400" />
-                    )}
-                  </button>
+                    icon={walletCopied ? <CheckIcon /> : <Copy />}
+                  />
                   {walletStatus.accountType !== 'cardano' && walletStatus.accountType !== 'managed_cardano' && (
-                    <button
+                    <Button
+                      emphasis="outline"
+                      intent="danger"
+                      size="compact"
                       onClick={handleRemoveWalletAccess}
                       disabled={walletActionLoading}
-                      className="flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-rose-600 dark:text-rose-300 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-lg hover:bg-rose-100 dark:hover:bg-rose-900/40 transition-colors disabled:opacity-50"
+                      icon={<Unlink className="h-3.5 w-3.5" />}
                     >
-                      <Unlink className="h-3.5 w-3.5" />
                       {walletActionLoading ? 'Removing...' : 'Remove access'}
-                    </button>
+                    </Button>
                   )}
                 </div>
               </div>
               {(walletStatus.accountType === 'cardano' || walletStatus.accountType === 'managed_cardano') && (
-                <p className="mt-2 text-xs text-green-600 dark:text-green-400">
+                <p className="mt-2 text-xs text-success">
                   This is your primary wallet identity and cannot be unlinked.
                 </p>
               )}
@@ -3853,21 +3999,21 @@ export default function SettingsPage() {
 
             {/* ── Managed wallet: export private key ── */}
             {isManagedAddress(walletStatus.walletAddress) && (
-              <div className="p-4 bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 rounded-lg space-y-3">
+              <div className="p-4 bg-warning-subtle border border-warning-muted rounded-lg space-y-3">
                 <div className="flex items-start gap-2">
-                  <Key className="h-4 w-4 text-amber-600 dark:text-amber-400 mt-0.5 flex-shrink-0" />
+                  <Key className="h-4 w-4 text-warning mt-0.5 shrink-0" />
                   <div>
-                    <p className="text-sm font-medium text-amber-900 dark:text-amber-100">App-Managed Wallet</p>
-                    <p className="text-xs text-amber-700 dark:text-amber-300 mt-0.5">
+                    <p className="text-sm font-medium text-foreground">App-Managed Wallet</p>
+                    <p className="text-xs text-warning mt-0.5">
                       This wallet was generated by the app. Your private key is encrypted and stored on this device. Back it up to avoid losing access.
                     </p>
                   </div>
                 </div>
 
                 {!hasDeviceKey() && (
-                  <div className="flex items-start gap-2 p-2.5 rounded-md bg-amber-100 dark:bg-amber-900/40 border border-amber-200 dark:border-amber-700">
-                    <AlertCircle className="h-4 w-4 text-amber-600 dark:text-amber-400 mt-0.5 flex-shrink-0" />
-                    <p className="text-xs text-amber-700 dark:text-amber-300">
+                  <div className="flex items-start gap-2 p-2.5 rounded-md bg-warning-subtle border border-warning-muted">
+                    <AlertCircle className="h-4 w-4 text-warning mt-0.5 shrink-0" />
+                    <p className="text-xs text-warning">
                       Device key not found. This device was not used to create the wallet. Key export is only available on the original device.
                     </p>
                   </div>
@@ -3875,78 +4021,81 @@ export default function SettingsPage() {
 
                 {exportedPrivateKey ? (
                   <div className="space-y-2">
-                    <p className="text-xs font-medium text-amber-900 dark:text-amber-100">
+                    <p className="text-xs font-medium text-foreground">
                       Private Key (Ed25519 hex) -- keep this secret:
                     </p>
                     <div className="flex items-center gap-2">
-                      <code className="flex-1 text-xs font-mono bg-white text-slate-900 dark:bg-black/30 dark:text-slate-100 border border-amber-200 dark:border-amber-700 rounded px-2 py-1.5 break-all">
+                      <code className="flex-1 text-xs font-mono bg-background text-foreground border border-warning-muted rounded px-2 py-1.5 break-all">
                         {exportedPrivateKey}
                       </code>
-                      <button
+                      <IconButton
+                        intent="warning"
+                        size="standard"
+                        label="Copy"
                         onClick={() => {
                           navigator.clipboard.writeText(exportedPrivateKey)
                           setExportedKeyCopied(true)
                           setTimeout(() => setExportedKeyCopied(false), 2000)
                         }}
-                        className="p-2 rounded hover:bg-amber-100 dark:hover:bg-amber-900/50 transition-colors flex-shrink-0"
-                        title="Copy"
-                      >
-                        {exportedKeyCopied ? <CheckIcon className="h-4 w-4 text-green-600" /> : <Copy className="h-4 w-4 text-amber-600" />}
-                      </button>
+                        icon={exportedKeyCopied ? <CheckIcon /> : <Copy />}
+                      />
                     </div>
                     <button
                       onClick={() => setExportedPrivateKey(null)}
-                      className="text-xs text-amber-600 dark:text-amber-400 hover:underline"
+                      className="text-xs text-warning hover:underline"
                     >
                       Hide key
                     </button>
                   </div>
                 ) : showExportConfirm ? (
                   <div className="space-y-2">
-                    <p className="text-xs text-amber-800 dark:text-amber-200">
+                    <p className="text-xs text-warning">
                       This will display your private key in plaintext. Do not share it with anyone.
                     </p>
                     <div className="flex gap-2">
-                      <button
+                      <Button
+                        intent="warning"
+                        size="compact"
                         onClick={handleExportPrivateKey}
                         disabled={exportKeyLoading}
-                        className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium bg-amber-600 hover:bg-amber-700 text-white rounded transition-colors disabled:opacity-50"
+                        icon={exportKeyLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Eye className="h-3.5 w-3.5" />}
                       >
-                        {exportKeyLoading ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Eye className="h-3.5 w-3.5" />}
                         {exportKeyLoading ? 'Decrypting...' : 'Reveal key'}
-                      </button>
-                      <button
+                      </Button>
+                      <Button
+                        emphasis="outline"
+                        size="compact"
                         onClick={() => setShowExportConfirm(false)}
-                        className="px-3 py-1.5 text-xs font-medium border border-border rounded hover:bg-muted transition-colors"
                       >
                         Cancel
-                      </button>
+                      </Button>
                     </div>
                   </div>
                 ) : (
                   hasDeviceKey() && (
-                    <button
+                    <Button
+                      emphasis="outline"
+                      intent="warning"
+                      size="compact"
                       onClick={() => setShowExportConfirm(true)}
-                      className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium border border-amber-300 dark:border-amber-600 text-amber-700 dark:text-amber-300 rounded hover:bg-amber-100 dark:hover:bg-amber-900/30 transition-colors"
+                      icon={<Key className="h-3.5 w-3.5" />}
                     >
-                      <Key className="h-3.5 w-3.5" />
                       Export private key
-                    </button>
+                    </Button>
                   )
                 )}
 
                 {/* ── How it works / security info ── */}
-                <div className="border-t border-amber-200 dark:border-amber-700 pt-2">
-                  <button
-                    onClick={() => setShowWalletInfo(v => !v)}
-                    className="flex items-center gap-1.5 text-xs text-amber-700 dark:text-amber-300 hover:text-amber-900 dark:hover:text-amber-100 transition-colors"
+                <div className="border-t border-warning-muted pt-2">
+                  <Disclosure
+                    size="compact"
+                    title="How this wallet works & what's at risk"
+                    icon={<Info className="h-3.5 w-3.5" />}
+                    expanded={showWalletInfo}
+                    onToggle={setShowWalletInfo}
+                    panelClassName="mt-3 space-y-3 text-xs text-warning"
                   >
-                    <Info className="h-3.5 w-3.5" />
-                    How this wallet works &amp; what's at risk
-                    {showWalletInfo ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronRight className="h-3.5 w-3.5" />}
-                  </button>
-                  {showWalletInfo && (
-                    <div className="mt-3 space-y-3 text-xs text-amber-800 dark:text-amber-200">
+                    <>
                       <div className="space-y-1">
                         <p className="font-medium flex items-center gap-1.5"><ShieldCheck className="h-3.5 w-3.5" /> How the key is stored</p>
                         <p>Your Ed25519 private key was generated inside your browser using the Web Crypto API. It is immediately encrypted with AES-256-GCM using a device secret stored only in your browser's local storage. The platform never sees your private key -- only the encrypted blob.</p>
@@ -3967,15 +4116,15 @@ export default function SettingsPage() {
                             href="https://gamechanger.finance/"
                             target="_blank"
                             rel="noopener noreferrer"
-                            className="underline hover:text-amber-900 dark:hover:text-amber-100"
+                            className="underline hover:text-foreground"
                           >
                             GameChanger Wallet
                           </a>
                           {' '}-- a Cardano web wallet that also generates keys in-browser without an extension. If you want full wallet features (sending ADA, NFTs, DApps), consider migrating to GameChanger or another CIP-30 wallet.
                         </p>
                       </div>
-                    </div>
-                  )}
+                    </>
+                  </Disclosure>
                 </div>
               </div>
             )}
@@ -3991,7 +4140,7 @@ export default function SettingsPage() {
                     Have a CIP-30 wallet (Eternl, Lace, Typhon)? Linking it proves you own a real Cardano address. No transaction is submitted -- only a signature.
                   </p>
                   {walletStatus.accountType !== 'cardano' && (
-                    <p className="text-xs text-amber-600 dark:text-amber-400">
+                    <p className="text-xs text-warning">
                       Note: If this wallet belongs to an existing Cardano account, linking will merge both accounts.
                     </p>
                   )}
@@ -4003,7 +4152,7 @@ export default function SettingsPage() {
                           href="https://lace.io"
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="inline-flex items-center gap-2 text-sm font-medium text-blue-600 dark:text-blue-400 hover:underline"
+                          className="inline-flex items-center gap-2 text-sm font-medium text-primary hover:underline"
                         >
                           <ExternalLink className="h-3.5 w-3.5" />
                           No wallet detected -- Get Lace Wallet
@@ -4013,35 +4162,36 @@ export default function SettingsPage() {
                     if (installed.length === 1) {
                       const wallet = installed[0]
                       return (
-                        <button
+                        <Button
+                          emphasis="outline"
+                          intent="primary"
+                          fullWidth
                           onClick={() => handleLinkWallet(wallet.id)}
                           disabled={walletActionLoading}
-                          className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-                        >
-                          {wallet.icon ? (
+                          icon={wallet.icon ? (
                             <img src={wallet.icon} alt={wallet.name} className="w-5 h-5 rounded" />
                           ) : (
-                            <Wallet className="w-5 h-5 text-blue-600 dark:text-blue-400" />
+                            <Wallet className="w-5 h-5" />
                           )}
-                          <span className="font-medium text-blue-800 dark:text-blue-200">
-                            {walletActionLoading ? 'Connecting...' : `Link ${wallet.name} Wallet`}
-                          </span>
-                        </button>
+                        >
+                          {walletActionLoading ? 'Connecting...' : `Link ${wallet.name} Wallet`}
+                        </Button>
                       )
                     }
                     return (
                       <div>
-                        <button
+                        <Button
+                          emphasis="outline"
+                          intent="primary"
+                          fullWidth
+                          aria-expanded={showWalletPicker}
                           onClick={() => setShowWalletPicker(!showWalletPicker)}
                           disabled={walletActionLoading}
-                          className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900 transition-colors disabled:opacity-50"
+                          icon={<Wallet className="w-5 h-5" />}
                         >
-                          <Wallet className="w-5 h-5 text-blue-600 dark:text-blue-400" />
-                          <span className="font-medium text-blue-800 dark:text-blue-200">
-                            {walletActionLoading ? 'Connecting...' : 'Link Cardano Wallet'}
-                          </span>
-                          <ChevronDown className={`h-4 w-4 text-blue-600 dark:text-blue-400 transition-transform ${showWalletPicker ? 'rotate-180' : ''}`} />
-                        </button>
+                          {walletActionLoading ? 'Connecting...' : 'Link Cardano Wallet'}
+                          <ChevronDown className={`h-4 w-4 transition-transform motion-reduce:transition-none ${showWalletPicker ? 'rotate-180' : ''}`} />
+                        </Button>
                         {showWalletPicker && (
                           <div className="mt-2 border border-border rounded-lg overflow-hidden">
                             {installed.map(wallet => (
@@ -4074,7 +4224,7 @@ export default function SettingsPage() {
           <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wider">Coming Soon</p>
           
           <div className="flex items-start gap-3 p-3 bg-card rounded-lg border border-border opacity-70">
-            <CreditCard className="h-5 w-5 text-muted-foreground mt-0.5 flex-shrink-0" />
+            <CreditCard className="h-5 w-5 text-muted-foreground mt-0.5 shrink-0" />
             <div>
               <div className="flex items-center gap-2">
                 <p className="text-sm font-medium">Billing & Credits</p>
@@ -4087,7 +4237,7 @@ export default function SettingsPage() {
           </div>
 
           <div className="flex items-start gap-3 p-3 bg-card rounded-lg border border-border opacity-70">
-            <Users className="h-5 w-5 text-muted-foreground mt-0.5 flex-shrink-0" />
+            <Users className="h-5 w-5 text-muted-foreground mt-0.5 shrink-0" />
             <div>
               <div className="flex items-center gap-2">
                 <p className="text-sm font-medium">Wallet-Gated Events</p>
@@ -4100,7 +4250,7 @@ export default function SettingsPage() {
           </div>
 
           <div className="flex items-start gap-3 p-3 bg-card rounded-lg border border-border opacity-70">
-            <Shield className="h-5 w-5 text-muted-foreground mt-0.5 flex-shrink-0" />
+            <Shield className="h-5 w-5 text-muted-foreground mt-0.5 shrink-0" />
             <div>
               <div className="flex items-center gap-2">
                 <p className="text-sm font-medium">Wallet-Based Permissions</p>
@@ -4124,17 +4274,17 @@ export default function SettingsPage() {
 
         {/* Status messages */}
         {linkError && (
-          <div className="mb-4 p-3 bg-rose-50 dark:bg-rose-950/40 border border-rose-200 dark:border-rose-800 rounded-lg">
-            <p className="text-sm text-rose-700 dark:text-rose-200 flex items-center gap-2">
-              <AlertCircle className="h-4 w-4 flex-shrink-0" />
+          <div className="mb-4 p-3 bg-danger-subtle border border-danger-muted rounded-lg">
+            <p className="text-sm text-danger flex items-center gap-2">
+              <AlertCircle className="h-4 w-4 shrink-0" />
               {linkError}
             </p>
           </div>
         )}
         {linkSuccess && (
-          <div className="mb-4 p-3 bg-green-50 dark:bg-green-950 border border-green-200 dark:border-green-800 rounded-lg">
-            <p className="text-sm text-green-800 dark:text-green-200 flex items-center gap-2">
-              <CheckIcon className="h-4 w-4 flex-shrink-0" />
+          <div className="mb-4 p-3 bg-success-subtle border border-success-muted rounded-lg">
+            <p className="text-sm text-success flex items-center gap-2">
+              <CheckIcon className="h-4 w-4 shrink-0" />
               {linkSuccess}
             </p>
           </div>
@@ -4144,33 +4294,33 @@ export default function SettingsPage() {
         <div className="space-y-3 mb-4">
           <div className={`flex items-center gap-3 p-3 rounded-lg border ${
             walletStatus.accountType === 'google' || (walletStatus.accountType !== 'cardano' && user?.accountType === 'google')
-              ? 'border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-950'
+              ? 'border-success-muted bg-success-subtle'
               : 'border-border bg-muted/50'
           }`}>
-            <Globe className="h-5 w-5 flex-shrink-0 text-blue-600 dark:text-blue-400" />
+            <Globe className="h-5 w-5 shrink-0 text-primary" />
             <div className="flex-1 min-w-0">
               <p className="text-sm font-medium">Google Account</p>
               {(walletStatus.accountType === 'google' || (walletStatus.accountType !== 'cardano' && user?.accountType === 'google')) ? (
-                <p className="text-xs text-green-700 dark:text-green-300">Connected — {user?.email}</p>
+                <p className="text-xs text-success">Connected — {user?.email}</p>
               ) : (
                 <p className="text-xs text-muted-foreground">Not connected</p>
               )}
             </div>
             {(walletStatus.accountType === 'google' || (walletStatus.accountType !== 'cardano' && user?.accountType === 'google')) && (
-              <CheckIcon className="h-4 w-4 text-green-600 dark:text-green-400 flex-shrink-0" />
+              <CheckIcon className="h-4 w-4 text-success shrink-0" />
             )}
           </div>
 
           <div className={`flex items-center gap-3 p-3 rounded-lg border ${
             walletStatus.linked
-              ? 'border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-950'
+              ? 'border-success-muted bg-success-subtle'
               : 'border-border bg-muted/50'
           }`}>
-            <Wallet className="h-5 w-5 flex-shrink-0 text-blue-600 dark:text-blue-400" />
+            <Wallet className="h-5 w-5 shrink-0 text-primary" />
             <div className="flex-1 min-w-0">
               <p className="text-sm font-medium">Cardano Wallet</p>
               {walletStatus.linked && walletStatus.walletAddress ? (
-                <p className="text-xs text-green-700 dark:text-green-300 font-mono truncate">
+                <p className="text-xs text-success font-mono truncate">
                   Connected — {walletStatus.walletAddress.slice(0, 12)}...{walletStatus.walletAddress.slice(-6)}
                 </p>
               ) : (
@@ -4178,7 +4328,7 @@ export default function SettingsPage() {
               )}
             </div>
             {walletStatus.linked && (
-              <CheckIcon className="h-4 w-4 text-green-600 dark:text-green-400 flex-shrink-0" />
+              <CheckIcon className="h-4 w-4 text-success shrink-0" />
             )}
           </div>
         </div>
@@ -4186,8 +4336,8 @@ export default function SettingsPage() {
         {/* Link Google Account button (for Cardano-native users) */}
         {walletStatus.accountType === 'cardano' && !linkSuccess && (
           <div className="space-y-3">
-            <div className="p-4 bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 rounded-lg">
-              <p className="text-sm text-amber-800 dark:text-amber-200">
+            <div className="p-4 bg-warning-subtle border border-warning-muted rounded-lg">
+              <p className="text-sm text-warning">
                 <strong>Note:</strong> Linking a Google Account will merge data from both accounts. Your current settings
                 (timezone, theme, preferences) will be preserved. Events, templates, and calendars from both accounts will be combined.
                 {user?.email?.endsWith('@cardano.wallet') && (
@@ -4196,28 +4346,28 @@ export default function SettingsPage() {
               </p>
             </div>
 
-            <button
+            <Button
+              emphasis="outline"
+              intent="primary"
+              fullWidth
               onClick={handleLinkGoogleAccount}
               disabled={linkLoading}
-              className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900 transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
-            >
-              {linkLoading ? (
-                <Loader2 className="h-5 w-5 animate-spin text-blue-600 dark:text-blue-400" />
+              icon={linkLoading ? (
+                <Loader2 className="h-5 w-5 animate-spin" />
               ) : (
-                <Globe className="h-5 w-5 text-blue-600 dark:text-blue-400" />
+                <Globe className="h-5 w-5" />
               )}
-              <span className="font-medium text-blue-800 dark:text-blue-200">
-                {linkLoading ? 'Preparing...' : 'Link Google Account'}
-              </span>
-            </button>
+            >
+              {linkLoading ? 'Preparing...' : 'Link Google Account'}
+            </Button>
           </div>
         )}
 
         {/* Both methods connected */}
         {walletStatus.linked && (walletStatus.accountType === 'google' || user?.accountType === 'google') && (
-          <div className="p-4 bg-green-50 dark:bg-green-950 border border-green-200 dark:border-green-800 rounded-lg">
-            <p className="text-sm text-green-800 dark:text-green-200 flex items-center gap-2">
-              <LinkIcon className="h-4 w-4 flex-shrink-0" />
+          <div className="p-4 bg-success-subtle border border-success-muted rounded-lg">
+            <p className="text-sm text-success flex items-center gap-2">
+              <LinkIcon className="h-4 w-4 shrink-0" />
               <strong>Fully linked!</strong> You can sign in with either Google or your Cardano wallet.
             </p>
           </div>
@@ -4226,34 +4376,42 @@ export default function SettingsPage() {
 
       {/* ── Merge confirmation modal ── */}
       {showMergeConfirm && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4">
-          <div className="bg-card text-card-foreground rounded-2xl shadow-xl border border-border p-6 max-w-md w-full">
-            <div className="flex items-center gap-3 mb-4">
-              <div className="w-10 h-10 rounded-full bg-amber-100 dark:bg-amber-950 flex items-center justify-center">
-                <Merge className="h-5 w-5 text-amber-600 dark:text-amber-400" />
-              </div>
-              <h3 className="text-lg font-semibold">Merge Accounts?</h3>
-            </div>
-
+        <Dialog
+          open
+          onClose={() => {
+            setShowMergeConfirm(false)
+            setPendingMergeWalletData(null)
+          }}
+          title={
+            <span className="flex items-center gap-3">
+              <span className="w-10 h-10 shrink-0 rounded-full bg-warning-subtle flex items-center justify-center">
+                <Merge className="h-5 w-5 text-warning" />
+              </span>
+              Merge Accounts?
+            </span>
+          }
+          size="md"
+          closeOnScrimClick={false}
+        >
             <p className="text-sm text-muted-foreground mb-4">
               This wallet is linked to an existing Cardano account. Merging will:
             </p>
 
             <ul className="text-sm space-y-2 mb-4">
               <li className="flex items-start gap-2">
-                <CheckIcon className="h-4 w-4 text-green-600 mt-0.5 flex-shrink-0" />
+                <CheckIcon className="h-4 w-4 text-success mt-0.5 shrink-0" />
                 <span>Combine all events, calendars, and templates from both accounts</span>
               </li>
               <li className="flex items-start gap-2">
-                <CheckIcon className="h-4 w-4 text-green-600 mt-0.5 flex-shrink-0" />
+                <CheckIcon className="h-4 w-4 text-success mt-0.5 shrink-0" />
                 <span>Link the wallet to your current account</span>
               </li>
               <li className="flex items-start gap-2">
-                <AlertCircle className="h-4 w-4 text-amber-600 mt-0.5 flex-shrink-0" />
+                <AlertCircle className="h-4 w-4 text-warning mt-0.5 shrink-0" />
                 <span>Keep your current account's settings (timezone, theme, preferences)</span>
               </li>
               <li className="flex items-start gap-2">
-                <AlertCircle className="h-4 w-4 text-amber-600 mt-0.5 flex-shrink-0" />
+                <AlertCircle className="h-4 w-4 text-warning mt-0.5 shrink-0" />
                 <span>The old Cardano-only account will be removed</span>
               </li>
             </ul>
@@ -4263,25 +4421,26 @@ export default function SettingsPage() {
             </p>
 
             <div className="flex gap-3">
-              <button
+              <Button
+                emphasis="outline"
+                className="flex-1"
                 onClick={() => {
                   setShowMergeConfirm(false)
                   setPendingMergeWalletData(null)
                 }}
-                className="flex-1 px-4 py-2.5 border border-border rounded-lg hover:bg-muted transition-colors font-medium"
               >
                 Cancel
-              </button>
-              <button
+              </Button>
+              <Button
+                intent="primary"
+                className="flex-1"
                 onClick={handleConfirmMerge}
                 disabled={walletActionLoading}
-                className="flex-1 px-4 py-2.5 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors font-medium disabled:opacity-50"
               >
                 {walletActionLoading ? 'Merging...' : 'Merge Accounts'}
-              </button>
+              </Button>
             </div>
-          </div>
-        </div>
+        </Dialog>
       )}
 
       {/* ─── Profile Visibility ────────────────────────────────── */}
@@ -4291,13 +4450,13 @@ export default function SettingsPage() {
         {/* ── Current Status ── */}
         <div className={`p-4 rounded-lg border-2 mb-4 transition-colors duration-300 ${
           privacyPrivateEnabled
-            ? 'border-rose-300 dark:border-rose-700 bg-rose-50/30 dark:bg-rose-950/20'
-            : 'border-blue-400 dark:border-blue-500 bg-blue-50/30 dark:bg-blue-950/20'
+            ? 'border-danger-muted bg-danger-subtle'
+            : 'border-info-muted bg-info-subtle'
         }`}>
           <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
             <div className="flex items-start gap-3">
               <div className={`w-8 h-8 rounded-full flex items-center justify-center transition-colors duration-300 ${
-                privacyPrivateEnabled ? 'bg-rose-400 text-white' : 'bg-blue-500 text-white'
+                privacyPrivateEnabled ? 'bg-danger text-danger-foreground' : 'bg-primary text-primary-foreground'
               }`}>
                 {privacyPrivateEnabled ? <Lock className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
               </div>
@@ -4306,8 +4465,8 @@ export default function SettingsPage() {
                   <p className="font-medium">Current Status:</p>
                   <span className={`text-sm font-semibold transition-colors duration-300 ${
                     privacyPrivateEnabled
-                      ? 'text-rose-600 dark:text-rose-400'
-                      : 'text-blue-700 dark:text-blue-400'
+                      ? 'text-danger'
+                      : 'text-info'
                   }`}>
                     {privacyPrivateEnabled ? 'Hidden' : 'Conditionally Visible'}
                   </span>
@@ -4321,7 +4480,10 @@ export default function SettingsPage() {
               </div>
             </div>
             {!privacyPrivateEnabled && (
-              <button
+              <Button
+                intent="danger"
+                size="compact"
+                className="w-full sm:w-auto shrink-0"
                 onClick={() => {
                   setPrivacyFollowersEnabled(false)
                   setPrivacyContactsEnabled(false)
@@ -4342,11 +4504,10 @@ export default function SettingsPage() {
                     pEmail: false, pPrefs: false, pConn: false,
                   })
                 }}
-                className="flex w-full sm:w-auto items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg bg-rose-500 text-white hover:bg-rose-600 transition-colors flex-shrink-0"
+                icon={<ShieldBan className="w-3.5 h-3.5" />}
               >
-                <ShieldBan className="w-3.5 h-3.5" />
                 Reset to Hidden
-              </button>
+              </Button>
             )}
           </div>
         </div>
@@ -4355,10 +4516,10 @@ export default function SettingsPage() {
         <div className="mb-4 overflow-hidden">
           <div
             key={visibilityGuideKey}
-            className="p-3 rounded-lg bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800"
+            className="p-3 rounded-lg bg-info-subtle border border-info-muted"
             style={{ animation: 'fadeSlideIn 0.3s ease-out' }}
           >
-            <p className="text-sm text-blue-700 dark:text-blue-400">
+            <p className="text-sm text-info">
               {visibilityGuideKey === 'followers'
                 ? 'Followed Calendars: When you submit availability to a Coordination Calendar, you automatically follow it. Only the organiser of that calendar can see the profile data you enable in this column. Click cells below to toggle what organisers can see.'
                 : visibilityGuideKey === 'contacts'
@@ -4384,17 +4545,17 @@ export default function SettingsPage() {
             <thead>
               <tr className="bg-muted/50">
                 <th
-                  className={`text-left p-2 sm:p-3 font-medium border-b cursor-pointer transition-colors hover:bg-blue-50/50 dark:hover:bg-blue-950/30 ${
+                  className={`text-left p-2 sm:p-3 font-medium border-b cursor-pointer transition-colors hover:bg-info-subtle ${
                     visibilityGuideKey === 'feature'
-                      ? 'border-blue-400 dark:border-blue-500 bg-blue-100/60 dark:bg-blue-950/30'
+                      ? 'border-info-muted bg-info-subtle'
                       : 'border-border'
                   }`}
                   onClick={() => setVisibilityGuideKey(visibilityGuideKey === 'feature' ? 'default' : 'feature')}
                 >Profile Data Feature</th>
                 <th
-                  className={`text-center p-2 sm:p-3 font-medium border-b border-l cursor-pointer transition-colors hover:bg-blue-50/50 dark:hover:bg-blue-950/30 ${
+                  className={`text-center p-2 sm:p-3 font-medium border-b border-l cursor-pointer transition-colors hover:bg-info-subtle ${
                     visibilityGuideKey === 'followers'
-                      ? 'border-blue-400 dark:border-blue-500 bg-blue-100/60 dark:bg-blue-950/30'
+                      ? 'border-info-muted bg-info-subtle'
                       : 'border-border'
                   }`}
                   onClick={() => setVisibilityGuideKey(visibilityGuideKey === 'followers' ? 'default' : 'followers')}
@@ -4406,9 +4567,9 @@ export default function SettingsPage() {
                   </div>
                 </th>
                 <th
-                  className={`text-center p-2 sm:p-3 font-medium border-b border-l cursor-pointer transition-colors hover:bg-blue-50/50 dark:hover:bg-blue-950/30 ${
+                  className={`text-center p-2 sm:p-3 font-medium border-b border-l cursor-pointer transition-colors hover:bg-info-subtle ${
                     visibilityGuideKey === 'contacts'
-                      ? 'border-blue-400 dark:border-blue-500 bg-blue-100/60 dark:bg-blue-950/30'
+                      ? 'border-info-muted bg-info-subtle'
                       : 'border-border'
                   }`}
                   onClick={() => setVisibilityGuideKey(visibilityGuideKey === 'contacts' ? 'default' : 'contacts')}
@@ -4431,29 +4592,29 @@ export default function SettingsPage() {
                 const enabledCount = (fActive ? 1 : 0) + (row.disableContacts ? 0 : (cActive ? 1 : 0))
                 const maxCount = row.disableContacts ? 1 : 2
                 const rowHue = enabledCount === maxCount
-                  ? 'bg-blue-50/30 dark:bg-blue-950/10'
+                  ? 'bg-info-subtle'
                   : enabledCount >= 1
-                    ? 'bg-amber-50/30 dark:bg-amber-950/10'
-                    : 'bg-rose-50/20 dark:bg-rose-950/10'
+                    ? 'bg-warning-subtle'
+                    : 'bg-danger-subtle'
                 const rowLabelColor = enabledCount === maxCount
-                  ? 'text-blue-700 dark:text-blue-400'
+                  ? 'text-info'
                   : enabledCount >= 1
-                    ? 'text-amber-700 dark:text-amber-400'
-                    : 'text-rose-500 dark:text-rose-400'
+                    ? 'text-warning'
+                    : 'text-danger'
                 return (
                   <tr key={row.label} className={`${i < 2 ? 'border-b border-border' : ''} ${rowHue} transition-colors duration-300`}>
                     <td
-                      className={`p-2 sm:p-3 font-medium leading-tight transition-colors duration-300 cursor-pointer hover:underline break-words ${rowLabelColor}`}
+                      className={`p-2 sm:p-3 font-medium leading-tight transition-colors duration-300 cursor-pointer hover:underline wrap-break-word ${rowLabelColor}`}
                       onClick={() => setVisibilityGuideKey(visibilityGuideKey === row.guideKey ? 'default' : row.guideKey)}
                     >{row.label}</td>
                     <td
                       className={`p-2 sm:p-3 text-center border-l cursor-pointer transition-all duration-200 group/cell ${
                         fActive
-                          ? 'border-blue-400 dark:border-blue-500 bg-blue-100/50 dark:bg-blue-900/30'
+                          ? 'border-info-muted bg-info-subtle'
                           : visibilityGuideKey === 'followers'
-                            ? 'border-blue-300 dark:border-blue-600 bg-blue-50/30 dark:bg-blue-950/15'
-                            : 'border-border hover:border-amber-300 dark:hover:border-amber-600'
-                      } hover:bg-blue-100/50 dark:hover:bg-blue-900/30`}
+                            ? 'border-info-muted bg-info-subtle'
+                            : 'border-border hover:border-warning-muted'
+                      } hover:bg-info-muted`}
                       onClick={() => {
                         const newFVal = !row.fVal
                         if (!privacyFollowersEnabled) setPrivacyFollowersEnabled(true)
@@ -4468,13 +4629,13 @@ export default function SettingsPage() {
                     >
                       <div className="flex items-center justify-center">
                         {fActive
-                          ? <CheckCircle2 className="w-4 h-4 sm:w-5 sm:h-5 text-green-500" />
+                          ? <CheckCircle2 className="w-4 h-4 sm:w-5 sm:h-5 text-success" />
                           : <>
-                              <X className="w-4 h-4 sm:w-5 sm:h-5 text-rose-400 group-hover/cell:hidden" />
-                              <span className="hidden group-hover/cell:inline-flex items-center gap-0.5 text-xs font-medium text-amber-600 dark:text-amber-400">
-                                <X className="w-3.5 h-3.5 text-rose-400" />
+                              <X className="w-4 h-4 sm:w-5 sm:h-5 text-danger group-hover/cell:hidden" />
+                              <span className="hidden group-hover/cell:inline-flex items-center gap-0.5 text-xs font-medium text-warning">
+                                <X className="w-3.5 h-3.5 text-danger" />
                                 <span>&rarr;</span>
-                                <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />
+                                <CheckCircle2 className="w-3.5 h-3.5 text-success" />
                               </span>
                             </>
                         }
@@ -4491,11 +4652,11 @@ export default function SettingsPage() {
                       <td
                         className={`p-2 sm:p-3 text-center border-l cursor-pointer transition-all duration-200 group/cell2 ${
                           cActive
-                            ? 'border-blue-400 dark:border-blue-500 bg-blue-100/50 dark:bg-blue-900/30'
+                            ? 'border-info-muted bg-info-subtle'
                             : visibilityGuideKey === 'contacts'
-                              ? 'border-blue-300 dark:border-blue-600 bg-blue-50/30 dark:bg-blue-950/15'
-                              : 'border-border hover:border-amber-300 dark:hover:border-amber-600'
-                        } hover:bg-blue-100/50 dark:hover:bg-blue-900/30`}
+                              ? 'border-info-muted bg-info-subtle'
+                              : 'border-border hover:border-warning-muted'
+                        } hover:bg-info-muted`}
                         onClick={() => {
                           const newCVal = !row.cVal
                           if (!privacyContactsEnabled) setPrivacyContactsEnabled(true)
@@ -4508,13 +4669,13 @@ export default function SettingsPage() {
                       >
                         <div className="flex items-center justify-center">
                           {cActive
-                            ? <CheckCircle2 className="w-4 h-4 sm:w-5 sm:h-5 text-green-500" />
+                            ? <CheckCircle2 className="w-4 h-4 sm:w-5 sm:h-5 text-success" />
                             : <>
-                                <X className="w-4 h-4 sm:w-5 sm:h-5 text-rose-400 group-hover/cell2:hidden" />
-                                <span className="hidden group-hover/cell2:inline-flex items-center gap-0.5 text-xs font-medium text-amber-600 dark:text-amber-400">
-                                  <X className="w-3.5 h-3.5 text-rose-400" />
+                                <X className="w-4 h-4 sm:w-5 sm:h-5 text-danger group-hover/cell2:hidden" />
+                                <span className="hidden group-hover/cell2:inline-flex items-center gap-0.5 text-xs font-medium text-warning">
+                                  <X className="w-3.5 h-3.5 text-danger" />
                                   <span>&rarr;</span>
-                                  <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />
+                                  <CheckCircle2 className="w-3.5 h-3.5 text-success" />
                                 </span>
                               </>
                           }
@@ -4533,25 +4694,27 @@ export default function SettingsPage() {
       {isTraveler ? (
         <div id="settings-sharing" className="pt-6 border-t border-border">
           <h3 className="text-lg font-medium mb-2">Invite Friends</h3>
-          <p className="text-sm text-amber-600 dark:text-amber-400">Friend invites are not available for Traveler accounts. Sign in with Google or a Cardano wallet to connect with friends.</p>
+          <p className="text-sm text-warning">Friend invites are not available for Traveler accounts. Sign in with Google or a Cardano wallet to connect with friends.</p>
         </div>
       ) : (
       <div id="settings-sharing" className="pt-6 border-t border-border">
         <h3 className="text-lg font-medium mb-4">Invite Friends</h3>
         
-        <p className="text-sm text-blue-600 dark:text-blue-400 mb-4">
+        <p className="text-sm text-primary mb-4">
           Generate invite codes to add friends on the platform. Friends can see the profile data you share based on your privacy settings above.
         </p>
         
         <div className="space-y-3">
           <div className="p-4 bg-card rounded-lg border border-border space-y-3">
             {!privacyContactsEnabled || (!contactsShowEmail && !contactsShowPrefs && !contactsAllowConnections) ? (
-              <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 text-xs text-amber-700 dark:text-amber-400">
+              <div className="p-3 rounded-lg bg-warning-subtle border border-warning-muted text-xs text-warning">
                 <p>Enable the <strong>Friends</strong> privacy level above and turn on at least one preference before generating invite codes.</p>
               </div>
             ) : !settingsInviteCode ? (
               <div className="space-y-2">
-                <button
+                <Button
+                  emphasis="outline"
+                  intent="primary"
                   onClick={async () => {
                     try {
                       const res = await apiClient.post('/api/connections/invites')
@@ -4563,36 +4726,35 @@ export default function SettingsPage() {
                       console.error('Failed to generate invite:', err)
                     }
                   }}
-                  className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
+                  icon={<Plus className="w-4 h-4" />}
                 >
-                  <Plus className="w-4 h-4" />
                   Generate Invite Code
-                </button>
+                </Button>
                 <p className="text-xs text-muted-foreground">Invite codes expire after 48 hours and are automatically deleted.</p>
               </div>
             ) : null}
 
             {settingsInviteCode && (
-              <div className="p-3 rounded-lg bg-green-50 dark:bg-green-950 border border-green-200 dark:border-green-800 space-y-2">
+              <div className="p-3 rounded-lg bg-success-subtle border border-success-muted space-y-2">
                 <div className="flex items-center gap-2">
-                  <CheckCircle2 className="w-4 h-4 text-green-500" />
-                  <span className="text-sm font-medium text-green-700 dark:text-green-300">Invite code generated!</span>
+                  <CheckCircle2 className="w-4 h-4 text-success" />
+                  <span className="text-sm font-medium text-success">Invite code generated!</span>
                 </div>
-                <p className="text-xs text-green-600 dark:text-green-400">
+                <p className="text-xs text-success">
                   This code is shown only once. Copy it and share it with the people you want to connect with.
                 </p>
                 <div className="flex flex-col sm:flex-row sm:items-center gap-2 bg-card rounded-lg p-2 border border-border">
                   <code className="flex-1 text-xs font-mono break-all select-all">{`${window.location.origin}/join/invite/${settingsInviteCode}`}</code>
-                  <button
+                  <IconButton
+                    label={settingsInviteCopied ? 'Copied' : 'Copy invite link'}
                     onClick={async () => {
                       await navigator.clipboard.writeText(`${window.location.origin}/join/invite/${encodeURIComponent(settingsInviteCode)}`)
                       setSettingsInviteCopied(true)
                       setTimeout(() => setSettingsInviteCopied(false), 2000)
                     }}
-                    className="p-1.5 rounded hover:bg-muted transition-colors self-end sm:self-auto shrink-0"
-                  >
-                    {settingsInviteCopied ? <CheckIcon className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
-                  </button>
+                    className="self-end sm:self-auto"
+                    icon={settingsInviteCopied ? <CheckIcon className="text-success" /> : <Copy />}
+                  />
                 </div>
               </div>
             )}
@@ -4767,30 +4929,30 @@ export default function SettingsPage() {
         <div className="space-y-3">
           <button
             onClick={handleLogout}
-            className="w-full flex items-center justify-between p-4 bg-card rounded-lg border border-rose-200 dark:border-rose-800 hover:bg-rose-50 dark:hover:bg-rose-950/40 transition-colors group"
+            className="w-full flex items-center justify-between p-4 bg-card rounded-lg border border-danger-muted hover:bg-danger-subtle transition-colors group"
           >
             <div className="flex items-center gap-3">
-              <LogOut className="h-5 w-5 text-rose-500 dark:text-rose-400" />
+              <LogOut className="h-5 w-5 text-danger" />
               <div className="text-left">
-                <p className="font-medium text-rose-800 dark:text-rose-200">Sign out</p>
-                <p className="text-sm text-rose-500 dark:text-rose-400">Sign out of your account</p>
+                <p className="font-medium text-danger">Sign out</p>
+                <p className="text-sm text-danger">Sign out of your account</p>
               </div>
             </div>
-            <ChevronRight className="h-5 w-5 text-rose-400 group-hover:text-rose-500 dark:group-hover:text-rose-300" />
+            <ChevronRight className="h-5 w-5 text-danger group-hover:text-danger" />
           </button>
           
           <button
             onClick={handleDeleteAccount}
-            className="w-full flex items-center justify-between p-4 bg-rose-50 dark:bg-rose-950/40 rounded-lg hover:bg-rose-100 dark:hover:bg-rose-900/40 transition-colors group"
+            className="w-full flex items-center justify-between p-4 bg-danger-subtle rounded-lg hover:bg-danger-muted transition-colors group"
           >
             <div className="flex items-center gap-3">
-              <Trash2 className="h-5 w-5 text-rose-500 dark:text-rose-400" />
+              <Trash2 className="h-5 w-5 text-danger" />
               <div className="text-left">
-                <p className="font-medium text-rose-800 dark:text-rose-200">Delete account</p>
-                <p className="text-sm text-rose-500 dark:text-rose-400">Permanently delete your account and data</p>
+                <p className="font-medium text-danger">Delete account</p>
+                <p className="text-sm text-danger">Permanently delete your account and data</p>
               </div>
             </div>
-            <ChevronRight className="h-5 w-5 text-rose-400 group-hover:text-rose-500 dark:group-hover:text-rose-300" />
+            <ChevronRight className="h-5 w-5 text-danger group-hover:text-danger" />
           </button>
         </div>
       </div>
@@ -4811,7 +4973,7 @@ export default function SettingsPage() {
         <div className="flex flex-col gap-4 lg:flex-row lg:gap-6">
           {/* Mobile Categories */}
           <nav className="lg:hidden">
-            <div className="bg-card text-card-foreground rounded-xl shadow-sm border border-border p-2">
+            <div className="bg-card text-card-foreground rounded-xl shadow-xs border border-border p-2">
               <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
                 {tabs.map(tab => {
                   const Icon = tab.icon
@@ -4823,10 +4985,10 @@ export default function SettingsPage() {
                       className={`flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm text-center min-w-0 transition-colors ${
                         activeTab === tab.id
                           ? isPrivate
-                            ? 'bg-rose-50 dark:bg-rose-950/40 text-rose-600 dark:text-rose-300 border border-rose-200 dark:border-rose-800'
+                            ? 'bg-danger-subtle text-danger border border-danger-muted'
                             : 'bg-primary/10 text-primary'
                           : isPrivate
-                            ? 'text-rose-500 dark:text-rose-400 hover:bg-rose-50/50 dark:hover:bg-rose-950/30 border border-transparent'
+                            ? 'text-danger hover:bg-danger-subtle border border-transparent'
                             : 'text-muted-foreground hover:bg-muted'
                       }`}
                     >
@@ -4840,8 +5002,8 @@ export default function SettingsPage() {
           </nav>
 
           {/* Left Sidebar — Categories */}
-          <nav className="hidden w-52 flex-shrink-0 lg:block">
-            <div className="sticky top-8 bg-card text-card-foreground rounded-xl shadow-sm border border-border p-2">
+          <nav className="hidden w-52 shrink-0 lg:block">
+            <div className="sticky top-8 bg-card text-card-foreground rounded-xl shadow-xs border border-border p-2">
               {tabs.map(tab => {
                 const Icon = tab.icon
                 const isPrivate = tab.id === 'calendar' || tab.id === 'privacy'
@@ -4852,10 +5014,10 @@ export default function SettingsPage() {
                     className={`w-full flex items-center gap-3 px-4 py-3 rounded-lg text-left transition-colors ${
                       activeTab === tab.id
                         ? isPrivate
-                          ? 'bg-rose-50 dark:bg-rose-950/40 text-rose-600 dark:text-rose-300 border border-rose-200 dark:border-rose-800'
+                          ? 'bg-danger-subtle text-danger border border-danger-muted'
                           : 'bg-primary/10 text-primary'
                         : isPrivate
-                          ? 'text-rose-500 dark:text-rose-400 hover:bg-rose-50/50 dark:hover:bg-rose-950/30 border border-transparent'
+                          ? 'text-danger hover:bg-danger-subtle border border-transparent'
                           : 'text-muted-foreground hover:bg-muted'
                     }`}
                   >
@@ -4869,7 +5031,7 @@ export default function SettingsPage() {
           
           {/* Content */}
           <div className="flex-1 min-w-0" ref={contentRef}>
-            <div className="bg-card text-card-foreground rounded-xl shadow-sm border border-border p-4 sm:p-6">
+            <div className="bg-card text-card-foreground rounded-xl shadow-xs border border-border p-4 sm:p-6">
               {activeTab === 'profile' && renderProfileTab()}
               {activeTab === 'notifications' && renderNotificationsTab()}
               {activeTab === 'calendar' && renderCalendarTab()}
@@ -4880,8 +5042,8 @@ export default function SettingsPage() {
 
           {/* Right Sidebar — Subcategory Quicklinks */}
           {TAB_SUBCATEGORIES[activeTab].length > 0 && (
-            <nav className="w-48 flex-shrink-0 hidden lg:block">
-              <div className="sticky top-8 bg-card text-card-foreground rounded-xl shadow-sm border border-border p-2">
+            <nav className="w-48 shrink-0 hidden lg:block">
+              <div className="sticky top-8 bg-card text-card-foreground rounded-xl shadow-xs border border-border p-2">
                 <p className="px-3 py-2 text-xs font-semibold text-muted-foreground uppercase tracking-wider">On this page</p>
                 {TAB_SUBCATEGORIES[activeTab].map(sub => (
                   <button
@@ -4893,7 +5055,7 @@ export default function SettingsPage() {
                         : 'text-muted-foreground hover:bg-muted hover:text-foreground'
                     }`}
                   >
-                    <span className={`w-1 h-4 rounded-full flex-shrink-0 transition-colors ${
+                    <span className={`w-1 h-4 rounded-full shrink-0 transition-colors ${
                       activeSection === sub.id ? 'bg-primary' : 'bg-transparent'
                     }`} />
                     {sub.label}

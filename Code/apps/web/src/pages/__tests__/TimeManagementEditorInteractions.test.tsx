@@ -1,4 +1,4 @@
-import '@testing-library/jest-dom'
+import '@testing-library/jest-dom/vitest'
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
@@ -23,7 +23,7 @@ describe('TimeManagement editor interaction regressions', () => {
   const openFullView = async (): Promise<HTMLElement> => {
     await screen.findByRole('heading', { name: 'Time Management' })
     fireEvent.click(screen.getByTitle('Open full view editor'))
-    await screen.findByRole('button', { name: 'Collapse' })
+    await screen.findByRole('button', { name: 'Collapse' }, { timeout: 5000 })
 
     const editor = document.querySelector('div.fixed.inset-0 .markdown-editor') as HTMLElement | null
     expect(editor).toBeTruthy()
@@ -49,7 +49,7 @@ describe('TimeManagement editor interaction regressions', () => {
 
   it('turns on bullet and ordered list nodes from toolbar buttons', async () => {
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -69,7 +69,7 @@ describe('TimeManagement editor interaction regressions', () => {
 
   it('changes the current block type when heading buttons are used', async () => {
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -92,9 +92,98 @@ describe('TimeManagement editor interaction regressions', () => {
     })
   })
 
+  it('turns HTTP URLs into safe clickable links after Space or Enter', async () => {
+    render(
+      <MemoryRouter>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    const editor = await openFullView()
+    fireEvent.focus(editor)
+    pasteText(editor, 'https://example.com/notes')
+    fireEvent.keyDown(editor, { key: ' ', code: 'Space', charCode: 32 })
+    pasteText(editor, 'https://example.com/agenda')
+    pressEnter(editor)
+
+    await waitFor(() => {
+      const spaceAnchor = editor.querySelector('a[href="https://example.com/notes"]')
+      const enterAnchor = editor.querySelector('a[href="https://example.com/agenda"]')
+      expect(spaceAnchor).toBeInTheDocument()
+      expect(spaceAnchor).toHaveAttribute('target', '_blank')
+      expect(spaceAnchor).toHaveAttribute('rel', 'noopener noreferrer')
+      expect(enterAnchor).toBeInTheDocument()
+    })
+  })
+
+  it('adds a root-relative app route with the final Link toolbar button', async () => {
+    render(
+      <MemoryRouter>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    const editor = await openFullView()
+    fireEvent.click(screen.getByRole('button', { name: 'Link' }))
+    const linkForm = await screen.findByRole('form', { name: 'Link URL' })
+    expect(linkForm).toHaveClass('fixed')
+    expect(linkForm).toHaveStyle({ left: '12px', top: '12px' })
+    // The link popover claims the popover layer, so it resolves above the full editor it opened from.
+    const fullEditorOverlay = screen.getByTestId('full-editor-overlay')
+    expect(Number(linkForm.style.zIndex)).toBeGreaterThan(Number(fullEditorOverlay.style.zIndex))
+
+    fireEvent.change(screen.getByRole('textbox', { name: 'URL' }), {
+      target: { value: '/calendar/example' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    await waitFor(() => {
+      const anchor = editor.querySelector('a[href="/calendar/example"]')
+      expect(anchor).toBeInTheDocument()
+      expect(anchor).toHaveTextContent('/calendar/example')
+      expect(editor.textContent).toBe(' /calendar/example ')
+    })
+  })
+
+  it('adds missing spaces around a linked single-character selection', async () => {
+    render(
+      <MemoryRouter>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    const editor = await openFullView()
+    fireEvent.focus(editor)
+    pasteText(editor, 'leftXright')
+
+    const textNode = editor.querySelector('p')?.firstChild
+    expect(textNode).toBeInstanceOf(Text)
+    if (!(textNode instanceof Text)) return
+
+    const range = document.createRange()
+    range.setStart(textNode, 4)
+    range.setEnd(textNode, 5)
+    const selection = window.getSelection()
+    selection?.removeAllRanges()
+    selection?.addRange(range)
+    document.dispatchEvent(new Event('selectionchange'))
+
+    fireEvent.click(screen.getByRole('button', { name: 'Link' }))
+    fireEvent.change(await screen.findByRole('textbox', { name: 'URL' }), {
+      target: { value: 'https://example.com/x' },
+    })
+    fireEvent.click(screen.getByRole('button', { name: 'Apply' }))
+
+    await waitFor(() => {
+      const anchor = editor.querySelector('a[href="https://example.com/x"]')
+      expect(anchor).toHaveTextContent('X')
+      expect(editor.textContent).toBe('left X right')
+    })
+  })
+
   it('moves out of an empty checklist item on Enter', async () => {
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -117,7 +206,7 @@ describe('TimeManagement editor interaction regressions', () => {
 
   it('preserves an intentional blank line after exiting checklist mode', async () => {
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -151,7 +240,7 @@ describe('TimeManagement editor interaction regressions', () => {
 
   it('keeps cursor flow stable through checklist, list, ordered list, collapse, and code steps', async () => {
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -239,6 +328,6 @@ describe('TimeManagement editor interaction regressions', () => {
       expect(text).toContain('AFTER NUMBERED EXIT')
       expect(text).toContain('THE END')
     })
-  })
+  }, 10000)
 
 })

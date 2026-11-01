@@ -1,73 +1,34 @@
 ---
-description: Dependency governance, CI supply-chain hardening, SBOM, and pnpm security
+name: supply-chain-security
+description: Governs dependency and CI supply-chain security for the pnpm monorepo - pnpm audit, allowBuilds and blockExoticSubdeps, SHA-pinned GitHub Actions, SBOM generation, OpenSSF Scorecard, and compromised-package response. Use when adding or updating dependencies, editing GitHub Actions workflows, handling Dependabot or vulnerability alerts, preparing release SBOMs, or reviewing pnpm security config. Not for workflow structure or CodeQL YAML (use github-workflow), or gitleaks and secret rotation (use security-hardening).
 ---
 
 # supply-chain-security
 
-## Purpose
-
-Guides JavaScript/TypeScript supply-chain security across the pnpm monorepo: dependency
-governance, CI/CD workflow hardening, SBOM generation, build provenance, and continuous
-dependency monitoring. Based on OWASP Top 10:2025, SLSA framework, and OpenSSF Scorecard.
-
-## When to Use
-
-- Adding or updating dependencies in any workspace package
-- Configuring CI/CD pipelines or GitHub Actions
-- Auditing dependency health or responding to vulnerability alerts
-- Preparing releases with SBOM or provenance artifacts
-- Reviewing pnpm configuration for security controls
-- Responding to compromised package advisories
+Pick the task: audit, configure, add dependency, CI hardening, SBOM, or advisory response.
 
 ## Workflow
 
-1. Identify action type: audit, configure, generate-sbom, review-ci, or respond-to-advisory
-2. For **audit**: run `pnpm audit` from `Code/` directory, review high/critical findings
-3. For **configure**: verify pnpm.onlyBuiltDependencies and blockExoticSubdeps are set (see references)
-4. For **add dependency**: check package health (maintenance, downloads, transitive deps), verify no suspicious postinstall scripts, use `pnpm why <package>` to understand dep tree
-5. For **CI hardening**: pin all GitHub Actions to commit SHAs, set minimal token permissions, use `pull_request` (not `pull_request_target`) for untrusted code
-6. For **SBOM**: generate CycloneDX JSON with `npx @cyclonedx/cyclonedx-npm`, include in release artifacts
-7. For **advisory response**: follow incident response checklist (check exposure, pin safe version, audit lockfile, rotate credentials if needed)
-8. Document any overrides or incident responses in team security channel
-9. Run OpenSSF Scorecard weekly to track supply-chain posture drift
+1. **Audit**: the blocking CI gate is the OSV check in `scripts/security-check.ps1` (`ci.yml`, high/critical; also `pnpm security:check` / `security:premerge` locally and inside `pnpm verify:release`). `pnpm audit` is a local aid and runs weekly non-blocking in `security-drift-weekly.yml`. Dependency-review is advisory only.
+2. **Configure**: all pnpm settings live in `Code/pnpm-workspace.yaml` (pnpm 11+ ignores the
+   `"pnpm"` field of `package.json`). Verify `allowBuilds` (deny-by-default install-script allowlist;
+   replaced `onlyBuiltDependencies`) and `blockExoticSubdeps: true`.
+   `minimumReleaseAgeExclude` entries are temporary security exceptions; remove each after its
+   review date (comment beside it). `minimumReleaseAge: 4320` in `pnpm-workspace.yaml` makes pnpm ignore versions younger than 3 days
+   (worm defense); an exact pin or override to a fresher version fails, so pick an older patched one.
+   Never use `dangerouslyAllowAllBuilds`. Keep pnpm up to date for integrity-hashing fixes.
+3. **Add dependency**: check package health (maintenance, downloads, transitive deps), verify no
+   suspicious postinstall scripts, run `pnpm why <package>` to understand the dep tree. Document every
+   `overrides` entry (`Code/pnpm-workspace.yaml`, ~30 entries) with reason and review date in `docs/private/DEPENDENCY_OVERRIDE_RATIONALE.md`; remove overrides the upgraded tree no longer needs. Update commands only: monorepo-conventions.
+4. **CI hardening** (`.github/workflows/*.yml`): pin every action to a full commit SHA (never a tag; take current SHAs from the workflow files, and add a version comment on update), keep minimal token permissions. Workflow structure, CodeQL and fork-PR / `pull_request_target` rules: github-workflow `references/ci-workflows.md`.
+5. **SBOM**: generate CycloneDX JSON with `npx @cyclonedx/cyclonedx-npm@<pinned-version>` (pin the version; no SBOM tooling or workflow exists in the repo yet) and include it in release artifacts.
+6. **Advisory response**: follow the incident checklist (check exposure, pin safe version, audit lockfile,
+   rotate credentials if needed) and record it in the team security channel. Rotation specifics: security-hardening.
+7. **Scorecard**: run OpenSSF Scorecard manually (no Scorecard workflow exists in `.github/workflows/`). Weekly review cadence: security-hardening.
 
-## Outputs
+Done when: no exotic subdependency sources in the lockfile, all actions SHA-pinned, Dependabot alerts at
+zero or documented overrides, Scorecard stable or improving.
 
-| Output | Location | Format |
-|--------|----------|--------|
-| Audit report | CI logs / terminal | pnpm audit output |
-| pnpm config | `Code/package.json` | JSON (pnpm key) |
-| CI workflow | `.github/workflows/*.yml` | YAML with SHA-pinned actions |
-| SBOM | Release artifacts | CycloneDX JSON |
-| Override docs | `Code/package.json` comments | Inline justification |
-| Incident report | Security channel | Markdown summary |
+## References
 
-## Constraints
-
-- NEVER use `dangerouslyAllowAllBuilds` in pnpm config
-- NEVER use mutable tag references for GitHub Actions in CI (pin to SHA)
-- NEVER expose secrets to untrusted PR contexts (fork workflows)
-- ALWAYS use `--frozen-lockfile` in CI installs (reproducible builds)
-- ALWAYS audit before deploying (fail CI on high/critical vulns)
-- Keep pnpm up to date for integrity hashing fixes
-- Document all pnpm.overrides with reason and review date
-
-## Self-Validation
-
-### Trigger Indicators
-- [ ] User asks about dependencies, npm audit, supply chain, or CI security
-- [ ] Dependabot alert or vulnerability advisory needs response
-- [ ] New dependency being added to any workspace package
-- [ ] CI/CD pipeline being created or modified
-
-### Completion Markers
-- [ ] pnpm config includes blockExoticSubdeps and onlyBuiltDependencies
-- [ ] CI workflow pins actions to SHAs with minimal token permissions
-- [ ] pnpm audit passes or overrides are documented with justification
-- [ ] SBOM generated for release artifacts (if release workflow)
-
-### Quality Signals
-- [ ] No exotic subdependency sources in lockfile
-- [ ] All CI actions pinned to immutable SHAs (not tags)
-- [ ] Dependabot alerts at zero or documented overrides
-- [ ] OpenSSF Scorecard score stable or improving
+- [references/security-reference.md](references/security-reference.md) - read for exact pnpm settings, SHA-pin policy pointers, SBOM commands, the incident response checklist, and the habits table

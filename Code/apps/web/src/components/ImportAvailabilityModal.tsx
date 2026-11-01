@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import { X, Loader2, Calendar, Clock } from 'lucide-react'
 import { apiClient } from '../lib/api-client'
+import { IconButton } from './ui/IconButton'
 
 interface PastAvailabilityEntry {
   calendar_id: string
@@ -249,20 +250,18 @@ export default function ImportAvailabilityModal({
 
   return (
     <aside
-      className="shrink-0 sticky top-0 h-screen w-[38.5rem] sm:w-[42rem] max-w-[95vw] bg-card text-card-foreground border-l border-border shadow-xl flex flex-col"
+      className="shrink-0 sticky top-0 h-screen w-154 sm:w-2xl max-w-[95vw] bg-card text-card-foreground border-l border-border shadow-xl flex flex-col"
     >
         <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-muted/30">
           <h2 className="text-base font-bold flex items-center gap-2">
-            <Calendar className="w-4 h-4 text-purple-500" />
+            <Calendar className="w-4 h-4 text-primary" />
             Import Availability
           </h2>
-          <button
+          <IconButton
             onClick={onClose}
-            className="p-1 rounded-md hover:bg-muted text-muted-foreground"
-            aria-label="Close import availability panel"
-          >
-            <X className="w-5 h-5" />
-          </button>
+            label="Close import availability panel"
+            icon={<X className="w-5 h-5" />}
+          />
         </div>
 
         <div className="px-4 pt-3 pb-2">
@@ -276,12 +275,12 @@ export default function ImportAvailabilityModal({
 
         {loading && (
           <div className="flex items-center justify-center py-8">
-            <Loader2 className="w-6 h-6 animate-spin text-purple-500" />
+            <Loader2 className="w-6 h-6 animate-spin text-muted-foreground" />
           </div>
         )}
 
         {error && (
-          <div className="text-sm text-red-600 py-4 text-center">{error}</div>
+          <div className="text-sm text-danger py-4 text-center">{error}</div>
         )}
 
         {!loading && !error && entries.length === 0 && (
@@ -322,7 +321,7 @@ export default function ImportAvailabilityModal({
                       onClick={() => handleImport(entry, 'selected')}
                       onMouseEnter={() => onPreview?.(getImportSlots(entry, 'selected'))}
                       onMouseLeave={() => onPreview?.(null)}
-                      className="border-b border-border/50 cursor-pointer hover:bg-purple-50 dark:hover:bg-purple-950/30 transition-colors"
+                      className="border-b border-border/50 cursor-pointer hover:bg-accent transition-colors"
                     >
                       <td className="px-2 py-2.5 whitespace-nowrap text-foreground">
                         <div className="flex items-center gap-1.5">
@@ -354,7 +353,7 @@ export default function ImportAvailabilityModal({
                               e.stopPropagation()
                               onPreview?.(getImportSlots(entry, 'selected'))
                             }}
-                            className="px-2 py-1 rounded-md text-[11px] font-medium border border-cyan-300 text-cyan-700 hover:bg-cyan-50 dark:border-cyan-700 dark:text-cyan-300 dark:hover:bg-cyan-950/30"
+                            className="px-2 py-1 rounded-md text-[11px] font-medium border border-info-muted text-info hover:bg-info-subtle"
                           >
                             Selected
                           </button>
@@ -368,7 +367,7 @@ export default function ImportAvailabilityModal({
                               e.stopPropagation()
                               onPreview?.(getImportSlots(entry, 'unselected'))
                             }}
-                            className="px-2 py-1 rounded-md text-[11px] font-medium border border-amber-300 text-amber-700 hover:bg-amber-50 dark:border-amber-700 dark:text-amber-300 dark:hover:bg-amber-950/30"
+                            className="px-2 py-1 rounded-md text-[11px] font-medium border border-warning-muted text-warning hover:bg-warning-subtle"
                           >
                             Unselected
                           </button>

@@ -331,7 +331,7 @@ $$;
 -- ============================================================
 -- Migration: User SMTP configurations for email announcements
 -- Allows users to store their own SMTP credentials to send emails from their own address.
--- Falls back to platform default (coreswarm@gmail.com) when no user config exists.
+-- Falls back to platform default (SMTP_USER) when no user config exists.
 
 -- 1. Create the user_smtp_configs table
 CREATE TABLE IF NOT EXISTS user_smtp_configs (
@@ -612,4 +612,30 @@ CREATE INDEX IF NOT EXISTS idx_announcement_schedules_env_pending
 
 
 -- END SOURCE: 055_announcement_source_env.sql
+
+-- BEGIN SOURCE: 036_announcement_message_deletion.sql
+-- Migration 036: Track sender-initiated deletion of posted Discord announcement messages
+--
+-- A sender can delete the Discord channel posts and DMs that an announcement
+-- already delivered. The API (service role) records the outcome per delivery
+-- log row: deleted_at when the Discord message is gone (or was already gone),
+-- delete_error when the bot could not delete it. Email deliveries cannot be
+-- recalled and are never marked.
+--
+-- RLS: no change. The existing "Users view own delivery logs" SELECT policy
+-- covers the new columns; writes go through the backend service role only
+-- (there is no INSERT/UPDATE/DELETE policy for authenticated users).
+
+ALTER TABLE announcement_delivery_log
+  ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+
+ALTER TABLE announcement_delivery_log
+  ADD COLUMN IF NOT EXISTS delete_error TEXT;
+
+COMMENT ON COLUMN announcement_delivery_log.deleted_at IS
+  'When the sender deleted the posted Discord message (NULL = still posted or never posted)';
+
+COMMENT ON COLUMN announcement_delivery_log.delete_error IS
+  'Last error from a sender-initiated Discord message deletion attempt (NULL = none)';
+-- END SOURCE: 036_announcement_message_deletion.sql
 

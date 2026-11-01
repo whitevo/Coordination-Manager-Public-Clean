@@ -16,6 +16,7 @@ import {
   ThreadChannel,
 } from 'discord.js'
 import { supabase } from './supabase.js'
+import { syncGuardianChannelMetadata, syncGuardianRoleMetadata } from './metadata-sync.js'
 import {
   isLeader,
   startInstanceLock,
@@ -34,6 +35,16 @@ import {
   type ReactionKind,
   type ActionKind,
 } from './rule-engine.js'
+import { RetryBackoff } from './retry-backoff.js'
+import { BanRegistryWorker, BAN_WORKER_INTERVAL_MS } from './ban-registry.js'
+import { BanPreviewWorker } from './ban-preview.js'
+import {
+  getSettingsSkipReason,
+  isRecentContentEdit,
+  isWithinHistoryWindow,
+  shouldProcessMessageUpdate,
+  type SettingsSkipReason,
+} from './message-admission.js'
 
 // ─── Types ────────────────────────────────────────────────────────────
 
@@ -57,10 +68,25 @@ let disabledChannelKeys: Set<string> = new Set()
 let lastDisabledChannelsRefresh = 0
 const DISABLED_CHANNELS_REFRESH_INTERVAL = 60_000 // 60 seconds
 
+// Category monitoring defaults (guild_id:category_channel_id -> is_monitored).
+// Used only to seed newly discovered child channels -- never overrides an
+// existing per-channel row (per-channel setting always wins).
+let categoryMonitorDefaults: Map<string, boolean> = new Map()
+let lastCategoryDefaultsRefresh = 0
+const CATEGORY_DEFAULTS_REFRESH_INTERVAL = 60_000 // 60 seconds
+
+// Explicit thread defaults (guild_id:channel_id -> true/false/null) and
+// parent relationships used to resolve a new thread's effective default.
+let threadMonitorDefaults: Map<string, boolean | null> = new Map()
+let channelParentIds: Map<string, string | null> = new Map()
+let lastThreadDefaultsRefresh = 0
+const THREAD_DEFAULTS_REFRESH_INTERVAL = 60_000 // 60 seconds
+
 // Per-guild notification config (actions log + user feedback channel) — loaded from DB
 interface GuildNotificationConfig {
   actionsLogChannelId: string | null
   userFeedbackChannelId: string | null
+  defaultMonitorNewChannels: boolean
 }
 let guildNotificationConfig: Map<string, GuildNotificationConfig> = new Map()
 let lastNotificationConfigRefresh = 0
@@ -75,6 +101,15 @@ const recentFeedbackNotificationKeys: Map<string, number> = new Map()
 let compiledRules: CompiledRule[] = []
 let lastRulesRefresh = 0
 const RULES_REFRESH_INTERVAL = 30_000 // Refresh rules from DB every 30 seconds
+const REFRESH_RETRY_BACKOFF = {
+  baseDelayMs: 5_000,
+  maxDelayMs: 60_000,
+}
+const rulesRefreshBackoff = new RetryBackoff(REFRESH_RETRY_BACKOFF)
+const ignoredRolesRefreshBackoff = new RetryBackoff(REFRESH_RETRY_BACKOFF)
+const disabledChannelsRefreshBackoff = new RetryBackoff(REFRESH_RETRY_BACKOFF)
+const categoryDefaultsRefreshBackoff = new RetryBackoff(REFRESH_RETRY_BACKOFF)
+const notificationConfigRefreshBackoff = new RetryBackoff(REFRESH_RETRY_BACKOFF)
 
 // Delay between the user DM (with reactions) and the actual ban call.
 // Discord can silently strip reactions on a DM if the bot loses its only
@@ -82,11 +117,26 @@ const RULES_REFRESH_INTERVAL = 30_000 // Refresh rules from DB every 30 seconds
 // well within Discord's reaction-rate budget and gives the gateway enough
 // time to flush before the ban takes effect.
 const BAN_DELAY_AFTER_DM_MS = 2500
+const HISTORICAL_EDIT_ACTION_WINDOW_MS = 10 * 60 * 1000
+
+function shouldApplyActionsForEdit(oldMessage: Message | PartialMessage, newMessage: Message): boolean {
+  if (isRecentContentEdit({
+    createdTimestamp: newMessage.createdTimestamp,
+    editedTimestamp: newMessage.editedTimestamp,
+    content: newMessage.content,
+    previousContent: oldMessage.partial ? undefined : oldMessage.content,
+    previousEditedTimestamp: oldMessage.partial ? undefined : oldMessage.editedTimestamp,
+  })) {
+    return true
+  }
+
+  return Date.now() - newMessage.createdTimestamp <= HISTORICAL_EDIT_ACTION_WINDOW_MS
+}
 
 /**
  * Load rules from the database and compile them into RegExp objects.
  */
-async function refreshRules(): Promise<void> {
+async function refreshRules(): Promise<boolean> {
   try {
     const { data: groups, error: groupsError } = await supabase
       .from('guardian_rule_groups')
@@ -95,12 +145,13 @@ async function refreshRules(): Promise<void> {
 
     if (groupsError) {
       console.error('Failed to load rule groups:', groupsError.message)
-      return
+      return false
     }
 
     if (!groups || groups.length === 0) {
       compiledRules = []
-      return
+      lastRulesRefresh = Date.now()
+      return true
     }
 
     const groupMap = new Map<string, RuleGroup>()
@@ -116,7 +167,7 @@ async function refreshRules(): Promise<void> {
 
     if (rulesError) {
       console.error('Failed to load rules:', rulesError.message)
-      return
+      return false
     }
 
     const newCompiled: CompiledRule[] = []
@@ -147,8 +198,10 @@ async function refreshRules(): Promise<void> {
     if (newCompiled.length !== prevCount || prevCount === 0) {
       console.log(`Loaded ${compiledRules.length} rules from ${groups.length} groups`)
     }
+    return true
   } catch (err) {
     console.error('Error refreshing rules:', err)
+    return false
   }
 }
 
@@ -156,8 +209,9 @@ async function refreshRules(): Promise<void> {
  * Ensure rules are fresh (reload if stale).
  */
 async function ensureRules(): Promise<CompiledRule[]> {
-  if (Date.now() - lastRulesRefresh > RULES_REFRESH_INTERVAL) {
-    await refreshRules()
+  const now = Date.now()
+  if (now - lastRulesRefresh > RULES_REFRESH_INTERVAL && rulesRefreshBackoff.canAttempt(now)) {
+    await rulesRefreshBackoff.run(refreshRules)
   }
   return compiledRules
 }
@@ -165,7 +219,7 @@ async function ensureRules(): Promise<CompiledRule[]> {
 /**
  * Load ignored roles from DB.
  */
-async function refreshIgnoredRoles(): Promise<void> {
+async function refreshIgnoredRoles(): Promise<boolean> {
   try {
     const { data, error } = await supabase
       .from('guardian_server_roles')
@@ -174,21 +228,24 @@ async function refreshIgnoredRoles(): Promise<void> {
 
     if (error) {
       console.error('Failed to load ignored roles:', error.message)
-      return
+      return false
     }
 
     ignoredRoleKeys = new Set(
       (data || []).map(r => `${r.guild_id}:${r.role_id}`)
     )
     lastIgnoredRolesRefresh = Date.now()
+    return true
   } catch (err) {
     console.error('Error refreshing ignored roles:', err)
+    return false
   }
 }
 
 async function ensureIgnoredRoles(): Promise<Set<string>> {
-  if (Date.now() - lastIgnoredRolesRefresh > IGNORED_ROLES_REFRESH_INTERVAL) {
-    await refreshIgnoredRoles()
+  const now = Date.now()
+  if (now - lastIgnoredRolesRefresh > IGNORED_ROLES_REFRESH_INTERVAL && ignoredRolesRefreshBackoff.canAttempt(now)) {
+    await ignoredRolesRefreshBackoff.run(refreshIgnoredRoles)
   }
   return ignoredRoleKeys
 }
@@ -196,7 +253,7 @@ async function ensureIgnoredRoles(): Promise<Set<string>> {
 /**
  * Load disabled channels from DB.
  */
-async function refreshDisabledChannels(): Promise<void> {
+async function refreshDisabledChannels(): Promise<boolean> {
   try {
     const { data, error } = await supabase
       .from('guardian_server_channels')
@@ -205,37 +262,106 @@ async function refreshDisabledChannels(): Promise<void> {
 
     if (error) {
       console.error('Failed to load disabled channels:', error.message)
-      return
+      return false
     }
 
     disabledChannelKeys = new Set(
       (data || []).map(c => `${c.guild_id}:${c.channel_id}`)
     )
     lastDisabledChannelsRefresh = Date.now()
+    return true
   } catch (err) {
     console.error('Error refreshing disabled channels:', err)
+    return false
   }
 }
 
 async function ensureDisabledChannels(): Promise<Set<string>> {
-  if (Date.now() - lastDisabledChannelsRefresh > DISABLED_CHANNELS_REFRESH_INTERVAL) {
-    await refreshDisabledChannels()
+  const now = Date.now()
+  if (now - lastDisabledChannelsRefresh > DISABLED_CHANNELS_REFRESH_INTERVAL && disabledChannelsRefreshBackoff.canAttempt(now)) {
+    await disabledChannelsRefreshBackoff.run(refreshDisabledChannels)
   }
   return disabledChannelKeys
 }
 
 /**
+ * Load current category monitoring defaults from DB.
+ */
+async function refreshCategoryDefaults(): Promise<boolean> {
+  try {
+    const { data, error } = await supabase
+      .from('guardian_server_channels')
+      .select('guild_id, channel_id, is_monitored')
+      .eq('channel_type', ChannelType.GuildCategory)
+
+    if (error) {
+      console.error('Failed to load category defaults:', error.message)
+      return false
+    }
+
+    categoryMonitorDefaults = new Map(
+      (data || []).map(c => [`${c.guild_id}:${c.channel_id}`, c.is_monitored !== false])
+    )
+    lastCategoryDefaultsRefresh = Date.now()
+    return true
+  } catch (err) {
+    console.error('Error refreshing category defaults:', err)
+    return false
+  }
+}
+
+async function ensureCategoryDefaults(): Promise<Map<string, boolean>> {
+  const now = Date.now()
+  if (now - lastCategoryDefaultsRefresh > CATEGORY_DEFAULTS_REFRESH_INTERVAL && categoryDefaultsRefreshBackoff.canAttempt(now)) {
+    await categoryDefaultsRefreshBackoff.run(refreshCategoryDefaults)
+  }
+  return categoryMonitorDefaults
+}
+
+async function refreshThreadDefaults(): Promise<boolean> {
+  try {
+    const { data, error } = await supabase
+      .from('guardian_server_channels')
+      .select('guild_id, channel_id, parent_id, default_monitor_new_threads')
+
+    if (error) {
+      console.error('Failed to load thread defaults:', error.message)
+      return false
+    }
+
+    threadMonitorDefaults = new Map(
+      (data || []).map(row => [`${row.guild_id}:${row.channel_id}`, row.default_monitor_new_threads ?? null])
+    )
+    channelParentIds = new Map(
+      (data || []).map(row => [`${row.guild_id}:${row.channel_id}`, row.parent_id || null])
+    )
+    lastThreadDefaultsRefresh = Date.now()
+    return true
+  } catch (err) {
+    console.error('Error refreshing thread defaults:', err)
+    return false
+  }
+}
+
+async function ensureThreadDefaults(): Promise<void> {
+  const now = Date.now()
+  if (now - lastThreadDefaultsRefresh > THREAD_DEFAULTS_REFRESH_INTERVAL) {
+    await refreshThreadDefaults()
+  }
+}
+
+/**
  * Load per-guild notification channel config (actions log + user feedback).
  */
-async function refreshNotificationConfig(): Promise<void> {
+async function refreshNotificationConfig(): Promise<boolean> {
   try {
     const { data, error } = await supabase
       .from('guardian_bot_config')
-      .select('guild_id, actions_log_channel_id, user_feedback_channel_id')
+      .select('guild_id, actions_log_channel_id, user_feedback_channel_id, default_monitor_new_channels')
 
     if (error) {
       console.error('Failed to load notification config:', error.message)
-      return
+      return false
     }
 
     const next = new Map<string, GuildNotificationConfig>()
@@ -243,23 +369,54 @@ async function refreshNotificationConfig(): Promise<void> {
       next.set(row.guild_id, {
         actionsLogChannelId: row.actions_log_channel_id || null,
         userFeedbackChannelId: row.user_feedback_channel_id || null,
+        defaultMonitorNewChannels: row.default_monitor_new_channels !== false,
       })
     }
     guildNotificationConfig = next
     lastNotificationConfigRefresh = Date.now()
+    return true
   } catch (err) {
     console.error('Error refreshing notification config:', err)
+    return false
   }
 }
 
 async function ensureNotificationConfig(): Promise<void> {
-  if (Date.now() - lastNotificationConfigRefresh > NOTIFICATION_CONFIG_REFRESH_INTERVAL) {
-    await refreshNotificationConfig()
+  const now = Date.now()
+  if (now - lastNotificationConfigRefresh > NOTIFICATION_CONFIG_REFRESH_INTERVAL && notificationConfigRefreshBackoff.canAttempt(now)) {
+    await notificationConfigRefreshBackoff.run(refreshNotificationConfig)
   }
 }
 
 function getNotificationConfig(guildId: string): GuildNotificationConfig {
-  return guildNotificationConfig.get(guildId) || { actionsLogChannelId: null, userFeedbackChannelId: null }
+  return guildNotificationConfig.get(guildId) || { actionsLogChannelId: null, userFeedbackChannelId: null, defaultMonitorNewChannels: true }
+}
+
+/**
+ * Resolve the monitoring default for a newly discovered channel/category:
+ * inherit the parent category's current setting if known, otherwise fall
+ * back to the guild's "auto-monitor new channels" toggle.
+ */
+function resolveNewChannelDefault(guildId: string, parentId: string | null): boolean {
+  if (parentId) {
+    const categoryDefault = categoryMonitorDefaults.get(`${guildId}:${parentId}`)
+    if (categoryDefault !== undefined) return categoryDefault
+  }
+  return getNotificationConfig(guildId).defaultMonitorNewChannels
+}
+
+function resolveNewThreadDefault(guildId: string, parentId: string | null): boolean {
+  if (parentId) {
+    const channelDefault = threadMonitorDefaults.get(`${guildId}:${parentId}`)
+    if (channelDefault !== undefined && channelDefault !== null) return channelDefault
+
+    const categoryId = channelParentIds.get(`${guildId}:${parentId}`)
+    if (categoryId) {
+      const categoryDefault = threadMonitorDefaults.get(`${guildId}:${categoryId}`)
+      if (categoryDefault !== undefined && categoryDefault !== null) return categoryDefault
+    }
+  }
+  return getNotificationConfig(guildId).defaultMonitorNewChannels
 }
 
 /**
@@ -269,13 +426,13 @@ function isChannelDisabled(guildId: string, channelId: string): boolean {
   return disabledChannelKeys.has(`${guildId}:${channelId}`)
 }
 
-function getMonitoringChannelId(message: Message): string {
-  if (message.channel.isThread() && message.channel.parentId) {
-    // Thread messages (including forum posts) inherit monitoring setting
-    // from their parent channel to avoid per-thread configuration drift.
-    return message.channel.parentId
-  }
-  return message.channelId
+function messageSettingsSkipReason(message: Message): SettingsSkipReason | null {
+  return getSettingsSkipReason({
+    channelDisabled: isChannelDisabled(message.guildId || '', message.channelId),
+    parentChannelDisabled: message.channel.isThread() && !!message.channel.parentId &&
+      isChannelDisabled(message.guildId || '', message.channel.parentId),
+    ignoredRole: hasIgnoredRole(message),
+  })
 }
 
 /**
@@ -304,6 +461,7 @@ async function syncGuildChannels(client: Client): Promise<void> {
         ChannelType.GuildForum,
         ChannelType.GuildVoice,
         ChannelType.GuildStageVoice,
+        ChannelType.GuildCategory,
       ])
 
       const supportedThreadTypes = new Set<number>([
@@ -320,6 +478,7 @@ async function syncGuildChannels(client: Client): Promise<void> {
           channel_id: c!.id,
           channel_name: c!.name,
           channel_type: c!.type,
+          parent_id: c!.type === ChannelType.GuildCategory ? null : (c!.parentId || null),
           synced_at: new Date().toISOString(),
         }))
 
@@ -331,6 +490,7 @@ async function syncGuildChannels(client: Client): Promise<void> {
           channel_id: t.id,
           channel_name: t.name,
           channel_type: t.type,
+          parent_id: t.parentId || null,
           synced_at: new Date().toISOString(),
         }))
 
@@ -346,14 +506,16 @@ async function syncGuildChannels(client: Client): Promise<void> {
 
       if (allChannelRows.length === 0) continue
 
-      const { error } = await supabase
-        .from('guardian_server_channels')
-        .upsert(allChannelRows, { onConflict: 'guild_id,channel_id' })
-
-      if (error) {
-        console.error(`Failed to sync channels for guild ${guild.name}:`, error.message)
-      } else {
-        console.log(`Synced ${allChannelRows.length} channels for guild "${guild.name}"`)
+      try {
+        const changed = await syncGuardianChannelMetadata(guild.id, allChannelRows, row => {
+          const isThread = supportedThreadTypes.has(row.channel_type)
+          return isThread
+            ? resolveNewThreadDefault(guild.id, row.parent_id)
+            : resolveNewChannelDefault(guild.id, row.parent_id)
+        })
+        console.log(`Checked ${allChannelRows.length} channels for guild "${guild.name}"; changed ${changed}`)
+      } catch (err) {
+        console.error(`Failed to sync channels for guild ${guild.name}:`, err)
       }
     }
   } catch (err) {
@@ -383,14 +545,11 @@ async function syncGuildRoles(client: Client): Promise<void> {
 
       if (roleRows.length === 0) continue
 
-      const { error } = await supabase
-        .from('guardian_server_roles')
-        .upsert(roleRows, { onConflict: 'guild_id,role_id' })
-
-      if (error) {
-        console.error(`Failed to sync roles for guild ${guild.name}:`, error.message)
-      } else {
-        console.log(`Synced ${roleRows.length} roles for guild "${guild.name}"`)
+      try {
+        const changed = await syncGuardianRoleMetadata(guild.id, roleRows)
+        console.log(`Checked ${roleRows.length} roles for guild "${guild.name}"; changed ${changed}`)
+      } catch (err) {
+        console.error(`Failed to sync roles for guild ${guild.name}:`, err)
       }
     }
   } catch (err) {
@@ -573,7 +732,11 @@ async function scanMessage(message: Message, rules: CompiledRule[]): Promise<Mat
 
 // ─── Database Logging ─────────────────────────────────────────────────
 
-async function logMessage(message: Message, wasFlagged: boolean): Promise<void> {
+async function logMessage(
+  message: Message,
+  wasFlagged: boolean,
+  skipReason: SettingsSkipReason | null = null,
+): Promise<void> {
   try {
     const { messageType, hasAttachments, hasEmbeds, attachmentTypes, contentPreview } = classifyMessage(message)
     const channel = message.channel
@@ -602,6 +765,7 @@ async function logMessage(message: Message, wasFlagged: boolean): Promise<void> 
       author_username: message.author.username,
       content_preview: contentPreview,
       was_flagged: wasFlagged,
+      skip_reason: skipReason,
       scanned_at: new Date().toISOString(),
       message_type: messageType,
       has_attachments: hasAttachments,
@@ -630,7 +794,11 @@ async function logMessage(message: Message, wasFlagged: boolean): Promise<void> 
   }
 }
 
-async function logMessageEdit(message: Message, wasFlagged: boolean): Promise<void> {
+async function logMessageEdit(
+  message: Message,
+  wasFlagged: boolean,
+  skipReason: SettingsSkipReason | null = null,
+): Promise<void> {
   try {
     const { messageType, hasAttachments, hasEmbeds, attachmentTypes, contentPreview } = classifyMessage(message)
     const channel = message.channel
@@ -656,6 +824,7 @@ async function logMessageEdit(message: Message, wasFlagged: boolean): Promise<vo
       author_username: message.author.username,
       content_preview: contentPreview,
       was_flagged: wasFlagged,
+      skip_reason: skipReason,
       scanned_at: new Date().toISOString(),
       message_type: messageType,
       has_attachments: hasAttachments,
@@ -823,6 +992,28 @@ async function recordActionLog(
   }
 }
 
+async function hasSuccessfulActionForMessage(messageId: string, action: ActionKind): Promise<boolean> {
+  try {
+    const { data, error } = await supabase
+      .from('guardian_action_log')
+      .select('id')
+      .eq('message_id', messageId)
+      .eq('action', action)
+      .eq('success', true)
+      .limit(1)
+
+    if (error) {
+      console.error(`Failed to check prior ${action} action for message ${messageId}:`, error.message)
+      return false
+    }
+
+    return (data?.length || 0) > 0
+  } catch (err) {
+    console.error(`Failed to check prior ${action} action for message ${messageId}:`, err)
+    return false
+  }
+}
+
 /**
  * Execute delete + timeout actions. Ban is deliberately split out into
  * `executeBan` so the user DM can be sent BEFORE the ban -- once a user is
@@ -844,11 +1035,15 @@ async function executeActions(message: Message, match: MatchResult): Promise<Act
   // Delete the flagged message
   if (rule.actionDeleteMessage) {
     try {
-      await message.delete()
-      actions.push('deleted')
-      deleted = true
-      console.log(`[action] Deleted message ${message.id} by ${message.author.username}`)
-      await recordActionLog(message, match, 'delete', { success: true })
+      if (await hasSuccessfulActionForMessage(message.id, 'delete')) {
+        console.log(`[action] Skipping duplicate delete for message ${message.id}`)
+      } else {
+        await message.delete()
+        actions.push('deleted')
+        deleted = true
+        console.log(`[action] Deleted message ${message.id} by ${message.author.username}`)
+        await recordActionLog(message, match, 'delete', { success: true })
+      }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err)
       console.error(
@@ -865,11 +1060,15 @@ async function executeActions(message: Message, match: MatchResult): Promise<Act
   if (rule.actionTimeoutMember && message.member) {
     const durationSec = rule.actionTimeoutDuration || 60
     try {
-      await message.member.timeout(durationSec * 1000, `Guardian auto-timeout: matched rule group "${rule.groupName}"`)
-      actions.push('timeout')
-      timedOut = true
-      console.log(`[action] Timed out ${message.author.username} for ${durationSec}s`)
-      await recordActionLog(message, match, 'mute', { durationSeconds: durationSec, success: true })
+      if (await hasSuccessfulActionForMessage(message.id, 'mute')) {
+        console.log(`[action] Skipping duplicate timeout for message ${message.id}`)
+      } else {
+        await message.member.timeout(durationSec * 1000, `Guardian auto-timeout: matched rule group "${rule.groupName}"`)
+        actions.push('timeout')
+        timedOut = true
+        console.log(`[action] Timed out ${message.author.username} for ${durationSec}s`)
+        await recordActionLog(message, match, 'mute', { durationSeconds: durationSec, success: true })
+      }
     } catch (err) {
       const reason = err instanceof Error ? err.message : String(err)
       console.error(`[action] Failed to timeout ${message.author.username}:`, err)
@@ -881,7 +1080,7 @@ async function executeActions(message: Message, match: MatchResult): Promise<Act
   // has been delivered. We still mark the action as `banned` in the returned
   // actionsTaken string if the rule intends to ban, so downstream logging
   // and the DM reflect the intended outcome.
-  const willBan = !!(rule.actionBanMember && message.member)
+  const willBan = !!(rule.actionBanMember && message.member && !(await hasSuccessfulActionForMessage(message.id, 'ban')))
   if (willBan) actions.push('banned')
 
   return { actionsTaken: actions.join(','), deleted, timedOut, banned: willBan }
@@ -1353,6 +1552,23 @@ const client = new Client({
   allowedMentions: { parse: [] },
 })
 
+const banRegistry = new BanRegistryWorker({
+  database: supabase,
+  client,
+  isLeader,
+  instanceId: INSTANCE_ID,
+})
+const banPreview = new BanPreviewWorker({
+  database: supabase,
+  client,
+  isLeader,
+  instanceId: INSTANCE_ID,
+})
+
+client.on(Events.GuildCreate, () => banRegistry.requestRecovery())
+client.on(Events.ShardResume, () => banRegistry.requestRecovery())
+client.on(Events.ShardReady, () => banRegistry.requestRecovery())
+
 client.once(Events.ClientReady, async (readyClient) => {
   console.log(`Demon X online as ${readyClient.user.tag}`)
   console.log(`Watching ${readyClient.guilds.cache.size} guild(s)`)
@@ -1362,12 +1578,18 @@ client.once(Events.ClientReady, async (readyClient) => {
   // Discord events; followers stay connected but idle so they can take
   // over instantly when the lease becomes available.
   await startInstanceLock()
+  setInterval(() => {
+    banRegistry.tick().catch(error => console.error('[ban-registry] Queue tick failed:', error))
+    banPreview.tick().catch(error => console.error('[ban-preview] Queue tick failed:', error))
+  }, BAN_WORKER_INTERVAL_MS)
 
   // Initial rules load
   await refreshRules()
   await refreshIgnoredRoles()
   await refreshDisabledChannels()
+  await refreshCategoryDefaults()
   await refreshNotificationConfig()
+  await refreshThreadDefaults()
 
   // Sync guild roles & channels to DB for the Settings UI
   await syncGuildRoles(readyClient)
@@ -1385,12 +1607,90 @@ client.once(Events.ClientReady, async (readyClient) => {
   // Periodic disabled channels refresh
   setInterval(refreshDisabledChannels, DISABLED_CHANNELS_REFRESH_INTERVAL)
 
+  // Periodic category monitoring defaults refresh
+  setInterval(refreshCategoryDefaults, CATEGORY_DEFAULTS_REFRESH_INTERVAL)
+
+  // Periodic thread default refresh
+  setInterval(refreshThreadDefaults, THREAD_DEFAULTS_REFRESH_INTERVAL)
+
   // Periodic notification-config refresh
   setInterval(refreshNotificationConfig, NOTIFICATION_CONFIG_REFRESH_INTERVAL)
 
   // Re-sync guild roles & channels every 30 minutes
   setInterval(() => syncGuildRoles(readyClient), 30 * 60 * 1000)
   setInterval(() => syncGuildChannels(readyClient), 30 * 60 * 1000)
+})
+
+// New channel/category created -- apply the resolved monitoring default
+// immediately instead of waiting for the next periodic/manual sync.
+client.on(Events.ChannelCreate, async (channel) => {
+  if (!isLeader()) return
+  if (!('guild' in channel) || !channel.guild) return
+
+  const supportedTypes = new Set<number>([
+    ChannelType.GuildText,
+    ChannelType.GuildAnnouncement,
+    ChannelType.GuildForum,
+    ChannelType.GuildVoice,
+    ChannelType.GuildStageVoice,
+    ChannelType.GuildCategory,
+    ChannelType.PublicThread,
+    ChannelType.PrivateThread,
+    ChannelType.AnnouncementThread,
+  ])
+  if (!supportedTypes.has(channel.type)) return
+
+  const guildId = channel.guild.id
+  const isCategory = channel.type === ChannelType.GuildCategory
+  const isThread = channel.isThread()
+  const parentId = isCategory ? null : (channel.parentId || null)
+  // Settings can change between the periodic refreshes. Read the current
+  // category and guild defaults before assigning a state to this new channel.
+  await refreshCategoryDefaults()
+  await refreshNotificationConfig()
+  await refreshThreadDefaults()
+  const isMonitored = isThread
+    ? resolveNewThreadDefault(guildId, parentId)
+    : resolveNewChannelDefault(guildId, parentId)
+
+  try {
+    const { error } = await supabase
+      .from('guardian_server_channels')
+      .upsert(
+        {
+          guild_id: guildId,
+          guild_name: channel.guild.name,
+          channel_id: channel.id,
+          channel_name: channel.name,
+          channel_type: channel.type,
+          parent_id: parentId,
+          is_monitored: isMonitored,
+          synced_at: new Date().toISOString(),
+        },
+        { onConflict: 'guild_id,channel_id' }
+      )
+    if (error) {
+      console.error(`Failed to register new channel ${channel.name}:`, error.message)
+    } else {
+      // Keep the in-memory disabled-channel set in sync without waiting for
+      // the next periodic refresh, so scanning respects the new channel now.
+        if (!isMonitored) disabledChannelKeys.add(`${guildId}:${channel.id}`)
+        else disabledChannelKeys.delete(`${guildId}:${channel.id}`)
+        if (isCategory) categoryMonitorDefaults.set(`${guildId}:${channel.id}`, isMonitored)
+        channelParentIds.set(`${guildId}:${channel.id}`, parentId)
+        threadMonitorDefaults.set(`${guildId}:${channel.id}`, null)
+    }
+  } catch (err) {
+    console.error('Error handling channelCreate:', err)
+  }
+})
+
+client.on(Events.GuildMemberAdd, async member => {
+  try {
+    await banRegistry.enqueueJoin(member.guild.id, member.id)
+  } catch (error) {
+    console.error('[ban-registry] Join enforcement failed:', error)
+  }
 })
 
 client.on(Events.MessageCreate, async (message) => {
@@ -1402,20 +1702,16 @@ client.on(Events.MessageCreate, async (message) => {
 
   // Skip DMs -- only scan guild messages
   if (!message.guild) return
+  if (!isWithinHistoryWindow(message.createdTimestamp)) return
 
   try {
     const rules = await ensureRules()
     await ensureIgnoredRoles()
     await ensureDisabledChannels()
 
-    // Skip scanning if the channel has monitoring disabled
-    if (isChannelDisabled(message.guildId!, getMonitoringChannelId(message))) {
-      return
-    }
-
-    // Skip scanning if the author has a whitelisted role
-    if (hasIgnoredRole(message)) {
-      await logMessage(message, false)
+    const skipReason = messageSettingsSkipReason(message)
+    if (skipReason) {
+      await logMessage(message, false, skipReason)
       return
     }
 
@@ -1474,7 +1770,7 @@ client.on(Events.MessageCreate, async (message) => {
 })
 
 // Re-scan edited messages — prevents bypassing scam detection via edits
-client.on(Events.MessageUpdate, async (_oldMessage, newMessage) => {
+client.on(Events.MessageUpdate, async (oldMessage, newMessage) => {
   if (!isLeader()) return
   // Partials may lack content; fetch the full message
   if (newMessage.partial) {
@@ -1487,20 +1783,22 @@ client.on(Events.MessageUpdate, async (_oldMessage, newMessage) => {
 
   if (newMessage.author?.bot) return
   if (!newMessage.guild) return
+  if (!shouldProcessMessageUpdate({
+    createdTimestamp: newMessage.createdTimestamp,
+    editedTimestamp: newMessage.editedTimestamp,
+    content: newMessage.content,
+    previousContent: oldMessage.partial ? undefined : oldMessage.content,
+    previousEditedTimestamp: oldMessage.partial ? undefined : oldMessage.editedTimestamp,
+  })) return
 
   try {
     const rules = await ensureRules()
     await ensureIgnoredRoles()
     await ensureDisabledChannels()
 
-    // Skip scanning if the channel has monitoring disabled
-    if (isChannelDisabled(newMessage.guildId!, getMonitoringChannelId(newMessage as Message))) {
-      return
-    }
-
-    // Skip scanning if the author has a whitelisted role
-    if (hasIgnoredRole(newMessage as Message)) {
-      await logMessage(newMessage as Message, false)
+    const skipReason = messageSettingsSkipReason(newMessage)
+    if (skipReason) {
+      await logMessageEdit(newMessage, false, skipReason)
       return
     }
 
@@ -1521,6 +1819,16 @@ client.on(Events.MessageUpdate, async (_oldMessage, newMessage) => {
         `"${match.matchedText}" by ${newMessage.author!.username} ` +
         `(rule: ${match.rule.groupName}, source: ${match.sourceType})`
       )
+
+      const shouldApplyActions = shouldApplyActionsForEdit(oldMessage, newMessage as Message)
+      if (!shouldApplyActions) {
+        console.log(
+          `[action] Skipping auto-actions for historical edit/update on message ${newMessage.id} ` +
+          `by ${newMessage.author!.username}`
+        )
+        await logFlaggedMessage(newMessage as Message, match, true, 'flagged')
+        return
+      }
 
       await ensureNotificationConfig()
       const actions = await executeActions(newMessage as Message, match)
