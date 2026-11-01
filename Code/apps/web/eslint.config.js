@@ -12,10 +12,24 @@ export default tseslint.config(
       'react-refresh': reactRefresh,
     },
     rules: {
-      ...reactHooks.configs.recommended.rules,
+      // react-hooks v7 "recommended" bundles React Compiler diagnostics; adopting those is a
+      // separate refactor, so keep the v5-equivalent hook rules enforced for now.
+      'react-hooks/rules-of-hooks': 'error',
+      'react-hooks/exhaustive-deps': 'warn',
       'react-refresh/only-export-components': ['warn', { allowConstantExport: true }],
       '@typescript-eslint/no-unused-vars': ['error', { argsIgnorePattern: '^_', varsIgnorePattern: '^_', caughtErrorsIgnorePattern: '^_' }],
       '@typescript-eslint/no-explicit-any': 'error',
+    },
+  },
+  {
+    files: ['src/lib/resource-reconciliation.ts', 'src/hooks/use-list-presence.ts', 'src/hooks/use-resource-reconciliation.ts'],
+    rules: {
+      'no-restricted-imports': ['error', {
+        patterns: [{
+          group: ['**/api-client', '**/session-data-cache'],
+          message: 'Shared reconciliation and presence primitives must not own feature transport or cache persistence.',
+        }],
+      }],
     },
   },
   {

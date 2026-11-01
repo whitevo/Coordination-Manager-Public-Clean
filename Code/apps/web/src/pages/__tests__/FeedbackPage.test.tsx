@@ -1,4 +1,4 @@
-import '@testing-library/jest-dom'
+import '@testing-library/jest-dom/vitest'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
 import { render, screen, waitFor, fireEvent, act, within } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
@@ -73,11 +73,11 @@ function makeFeedbackResponse(attachments: string[] = []) {
   }
 }
 
-async function renderPage() {
+async function renderPage(route = '/feedback') {
   let result!: ReturnType<typeof render>
   await act(async () => {
     result = render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter initialEntries={[route]}>
         <FeedbackPage />
       </MemoryRouter>
     )
@@ -107,14 +107,14 @@ describe('FeedbackPage -- image lightbox', () => {
 
   it('lightbox is not visible on initial render', async () => {
     await renderPage()
-    expect(screen.queryByRole('img', { name: 'Preview' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('img', { name: 'Attachment preview' })).not.toBeInTheDocument()
   })
 
   it('clicking an attachment image opens the lightbox', async () => {
     await renderPage()
     const thumb = await screen.findByAltText('Attachment 1')
     await act(async () => { fireEvent.click(thumb) })
-    const preview = await screen.findByRole('img', { name: 'Preview' })
+    const preview = await screen.findByRole('img', { name: 'Attachment preview' })
     expect(preview).toBeInTheDocument()
     expect(preview).toHaveAttribute('src', IMAGE_URL)
   })
@@ -123,7 +123,7 @@ describe('FeedbackPage -- image lightbox', () => {
     await renderPage()
     const enlargeBtn = await screen.findByTitle('Enlarge')
     await act(async () => { fireEvent.click(enlargeBtn) })
-    const preview = await screen.findByRole('img', { name: 'Preview' })
+    const preview = await screen.findByRole('img', { name: 'Attachment preview' })
     expect(preview).toBeInTheDocument()
   })
 
@@ -131,10 +131,11 @@ describe('FeedbackPage -- image lightbox', () => {
     await renderPage()
     const thumb = await screen.findByAltText('Attachment 1')
     await act(async () => { fireEvent.click(thumb) })
-    expect(await screen.findByRole('img', { name: 'Preview' })).toBeInTheDocument()
-    await act(async () => { fireEvent.keyDown(window, { key: 'Escape' }) })
+    expect(await screen.findByRole('img', { name: 'Attachment preview' })).toBeInTheDocument()
+    const lightbox = screen.getByRole('dialog', { name: 'Image preview' })
+    await act(async () => { fireEvent.keyDown(lightbox, { key: 'Escape' }) })
     await waitFor(() => {
-      expect(screen.queryByRole('img', { name: 'Preview' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('img', { name: 'Attachment preview' })).not.toBeInTheDocument()
     })
   })
 
@@ -142,10 +143,10 @@ describe('FeedbackPage -- image lightbox', () => {
     await renderPage()
     const thumb = await screen.findByAltText('Attachment 1')
     await act(async () => { fireEvent.click(thumb) })
-    const closeBtn = await screen.findByTitle('Close')
+    const closeBtn = await screen.findByRole('button', { name: 'Close preview' })
     await act(async () => { fireEvent.click(closeBtn) })
     await waitFor(() => {
-      expect(screen.queryByRole('img', { name: 'Preview' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('img', { name: 'Attachment preview' })).not.toBeInTheDocument()
     })
   })
 
@@ -153,12 +154,12 @@ describe('FeedbackPage -- image lightbox', () => {
     await renderPage()
     const thumb = await screen.findByAltText('Attachment 1')
     await act(async () => { fireEvent.click(thumb) })
-    const preview = await screen.findByRole('img', { name: 'Preview' })
-    // The overlay is the grandparent of the preview image (overlay > button + img)
+    const preview = await screen.findByRole('img', { name: 'Attachment preview' })
+    // The area around the image (the lightbox panel) acts as the scrim
     const overlay = preview.parentElement as HTMLElement
     await act(async () => { fireEvent.click(overlay) })
     await waitFor(() => {
-      expect(screen.queryByRole('img', { name: 'Preview' })).not.toBeInTheDocument()
+      expect(screen.queryByRole('img', { name: 'Attachment preview' })).not.toBeInTheDocument()
     })
   })
 
@@ -166,10 +167,10 @@ describe('FeedbackPage -- image lightbox', () => {
     await renderPage()
     const thumb = await screen.findByAltText('Attachment 1')
     await act(async () => { fireEvent.click(thumb) })
-    const preview = await screen.findByRole('img', { name: 'Preview' })
-    // The image calls stopPropagation, so clicking it should keep lightbox open
+    const preview = await screen.findByRole('img', { name: 'Attachment preview' })
+    // Only clicks on the area around the image close the lightbox
     await act(async () => { fireEvent.click(preview) })
-    expect(screen.getByRole('img', { name: 'Preview' })).toBeInTheDocument()
+    expect(screen.getByRole('img', { name: 'Attachment preview' })).toBeInTheDocument()
   })
 })
 
@@ -212,5 +213,223 @@ describe('FeedbackPage -- page renders', () => {
     expect(
       screen.getByPlaceholderText(/report a bug, suggest a feature/i)
     ).toBeInTheDocument()
+  })
+})
+
+// -- Status change motion + next-page prefetch (stateful mock server) --------
+
+interface ServerRow { id: string; status: string; created_at: string }
+
+const STATUS_ORDER = ['open', 'reviewed', 'affirmed', 'resolved', 'dismissed']
+
+function makeRow(row: ServerRow) {
+  return {
+    ...row,
+    user_id: 'user-2',
+    discord_user_id: null,
+    discord_username: null,
+    user_display_name: `User ${row.id}`,
+    user_email: null,
+    user_avatar_url: null,
+    message: `Message ${row.id}`,
+    source: 'web',
+    attachments: [],
+    feedback_responses: [],
+  }
+}
+
+function installServer(rows: ServerRow[], options: { failPatch?: boolean; savedStatusOrder?: string[] } = {}) {
+  const server = rows.map(row => ({ ...row }))
+  vi.mocked(apiClient.get).mockImplementation(async (_url, config) => {
+    const params = config?.params
+    const pageNum = Number(
+      typeof params === 'object' && params !== null && 'page' in params
+        ? params.page
+        : '1'
+    )
+    const limit = Number(
+      typeof params === 'object' && params !== null && 'limit' in params
+        ? params.limit
+        : '5'
+    )
+    const statusOrder: string[] = typeof params === 'object' && params !== null && 'statusOrder' in params
+      ? JSON.parse(String(params.statusOrder))
+      : STATUS_ORDER
+    const sorted = [...server].sort((a, b) => {
+      const byStatus = statusOrder.indexOf(a.status) - statusOrder.indexOf(b.status)
+      return byStatus !== 0 ? byStatus : Date.parse(b.created_at) - Date.parse(a.created_at)
+    })
+    return {
+      data: {
+        feedback: sorted.slice((pageNum - 1) * limit, pageNum * limit).map(makeRow),
+        total: sorted.length,
+        statusCounts: {
+          open: server.filter(r => r.status === 'open').length,
+          reviewed: server.filter(r => r.status === 'reviewed').length,
+        },
+        isAdmin: true,
+        savedStatusOrder: options.savedStatusOrder,
+      },
+    }
+  })
+  vi.mocked(apiClient.patch).mockImplementation(async (url: string, body?: unknown) => {
+    if (options.failPatch) throw new Error('boom')
+    const id = url.split('/').pop()
+    const row = server.find(r => r.id === id)
+    if (row && body && typeof body === 'object' && 'status' in body) row.status = String(body.status)
+    return { data: {} }
+  })
+}
+
+function pageRequests(pageNum: number) {
+  return vi.mocked(apiClient.get).mock.calls.filter(([, config]) =>
+    (config as { params?: Record<string, string> } | undefined)?.params?.page === String(pageNum))
+}
+
+function cardOrder() {
+  return screen.getAllByTestId(/^feedback-card-/).map(el => el.getAttribute('data-testid')?.replace('feedback-card-', ''))
+}
+
+async function renderAdminExpanded() {
+  await renderPage()
+  const toggle = await screen.findByRole('button', { name: /all feedback/i })
+  await act(async () => { fireEvent.click(toggle) })
+  await screen.findByTestId('feedback-card-a')
+}
+
+async function setStatus(id: string, label: string) {
+  const card = screen.getByTestId(`feedback-card-${id}`)
+  const step = within(card).getByTitle(`Set status to ${label}`)
+  await act(async () => { fireEvent.click(step) })
+}
+
+describe('FeedbackPage -- saved status order', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  const savedStatusOrder = ['resolved', 'reviewed', 'affirmed', 'open', 'dismissed']
+  const rows: ServerRow[] = [
+    { id: 'a', status: 'open', created_at: '2026-04-06T10:00:00Z' },
+    { id: 'b', status: 'open', created_at: '2026-04-05T10:00:00Z' },
+    { id: 'c', status: 'open', created_at: '2026-04-04T10:00:00Z' },
+    { id: 'd', status: 'open', created_at: '2026-04-03T10:00:00Z' },
+    { id: 'e', status: 'reviewed', created_at: '2026-04-02T10:00:00Z' },
+    { id: 'f', status: 'resolved', created_at: '2026-04-01T10:00:00Z' },
+  ]
+
+  it.each(['/feedback', '/feedback?tab=support'])(
+    'restores the saved order on returning to %s, including paginated cards',
+    async route => {
+      installServer(rows, { savedStatusOrder })
+      const firstVisit = await renderPage(route)
+      firstVisit.unmount()
+
+      await renderPage(route)
+      await act(async () => {
+        fireEvent.click(await screen.findByRole('button', { name: /all (feedback|support requests)/i }))
+      })
+      await waitFor(() => expect(cardOrder()).toEqual(['f', 'e', 'a', 'b', 'c']))
+      const orderByRow = screen.getByText('Order by:').parentElement
+      expect(orderByRow?.textContent).toBe('Order by:ResolvedAcknowledgedAffirmedReceivedDismissed')
+
+      await waitFor(() => expect(pageRequests(2).some(([, config]) => {
+        const params = config?.params
+        return typeof params === 'object' && params !== null && 'statusOrder' in params
+          && params.statusOrder === JSON.stringify(savedStatusOrder)
+      })).toBe(true))
+      await act(async () => { fireEvent.click(screen.getAllByRole('button', { name: 'Next' })[0]) })
+      await waitFor(() => expect(cardOrder()).toEqual(['d']))
+
+      await act(async () => { fireEvent.click(screen.getByRole('radio', { name: '10' })) })
+      await waitFor(() => expect(cardOrder()).toEqual(['f', 'e', 'a', 'b', 'c', 'd']))
+    }
+  )
+
+  it.each([undefined, STATUS_ORDER])('does not refetch for an unchanged saved order (%s)', async savedOrder => {
+    installServer(rows.slice(0, 2), { savedStatusOrder: savedOrder })
+    await renderAdminExpanded()
+    expect(cardOrder()).toEqual(['a', 'b'])
+    expect(pageRequests(1)).toHaveLength(1)
+  })
+})
+
+describe('FeedbackPage -- status change motion', () => {
+  beforeEach(() => {
+    vi.clearAllMocks()
+  })
+
+  it('moves the card to its new slot without reloading the list', async () => {
+    installServer([
+      { id: 'a', status: 'open', created_at: '2026-04-05T10:00:00Z' },
+      { id: 'b', status: 'open', created_at: '2026-04-04T10:00:00Z' },
+      { id: 'c', status: 'reviewed', created_at: '2026-04-03T10:00:00Z' },
+      { id: 'd', status: 'resolved', created_at: '2026-04-02T10:00:00Z' },
+    ])
+    await renderAdminExpanded()
+    expect(cardOrder()).toEqual(['a', 'b', 'c', 'd'])
+
+    await setStatus('a', 'Acknowledged')
+    // Status changes in place first; the list is never replaced by the loader
+    expect(screen.queryByText('Loading feedback...')).not.toBeInTheDocument()
+    expect(cardOrder()).toEqual(['a', 'b', 'c', 'd'])
+    expect(within(screen.getByTestId('feedback-card-a')).getByTitle('Set status to Acknowledged').className).toContain('ring-1')
+
+    await waitFor(() => expect(cardOrder()).toEqual(['b', 'a', 'c', 'd']), { timeout: 3000 })
+    expect(screen.queryByText('Loading feedback...')).not.toBeInTheDocument()
+    expect(apiClient.patch).toHaveBeenCalledWith('/api/feedback/a', { status: 'reviewed' })
+  })
+
+  it('exits a card whose new position is past this page and backfills from the prefetched next page', async () => {
+    installServer([
+      { id: 'a', status: 'open', created_at: '2026-04-06T10:00:00Z' },
+      { id: 'b', status: 'open', created_at: '2026-04-05T10:00:00Z' },
+      { id: 'c', status: 'open', created_at: '2026-04-04T10:00:00Z' },
+      { id: 'd', status: 'open', created_at: '2026-04-03T10:00:00Z' },
+      { id: 'e', status: 'open', created_at: '2026-04-02T10:00:00Z' },
+      { id: 'f', status: 'open', created_at: '2026-04-01T10:00:00Z' },
+    ])
+    await renderAdminExpanded()
+    await waitFor(() => expect(pageRequests(2).length).toBe(1))
+
+    await setStatus('a', 'Resolved')
+    expect(screen.queryByText('Loading feedback...')).not.toBeInTheDocument()
+
+    await waitFor(() => expect(cardOrder()).toEqual(['b', 'c', 'd', 'e', 'f']), { timeout: 3000 })
+    expect(screen.queryByText('Loading feedback...')).not.toBeInTheDocument()
+  })
+
+  it('serves Next from the background prefetch without another request', async () => {
+    installServer([
+      { id: 'a', status: 'open', created_at: '2026-04-06T10:00:00Z' },
+      { id: 'b', status: 'open', created_at: '2026-04-05T10:00:00Z' },
+      { id: 'c', status: 'open', created_at: '2026-04-04T10:00:00Z' },
+      { id: 'd', status: 'open', created_at: '2026-04-03T10:00:00Z' },
+      { id: 'e', status: 'open', created_at: '2026-04-02T10:00:00Z' },
+      { id: 'f', status: 'open', created_at: '2026-04-01T10:00:00Z' },
+    ])
+    await renderAdminExpanded()
+    await waitFor(() => expect(pageRequests(2).length).toBe(1))
+
+    const [nextButton] = screen.getAllByRole('button', { name: 'Next' })
+    await act(async () => { fireEvent.click(nextButton) })
+
+    expect(screen.queryByText('Loading feedback...')).not.toBeInTheDocument()
+    expect(cardOrder()).toEqual(['f'])
+    expect(pageRequests(2).length).toBe(1)
+  })
+
+  it('rolls the status back in place when the update fails', async () => {
+    installServer([
+      { id: 'a', status: 'open', created_at: '2026-04-05T10:00:00Z' },
+      { id: 'b', status: 'reviewed', created_at: '2026-04-04T10:00:00Z' },
+    ], { failPatch: true })
+    await renderAdminExpanded()
+
+    await setStatus('a', 'Resolved')
+    expect(await screen.findByRole('alert')).toHaveTextContent('Could not update the status')
+    expect(cardOrder()).toEqual(['a', 'b'])
+    const card = screen.getByTestId('feedback-card-a')
+    expect(within(card).getByTitle('Set status to Received').className).toContain('ring-1')
   })
 })

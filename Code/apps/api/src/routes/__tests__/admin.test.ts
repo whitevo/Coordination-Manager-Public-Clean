@@ -42,6 +42,7 @@ vi.mock('../../supabaseClient.js', () => ({
 const MOCK_USER_ID = '550e8400-e29b-41d4-a716-446655440000'
 let mockUserRole = 'admin'
 let mockUserRoles = ['admin', 'user']
+let mockAuthAal = 'aal2'
 
 vi.mock('../../middleware/auth.js', () => ({
   authMiddleware: (req: any, _res: any, next: any) => {
@@ -49,9 +50,11 @@ vi.mock('../../middleware/auth.js', () => ({
     req.userEmail = 'admin@example.com'
     req.userRole = mockUserRole
     req.userRoles = mockUserRoles
+    req.authAal = mockAuthAal
     next()
   },
   hasRole: (req: any, role: string) => req.userRoles?.includes(role) ?? false,
+  hasMfaAssurance: (req: any) => req.authAal === 'aal2',
   AuthenticatedRequest: {},
 }))
 
@@ -92,6 +95,7 @@ describe('Admin Routes', () => {
     mockOrder.mockReturnThis()
     mockUserRole = 'admin'
     mockUserRoles = ['admin', 'user']
+    mockAuthAal = 'aal2'
     await createApp()
   })
 
@@ -129,6 +133,16 @@ describe('Admin Routes', () => {
 
       expect(res.status).toBe(403)
       expect(res.body.error).toContain('Admin role required')
+    })
+
+    it('rejects admin users without MFA assurance', async () => {
+      mockAuthAal = 'aal1'
+      await createApp()
+
+      const res = await request(app).get('/api/admin/users')
+
+      expect(res.status).toBe(403)
+      expect(res.body.error).toBe('ADMIN_MFA_REQUIRED')
     })
 
     it('respects pagination params', async () => {

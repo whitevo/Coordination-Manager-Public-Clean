@@ -5,6 +5,7 @@
     "ignoreDeprecations": "5.0",
     "module": "ESNext",
     "moduleResolution": "bundler",
+    "rewriteRelativeImportExtensions": true,
     "allowSyntheticDefaultImports": true
   },
   "include": ["vite.config.ts"]

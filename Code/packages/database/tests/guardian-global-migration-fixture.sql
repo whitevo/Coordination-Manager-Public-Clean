@@ -1,0 +1,17 @@
+BEGIN;
+DO $$ BEGIN
+  IF current_database() <> 'guardian_test' THEN RAISE EXCEPTION 'Requires guardian_test'; END IF;
+END $$;
+INSERT INTO public.users VALUES ('550e8400-e29b-41d4-a716-446655440000');
+INSERT INTO public.guardian_ban_entries(guild_id, discord_user_id, reason, created_by, requested_by,
+  requested_by_discord_id, created_at, is_enabled)
+VALUES
+  ('123456789012345678', '223456789012345678', 'Old report',
+   '550e8400-e29b-41d4-a716-446655440000', '550e8400-e29b-41d4-a716-446655440000',
+   '423456789012345678', '2026-01-01T00:00:00Z', TRUE),
+  ('623456789012345678', '223456789012345678', 'Newer report',
+   '550e8400-e29b-41d4-a716-446655440000', '550e8400-e29b-41d4-a716-446655440000',
+   '423456789012345678', '2026-02-01T00:00:00Z', TRUE),
+  ('123456789012345678', '323456789012345678', 'Disabled report',
+   '550e8400-e29b-41d4-a716-446655440000', '550e8400-e29b-41d4-a716-446655440000',
+   '423456789012345678', '2026-01-01T00:00:00Z', FALSE);

@@ -1,5 +1,5 @@
 import dotenv from 'dotenv'
-dotenv.config()
+dotenv.config({ quiet: true })
 
 import {
   Client,
@@ -27,6 +27,10 @@ import {
 } from './supabase.js'
 import { sendDM, handleSubscribe, handleUnsubscribe, handleOptOut, wrapUrlsForEmbed } from './dm-flow.js'
 import type { DmDeps, DmSendResult } from './dm-flow.js'
+import { linkDiscordAccount } from './link-flow.js'
+import type { LinkDeps } from './link-flow.js'
+import { describeOptOutStatus, undoOptOuts } from './optout-flow.js'
+import { createDiscordDeleteDeps, deleteMessages, parseDeleteRequest } from './delete-flow.js'
 
 // ─── Config ───────────────────────────────────────────────────────────
 
@@ -57,7 +61,7 @@ if (!isSupabaseConfigured || !maybeSupabase) {
   console.warn(
     '[bot] Setup mode enabled -- missing Supabase config: ' + missingSupabaseEnvVars.join(', ') + '\n' +
     '      Discord bot database features are disabled until setup is complete.\n' +
-    '      Add SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY, then restart.'
+    '      Add SUPABASE_URL and SUPABASE_SECRET_KEY_LOCALHOST (NODE_ENV=production: SUPABASE_SECRET_KEY_PRODUCTION), then restart.'
   )
   process.exit(0)
 }
@@ -114,6 +118,15 @@ const commands = [
         .setDescription('Your feedback message')
         .setRequired(true)
     ),
+  new SlashCommandBuilder()
+    .setName('optout')
+    .setDescription('Manage DMs from Swarm Coordinator')
+    .addSubcommand(sub =>
+      sub.setName('status').setDescription('Show whether you have opted out of bot DMs')
+    )
+    .addSubcommand(sub =>
+      sub.setName('undo').setDescription('Remove your DM opt-outs and receive DMs again')
+    ),
 ]
 
 async function registerCommands() {
@@ -131,85 +144,17 @@ async function registerCommands() {
 
 // ─── Command Handlers ─────────────────────────────────────────────────
 
+function linkDeps(): LinkDeps {
+  return { supabase, syncGuildsForUser, frontendUrl: FRONTEND_URL }
+}
+
 async function handleLink(interaction: ChatInputCommandInteraction) {
   // Defer immediately — sync can take a while
   await interaction.deferReply({ flags: 64 }) // 64 = ephemeral
 
   const key = interaction.options.getString('key', true).trim()
-  const discordUserId = interaction.user.id
-  const discordUsername = interaction.user.tag
-
-  // Look up the key in the database
-  const { data: integration, error } = await supabase
-    .from('discord_integrations')
-    .select('*')
-    .eq('link_key', key)
-    .eq('is_active', true)
-    .single()
-
-  if (error || !integration) {
-    await interaction.editReply({ content: 'Invalid or expired link key. Please generate a new one from the platform.' })
-    return
-  }
-
-  // Check expiry
-  if (new Date(integration.link_key_expires_at) < new Date()) {
-    await interaction.editReply({ content: 'This link key has expired. Please generate a new one from the platform.' })
-    return
-  }
-
-  // Check if already verified by a different Discord user
-  if (integration.discord_user_id && integration.discord_user_id !== discordUserId) {
-    await interaction.editReply({ content: 'This link key is already used by another Discord account.' })
-    return
-  }
-
-  // Deactivate any other active integrations already linked to this Discord user
-  // (prevents unique constraint violation on discord_user_id)
-  await supabase
-    .from('discord_integrations')
-    .update({ is_active: false })
-    .eq('discord_user_id', discordUserId)
-    .eq('is_active', true)
-    .neq('id', integration.id)
-
-  // Update the integration with Discord info
-  const { error: updateError } = await supabase
-    .from('discord_integrations')
-    .update({
-      discord_user_id: discordUserId,
-      discord_username: discordUsername,
-      discord_avatar: interaction.user.displayAvatarURL(),
-      bot_verified: true,
-      bot_verified_at: new Date().toISOString(),
-    })
-    .eq('id', integration.id)
-
-  if (updateError) {
-    console.error('Failed to update integration:', updateError)
-    await interaction.editReply({ content: 'Something went wrong linking your account. Please try again.' })
-    return
-  }
-
-  // Auto-sync available channels for this user (runs in background after reply)
-  syncGuildsForUser(integration.id, integration.user_id, discordUserId).catch(err =>
-    console.error('Background sync failed:', err)
-  )
-
-  // Retroactive: backfill cm_user_id on all existing dm_calendar_invites for this Discord user
-  supabase
-    .from('dm_calendar_invites')
-    .update({ cm_user_id: integration.user_id, updated_at: new Date().toISOString() })
-    .eq('recipient_discord_id', discordUserId)
-    .is('cm_user_id', null)
-    .then(({ error: backfillErr }) => {
-      if (backfillErr) console.error('Failed to backfill cm_user_id on dm_calendar_invites:', backfillErr)
-    })
-
-  await interaction.editReply({
-    content: `Successfully linked! Your Discord account is now connected to the Coordination Manager platform. Channels are being synced -- go to the Announcements page to select where to post: ${FRONTEND_URL}/announcements?tab=discord`,
-    flags: MessageFlags.SuppressEmbeds,
-  })
+  const result = await linkDiscordAccount(linkDeps(), key, interaction.user)
+  await interaction.editReply({ content: result.message, flags: MessageFlags.SuppressEmbeds })
 }
 
 async function handleStatus(interaction: ChatInputCommandInteraction) {
@@ -293,6 +238,16 @@ async function handleChannels(interaction: ChatInputCommandInteraction) {
     ].join('\n'),
     flags: 64,
   })
+}
+
+// ─── /optout ──────────────────────────────────────────────────────────
+
+async function handleOptOutCommand(interaction: ChatInputCommandInteraction) {
+  const sub = interaction.options.getSubcommand()
+  const content = sub === 'undo'
+    ? await undoOptOuts({ supabase }, interaction.user.id)
+    : await describeOptOutStatus({ supabase }, interaction.user.id)
+  await interaction.reply({ content, flags: 64 })
 }
 
 // ─── /feedback ────────────────────────────────────────────────────────
@@ -380,7 +335,7 @@ async function handleDM(message: Message) {
           reason: 'dm_keyword',
         })
         // Duplicate insert is fine — means already opted out
-      await message.reply('✅ You\'ve been opted out of all DMs from Swarm Coordinator. You can undo this by using `/optout undo` in any server with this bot.')
+      await message.reply('✅ You\'ve been opted out of all DMs from Swarm Coordinator. You can undo this with `/optout undo` (here or in any server with this bot).')
     } catch {
       await message.reply('Something went wrong. Please try again.')
     }
@@ -389,59 +344,8 @@ async function handleDM(message: Message) {
 
   // Check if it looks like a link key (UUID-like or starts with 'sc-')
   if (content.startsWith('sc-') || /^[a-f0-9-]{20,}$/i.test(content)) {
-    const { data: integration } = await supabase
-      .from('discord_integrations')
-      .select('*')
-      .eq('link_key', content)
-      .eq('is_active', true)
-      .single()
-
-    if (!integration) {
-      await message.reply('Invalid or expired link key. Please generate a new one from the platform.')
-      return
-    }
-
-    if (new Date(integration.link_key_expires_at) < new Date()) {
-      await message.reply('This link key has expired. Please generate a new one from the platform.')
-      return
-    }
-
-    // Deactivate any other active integrations already linked to this Discord user
-    // (prevents unique constraint violation on discord_user_id)
-    await supabase
-      .from('discord_integrations')
-      .update({ is_active: false })
-      .eq('discord_user_id', message.author.id)
-      .eq('is_active', true)
-      .neq('id', integration.id)
-
-    const { error } = await supabase
-      .from('discord_integrations')
-      .update({
-        discord_user_id: message.author.id,
-        discord_username: message.author.tag,
-        discord_avatar: message.author.displayAvatarURL(),
-        bot_verified: true,
-        bot_verified_at: new Date().toISOString(),
-      })
-      .eq('id', integration.id)
-
-    if (error) {
-      await message.reply('Something went wrong. Please try again.')
-      return
-    }
-
-    // Retroactive: backfill cm_user_id on existing dm_calendar_invites for this Discord user
-    supabase
-      .from('dm_calendar_invites')
-      .update({ cm_user_id: integration.user_id, updated_at: new Date().toISOString() })
-      .eq('recipient_discord_id', message.author.id)
-      .is('cm_user_id', null)
-      .then(({ error: backfillErr }) => {
-        if (backfillErr) console.error('Failed to backfill cm_user_id on dm_calendar_invites:', backfillErr)
-      })
-
-    await message.reply(`Successfully linked! Your Discord account is now connected to the Coordination Manager platform. Channels are being synced -- go to the Announcements page to select where to post: <${FRONTEND_URL}/announcements?tab=discord>`)
+    const result = await linkDiscordAccount(linkDeps(), content, message.author)
+    await message.reply(result.message)
     return
   }
 
@@ -551,6 +455,11 @@ async function syncGuildsForUser(integrationId: string, userId: string, discordU
 
 const app = express()
 app.use(express.json())
+// Express 5 leaves req.body undefined when no parser matched; keep the Express 4 `{}` default.
+app.use((req, _res, next) => {
+  if (req.body === undefined) req.body = {}
+  next()
+})
 
 const BOT_API_PORT = parseInt(process.env.BOT_API_PORT || '3002', 10)
 
@@ -796,6 +705,24 @@ app.post('/guild-emojis', async (req, res) => {
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : 'Unknown error'
     res.status(500).json({ error: msg })
+  }
+})
+
+// Delete announcement messages the bot already posted (channel posts and DMs).
+// The API verifies the sender owns the schedule before calling this.
+app.post('/delete-messages', async (req, res) => {
+  const parsed = parseDeleteRequest(req.body)
+  if (!parsed.ok) {
+    return res.status(400).json({ error: parsed.error })
+  }
+  try {
+    const results = await deleteMessages(createDiscordDeleteDeps(client), parsed.items)
+    const failed = results.filter(r => !r.ok).length
+    console.log(`delete-messages: ${results.length - failed} deleted, ${failed} failed`)
+    res.json({ results })
+  } catch (err: unknown) {
+    console.error('delete-messages failed:', err instanceof Error ? err.message : 'Unknown error')
+    res.status(500).json({ error: 'Failed to delete messages' })
   }
 })
 
@@ -1392,7 +1319,7 @@ client.on(Events.InteractionCreate, async (interaction) => {
 
         if (!interaction.replied && !interaction.deferred) {
           await interaction.reply({
-            content: '✅ You\'ve been opted out. You won\'t receive further DMs from this sender through Swarm Coordinator.\n\nTo undo, use `/optout undo` in any server with this bot.',
+            content: '✅ You\'ve been opted out. You won\'t receive further DMs from this sender through Swarm Coordinator.\n\nTo undo, use `/optout undo` (here or in any server with this bot; it removes all your DM opt-outs).',
             flags: 64,
           })
         }
@@ -1425,6 +1352,9 @@ client.on(Events.InteractionCreate, async (interaction) => {
         break
       case 'feedback':
         await handleFeedback(interaction)
+        break
+      case 'optout':
+        await handleOptOutCommand(interaction)
         break
       default:
         await interaction.reply({ content: 'Unknown command.', ephemeral: true })

@@ -1,5 +1,5 @@
 import React, { createContext, useContext, useState, useEffect, useCallback, useRef } from 'react'
-import { supabase } from '../lib/supabase'
+import { isAuthPersistenceRemembered, setAuthPersistence, supabase } from '../lib/supabase'
 import {
   signInWithGoogle,
   signInAsTraveler,
@@ -12,6 +12,7 @@ import {
 } from '../lib/auth-service'
 import { signInWithCardanoWallet } from '../lib/cardano-wallet'
 import { STORAGE_KEY as TZ_STORAGE_KEY } from '../lib/use-timezones'
+import { recordActivity, hasExceededInactivityLimit, clearActivity } from '../lib/session-activity'
 import type { CardanoWalletId } from '../lib/cardano-types'
 import type { Session } from '@supabase/supabase-js'
 
@@ -22,9 +23,9 @@ interface AuthContextType {
   isAuthenticated: boolean
   isTraveler: boolean
   isCardano: boolean
-  login: () => Promise<void>
-  loginAsTraveler: (captchaToken?: string) => Promise<void>
-  loginWithCardano: (walletId: CardanoWalletId, captchaToken?: string) => Promise<void>
+  login: (rememberMe?: boolean) => Promise<void>
+  loginAsTraveler: (captchaToken?: string, rememberMe?: boolean) => Promise<void>
+  loginWithCardano: (walletId: CardanoWalletId, captchaToken?: string, rememberMe?: boolean) => Promise<void>
   registerWithManagedWallet: (wallet: { address: string; encryptedBlob: string; publicKeyHex: string }) => Promise<void>
   logout: () => Promise<void>
   updateProfile: (updates: { displayName?: string; timezone?: string; defaultReminderMinutes?: number }) => Promise<void>
@@ -32,6 +33,23 @@ interface AuthContextType {
 }
 
 const AuthContext = createContext<AuthContextType | undefined>(undefined)
+
+async function getInitialSessionWithTimeout(): Promise<Session | null> {
+  const result = await Promise.race([
+    supabase.auth.getSession(),
+    new Promise<null>((resolve) => setTimeout(() => resolve(null), 3000)),
+  ])
+
+  if (!result) {
+    return null
+  }
+
+  if (result.error) {
+    throw result.error
+  }
+
+  return result.data.session
+}
 
 export function AuthProvider({ children }: { children: React.ReactNode }) {
   const [user, setUser] = useState<AuthUser | null>(null)
@@ -84,20 +102,39 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }, 5000)
 
     // Get initial session
-    supabase.auth.getSession().then(({ data: { session: currentSession } }) => {
-      setSession(currentSession)
-      if (currentSession) {
-        initializedRef.current = true
-        loadUserProfile(currentSession).finally(() => {
+    getInitialSessionWithTimeout()
+      .then(async (currentSession) => {
+        // A persistent (localStorage) login is bounded by an inactivity window
+        // rather than staying valid indefinitely -- force a fresh login instead
+        // of silently restoring a long-dormant session.
+        if (currentSession && isAuthPersistenceRemembered() && hasExceededInactivityLimit()) {
+          clearActivity()
+          await supabase.auth.signOut({ scope: 'local' })
+          currentSession = null
+        }
+
+        setSession(currentSession)
+        if (currentSession) {
+          initializedRef.current = true
+          if (isAuthPersistenceRemembered()) recordActivity()
+          loadUserProfile(currentSession).finally(() => {
+            clearTimeout(safetyTimer)
+            setIsLoading(false)
+          })
+        } else {
+          initializedRef.current = true
           clearTimeout(safetyTimer)
           setIsLoading(false)
-        })
-      } else {
+        }
+      })
+      .catch((error) => {
+        console.warn('Supabase session initialization failed:', error)
         initializedRef.current = true
+        setSession(null)
+        setUser(null)
         clearTimeout(safetyTimer)
         setIsLoading(false)
-      }
-    })
+      })
 
     // Listen for auth state changes (login, logout, token refresh)
     const { data: { subscription } } = supabase.auth.onAuthStateChange(
@@ -116,6 +153,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
         if (event === 'INITIAL_SESSION') return
 
         if (currentSession) {
+          if (isAuthPersistenceRemembered()) recordActivity()
           await loadUserProfile(currentSession)
         } else {
           setUser(null)
@@ -131,8 +169,9 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, [loadUserProfile])
 
-  const handleLogin = useCallback(async () => {
+  const handleLogin = useCallback(async (rememberMe?: boolean) => {
     try {
+      if (typeof rememberMe === 'boolean') setAuthPersistence(rememberMe)
       await signInWithGoogle()
     } catch (err) {
       // AbortError is expected: signInWithOAuth redirects the page, which
@@ -142,7 +181,8 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     }
   }, [])
 
-  const handleLoginAsTraveler = useCallback(async (captchaToken?: string) => {
+  const handleLoginAsTraveler = useCallback(async (captchaToken?: string, rememberMe?: boolean) => {
+    if (typeof rememberMe === 'boolean') setAuthPersistence(rememberMe)
     const { session: travelerSession, user: travelerUser } = await signInAsTraveler(captchaToken)
     setSession(travelerSession)
     setUser(travelerUser)
@@ -156,12 +196,13 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     setUser(newUser)
   }, [])
 
-  const handleLoginWithCardano = useCallback(async (walletId: CardanoWalletId, captchaToken?: string) => {
+  const handleLoginWithCardano = useCallback(async (walletId: CardanoWalletId, captchaToken?: string, rememberMe?: boolean) => {
     // Suppress onAuthStateChange events during the login flow to prevent
     // the intermediate signOut({scope:'local'}) from clearing user/session
     // state and causing a flash of unauthenticated UI or a crash.
     walletLoginInProgressRef.current = true
     try {
+      if (typeof rememberMe === 'boolean') setAuthPersistence(rememberMe)
       const { session: cardanoSession, user: cardanoUser } = await signInWithCardanoWallet(walletId, captchaToken)
       setSession(cardanoSession)
       setUser(cardanoUser)
@@ -176,6 +217,7 @@ export function AuthProvider({ children }: { children: React.ReactNode }) {
     } catch (err) {
       console.error('Logout failed, forcing local cleanup:', err)
     }
+    clearActivity()
     // Always clear local state, even if the server-side signOut failed
     setUser(null)
     setSession(null)

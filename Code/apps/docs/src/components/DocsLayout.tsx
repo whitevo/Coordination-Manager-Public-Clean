@@ -1,10 +1,11 @@
 import { useState, useCallback, useEffect } from 'react'
-import { Outlet } from 'react-router-dom'
+import { Outlet, useMatch } from 'react-router-dom'
 import { Sidebar } from './Sidebar'
 import { TopBar } from './TopBar'
 import { AiSearchPanel } from './AiSearchPanel'
 
 export function DocsLayout() {
+  const isCatalogPage = useMatch('/design/catalog') !== null
   const [sidebarOpen, setSidebarOpen] = useState(false)
   const [aiPanelOpen, setAiPanelOpen] = useState(false)
 
@@ -63,7 +64,7 @@ export function DocsLayout() {
 
         {/* Main content */}
         <main className={`flex-1 min-w-0 transition-[margin] duration-300 ${aiPanelOpen ? 'lg:mr-96' : ''}`}>
-          <div className="max-w-4xl mx-auto px-6 py-10">
+          <div className={`mx-auto px-6 py-10 ${isCatalogPage ? 'w-full' : 'max-w-4xl'}`}>
             <Outlet />
           </div>
         </main>

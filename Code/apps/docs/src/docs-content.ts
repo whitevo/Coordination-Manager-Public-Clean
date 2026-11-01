@@ -10,7 +10,6 @@ import {
   Megaphone,
   MessageCircle,
   Code2,
-  Map,
   GraduationCap,
   Video,
   Network,
@@ -23,9 +22,14 @@ import {
   Sparkles,
   Clock3,
   CalendarDays,
+  Gauge,
+  Palette,
+  LayoutGrid,
+  ShieldAlert,
+  ListChecks,
 } from 'lucide-react'
 
-export type SectionId = 'general' | 'api' | 'guides' | 'legal' | 'proposals'
+export type SectionId = 'general' | 'api' | 'guides' | 'legal' | 'proposals' | 'design' | 'risk' | 'marketing'
 
 export interface SectionLink {
   label: string
@@ -71,7 +75,7 @@ export const sectionNavigation: SectionNavItem[] = [
     id: 'general',
     title: 'General',
     path: '/section/general',
-    description: 'Product overview, architecture, setup, and authentication.',
+    description: 'Product overview, workshops, architecture, setup, and authentication.',
     icon: BookOpen,
   },
   {
@@ -85,8 +89,15 @@ export const sectionNavigation: SectionNavItem[] = [
     id: 'guides',
     title: 'Guides',
     path: '/section/guides',
-    description: 'Examples, roadmap, workshops, and integration guides.',
+    description: 'Examples, integration guides, workshops, and contributor resources.',
     icon: Rocket,
+  },
+  {
+    id: 'design',
+    title: 'Design',
+    path: '/section/design',
+    description: 'Design tokens, component anatomy, and UI change governance.',
+    icon: Palette,
   },
   {
     id: 'legal',
@@ -96,11 +107,25 @@ export const sectionNavigation: SectionNavItem[] = [
     icon: Shield,
   },
   {
+    id: 'risk',
+    title: 'Risk & Ethics',
+    path: '/section/risk',
+    description: 'AI risk framework adoption and the live risk register.',
+    icon: ShieldAlert,
+  },
+  {
     id: 'proposals',
     title: 'Proposals',
     path: '/section/proposals',
     description: 'Draft proposals for product and platform direction.',
     icon: FileText,
+  },
+  {
+    id: 'marketing',
+    title: 'Marketing',
+    path: '/section/marketing',
+    description: 'Product directory listings and external product pages to keep up to date.',
+    icon: Megaphone,
   },
 ]
 
@@ -116,6 +141,12 @@ export const sectionLandingPages: Record<SectionId, SectionLandingPageData> = {
         path: '/overview',
         description: 'High-level summary, capabilities, and recommended entry points.',
         icon: BookOpen,
+      },
+      {
+        label: 'Workshops',
+        path: '/workshops',
+        description: 'Coordination sessions and planning materials.',
+        icon: GraduationCap,
       },
       {
         label: 'Architecture',
@@ -135,19 +166,26 @@ export const sectionLandingPages: Record<SectionId, SectionLandingPageData> = {
         description: 'Bearer tokens, scopes, and error handling basics.',
         icon: Key,
       },
+      {
+        label: 'Limits',
+        path: '/limits',
+        description: 'AI usage quotas, API rate limits, and mailbox operational limits.',
+        icon: Gauge,
+      },
     ],
     previewTitle: 'General docs snapshot',
     previewBullets: [
       'Platform overview and entry points',
       'Architecture and deployment context',
       'Setup, auth, and quick-start guidance',
+      'AI usage quotas and API rate limits',
     ],
   },
   api: {
     title: 'API Reference',
     eyebrow: 'Tooling and data',
-    summary: 'Endpoints for calendars, events, meetings, announcements, Discord, and feedback.',
-    intro: 'These pages document the core API surfaces that agents and integrations use to work with schedules, events, and user workflows.',
+    summary: 'Endpoints for calendars, events, meetings, announcements, Discord, mailbox, and feedback.',
+    intro: 'These pages document the core API surfaces that agents and integrations use to work with schedules, events, mail, and user workflows.',
     links: [
       {
         label: 'Calendars',
@@ -180,6 +218,12 @@ export const sectionLandingPages: Record<SectionId, SectionLandingPageData> = {
         icon: MessageCircle,
       },
       {
+        label: 'Mailbox',
+        path: '/api/mailbox',
+        description: 'Sync Gmail and Outlook mail, manage drafts, and automate inbox actions.',
+        icon: MessageCircle,
+      },
+      {
         label: 'Feedback',
         path: '/api/feedback',
         description: 'Capture and review product feedback from users and agents.',
@@ -189,7 +233,7 @@ export const sectionLandingPages: Record<SectionId, SectionLandingPageData> = {
     previewTitle: 'API surface snapshot',
     previewBullets: [
       'Calendars, meetings, and events',
-      'Announcements, Discord, and feedback',
+      'Announcements, Discord, mailbox, and feedback',
       'Agent-friendly read/write workflows',
     ],
   },
@@ -204,18 +248,6 @@ export const sectionLandingPages: Record<SectionId, SectionLandingPageData> = {
         path: '/examples',
         description: 'Python, JavaScript, and cURL examples for common tasks.',
         icon: Code2,
-      },
-      {
-        label: 'Roadmap',
-        path: '/roadmap',
-        description: 'What has shipped and where the platform could grow next.',
-        icon: Map,
-      },
-      {
-        label: 'Workshops',
-        path: '/workshops',
-        description: 'Coordination sessions and planning materials.',
-        icon: GraduationCap,
       },
       {
         label: 'Zoom Integration',
@@ -235,12 +267,37 @@ export const sectionLandingPages: Record<SectionId, SectionLandingPageData> = {
         description: 'Decision-making and collaboration patterns.',
         icon: Network,
       },
+      {
+        label: 'Mailbox Architecture Guide',
+        path: '/guides/mailbox-architecture',
+        description: 'Unified inbox sync model, data model, and security notes for the mailbox feature.',
+        icon: MessageCircle,
+      },
+      {
+        label: 'Testing Guide',
+        path: '/guides/testing',
+        description: 'Testing architecture, execution workflows, and suite coverage across the monorepo.',
+        icon: ListChecks,
+      },
+      {
+        label: 'UI State and Refresh Reliability',
+        path: '/guides/ui-state-reconciliation',
+        description: 'Collection ownership, guarded reads, motion contracts, and migration limits.',
+        icon: ListChecks,
+      },
+      {
+        label: 'Discord Guardian',
+        path: '/guides/discord-guardian',
+        description: 'Configure message scanning, moderation actions, and the user appeal process.',
+        icon: ShieldAlert,
+      },
     ],
     previewTitle: 'Guides snapshot',
     previewBullets: [
       'Examples and rollout guidance',
       'Workshop and review materials',
       'Integration walkthroughs and frameworks',
+      'Mailbox architecture and API surface',
     ],
   },
   legal: {
@@ -317,12 +374,91 @@ export const sectionLandingPages: Record<SectionId, SectionLandingPageData> = {
         description: 'Standards-first security artifacts and SBOM planning.',
         icon: Lock,
       },
+      {
+        label: 'Email Aliases (Deferred)',
+        path: '/proposals/email-aliases',
+        description: 'Deferred from active delivery and tracked as a governance proposal.',
+        icon: Lock,
+      },
     ],
     previewTitle: 'Proposal snapshot',
     previewBullets: [
-      'Three proposal documents',
+      'Four proposal documents',
       'Security, privacy, and video meeting ideas',
-      'Draft-only material for review',
+      'Draft-only material for review, including deferred mailbox aliases',
+    ],
+  },
+  design: {
+    title: 'Design System',
+    eyebrow: 'UI contract',
+    summary: 'The canonical vocabulary, design tokens, component anatomy, and governance workflow behind the web app UI.',
+    intro: 'Design consistency lives in Git, not in memory. These pages describe the written contract every UI change follows; new tokens, variants, and animations are proposed and reviewed first.',
+    links: [
+      {
+        label: 'Design System',
+        path: '/design/system',
+        description: 'Tokens, canonical vocabulary, page composition, and the change-proposal workflow.',
+        icon: Palette,
+      },
+      {
+        label: 'Component Catalog',
+        path: '/design/catalog',
+        description: 'Every component variant rendered live -- search, filter, and compare defaults vs drift.',
+        icon: LayoutGrid,
+      },
+    ],
+    previewTitle: 'Design snapshot',
+    previewBullets: [
+      'HSL token contract with user theme overlays',
+      'Canonical component vocabulary and anatomy',
+      'Review-first workflow for visual changes, validated with Playwright',
+    ],
+  },
+  risk: {
+    title: 'Risk & Ethics',
+    eyebrow: 'Accountability',
+    summary: 'How we assess and monitor product and AI risk -- a lightweight adoption of the AISSAE framework.',
+    intro: 'Coordination Manager uses AI for context and routing only, under human supervision. These pages document the framework subset we adopted, our classification profile, and the live risk register with scores and mitigations.',
+    links: [
+      {
+        label: 'AI Risk Framework',
+        path: '/risk/framework',
+        description: 'What we took from AISSAE, what we skipped, and how scoring works.',
+        icon: ShieldAlert,
+      },
+      {
+        label: 'Risk Register',
+        path: '/risk/register',
+        description: 'Twelve tracked risks across six domains, with impact/likelihood matrix and mitigations.',
+        icon: ListChecks,
+      },
+    ],
+    previewTitle: 'Risk snapshot',
+    previewBullets: [
+      'AISSAE taxonomy subset, six applicable domains',
+      'Supervised, static, non-persistent AI profile',
+      'Live register scored 2x(I+L) + (IxL)',
+      'Acceptable / Managed / Blocked zones with mitigations',
+    ],
+  },
+  marketing: {
+    title: 'Marketing',
+    eyebrow: 'Product visibility',
+    summary: 'Keep track of external product directory listings and where to review them.',
+    intro: 'This tracker records product listing pages so they can be revisited and updated as the product changes.',
+    links: [
+      {
+        label: 'Product Directory Listings',
+        path: '/marketing',
+        description: 'Review the product directories where Coordination Manager is listed.',
+        icon: Megaphone,
+      },
+    ],
+    previewTitle: 'Marketing snapshot',
+    previewBullets: [
+      'External product directory links',
+      'Listing status and review notes',
+      'A single place to add future product pages',
     ],
   },
 }

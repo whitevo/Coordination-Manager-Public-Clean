@@ -2,6 +2,9 @@ import { useState, useEffect, useMemo, useCallback } from 'react'
 import { useNavigate, useSearchParams } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { apiClient } from '../lib/api-client'
+import { AdminMfaPrompt } from '../components/AdminMfaPrompt'
+import { Button, Dialog, IconButton, ToggleButton } from '../components/ui'
+import { isAdminMfaRequiredError } from '../lib/admin-mfa'
 import { getPrimaryTimezone, formatDateInTimezone } from '../lib/timezone-data'
 import {
   Users,
@@ -55,6 +58,7 @@ export default function UserListPage() {
   const [users, setUsers] = useState<UserRecord[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [adminMfaRequired, setAdminMfaRequired] = useState(false)
   const [searchQuery, setSearchQuery] = useState(searchParams.get('search') || '')
   const [roleFilters, setRoleFilters] = useState<Set<RoleValue>>(new Set())
   const [statusFilters, setStatusFilters] = useState<Set<StatusValue>>(new Set())
@@ -100,11 +104,15 @@ export default function UserListPage() {
     setLoading(true)
     setError(null)
     try {
-      const res = await apiClient.get('/api/admin/users', {
-        headers: { Authorization: `Bearer ${session.access_token}` },
-      })
+      const res = await apiClient.get('/api/admin/users')
+      setAdminMfaRequired(false)
       setUsers(res.data.users || [])
     } catch (err) {
+      if (isAdminMfaRequiredError(err)) {
+        setAdminMfaRequired(true)
+        setError(null)
+        return
+      }
       setError((err as { response?: { data?: { error?: string } } }).response?.data?.error || 'Failed to load users')
     } finally {
       setLoading(false)
@@ -226,8 +234,6 @@ export default function UserListPage() {
       const endpoint = silenceAction === 'silence' ? '/api/admin/users/silence' : '/api/admin/users/unsilence'
       await apiClient.post(endpoint, {
         userIds: Array.from(selectedUsers),
-      }, {
-        headers: { Authorization: `Bearer ${session.access_token}` },
       })
       setShowSilenceConfirm(false)
       setSelectedUsers(new Set())
@@ -243,6 +249,10 @@ export default function UserListPage() {
     return users.some(u => selectedUsers.has(u.id) && getUserRoles(u).includes('admin'))
   }, [users, selectedUsers])
 
+  if (adminMfaRequired) {
+    return <AdminMfaPrompt onVerified={() => { setAdminMfaRequired(false); fetchUsers() }} onCancel={() => navigate('/settings?tab=profile')} />
+  }
+
   const selectedContainsSelf = selectedUsers.has(user?.id || '')
 
   const toggleModeratorRole = async (targetUser: UserRecord) => {
@@ -254,8 +264,6 @@ export default function UserListPage() {
       await apiClient.post('/api/admin/users/moderator', {
         userId: targetUser.id,
         enabled: !hasMod,
-      }, {
-        headers: { Authorization: `Bearer ${session.access_token}` },
       })
       await fetchUsers()
     } catch (err) {
@@ -275,7 +283,7 @@ export default function UserListPage() {
   return (
     <div className="container mx-auto px-4 py-8 max-w-6xl">
       <div className="flex items-center gap-3 mb-6">
-        <Users className="h-7 w-7 text-red-500" />
+        <Users className="h-7 w-7 text-danger" />
         <h1 className="text-2xl font-bold">User List</h1>
         <span className="text-sm text-muted-foreground">({users.length} total)</span>
       </div>
@@ -288,15 +296,16 @@ export default function UserListPage() {
           placeholder="Search by name, email, or user ID..."
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
-          className="w-full pl-9 pr-8 py-2 border border-border rounded-lg bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+          className="w-full pl-9 pr-8 py-2 border border-border rounded-lg bg-background text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
         />
         {searchQuery && (
-          <button
+          <IconButton
+            size="micro"
+            label="Clear search"
             onClick={() => setSearchQuery('')}
-            className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 text-muted-foreground hover:text-foreground rounded"
-          >
-            <X className="w-4 h-4" />
-          </button>
+            className="absolute right-2 top-1/2 -translate-y-1/2"
+            icon={<X />}
+          />
         )}
       </div>
 
@@ -305,33 +314,20 @@ export default function UserListPage() {
         {/* Role Filters */}
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider mr-1">Role</span>
-          <button
-            onClick={() => setRoleFilters(new Set())}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
-              roleFilters.size === 0
-                ? 'bg-primary/10 text-primary ring-1 ring-primary/30'
-                : 'bg-muted text-muted-foreground hover:bg-muted/80 hover:text-foreground'
-            }`}
+          <ToggleButton
+            size="compact"
+            pressed={roleFilters.size === 0}
+            onPressedChange={() => setRoleFilters(new Set())}
           >
             All
-          </button>
+          </ToggleButton>
           {([['admin', 'Admin'], ['moderator', 'Moderator'], ['oversight', 'Oversight'], ['user', 'User'], ['traveler', 'Traveler']] as [RoleValue, string][]).map(([value, label]) => (
-            <button
+            <ToggleButton
               key={value}
-              onClick={() => toggleFilter(setRoleFilters, value)}
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
-                roleFilters.has(value)
-                  ? value === 'admin'
-                    ? 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300 ring-1 ring-red-300 dark:ring-red-700'
-                    : value === 'moderator'
-                    ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/40 dark:text-indigo-300 ring-1 ring-indigo-300 dark:ring-indigo-700'
-                    : value === 'oversight'
-                    ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/40 dark:text-amber-300 ring-1 ring-amber-300 dark:ring-amber-700'
-                    : value === 'traveler'
-                    ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/40 dark:text-blue-300 ring-1 ring-blue-300 dark:ring-blue-700'
-                    : 'bg-primary/10 text-primary ring-1 ring-primary/30'
-                  : 'bg-muted text-muted-foreground hover:bg-muted/80 hover:text-foreground'
-              }`}
+              size="compact"
+              intent={value === 'admin' ? 'danger' : value === 'oversight' ? 'warning' : value === 'traveler' ? 'info' : 'primary'}
+              pressed={roleFilters.has(value)}
+              onPressedChange={() => toggleFilter(setRoleFilters, value)}
             >
               {value === 'admin' && <Shield className="w-3 h-3" />}
               {value === 'moderator' && <Shield className="w-3 h-3" />}
@@ -339,148 +335,129 @@ export default function UserListPage() {
               {value === 'user' && <UserCircle className="w-3 h-3" />}
               {value === 'traveler' && <Globe className="w-3 h-3" />}
               {label}
-            </button>
+            </ToggleButton>
           ))}
         </div>
 
         {/* Account Type Filters */}
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider mr-1">Account</span>
-          <button
-            onClick={() => setAccountFilters(new Set())}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
-              accountFilters.size === 0
-                ? 'bg-primary/10 text-primary ring-1 ring-primary/30'
-                : 'bg-muted text-muted-foreground hover:bg-muted/80 hover:text-foreground'
-            }`}
+          <ToggleButton
+            size="compact"
+            pressed={accountFilters.size === 0}
+            onPressedChange={() => setAccountFilters(new Set())}
           >
             All
-          </button>
+          </ToggleButton>
           {([['google', 'Google'], ['linked', 'Google + Cardano'], ['cardano', 'Cardano'], ['traveler', 'Traveler']] as [AccountValue, string][]).map(([value, label]) => (
-            <button
+            <ToggleButton
               key={value}
-              onClick={() => toggleFilter(setAccountFilters, value)}
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
-                accountFilters.has(value)
-                  ? 'bg-primary/10 text-primary ring-1 ring-primary/30'
-                  : 'bg-muted text-muted-foreground hover:bg-muted/80 hover:text-foreground'
-              }`}
+              size="compact"
+              pressed={accountFilters.has(value)}
+              onPressedChange={() => toggleFilter(setAccountFilters, value)}
             >
               {value === 'google' && <Mail className="w-3 h-3" />}
               {value === 'linked' && <><Mail className="w-3 h-3" /><Wallet className="w-3 h-3" /></>}
               {value === 'cardano' && <Wallet className="w-3 h-3" />}
               {value === 'traveler' && <Globe className="w-3 h-3" />}
               {label}
-            </button>
+            </ToggleButton>
           ))}
         </div>
 
         {/* Source Filters */}
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider mr-1">Source</span>
-          <button
-            onClick={() => setSourceFilters(new Set())}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
-              sourceFilters.size === 0
-                ? 'bg-primary/10 text-primary ring-1 ring-primary/30'
-                : 'bg-muted text-muted-foreground hover:bg-muted/80 hover:text-foreground'
-            }`}
+          <ToggleButton
+            size="compact"
+            pressed={sourceFilters.size === 0}
+            onPressedChange={() => setSourceFilters(new Set())}
           >
             All
-          </button>
+          </ToggleButton>
           {([['localhost', 'Localhost'], ['production', 'Production'], ['unknown', 'Unknown']] as [SourceValue, string][]).map(([value, label]) => (
-            <button
+            <ToggleButton
               key={value}
-              onClick={() => toggleFilter(setSourceFilters, value)}
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
-                sourceFilters.has(value)
-                  ? value === 'localhost'
-                    ? 'bg-orange-100 text-orange-700 dark:bg-orange-900/40 dark:text-orange-300 ring-1 ring-orange-300 dark:ring-orange-700'
-                    : value === 'production'
-                    ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/40 dark:text-emerald-300 ring-1 ring-emerald-300 dark:ring-emerald-700'
-                    : 'bg-gray-100 text-gray-700 dark:bg-gray-900/40 dark:text-gray-300 ring-1 ring-gray-300 dark:ring-gray-700'
-                  : 'bg-muted text-muted-foreground hover:bg-muted/80 hover:text-foreground'
-              }`}
+              size="compact"
+              intent={value === 'localhost' ? 'warning' : value === 'production' ? 'success' : 'neutral'}
+              pressed={sourceFilters.has(value)}
+              onPressedChange={() => toggleFilter(setSourceFilters, value)}
             >
               {label}
-            </button>
+            </ToggleButton>
           ))}
         </div>
 
         {/* Status Filters */}
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-xs font-medium text-muted-foreground uppercase tracking-wider mr-1">Status</span>
-          <button
-            onClick={() => setStatusFilters(new Set())}
-            className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
-              statusFilters.size === 0
-                ? 'bg-primary/10 text-primary ring-1 ring-primary/30'
-                : 'bg-muted text-muted-foreground hover:bg-muted/80 hover:text-foreground'
-            }`}
+          <ToggleButton
+            size="compact"
+            pressed={statusFilters.size === 0}
+            onPressedChange={() => setStatusFilters(new Set())}
           >
             All
-          </button>
+          </ToggleButton>
           {([['active', 'Active'], ['silenced', 'Silenced']] as [StatusValue, string][]).map(([value, label]) => (
-            <button
+            <ToggleButton
               key={value}
-              onClick={() => toggleFilter(setStatusFilters, value)}
-              className={`inline-flex items-center gap-1.5 px-3 py-1.5 rounded-full text-xs font-medium transition-colors ${
-                statusFilters.has(value)
-                  ? value === 'silenced'
-                    ? 'bg-red-100 text-red-700 dark:bg-red-900/40 dark:text-red-300 ring-1 ring-red-300 dark:ring-red-700'
-                    : 'bg-primary/10 text-primary ring-1 ring-primary/30'
-                  : 'bg-muted text-muted-foreground hover:bg-muted/80 hover:text-foreground'
-              }`}
+              size="compact"
+              intent={value === 'silenced' ? 'danger' : 'primary'}
+              pressed={statusFilters.has(value)}
+              onPressedChange={() => toggleFilter(setStatusFilters, value)}
             >
               {value === 'silenced' && <VolumeX className="w-3 h-3" />}
               {label}
-            </button>
+            </ToggleButton>
           ))}
         </div>
       </div>
 
       {/* Selection Actions */}
       {selectedUsers.size > 0 && (
-        <div className="flex items-center gap-3 mb-4 p-3 bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 rounded-lg">
-          <span className="text-sm font-medium text-red-700 dark:text-red-300">
+        <div className="flex items-center gap-3 mb-4 p-3 bg-danger-subtle border border-danger-muted rounded-lg">
+          <span className="text-sm font-medium text-danger">
             {selectedUsers.size} user{selectedUsers.size !== 1 ? 's' : ''} selected
           </span>
           <div className="flex gap-2 ml-auto">
-            <button
+            <Button
+              intent="danger"
+              size="compact"
               onClick={() => {
                 setSilenceAction('silence')
                 setShowSilenceConfirm(true)
               }}
               disabled={selectedContainsAdmin || selectedContainsSelf}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-white bg-red-600 hover:bg-red-700 rounded-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
               title={selectedContainsAdmin ? 'Cannot silence admin accounts' : selectedContainsSelf ? 'Cannot silence yourself' : 'Silence selected users'}
+              icon={<VolumeX className="w-3.5 h-3.5" />}
             >
-              <VolumeX className="w-3.5 h-3.5" />
               Silence
-            </button>
-            <button
+            </Button>
+            <Button
+              emphasis="outline"
+              size="compact"
               onClick={() => {
                 setSilenceAction('unsilence')
                 setShowSilenceConfirm(true)
               }}
-              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-sm font-medium text-foreground bg-muted hover:bg-muted/80 border border-border rounded-lg transition-colors"
+              icon={<Volume2 className="w-3.5 h-3.5" />}
             >
-              <Volume2 className="w-3.5 h-3.5" />
               Unsilence
-            </button>
-            <button
+            </Button>
+            <Button
+              emphasis="ghost"
+              size="compact"
               onClick={() => setSelectedUsers(new Set())}
-              className="px-3 py-1.5 text-sm text-muted-foreground hover:text-foreground transition-colors"
             >
               Clear
-            </button>
+            </Button>
           </div>
         </div>
       )}
 
       {/* Error */}
       {error && (
-        <div className="p-4 mb-4 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 rounded-lg text-red-700 dark:text-red-300 text-sm">
+        <div className="p-4 mb-4 bg-danger-subtle border border-danger-muted rounded-lg text-danger text-sm">
           {error}
         </div>
       )}
@@ -507,15 +484,19 @@ export default function UserListPage() {
         <div className="border border-border rounded-lg overflow-clip">
           <table className="w-full text-sm">
             <thead className="sticky top-0 z-10">
-              <tr className="bg-muted/95 dark:bg-muted/95 backdrop-blur-sm border-b border-border">
+              <tr className="bg-muted/95 dark:bg-muted/95 backdrop-blur-xs border-b border-border">
                   <th className="px-3 py-3 text-left w-10">
-                    <button onClick={toggleSelectAll} className="text-muted-foreground hover:text-foreground">
-                      {selectedUsers.size === paginatedUsers.length && paginatedUsers.length > 0 ? (
-                        <CheckSquare className="w-4 h-4" />
+                    <IconButton
+                      size="micro"
+                      label="Select all users on this page"
+                      aria-pressed={selectedUsers.size === paginatedUsers.length && paginatedUsers.length > 0}
+                      onClick={toggleSelectAll}
+                      icon={selectedUsers.size === paginatedUsers.length && paginatedUsers.length > 0 ? (
+                        <CheckSquare />
                       ) : (
-                        <Square className="w-4 h-4" />
+                        <Square />
                       )}
-                    </button>
+                    />
                   </th>
                   <th className="px-3 py-3 text-left font-medium">User</th>
                   <th className="px-3 py-3 text-left font-medium hidden md:table-cell">Account</th>
@@ -531,21 +512,25 @@ export default function UserListPage() {
                   <tr
                     key={u.id}
                     className={`border-b border-border last:border-b-0 hover:bg-muted/30 transition-colors ${
-                      u.is_silenced ? 'bg-red-50/50 dark:bg-red-950/10' : ''
+                      u.is_silenced ? 'bg-danger-subtle' : ''
                     } ${selectedUsers.has(u.id) ? 'bg-primary/5' : ''}`}
                   >
                     <td className="px-3 py-3">
-                      <button onClick={() => toggleSelect(u.id)} className="text-muted-foreground hover:text-foreground">
-                        {selectedUsers.has(u.id) ? (
-                          <CheckSquare className="w-4 h-4 text-primary" />
+                      <IconButton
+                        size="micro"
+                        label={`Select ${getDisplayName(u)}`}
+                        aria-pressed={selectedUsers.has(u.id)}
+                        onClick={() => toggleSelect(u.id)}
+                        icon={selectedUsers.has(u.id) ? (
+                          <CheckSquare className="text-primary" />
                         ) : (
-                          <Square className="w-4 h-4" />
+                          <Square />
                         )}
-                      </button>
+                      />
                     </td>
                     <td className="px-3 py-3">
                       <div className="flex items-center gap-2.5">
-                        <div className="w-8 h-8 rounded-full flex items-center justify-center text-white text-xs font-medium overflow-hidden shrink-0 bg-gradient-to-br from-blue-500 to-purple-500">
+                        <div className="w-8 h-8 rounded-full flex items-center justify-center text-primary-foreground text-xs font-medium overflow-hidden shrink-0 bg-primary">
                           {u.avatar_url ? (
                             <img src={u.avatar_url} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }} />
                           ) : (
@@ -577,14 +562,14 @@ export default function UserListPage() {
                         {getUserRoles(u).map((r) => (
                           <span key={r} className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium ${
                             r === 'admin'
-                              ? 'bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300'
+                              ? 'bg-danger-subtle text-danger'
                               : r === 'moderator'
-                              ? 'bg-indigo-100 text-indigo-700 dark:bg-indigo-900/30 dark:text-indigo-300'
+                              ? 'bg-primary-subtle text-primary'
                               : r === 'oversight'
-                              ? 'bg-amber-100 text-amber-700 dark:bg-amber-900/30 dark:text-amber-300'
+                              ? 'bg-warning-subtle text-warning'
                               : r === 'traveler'
-                              ? 'bg-blue-100 text-blue-700 dark:bg-blue-900/30 dark:text-blue-300'
-                              : 'bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300'
+                              ? 'bg-info-subtle text-info'
+                              : 'bg-success-subtle text-success'
                           }`}>
                             {r === 'admin' && <Shield className="w-2.5 h-2.5" />}
                             {r === 'moderator' && <Shield className="w-2.5 h-2.5" />}
@@ -596,33 +581,31 @@ export default function UserListPage() {
                         ))}
                         {/* Moderator toggle button */}
                         {!getUserRoles(u).includes('admin') && (
-                          <button
+                          <Button
+                            emphasis="outline"
+                            intent={getUserRoles(u).includes('moderator') ? 'primary' : 'neutral'}
+                            size="micro"
                             onClick={() => toggleModeratorRole(u)}
                             disabled={moderatorToggling === u.id}
-                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium border transition-colors ${
-                              getUserRoles(u).includes('moderator')
-                                ? 'border-indigo-300 dark:border-indigo-700 text-indigo-600 dark:text-indigo-400 hover:bg-indigo-50 dark:hover:bg-indigo-900/20'
-                                : 'border-border text-muted-foreground hover:bg-accent hover:text-foreground'
-                            } disabled:opacity-50`}
                             title={getUserRoles(u).includes('moderator') ? 'Remove moderator role' : 'Grant moderator role'}
+                            icon={<Shield className="w-2.5 h-2.5" />}
                           >
-                            <Shield className="w-2.5 h-2.5" />
                             {moderatorToggling === u.id ? '...' : getUserRoles(u).includes('moderator') ? 'Remove Mod' : '+ Mod'}
-                          </button>
+                          </Button>
                         )}
                       </div>
                     </td>
                     <td className="px-3 py-3 hidden md:table-cell">
                       {u.signup_source === 'localhost' ? (
-                        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-orange-100 text-orange-700 dark:bg-orange-900/30 dark:text-orange-300">
+                        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-warning-subtle text-warning">
                           Localhost
                         </span>
                       ) : u.signup_source === 'production' ? (
-                        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300">
+                        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-success-subtle text-success">
                           Production
                         </span>
                       ) : (
-                        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-gray-100 text-gray-500 dark:bg-gray-800/30 dark:text-gray-400">
+                        <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-muted text-muted-foreground">
                           Unknown
                         </span>
                       )}
@@ -635,12 +618,12 @@ export default function UserListPage() {
                     </td>
                     <td className="px-3 py-3">
                       {u.is_silenced ? (
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-red-100 text-red-700 dark:bg-red-900/30 dark:text-red-300">
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-danger-subtle text-danger">
                           <VolumeX className="w-3 h-3" />
                           Silenced
                         </span>
                       ) : (
-                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-green-100 text-green-700 dark:bg-green-900/30 dark:text-green-300">
+                        <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-success-subtle text-success">
                           Active
                         </span>
                       )}
@@ -659,20 +642,21 @@ export default function UserListPage() {
             Page {currentPage} of {totalPages}
           </span>
           <div className="flex items-center gap-1">
-            <button
+            <Button
+              emphasis="outline"
+              size="compact"
               onClick={() => setCurrentPage(1)}
               disabled={currentPage === 1}
-              className="px-2.5 py-1.5 text-xs font-medium rounded-md border border-border bg-background hover:bg-muted transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             >
               First
-            </button>
-            <button
+            </Button>
+            <IconButton
+              emphasis="outline"
+              label="Previous page"
               onClick={() => setCurrentPage(p => Math.max(1, p - 1))}
               disabled={currentPage === 1}
-              className="inline-flex items-center px-2 py-1.5 rounded-md border border-border bg-background hover:bg-muted transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              <ChevronLeft className="w-4 h-4" />
-            </button>
+              icon={<ChevronLeft />}
+            />
             {Array.from({ length: totalPages }, (_, i) => i + 1)
               .filter(p => p === 1 || p === totalPages || Math.abs(p - currentPage) <= 2)
               .reduce<(number | 'ellipsis')[]>((acc, p, i, arr) => {
@@ -684,33 +668,33 @@ export default function UserListPage() {
                 item === 'ellipsis' ? (
                   <span key={`e${i}`} className="px-1.5 text-muted-foreground">...</span>
                 ) : (
-                  <button
+                  <Button
                     key={item}
+                    emphasis={currentPage === item ? 'solid' : 'outline'}
+                    intent={currentPage === item ? 'primary' : 'neutral'}
+                    size="compact"
+                    aria-current={currentPage === item ? 'page' : undefined}
                     onClick={() => setCurrentPage(item as number)}
-                    className={`px-2.5 py-1.5 text-xs font-medium rounded-md border transition-colors ${
-                      currentPage === item
-                        ? 'bg-primary text-primary-foreground border-primary'
-                        : 'border-border bg-background hover:bg-muted'
-                    }`}
                   >
                     {item}
-                  </button>
+                  </Button>
                 )
               )}
-            <button
+            <IconButton
+              emphasis="outline"
+              label="Next page"
               onClick={() => setCurrentPage(p => Math.min(totalPages, p + 1))}
               disabled={currentPage === totalPages}
-              className="inline-flex items-center px-2 py-1.5 rounded-md border border-border bg-background hover:bg-muted transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
-            >
-              <ChevronRight className="w-4 h-4" />
-            </button>
-            <button
+              icon={<ChevronRight />}
+            />
+            <Button
+              emphasis="outline"
+              size="compact"
               onClick={() => setCurrentPage(totalPages)}
               disabled={currentPage === totalPages}
-              className="px-2.5 py-1.5 text-xs font-medium rounded-md border border-border bg-background hover:bg-muted transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
             >
               Last
-            </button>
+            </Button>
           </div>
         </div>
       )}
@@ -724,14 +708,18 @@ export default function UserListPage() {
 
       {/* Silence Confirmation Modal */}
       {showSilenceConfirm && (
-        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
-          <div className="bg-card text-card-foreground rounded-lg p-6 max-w-md mx-4 shadow-xl border border-border">
-            <div className="flex items-center gap-2 mb-4">
-              <AlertTriangle className={`w-5 h-5 ${silenceAction === 'silence' ? 'text-red-500' : 'text-amber-500'}`} />
-              <h2 className="text-lg font-bold">
-                {silenceAction === 'silence' ? 'Silence Users?' : 'Unsilence Users?'}
-              </h2>
-            </div>
+        <Dialog
+          open
+          onClose={() => { if (!actionLoading) setShowSilenceConfirm(false) }}
+          title={
+            <span className="flex items-center gap-2">
+              <AlertTriangle className={`w-5 h-5 shrink-0 ${silenceAction === 'silence' ? 'text-danger' : 'text-warning'}`} />
+              {silenceAction === 'silence' ? 'Silence Users?' : 'Unsilence Users?'}
+            </span>
+          }
+          size="md"
+          closeOnScrimClick={false}
+        >
             {silenceAction === 'silence' ? (
               <div className="text-sm text-muted-foreground space-y-2 mb-6">
                 <p>
@@ -751,29 +739,26 @@ export default function UserListPage() {
               </p>
             )}
             <div className="flex gap-3 justify-end">
-              <button
+              <Button
+                emphasis="ghost"
                 onClick={() => setShowSilenceConfirm(false)}
                 disabled={actionLoading}
-                className="px-4 py-2 text-sm font-medium text-muted-foreground bg-muted rounded-lg hover:bg-muted/80 transition-colors"
               >
                 Cancel
-              </button>
-              <button
+              </Button>
+              <Button
+                intent={silenceAction === 'silence' ? 'danger' : 'primary'}
                 onClick={handleSilenceAction}
                 disabled={actionLoading}
-                className={`px-4 py-2 text-sm font-medium text-white rounded-lg transition-colors disabled:opacity-50 ${
-                  silenceAction === 'silence' ? 'bg-red-600 hover:bg-red-700' : 'bg-amber-600 hover:bg-amber-700'
-                }`}
               >
                 {actionLoading ? (
                   <Loader2 className="w-4 h-4 animate-spin" />
                 ) : (
                   silenceAction === 'silence' ? 'Silence' : 'Unsilence'
                 )}
-              </button>
+              </Button>
             </div>
-          </div>
-        </div>
+        </Dialog>
       )}
     </div>
   )

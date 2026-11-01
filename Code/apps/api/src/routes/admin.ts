@@ -1,7 +1,7 @@
 import { Router, Response, NextFunction } from 'express'
 import { supabaseAdmin } from '../supabaseClient.js'
-import { authMiddleware, AuthenticatedRequest, hasRole } from '../middleware/auth.js'
-import { sanitizeUUID } from '../middleware/validation.js'
+import { authMiddleware, AuthenticatedRequest, hasMfaAssurance, hasRole } from '../middleware/auth.js'
+import { sanitizeUUID, safeErrorMessage } from '../middleware/validation.js'
 import { getCaptchaStatus, setCaptchaOverride, getSignupTimestamps } from '../services/signup-rate-tracker.js'
 
 const router: ReturnType<typeof Router> = Router()
@@ -13,6 +13,14 @@ router.use(authMiddleware)
 function requireAdmin(req: AuthenticatedRequest, res: Response): boolean {
   if (!hasRole(req, 'admin')) {
     res.status(403).json({ error: 'Admin role required' })
+    return false
+  }
+  if (!hasMfaAssurance(req)) {
+    res.status(403).json({
+      error: 'ADMIN_MFA_REQUIRED',
+      message: 'Admin actions require a current multi-factor authenticated session.',
+      statusCode: 403,
+    })
     return false
   }
   return true
@@ -36,7 +44,7 @@ router.get('/users', async (req: AuthenticatedRequest, res: Response, next: Next
       .range(from, to)
 
     if (error) {
-      return res.status(500).json({ error: error.message })
+      return res.status(500).json({ error: safeErrorMessage(error) })
     }
 
     res.json({ users: users || [], total: count ?? 0, page, limit })
@@ -95,7 +103,7 @@ router.post('/users/silence', async (req: AuthenticatedRequest, res: Response, n
       .in('id', validatedIds)
 
     if (updateError) {
-      return res.status(500).json({ error: updateError.message })
+      return res.status(500).json({ error: safeErrorMessage(updateError) })
     }
 
     // Make all their public calendars unlisted
@@ -142,7 +150,7 @@ router.post('/users/unsilence', async (req: AuthenticatedRequest, res: Response,
       .in('id', validatedIds)
 
     if (updateError) {
-      return res.status(500).json({ error: updateError.message })
+      return res.status(500).json({ error: safeErrorMessage(updateError) })
     }
 
     res.json({ success: true, unsilencedCount: validatedIds.length })
@@ -191,7 +199,7 @@ router.post('/users/moderator', async (req: AuthenticatedRequest, res: Response,
       .eq('id', userId)
 
     if (updateError) {
-      return res.status(500).json({ error: updateError.message })
+      return res.status(500).json({ error: safeErrorMessage(updateError) })
     }
 
     res.json({ success: true, userId, roles: newRoles })
@@ -241,7 +249,7 @@ router.post('/moderator-overlay', async (req: AuthenticatedRequest, res: Respons
       .eq('id', req.userId)
 
     if (updateError) {
-      return res.status(500).json({ error: updateError.message })
+      return res.status(500).json({ error: safeErrorMessage(updateError) })
     }
 
     res.json({ success: true, roles: newRoles })
@@ -274,7 +282,7 @@ router.delete('/calendars/:hash', async (req: AuthenticatedRequest, res: Respons
       .eq('hash', hash)
 
     if (deleteError) {
-      return res.status(500).json({ error: deleteError.message })
+      return res.status(500).json({ error: safeErrorMessage(deleteError) })
     }
 
     res.json({ success: true, message: `Calendar "${calendar.title}" deleted` })
@@ -307,7 +315,7 @@ router.get('/oversight/account-log', async (req: AuthenticatedRequest, res: Resp
 
     const { data: accounts, error } = await accountQuery
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
 
     // Build daily histogram for the last 30 days
     const now = new Date()

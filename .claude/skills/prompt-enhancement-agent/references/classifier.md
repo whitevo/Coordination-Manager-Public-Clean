@@ -1,6 +1,6 @@
-# Classifier and Quick-Command Mode
+# Classifier and Quick Fix Mode
 
-Used by `prompt-enhancement-agent` step 1 to decide whether to run full
+Used by `prompt-enhancement-agent` step 2 to decide whether to run full
 scaffolding or fall back to a faster path.
 
 ## Intent Scoring
@@ -37,20 +37,14 @@ settings, "is that it?", "was that it?".
 - Critique-only prompts ("we lost the background color after some changes"):
   treat the implied To-Be as "restore prior behaviour"; build As-Is from git/blame.
 - Short imperative prompts ("Give the buttons the same color effect as the cards"):
-  still scaffold lightly if a shared component is involved, else Quick Fix.
+  one named file and one change = no scaffold, just do it; if a shared
+  component is involved, scaffold lightly.
 
-## Quick-Command Mode
+## Quick Fix Mode
 
-When scaffolding is skipped, tell the user how to keep iterations fast:
-
-```
-This looks like a focused change, so I'll skip the full analysis.
-For quick changes you can prefix requests to stay on the fast path:
-  /quick <task>      one focused change, no scaffolding
-  /test <file>       run tests for a file
-  /ask <question>    direct answer, no plan
-Reply "scaffold" anytime to get the full intent + As-Is/To-Be breakdown.
-```
+When scaffolding is skipped, say in one line that this looks like a focused
+change and the full analysis is skipped. The user can reply "scaffold" anytime
+to get the full intent + As-Is/To-Be breakdown.
 
 Quick Fix Mode rules:
 - Make the smallest correct change to the single named target

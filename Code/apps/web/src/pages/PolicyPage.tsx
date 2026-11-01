@@ -43,16 +43,16 @@ export default function PolicyPage() {
           </p>
           <ul className="text-sm text-muted-foreground mt-2 list-disc list-inside space-y-1">
             <li>
-              <Link to="/privacy" className="text-blue-600 hover:underline">Privacy Policy</Link>
+              <Link to="/privacy" className="text-primary hover:underline">Privacy Policy</Link>
             </li>
             <li>
-              <Link to="/terms" className="text-blue-600 hover:underline">Terms of Service</Link>
+              <Link to="/terms" className="text-primary hover:underline">Terms of Service</Link>
             </li>
             <li>
-              <Link to="/email-abuse" className="text-blue-600 hover:underline">Email Abuse Policy</Link>
+              <Link to="/email-abuse" className="text-primary hover:underline">Email Abuse Policy</Link>
             </li>
             <li>
-              <Link to="/trademark" className="text-blue-600 hover:underline">Trademark Policy</Link>
+              <Link to="/trademark" className="text-primary hover:underline">Trademark Policy</Link>
             </li>
           </ul>
         </section>
@@ -60,10 +60,10 @@ export default function PolicyPage() {
         <section className="mb-8">
           <h2 className="text-xl font-semibold mb-3">Contact</h2>
           <p className="text-sm text-muted-foreground leading-relaxed">
-            For policy questions: <a href="mailto:privacy@coordinationmanager.com" className="text-blue-600 hover:underline">privacy@coordinationmanager.com</a>
+            For policy questions: <a href="mailto:privacy@coordinationmanager.com" className="text-primary hover:underline">privacy@coordinationmanager.com</a>
           </p>
           <p className="text-sm text-muted-foreground leading-relaxed mt-2">
-            For legal/trademark inquiries: <a href="mailto:legal@coordinationmanager.com" className="text-blue-600 hover:underline">legal@coordinationmanager.com</a>
+            For legal/trademark inquiries: <a href="mailto:legal@coordinationmanager.com" className="text-primary hover:underline">legal@coordinationmanager.com</a>
           </p>
         </section>
       </article>

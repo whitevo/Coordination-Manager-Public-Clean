@@ -25,6 +25,7 @@
 		"security:check:full-history": "powershell -ExecutionPolicy Bypass -File ./scripts/security-check.ps1 -GitleaksFullHistory",
 		"security:check:fast": "powershell -ExecutionPolicy Bypass -File ./scripts/security-check.ps1 -SkipMonorepoTests -SkipGitleaks",
 		"security:premerge": "powershell -ExecutionPolicy Bypass -File ./scripts/security-premerge.ps1",
+		"verify:release": "powershell -NoProfile -ExecutionPolicy Bypass -File ./scripts/release-preflight.ps1",
 		"release:loop": "powershell -ExecutionPolicy Bypass -File ./scripts/release-open-source-loop.ps1",
 		"release:loop:no-ci": "powershell -ExecutionPolicy Bypass -File ./scripts/release-open-source-loop.ps1 -SkipGitHubActionsCheck",
 		"release:loop:prep": "powershell -ExecutionPolicy Bypass -File ./scripts/release-open-source-loop.ps1 -SkipGitHubActionsCheck -SkipLiveApiCheck",

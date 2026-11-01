@@ -20,7 +20,6 @@ pass before implementation:
 	- Quick start with stated assumptions
 
 Use skill guidance from:
-- `.claude/skills/session-first-message-clarity/SKILL.md`
 - `.claude/skills/prompt-enhancement-agent/SKILL.md`
 
 Skip this protocol only for pure factual questions or trivial one-line ops

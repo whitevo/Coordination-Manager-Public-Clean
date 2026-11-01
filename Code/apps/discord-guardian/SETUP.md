@@ -44,11 +44,17 @@ Fill in the values:
 | `DISCORD_BOT_TOKEN` | Bot token from Developer Portal | Bot tab > Reset Token |
 | `DISCORD_CLIENT_ID` | OAuth2 Client ID | OAuth2 tab |
 | `SUPABASE_URL` | Supabase project URL | Supabase Dashboard > Settings > API |
-| `SUPABASE_SERVICE_ROLE_KEY` | Service role key (full DB access) | Supabase Dashboard > Settings > API |
+| `SUPABASE_SECRET_KEY_LOCALHOST` | Same local secret API key as API/coordinator (full DB access) | Supabase Dashboard > Settings > API Keys |
+| `SUPABASE_SECRET_KEY_PRODUCTION` | Same production secret API key as API/coordinator (full DB access); requires `NODE_ENV=production` | Supabase Dashboard > Settings > API Keys |
 | `GUARDIAN_INSTANCE_LABEL` | *(optional)* Human-readable tag shown in logs, e.g. `local-dev` or `railway-prod`. Defaults to host name. | You choose |
 | `GUARDIAN_FORCE_TAKEOVER` | *(optional)* Set to `true` on a local instance to forcibly steal the leader lease from production so your local code handles events while production stays connected but idle. Leave unset in production. | You choose |
 
-**Important:** The bot uses the `service_role` key (not the anon key) because it needs to read/write the guardian tables directly, not through RLS policies.
+**Important:** The bot uses a privileged server secret (not an anon/public key)
+because it reads/writes Guardian tables directly. Use separate local/production
+keys; these still bypass RLS. `NODE_ENV=production` selects the production setting;
+other modes select localhost. The selected setting is required; legacy
+service-role fallback is not supported, and one environment never uses the
+other environment's key.
 
 ### Single-instance leader lease
 
@@ -99,7 +105,7 @@ The bot will connect to Discord and start scanning messages in all guilds it has
 3. Select the Coordination Manager repository
 4. In the service settings:
    - **Root Directory:** `Code/apps/discord-guardian`
-   - **Build Command:** `pnpm install && pnpm build` (auto-detected from nixpacks.toml)
+   - **Build Command:** `pnpm install && pnpm build` (set this explicitly; there is no nixpacks.toml for the guardian)
    - **Start Command:** `pnpm start` (auto-detected)
 
 ### Set Environment Variables
@@ -110,7 +116,8 @@ In the Railway service settings, add:
 DISCORD_BOT_TOKEN=your_bot_token
 DISCORD_CLIENT_ID=your_client_id
 SUPABASE_URL=your_supabase_url
-SUPABASE_SERVICE_ROLE_KEY=your_service_role_key
+NODE_ENV=production
+SUPABASE_SECRET_KEY_PRODUCTION=your_supabase_secret_api_key
 ```
 
 ### Deploy

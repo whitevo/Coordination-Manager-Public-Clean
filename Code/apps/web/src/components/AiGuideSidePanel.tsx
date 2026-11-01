@@ -1,6 +1,8 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
-import { useLocation, Link } from 'react-router-dom'
-import { X, Sparkles, Send, Loader2, Trash2, MessageSquare, ChevronDown, ChevronUp, CheckCircle, AlertTriangle, Info, Compass, Eye } from 'lucide-react'
+import { subscribeAiAssistantMessages } from '@/lib/ai-assistant-message-events'
+import { createPortal } from 'react-dom'
+import { useLocation, Link, useNavigate } from 'react-router-dom'
+import { X, Sparkles, Send, Loader2, Trash2, MessageSquare, CheckCircle, AlertTriangle, Info, Compass, Eye, ExternalLink } from 'lucide-react'
 import { apiClient } from '../lib/api-client'
 import { useAuth } from '../contexts/AuthContext'
 import { useAiAssistant } from '../contexts/AiAssistantContext'
@@ -9,7 +11,13 @@ import { AI_MODEL_OPTIONS, AI_ROLE_OPTIONS, resolveAiRole } from '../lib/theme-t
 import SentimentGrid from './SentimentGrid'
 import LearnerHelpIcon from './LearnerHelpIcon'
 import MobilePanelSwitcher from './MobilePanelSwitcher'
-import type { PanelId } from './FloatingPanels'
+import CalendarQuickButtonToggle from './CalendarQuickButtonToggle'
+import type { PanelId } from './panel-types'
+import { buildEvaluationFeedback, formatUnresolvedIssues } from '../lib/ai-evaluation'
+import { SHELL_LAYER_CLASS } from '../lib/overlay-layers'
+import { Button, Disclosure, IconButton } from './ui'
+import { AiUserMessage } from '@/components/ai-user-message'
+import { AI_MESSAGE_MAX_LENGTH, getAiMessageError } from '@/lib/ai-message'
 
 // ── Types ───────────────────────────────────────────────────────────────────────
 
@@ -18,6 +26,17 @@ interface ChatMessage {
   content: string
   timestamp: Date
   action?: string
+  cta?: { label: string; to: string }
+  ctas?: Array<{ label: string; to: string; retryPrompt?: string }>
+}
+
+const getActionLabel = (action?: string) => {
+  if (!action || action === 'none') return null
+  if (action === 'set_availability') return 'Applied'
+  if (action === 'clear_availability') return 'Cleared'
+  if (action === 'configure') return 'Configured'
+  if (action === 'configure_time_management') return 'Updated'
+  return action
 }
 
 interface SentimentState {
@@ -41,6 +60,9 @@ interface AiGuideSidePanelProps {
 }
 
 const SESSION_KEY = 'cm-ai-guide-messages'
+// Exported so pages (e.g. SettingsPage) can read/consume a pending retry
+// stashed by a CTA click before navigating here.
+export const PENDING_RETRY_KEY = 'cm-ai-guide-pending-retry'
 
 function loadMessages(): ChatMessage[] {
   try {
@@ -79,6 +101,16 @@ const PAGE_SUGGESTIONS: Record<string, { suggestions: string[]; placeholder: str
     ],
     placeholder: 'Ask about feedback...',
     description: 'I can help with feedback best practices and phrasing.',
+  },
+  '/mailbox': {
+    suggestions: [
+      'Based on this email, trash future messages like it and tag them Auto-delete',
+      'Tag every email from this sender as Newsletter and archive it',
+      'Preview a rule for invoices with PDF attachments',
+      'Apply this rule to newly imported mail too',
+    ],
+    placeholder: 'e.g. "based on current email, trash these and apply the auto-delete tag"',
+    description: 'I can read the email you have open and configure an automation rule for you -- conditions, actions, and tags -- then preview it against the emails currently visible. Active rules process newly synced messages once; use Run on all visible to reprocess existing messages.',
   },
   '/settings': {
     suggestions: [
@@ -122,13 +154,57 @@ const DEFAULT_SUGGESTIONS = [
 const DEFAULT_PLACEHOLDER = 'Ask me anything...'
 const DEFAULT_DESCRIPTION = 'I can help with app features, coordination philosophy, meeting best practices, and more. Form auto-fill is available on the Distribute Messages page.'
 
+const LINK_PATTERN = /(\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)|(https?:\/\/[^\s<]+))/g
+
+function renderLinks(text: string, keyPrefix: string) {
+  const parts: React.ReactNode[] = []
+  let lastIndex = 0
+  let match: RegExpExecArray | null
+  let linkIndex = 0
+
+  while ((match = LINK_PATTERN.exec(text)) !== null) {
+    if (match.index > lastIndex) {
+      parts.push(text.slice(lastIndex, match.index))
+    }
+
+    const markdownLabel = match[2]
+    const url = match[3] ?? match[4]
+    if (url) {
+      const trailingPunctuation = url.match(/[.,!?;:]+$/)?.[0] ?? ''
+      const href = trailingPunctuation ? url.slice(0, -trailingPunctuation.length) : url
+      parts.push(
+        <a
+          key={`${keyPrefix}-link-${linkIndex}`}
+          href={href}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="text-primary underline underline-offset-2 hover:text-primary/80"
+        >
+          {markdownLabel ?? href}
+        </a>,
+      )
+      if (trailingPunctuation) parts.push(trailingPunctuation)
+      linkIndex += 1
+    }
+    lastIndex = LINK_PATTERN.lastIndex
+  }
+
+  if (lastIndex < text.length) {
+    parts.push(text.slice(lastIndex))
+  }
+
+  return parts
+}
+
 export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSidePanelProps) {
   const { user, isAuthenticated } = useAuth()
-  const { pageContext } = useAiAssistant()
+  const { pageContext, assistantHost } = useAiAssistant()
   const location = useLocation()
+  const navigate = useNavigate()
   const [messages, setMessages] = useState<ChatMessage[]>(loadMessages)
   const [input, setInput] = useState('')
   const [sending, setSending] = useState(false)
+  const [sendingLabel, setSendingLabel] = useState('Thinking...')
   const [error, setError] = useState('')
   const [status, setStatus] = useState<AiStatus | null>(null)
   const [remaining, setRemaining] = useState<number | null>(null)
@@ -163,6 +239,23 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
     sessionStorage.setItem(SESSION_KEY, JSON.stringify(messages.filter(m => m.role !== 'system')))
   }, [messages])
 
+  // Lets a page post a written result (e.g. an automation run explanation) into the chat.
+  useEffect(() => {
+    const handler = (event: Event) => {
+      const detail = (event as CustomEvent<{ content?: string; action?: string; ctas?: Array<{ label: string; to: string; retryPrompt?: string }> }>).detail
+      const content = typeof detail?.content === 'string' ? detail.content.trim() : ''
+      if (!content) return
+      setMessages(prev => [...prev, {
+        role: 'assistant',
+        content,
+        timestamp: new Date(),
+        action: typeof detail?.action === 'string' ? detail.action : undefined,
+        ctas: Array.isArray(detail?.ctas) ? detail.ctas : undefined,
+      }])
+    }
+    return subscribeAiAssistantMessages(handler)
+  }, [])
+
   // Auto-focus input when panel opens
   useEffect(() => {
     if (isOpen) {
@@ -175,7 +268,7 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
     const el = inputRef.current
     if (!el) return
     el.style.height = '0px'
-    el.style.height = `${el.scrollHeight}px`
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`
   }, [input, isOpen])
 
   // Check AI status when panel opens (only for authenticated users)
@@ -187,8 +280,9 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
         setStatus(data)
         if (typeof data.remaining === 'number') setRemaining(data.remaining)
         if (typeof data.limit === 'number') setLimit(data.limit)
-      } catch {
-        setStatus({ available: false, provider: 'unknown', model: 'unknown' })
+      } catch (statusError) {
+        console.error('Unable to check AI availability and allowance:', statusError)
+        setError('Unable to check AI availability or your daily allowance. Please refresh the page and try again.')
       }
     }
     checkStatus()
@@ -212,17 +306,23 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
   const autoGrowTextarea = (el: HTMLTextAreaElement | null) => {
     if (!el) return
     el.style.height = '0px'
-    el.style.height = `${el.scrollHeight}px`
+    el.style.height = `${Math.min(el.scrollHeight, 160)}px`
   }
 
   // Core send logic — accepts explicit text so suggestion buttons can bypass stale state
   const doSend = useCallback(async (text: string) => {
-    if (!text || sending) return
+    if (!text.trim() || sending) return
+    const messageError = getAiMessageError(text)
+    if (messageError) {
+      setError(messageError)
+      return
+    }
 
     setError('')
     const userMessage: ChatMessage = { role: 'user', content: text, timestamp: new Date() }
     setMessages(prev => [...prev, userMessage])
     setInput('')
+    setSendingLabel('Thinking...')
     setSending(true)
 
     try {
@@ -231,7 +331,36 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
         const history = messages
           .filter((m): m is ChatMessage & { role: 'user' | 'assistant' } => m.role !== 'system')
           .map(m => ({ role: m.role, content: m.content }))
-        const result = await pageContext.onSubmit(text, history)
+        let result = await pageContext.onSubmit(text, history)
+
+        // Evaluate -> retry: if the page reports the change did not land, re-ask once with what went wrong.
+        let selfCorrected = false
+        const firstEvaluation = result.evaluation
+        if (firstEvaluation && !firstEvaluation.ok && result.retryToken) {
+          setSendingLabel('Change not confirmed -- retrying with self-check feedback...')
+          try {
+            const retried = await pageContext.onSubmit(text, history, {
+              evaluationFeedback: buildEvaluationFeedback(result.message, firstEvaluation),
+              retryToken: result.retryToken,
+            })
+            result = { ...retried, systemPrompt: retried.systemPrompt ?? result.systemPrompt }
+            selfCorrected = true
+          } catch (retryErr) {
+            console.error('AI evaluated retry failed:', retryErr)
+          }
+        }
+
+        const firstApplied = selfCorrected ? firstEvaluation?.applied ?? [] : []
+        let content = result.message
+        if (firstApplied.length > 0) {
+          content += `\n\nAlso applied on the first attempt:\n- ${firstApplied.join('\n- ')}`
+        }
+        if (result.evaluation && !result.evaluation.ok) {
+          content += formatUnresolvedIssues(result.evaluation.issues)
+        } else if (selfCorrected) {
+          content += '\n\n(Self-check: the first attempt did not fully apply, so I retried automatically.)'
+        }
+
         const newMessages: ChatMessage[] = []
         if (result.systemPrompt) {
           newMessages.push({
@@ -242,11 +371,15 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
         }
         newMessages.push({
           role: 'assistant',
-          content: result.message,
+          content,
           timestamp: new Date(),
-          action: result.action,
+          action: firstApplied.length > 0 && (!result.action || result.action === 'none') ? 'Updated' : result.action,
+          cta: result.cta,
+          ctas: result.ctas,
         })
         setMessages(prev => [...prev, ...newMessages])
+        if (typeof result.remaining === 'number') setRemaining(result.remaining)
+        if (typeof result.limit === 'number') setLimit(result.limit)
       } else {
         // Default: general AI chat
         const history = messages
@@ -275,6 +408,8 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
           timestamp: new Date(),
         })
         setMessages(prev => [...prev, ...newMessages])
+        if (typeof data.remaining === 'number') setRemaining(data.remaining)
+        if (typeof data.limit === 'number') setLimit(data.limit)
 
         if (data.feedbackSubmitted?.submitted) {
           const fbCat = data.feedbackSubmitted.category || 'general'
@@ -287,7 +422,25 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
         }
       }
     } catch (err) {
-      const errorMsg = (err as { response?: { data?: { message?: string } } }).response?.data?.message || 'Failed to get a response. Please try again.'
+      const status = (err as { response?: { status?: number } }).response?.status
+      const responseData = (err as { response?: { data?: { message?: string; remaining?: number; limit?: number } } }).response?.data
+      if (typeof responseData?.remaining === 'number') setRemaining(responseData.remaining)
+      if (typeof responseData?.limit === 'number') setLimit(responseData.limit)
+      if (typeof responseData?.remaining !== 'number') {
+        try {
+          const { data } = await apiClient.get('/api/ai-chat/status')
+          if (typeof data.remaining === 'number') setRemaining(data.remaining)
+          if (typeof data.limit === 'number') setLimit(data.limit)
+        } catch (statusError) {
+          console.error('Unable to refresh AI allowance after a failed request:', statusError)
+        }
+      }
+      // apiClient already retries once with a refreshed token on 401; reaching here
+      // means the session genuinely could not be refreshed -- surface a friendly
+      // prompt instead of the raw backend auth message (e.g. "Missing authentication token").
+      const errorMsg = status === 401
+        ? 'Your session has expired. Please refresh the page and sign in again.'
+        : responseData?.message || 'Failed to get a response. Please try again.'
       setError(errorMsg)
     } finally {
       setSending(false)
@@ -296,8 +449,40 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
   }, [sending, messages, user, pageContext])
 
   const handleSend = useCallback(() => {
-    doSend(input.trim())
+    doSend(input)
   }, [input, doSend])
+
+  useEffect(() => {
+    if (!pageContext?.onSubmit || sending) return
+    const raw = sessionStorage.getItem(PENDING_RETRY_KEY)
+    if (!raw) return
+
+    try {
+      const pending = JSON.parse(raw) as { path?: string; prompt?: string }
+      if (pending.path !== location.pathname || !pending.prompt) return
+      sessionStorage.removeItem(PENDING_RETRY_KEY)
+      void doSend(pending.prompt)
+    } catch {
+      sessionStorage.removeItem(PENDING_RETRY_KEY)
+    }
+  }, [doSend, location.pathname, pageContext, sending])
+
+  const handleCtaClick = useCallback(async (cta: { to: string; retryPrompt?: string }) => {
+    if (pageContext?.beforeNavigate) {
+      try {
+        const canNavigate = await pageContext.beforeNavigate()
+        if (!canNavigate) return
+      } catch (err) {
+        // A failed pre-navigation save must never trap the user on the current page.
+        console.error('beforeNavigate failed; navigating anyway:', err)
+      }
+    }
+    if (cta.retryPrompt) {
+      const targetPath = cta.to.split('?')[0]
+      sessionStorage.setItem(PENDING_RETRY_KEY, JSON.stringify({ path: targetPath, prompt: cta.retryPrompt }))
+    }
+    navigate(cta.to)
+  }, [navigate, pageContext])
 
   const clearChat = () => {
     setMessages([])
@@ -382,7 +567,7 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
               if (bp.startsWith('**') && bp.endsWith('**')) {
                 return <strong key={`${j}-${k}`}>{bp.slice(2, -2)}</strong>
               }
-              return <span key={`${j}-${k}`}>{bp}</span>
+              return <span key={`${j}-${k}`}>{renderLinks(bp, `${i}-${j}-${k}`)}</span>
             })
           })}
         </span>
@@ -396,25 +581,16 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
     return opt ? `${opt.provider} · ${opt.label}` : ''
   })()
 
-  return (
+  const panelBody = (
     <>
-      {/* Panel */}
-      <aside
-        className={`
-          fixed inset-y-0 right-0 z-50 w-screen transition-transform duration-300 ease-in-out
-          ${isOpen ? 'translate-x-0 pointer-events-auto sm:w-[22rem] md:w-96' : 'translate-x-full pointer-events-none sm:w-0'}
-          sm:sticky sm:top-0 sm:h-screen sm:shrink-0 sm:overflow-hidden sm:translate-x-0 sm:pointer-events-auto
-        `}
-      >
-      <div className={`ml-auto h-full w-screen flex flex-col bg-card border-l border-border shadow-xl sm:w-[22rem] sm:min-w-[22rem] md:w-96 md:min-w-[24rem]`}>
         {/* Header */}
-        <div className="px-4 py-3 border-b border-border flex-shrink-0">
+        <div className="px-4 py-3 border-b border-border shrink-0">
           <div className="flex items-center justify-between">
           <div className="flex items-center gap-2">
-            <Sparkles className="w-5 h-5 text-purple-500" />
+            <Sparkles className="w-5 h-5 text-feature-ai" />
             <div>
               <span className="text-sm font-semibold text-foreground">AI Assistant</span>
-              <LearnerHelpIcon size={4} description={<><p className="font-semibold text-blue-700 dark:text-blue-300 mb-1">Side Panel - AI Assistant</p><p className="mb-1.5">Side panels slide in from the right on every page, giving you quick access to conversational tools without leaving what you're doing.</p><p className="mb-1.5">The AI Assistant adapts its <strong>role</strong> based on which page you are on. There are three roles:</p><ul className="list-disc pl-4 mb-1.5 space-y-1"><li><strong>Guider</strong> - General-purpose guide. Explains features, answers questions about coordination philosophy, and helps with onboarding. Active on most pages.</li><li><strong>Composer</strong> - Message specialist. Helps draft messages, configure distribution targets, create polls, and refine content. Active on the Distribute Messages page.</li><li><strong>Operator</strong> - Operational assistant for Calendar and Time Management. Interprets natural-language commands to set availability, adjust time ranges, configure calendar parameters, and update left-side Time Management tools.</li></ul><p>The current role is highlighted in the header. The role switches automatically when you navigate between pages.</p></>} />
+              <LearnerHelpIcon size={4} description={<><p className="font-semibold text-info mb-1">Side Panel - AI Assistant</p><p className="mb-1.5">Side panels slide in from the right on every page, giving you quick access to conversational tools without leaving what you're doing.</p><p className="mb-1.5">The AI Assistant adapts its <strong>role</strong> based on which page you are on. There are three roles:</p><ul className="list-disc pl-4 mb-1.5 space-y-1"><li><strong>Guider</strong> - General-purpose guide. Explains features, answers questions about coordination philosophy, and helps with onboarding. Active on most pages.</li><li><strong>Composer</strong> - Message specialist. Helps draft messages, configure distribution targets, create polls, and refine content. Active on the Distribute Messages page.</li><li><strong>Operator</strong> - Operational assistant for Calendar and Time Management. Interprets natural-language commands to set availability, adjust time ranges, configure calendar parameters, and update left-side Time Management tools.</li></ul><p>The current role is highlighted in the header. The role switches automatically when you navigate between pages.</p></>} />
               {(activePageName || modelLabel) && (
                 <p className="text-[10px] text-muted-foreground">
                   {activePageName ? `${activePageName}` : ''}
@@ -425,21 +601,19 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
             </div>
           </div>
             <div className="flex items-center gap-1">
+              <CalendarQuickButtonToggle toolKey="ai" label="AI Assistant" />
+              <IconButton
+                label="View AI feedback"
+                icon={<ExternalLink />}
+                onClick={() => {
+                  onClose()
+                  navigate('/feedback?tab=ai')
+                }}
+              />
               {messages.length > 0 && (
-                <button
-                  onClick={clearChat}
-                  className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-                  title="Clear history"
-                >
-                  <Trash2 className="w-4 h-4" />
-                </button>
+                <IconButton label="Clear history" icon={<Trash2 />} onClick={clearChat} />
               )}
-              <button
-                onClick={onClose}
-                className="p-1.5 rounded-md text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-              >
-                <X className="w-4 h-4" />
-              </button>
+              <IconButton label="Close" icon={<X />} onClick={onClose} />
             </div>
           </div>
 
@@ -449,15 +623,15 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
               const isActive = role.id === activeRole
               const colorMap: Record<string, { active: string; inactive: string }> = {
                 purple: {
-                  active: 'bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 border-purple-300 dark:border-purple-700',
+                  active: 'bg-feature-ai-subtle text-feature-ai border-feature-ai-muted',
                   inactive: 'bg-muted/40 text-muted-foreground border-transparent hover:bg-muted/70',
                 },
                 sky: {
-                  active: 'bg-sky-100 dark:bg-sky-900/40 text-sky-700 dark:text-sky-300 border-sky-300 dark:border-sky-700',
+                  active: 'bg-info-subtle text-info border-info-muted',
                   inactive: 'bg-muted/40 text-muted-foreground border-transparent hover:bg-muted/70',
                 },
                 emerald: {
-                  active: 'bg-emerald-100 dark:bg-emerald-900/40 text-emerald-700 dark:text-emerald-300 border-emerald-300 dark:border-emerald-700',
+                  active: 'bg-success-subtle text-success border-success-muted',
                   inactive: 'bg-muted/40 text-muted-foreground border-transparent hover:bg-muted/70',
                 },
               }
@@ -480,10 +654,10 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
 
         {/* Service unavailable warning */}
         {isAuthenticated && status && !status.available && (
-          <div className="px-4 py-2 bg-amber-50 dark:bg-amber-950 border-b border-amber-200 dark:border-amber-800 flex-shrink-0">
+          <div className="px-4 py-2 bg-warning-subtle border-b border-warning-muted shrink-0">
             <div className="flex items-start gap-2">
-              <AlertTriangle className="w-3.5 h-3.5 text-amber-500 mt-0.5 shrink-0" />
-              <p className="text-[11px] text-amber-700 dark:text-amber-300">AI service not configured. Contact your administrator.</p>
+              <AlertTriangle className="w-3.5 h-3.5 text-warning mt-0.5 shrink-0" />
+              <p className="text-[11px] text-warning">AI service not configured. Contact your administrator.</p>
             </div>
           </div>
         )}
@@ -491,7 +665,7 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
         {/* Sign-in prompt for unauthenticated users */}
         {!isAuthenticated ? (
           <div className="flex-1 flex flex-col items-center justify-center px-6 py-8">
-            <Sparkles className="w-10 h-10 text-purple-400 mb-4" />
+            <Sparkles className="w-10 h-10 text-feature-ai mb-4" />
             <h3 className="text-sm font-semibold mb-2">Sign in to use AI Assistant</h3>
             <p className="text-xs text-muted-foreground text-center mb-6">Create an account or continue as a traveler to chat with the AI assistant.</p>
             <div className="w-full max-w-[220px] space-y-2">
@@ -511,10 +685,10 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
               <Link
                 to="/auth/login"
                 state={{ from: { pathname: location.pathname } }}
-                className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 rounded-lg hover:bg-amber-100 dark:hover:bg-amber-900 transition-colors text-sm"
+                className="w-full flex items-center justify-center gap-2 px-3 py-2.5 bg-warning-subtle border border-warning-muted rounded-lg hover:bg-warning-muted transition-colors text-sm"
               >
-                <Compass className="w-4 h-4 text-amber-600 dark:text-amber-400" />
-                <span className="font-medium text-amber-800 dark:text-amber-200">Continue as Traveler</span>
+                <Compass className="w-4 h-4 text-warning" />
+                <span className="font-medium text-warning">Continue as Traveler</span>
               </Link>
             </div>
             <div className="flex items-start gap-1.5 mt-4 text-[10px] text-muted-foreground max-w-[220px]">
@@ -529,7 +703,7 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
           {messages.length === 0 ? (
             <div className="space-y-3">
               <div className="text-center py-6">
-                <Sparkles className="w-8 h-8 text-purple-400 mx-auto mb-3" />
+                <Sparkles className="w-8 h-8 text-feature-ai mx-auto mb-3" />
                 <p className="text-sm font-medium text-foreground mb-1">
                   {activePageName ? `${activePageName} Assistant` : 'AI Assistant'}
                 </p>
@@ -546,7 +720,7 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
                     key={q}
                     onClick={() => doSend(q)}
                     className="w-full text-left text-xs px-3 py-2 rounded-lg border border-border text-muted-foreground
-                               hover:border-purple-300 dark:hover:border-purple-700 hover:text-foreground transition-colors"
+                               hover:border-feature-ai-muted hover:text-foreground transition-colors"
                   >
                     {q}
                   </button>
@@ -558,75 +732,75 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
               <div key={idx} className="space-y-2">
                 {msg.role === 'system' ? (
                   /* System prompt bubble — Oversight only */
-                  <div className="rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/40 dark:bg-amber-950/20 mr-6">
-                    <button
-                      onClick={() => setExpandedSystemIdx(prev => {
+                  <div className="rounded-lg border border-warning-muted bg-warning-subtle mr-6">
+                    <Disclosure
+                      size="compact"
+                      icon={<Eye />}
+                      title="System Prompt"
+                      expanded={expandedSystemIdx.has(idx)}
+                      onToggle={() => setExpandedSystemIdx(prev => {
                         const next = new Set(prev)
                         if (next.has(idx)) next.delete(idx); else next.add(idx)
                         return next
                       })}
-                      className="w-full flex items-center gap-1.5 px-3 py-2 text-left"
+                      panelClassName="px-3 pb-3 border-t border-warning-muted"
                     >
-                      <Eye className="w-3 h-3 text-amber-500 shrink-0" />
-                      <span className="text-[10px] font-medium text-amber-700 dark:text-amber-300 uppercase tracking-wider">System Prompt</span>
-                      <span className="ml-auto">
-                        {expandedSystemIdx.has(idx) ? <ChevronUp className="w-3 h-3 text-amber-500" /> : <ChevronDown className="w-3 h-3 text-amber-500" />}
-                      </span>
-                    </button>
-                    {expandedSystemIdx.has(idx) && (
-                      <div className="px-3 pb-3 border-t border-amber-200/50 dark:border-amber-800/50">
-                        <pre className="text-[10px] text-muted-foreground whitespace-pre-wrap mt-2 max-h-80 overflow-y-auto font-mono leading-relaxed">{msg.content}</pre>
-                      </div>
-                    )}
+                      <pre className="text-[10px] text-muted-foreground whitespace-pre-wrap mt-2 max-h-80 overflow-y-auto font-mono leading-relaxed">{msg.content}</pre>
+                    </Disclosure>
                   </div>
                 ) : msg.role === 'user' ? (
                   /* User prompt */
-                  <div className="rounded-lg p-3 bg-purple-50/50 dark:bg-purple-950/30 border border-purple-200/50 dark:border-purple-800/30 ml-6">
+                  <div className="min-w-0 rounded-lg p-3 bg-feature-ai-subtle border border-feature-ai-muted ml-6">
                     <div className="flex items-center gap-1.5 mb-1">
-                      <MessageSquare className="w-3 h-3 text-purple-500" />
+                      <MessageSquare className="w-3 h-3 text-feature-ai" />
                       <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">You</span>
                     </div>
-                    <p className="text-xs text-foreground">{msg.content}</p>
+                    <div className="text-xs text-foreground"><AiUserMessage content={msg.content} /></div>
                   </div>
                 ) : (
                   /* AI Response */
                   <div className="rounded-lg p-3 bg-muted/50 border border-border mr-6">
                     <div className="flex items-center gap-1.5 mb-1">
-                      <Sparkles className="w-3 h-3 text-purple-500" />
+                      <Sparkles className="w-3 h-3 text-feature-ai" />
                       <span className="text-[10px] font-medium text-muted-foreground uppercase tracking-wider">AI</span>
-                      {msg.action && msg.action !== 'none' && (
-                        <span className="ml-auto text-[9px] font-medium text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-950/40 px-1.5 py-0.5 rounded">
-                          {
-                            msg.action === 'set_availability'
-                              ? 'Applied'
-                              : msg.action === 'clear_availability'
-                                ? 'Cleared'
-                                : msg.action === 'configure'
-                                  ? 'Configured'
-                                  : msg.action === 'configure_time_management'
-                                    ? 'Updated TM'
-                                    : msg.action
-                          }
+                      {getActionLabel(msg.action) && (
+                        <span className="ml-auto text-[9px] font-medium text-success bg-success-subtle px-1.5 py-0.5 rounded">
+                          {getActionLabel(msg.action)}
                         </span>
                       )}
                     </div>
                     <div className="text-xs text-foreground whitespace-pre-wrap">{formatMessage(msg.content)}</div>
+                    {(msg.ctas || (msg.cta ? [msg.cta] : [])).length > 0 && (
+                      <div className="mt-3 flex flex-wrap gap-2">
+                        {(msg.ctas || (msg.cta ? [msg.cta] : [])).map((cta, ctaIdx) => (
+                          <Button
+                            key={`${cta.label}-${ctaIdx}`}
+                            emphasis="outline"
+                            size="compact"
+                            onClick={() => { void handleCtaClick(cta) }}
+                          >
+                            {cta.label}
+                          </Button>
+                        ))}
+                      </div>
+                    )}
 
                     {/* Sentiment feedback — oversight/admin only */}
                     {sentimentToolEnabled && (
                       <>
-                        <button
-                          onClick={() => toggleFeedback(idx)}
-                          className="mt-2 flex items-center gap-1 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
-                        >
-                          {expandedFeedbackIdx === idx ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-                          {sentimentStates[idx]?.submitted ? 'Feedback submitted' : 'Give feedback'}
-                        </button>
+                        <Disclosure
+                          size="compact"
+                          className="mt-2"
+                          title={sentimentStates[idx]?.submitted ? 'Feedback submitted' : 'Give feedback'}
+                          expanded={expandedFeedbackIdx === idx}
+                          onToggle={() => toggleFeedback(idx)}
+                          panelId={`ai-guide-feedback-${idx}`}
+                        />
 
                         {expandedFeedbackIdx === idx && sentimentStates[idx] && (
-                          <div className="mt-2 pt-2 border-t border-border space-y-2">
+                          <div id={`ai-guide-feedback-${idx}`} className="mt-2 pt-2 border-t border-border space-y-2">
                             {sentimentStates[idx].submitted ? (
-                              <div className="flex items-center gap-1.5 text-xs text-green-600 dark:text-green-400">
+                              <div className="flex items-center gap-1.5 text-xs text-success">
                                 <CheckCircle className="w-3.5 h-3.5" />
                                 Thank you for your feedback!
                               </div>
@@ -662,24 +836,22 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
                                   placeholder="Optional: any additional thoughts..."
                                   rows={2}
                                   disabled={sentimentStates[idx].submitting}
-                                  className="w-full px-2 py-1.5 border border-border rounded text-xs bg-background text-foreground resize-none overflow-hidden focus:ring-1 focus:ring-purple-400 outline-none disabled:opacity-50 leading-5"
+                                  className="w-full px-2 py-1.5 border border-border rounded text-xs bg-background text-foreground resize-none overflow-hidden focus:ring-1 focus:ring-feature-ai outline-hidden disabled:opacity-50 leading-5"
                                 />
                                 <div className="flex items-start gap-1.5 text-[10px] text-muted-foreground">
                                   <Info className="h-3 w-3 shrink-0 mt-0.5" />
                                   <span>Prompt, AI answer, and sentiment data will be stored and visible to admins.</span>
                                 </div>
-                                <button
+                                <Button
+                                  intent="primary"
+                                  size="compact"
+                                  fullWidth
                                   onClick={() => handleSubmitFeedback(idx)}
-                                  disabled={sentimentStates[idx].submitting}
-                                  className="w-full px-3 py-1.5 bg-purple-600 text-white rounded text-xs font-medium hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed flex items-center justify-center gap-1.5"
+                                  loading={sentimentStates[idx].submitting}
+                                  icon={<Send className="w-3 h-3" />}
                                 >
-                                  {sentimentStates[idx].submitting ? (
-                                    <Loader2 className="w-3 h-3 animate-spin" />
-                                  ) : (
-                                    <Send className="w-3 h-3" />
-                                  )}
                                   Submit Feedback
-                                </button>
+                                </Button>
                               </>
                             )}
                           </div>
@@ -694,8 +866,8 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
 
           {sending && (
             <div className="flex items-center gap-2 text-xs text-muted-foreground px-2">
-              <Loader2 className="w-3.5 h-3.5 animate-spin text-purple-500" />
-              Thinking...
+              <Loader2 className="w-3.5 h-3.5 animate-spin text-feature-ai" />
+              {sendingLabel}
             </div>
           )}
 
@@ -705,31 +877,32 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
 
         {/* Error bar */}
         {error && (
-          <div className="px-4 py-2 bg-red-50 dark:bg-red-950/50 border-y border-red-200 dark:border-red-800 flex-shrink-0">
+          <div className="px-4 py-2 bg-danger-subtle border-y border-danger-muted shrink-0">
             <div className="flex items-center justify-between gap-2">
-              <p className="text-xs text-red-600 dark:text-red-400 flex-1">{error}</p>
-              <button onClick={() => setError('')} className="text-red-400 hover:text-red-600 shrink-0">
-                <X className="w-3 h-3" />
-              </button>
+              <p className="text-xs text-danger flex-1">{error}</p>
+              <IconButton label="Dismiss error" icon={<X />} intent="danger" size="micro" onClick={() => setError('')} />
             </div>
           </div>
         )}
 
         {/* Input bar */}
-        <div className="px-3 py-3 border-t border-border flex-shrink-0">
+        <div className="px-3 py-3 border-t border-border shrink-0">
           {remaining !== null && limit !== null && (
             <p className="text-[10px] text-muted-foreground mb-1.5 px-1">
-              {remaining}/{limit} AI prompts remaining today
+              AI prompts left today: {remaining} of {limit}
             </p>
           )}
           <div className="flex gap-2 items-end border border-border rounded-lg px-3 py-2
-                          focus-within:border-purple-400 dark:focus-within:border-purple-600 transition-colors bg-background">
+                          focus-within:border-feature-ai-muted transition-colors bg-background">
             <textarea
               ref={inputRef}
               value={input}
               onChange={(e) => setInput(e.target.value)}
               onKeyDown={handleKeyDown}
               rows={1}
+              aria-label="Message to AI"
+              aria-describedby="ai-panel-message-length"
+              aria-invalid={input.length > AI_MESSAGE_MAX_LENGTH || undefined}
               placeholder={
                 remaining === 0
                   ? 'Daily AI limit reached'
@@ -738,15 +911,12 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
                     : activePlaceholder
               }
               disabled={remaining === 0 || (status !== null && !status.available)}
-              className="flex-1 bg-transparent outline-none text-xs text-foreground placeholder-muted-foreground/50 disabled:opacity-50 resize-none overflow-hidden leading-5"
+              className="min-w-0 flex-1 max-h-40 bg-transparent outline-hidden text-xs text-foreground placeholder-muted-foreground/50 disabled:opacity-50 resize-none overflow-y-auto leading-5"
             />
             <button
               onClick={handleSend}
               disabled={!input.trim() || sending || remaining === 0 || (status !== null && !status.available)}
-              className="p-1.5 rounded-md text-white disabled:opacity-40 disabled:cursor-not-allowed transition-colors shrink-0"
-              style={{
-                background: 'linear-gradient(135deg, #8B5CF6, #6366F1, #3B82F6)',
-              }}
+              className="p-1.5 rounded-md bg-linear-to-br from-feature-ai to-info text-info-foreground disabled:opacity-40 disabled:cursor-not-allowed transition-colors shrink-0"
             >
               {sending ? (
                 <Loader2 className="w-3.5 h-3.5 animate-spin" />
@@ -755,14 +925,37 @@ export function AiGuideSidePanel({ isOpen, onClose, onPanelChange }: AiGuideSide
               )}
             </button>
           </div>
-          <p className="text-[9px] text-muted-foreground mt-1.5 text-center">
-            AI responses may be inaccurate. Powered by ASI Alliance &amp; SingularityNET.
+          <p id="ai-panel-message-length" className={input.length > AI_MESSAGE_MAX_LENGTH ? 'text-[10px] text-danger mt-1.5' : 'text-[10px] text-muted-foreground mt-1.5'}>
+            {input.length} / {AI_MESSAGE_MAX_LENGTH} characters
           </p>
+          <p className="text-[9px] text-muted-foreground mt-1.5 text-center">AI responses may be inaccurate.</p>
         </div>
         </>
         )}
-      </div>
-      </aside>
     </>
+  )
+
+  // When a host is registered (mailbox automation stack), the single panel instance
+  // portals into it so it renders below the configuration instead of on the far right.
+  if (assistantHost && isOpen) {
+    return createPortal(
+      <div className="flex h-full min-h-0 w-full flex-col bg-card">{panelBody}</div>,
+      assistantHost,
+    )
+  }
+
+  return (
+    <aside
+      data-testid="ai-guide-side-panel"
+      className={`
+        fixed inset-y-0 right-0 ${SHELL_LAYER_CLASS.sidePanel} w-screen transition-transform duration-300 ease-in-out
+        ${isOpen ? 'translate-x-0 pointer-events-auto sm:w-88 md:w-96' : 'translate-x-full pointer-events-none sm:w-0'}
+        sm:sticky sm:top-0 sm:h-screen sm:shrink-0 sm:overflow-hidden sm:translate-x-0 sm:pointer-events-auto
+      `}
+    >
+      <div className="ml-auto h-full w-screen flex flex-col bg-card border-l border-border shadow-xl sm:w-88 sm:min-w-88 md:w-96 md:min-w-[24rem]">
+        {panelBody}
+      </div>
+    </aside>
   )
 }

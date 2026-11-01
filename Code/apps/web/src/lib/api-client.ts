@@ -1,5 +1,6 @@
 import axios from 'axios';
 import { supabase } from './supabase';
+import { recordActivity } from './session-activity';
 
 // ─── Request deduplication for GET requests ──────────────────
 // Coalesces identical in-flight GET requests so multiple components
@@ -11,7 +12,7 @@ export function clearInflightRequests(): void {
   inflightGets.clear();
 }
 
-function dedupeKey(url: string, params?: Record<string, unknown>): string {
+function dedupeKey(url: string, params?: unknown): string {
   const qs = params ? JSON.stringify(params) : '';
   return `${url}::${qs}`;
 }
@@ -177,6 +178,7 @@ apiClient.interceptors.request.use(async (config) => {
       const session = result.data.session;
       if (session?.access_token) {
         config.headers.Authorization = `Bearer ${session.access_token}`;
+        recordActivity();
       }
     }
   } catch {
@@ -190,32 +192,36 @@ apiClient.interceptors.request.use(async (config) => {
 // emit a custom event so the UI can show a yellow warning banner.
 export const RATE_LIMIT_WARN_EVENT = 'rate-limit-warn';
 const RATE_LIMIT_WARN_KEY = 'rateLimitWarnAt';
+export const RATE_LIMIT_WARN_TTL_MS = 120_000;
 let _rateLimitWarnTimeout: ReturnType<typeof setTimeout> | null = null;
 
-/** Check if a persisted rate-limit warning exists (for admin visibility). */
+/** Only recent request-limit signals describe the current session's activity. */
 export function getPersistedRateLimitWarn(): { active: boolean; since: string | null } {
   try {
     const ts = localStorage.getItem(RATE_LIMIT_WARN_KEY);
-    if (ts) return { active: true, since: ts };
+    if (ts) {
+      const age = Date.now() - Date.parse(ts);
+      if (Number.isFinite(age) && age >= 0 && age < RATE_LIMIT_WARN_TTL_MS) {
+        return { active: true, since: ts };
+      }
+      localStorage.removeItem(RATE_LIMIT_WARN_KEY);
+    }
   } catch { /* ignore */ }
   return { active: false, since: null };
 }
 
 function checkRateLimitWarn(headers: Record<string, unknown> | undefined) {
   if (headers?.['x-ratelimit-warn'] === 'true') {
-    // Persist the first occurrence timestamp (don't overwrite if already set)
     try {
-      if (!localStorage.getItem(RATE_LIMIT_WARN_KEY)) {
-        localStorage.setItem(RATE_LIMIT_WARN_KEY, new Date().toISOString());
-      }
+      localStorage.setItem(RATE_LIMIT_WARN_KEY, new Date().toISOString());
     } catch { /* ignore */ }
     window.dispatchEvent(new CustomEvent(RATE_LIMIT_WARN_EVENT, { detail: { warn: true } }));
-    // Auto-clear for non-admin users after 2 minutes of no further warnings.
-    // Admins use the persisted 6-hour TTL checked in Layout.
+    // This is a per-client request budget, not a measurement of server load.
     if (_rateLimitWarnTimeout) clearTimeout(_rateLimitWarnTimeout);
     _rateLimitWarnTimeout = setTimeout(() => {
+      getPersistedRateLimitWarn();
       window.dispatchEvent(new CustomEvent(RATE_LIMIT_WARN_EVENT, { detail: { warn: false } }));
-    }, 120_000);
+    }, RATE_LIMIT_WARN_TTL_MS);
   }
 }
 
@@ -256,7 +262,8 @@ apiClient.interceptors.response.use(
         const refreshOutcome = await refreshSessionSingleFlight();
         if (!refreshOutcome.accessToken) {
           if (shouldForceLogoutForRefreshFailure(refreshOutcome.error)) {
-            await supabase.auth.signOut();
+            // 'local' scope: only end this tab's stale session, not every active session for the user.
+            await supabase.auth.signOut({ scope: 'local' });
             redirectToLogin();
           }
           return Promise.reject(error);

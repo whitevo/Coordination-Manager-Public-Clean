@@ -2,7 +2,7 @@ import { Router, Response } from 'express'
 import type { Router as RouterType } from 'express'
 import { supabaseAdmin } from '../supabaseClient.js'
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth.js'
-import { sanitizeString, safeErrorMessage, ANNOUNCEMENT_BODY_MAX_LENGTH } from '../middleware/validation.js'
+import { sanitizeString, sanitizeUUID, safeErrorMessage, ANNOUNCEMENT_BODY_MAX_LENGTH } from '../middleware/validation.js'
 
 const router: RouterType = Router()
 const SOURCE_ENV = process.env.NODE_ENV || 'development'
@@ -87,6 +87,10 @@ router.post('/templates', async (req: AuthenticatedRequest, res: Response) => {
 
 router.put('/templates/:id', async (req: AuthenticatedRequest, res: Response) => {
   try {
+    const templateId = sanitizeUUID(req.params.id)
+    if (!templateId) {
+      return res.status(404).json({ error: 'NOT_FOUND', message: 'Template not found', statusCode: 404 })
+    }
     const { title, body, calendarId, tags, meetingIds, distributionChannelIds, dmRecipientIds } = req.body
     const updates: Record<string, unknown> = {}
 
@@ -101,13 +105,13 @@ router.put('/templates/:id', async (req: AuthenticatedRequest, res: Response) =>
     const { data, error } = await supabaseAdmin
       .from('announcement_templates')
       .update(updates)
-      .eq('id', req.params.id)
+      .eq('id', templateId)
       .eq('user_id', req.userId!)
       .select()
-      .single()
+      .maybeSingle()
 
     if (error) throw error
-    if (!data) return res.status(404).json({ error: 'Template not found' })
+    if (!data) return res.status(404).json({ error: 'NOT_FOUND', message: 'Template not found', statusCode: 404 })
 
     res.json({ template: data })
   } catch (err) {
@@ -119,13 +123,22 @@ router.put('/templates/:id', async (req: AuthenticatedRequest, res: Response) =>
 
 router.delete('/templates/:id', async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { error } = await supabaseAdmin
+    const templateId = sanitizeUUID(req.params.id)
+    if (!templateId) {
+      return res.status(404).json({ error: 'NOT_FOUND', message: 'Template not found', statusCode: 404 })
+    }
+
+    const { data, error } = await supabaseAdmin
       .from('announcement_templates')
       .update({ is_archived: true })
-      .eq('id', req.params.id)
+      .eq('id', templateId)
       .eq('user_id', req.userId!)
+      .select('id')
 
     if (error) throw error
+    if (!data || data.length === 0) {
+      return res.status(404).json({ error: 'NOT_FOUND', message: 'Template not found', statusCode: 404 })
+    }
 
     res.json({ success: true })
   } catch (err) {
@@ -519,6 +532,217 @@ router.put('/schedules/:id/cancel', async (req: AuthenticatedRequest, res: Respo
 
     res.json({ schedule: data })
   } catch (err) {
+    res.status(500).json({ error: safeErrorMessage(err) })
+  }
+})
+
+// --- POST /api/announcements/schedules/:id/delete-messages -------------------
+// Delete the Discord channel posts and DMs this schedule already delivered.
+// Ownership is enforced server-side (404 for other users' schedules). Email
+// deliveries cannot be recalled and are only counted as skippedEmail.
+
+const DELETE_BOT_BATCH_SIZE = 500 // matches the bot's per-request cap
+const DELETE_BOT_TIMEOUT_MS = 120_000
+const DELETE_UPDATE_CHUNK = 100
+const DELETE_ERROR_MAX_LENGTH = 300
+const DELETE_LOG_IDS_MAX = 5000
+
+interface DeliveryLogDeleteRow {
+  id: string
+  channel_type: string
+  target_id: string
+  status: string | null
+  discord_message_id: string | null
+  deleted_at: string | null
+}
+
+interface MessageDeleteResult {
+  id: string
+  ok: boolean
+  error?: string
+}
+
+function isDiscordChannelType(value: string): value is 'discord_channel' | 'discord_dm' {
+  return value === 'discord_channel' || value === 'discord_dm'
+}
+
+function parseBotDeleteResults(body: unknown, pendingIds: Set<string>): MessageDeleteResult[] {
+  if (typeof body !== 'object' || body === null || !('results' in body)) return []
+  const raw = (body as { results: unknown }).results
+  if (!Array.isArray(raw)) return []
+  const results: MessageDeleteResult[] = []
+  for (const entry of raw) {
+    if (typeof entry !== 'object' || entry === null) continue
+    const { id, ok, error } = entry as { id?: unknown; ok?: unknown; error?: unknown }
+    if (typeof id !== 'string' || !pendingIds.has(id) || typeof ok !== 'boolean') continue
+    pendingIds.delete(id)
+    const message = typeof error === 'string' && error
+      ? error.replace(/[\r\n]+/g, ' ').slice(0, DELETE_ERROR_MAX_LENGTH)
+      : 'Delete failed'
+    results.push(ok ? { id, ok: true } : { id, ok: false, error: message })
+  }
+  return results
+}
+
+async function callBotDeleteMessages(rows: DeliveryLogDeleteRow[]): Promise<MessageDeleteResult[]> {
+  const botApiUrl = process.env.BOT_API_URL || 'http://localhost:3002'
+  const botSecret = process.env.BOT_API_SECRET
+  if (!botSecret) throw new Error('BOT_API_SECRET is not configured')
+
+  const response = await fetch(`${botApiUrl}/delete-messages`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-bot-secret': botSecret },
+    body: JSON.stringify({
+      items: rows.map(row => ({
+        id: row.id,
+        channelType: row.channel_type,
+        targetId: row.target_id,
+        messageId: row.discord_message_id,
+      })),
+    }),
+    signal: AbortSignal.timeout(DELETE_BOT_TIMEOUT_MS),
+  })
+  if (!response.ok) throw new Error(`Bot responded with HTTP ${response.status}`)
+
+  const pendingIds = new Set(rows.map(row => row.id))
+  const results = parseBotDeleteResults(await response.json(), pendingIds)
+  // Any row the bot did not report on counts as a failure
+  for (const id of pendingIds) results.push({ id, ok: false, error: 'No result from Discord bot' })
+  return results
+}
+
+async function persistDeleteResults(scheduleId: string, results: MessageDeleteResult[]): Promise<void> {
+  const deletedAt = new Date().toISOString()
+  const okIds = results.filter(r => r.ok).map(r => r.id)
+  for (let i = 0; i < okIds.length; i += DELETE_UPDATE_CHUNK) {
+    const { error } = await supabaseAdmin
+      .from('announcement_delivery_log')
+      .update({ deleted_at: deletedAt, delete_error: null })
+      .eq('schedule_id', scheduleId)
+      .in('id', okIds.slice(i, i + DELETE_UPDATE_CHUNK))
+    if (error) throw error
+  }
+
+  // Group failures by message so one update covers many rows
+  const byError = new Map<string, string[]>()
+  for (const result of results) {
+    if (result.ok) continue
+    const message = result.error || 'Delete failed'
+    const ids = byError.get(message) || []
+    ids.push(result.id)
+    byError.set(message, ids)
+  }
+  for (const [message, ids] of byError) {
+    for (let i = 0; i < ids.length; i += DELETE_UPDATE_CHUNK) {
+      const { error } = await supabaseAdmin
+        .from('announcement_delivery_log')
+        .update({ delete_error: message })
+        .eq('schedule_id', scheduleId)
+        .in('id', ids.slice(i, i + DELETE_UPDATE_CHUNK))
+      if (error) throw error
+    }
+  }
+}
+
+router.post('/schedules/:id/delete-messages', async (req: AuthenticatedRequest, res: Response) => {
+  try {
+    const scheduleId = sanitizeUUID(req.params.id)
+    if (!scheduleId) {
+      return res.status(404).json({ error: 'NOT_FOUND', message: 'Schedule not found', statusCode: 404 })
+    }
+
+    const rawLogIds: unknown = (req.body as { logIds?: unknown } | undefined)?.logIds
+    let logIdFilter: Set<string> | null = null
+    if (rawLogIds !== undefined) {
+      if (!Array.isArray(rawLogIds) || rawLogIds.length === 0 || rawLogIds.length > DELETE_LOG_IDS_MAX) {
+        return res.status(400).json({
+          error: 'VALIDATION_ERROR',
+          message: `logIds must be a non-empty array of up to ${DELETE_LOG_IDS_MAX} ids`,
+          statusCode: 400,
+        })
+      }
+      const ids: string[] = []
+      for (const raw of rawLogIds) {
+        const id = sanitizeUUID(raw)
+        if (!id) {
+          return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'logIds must contain valid ids', statusCode: 400 })
+        }
+        ids.push(id)
+      }
+      logIdFilter = new Set(ids)
+    }
+
+    const { data: schedule, error: scheduleError } = await supabaseAdmin
+      .from('announcement_schedules')
+      .select('id, status')
+      .eq('id', scheduleId)
+      .eq('user_id', req.userId!)
+      .maybeSingle()
+    if (scheduleError) throw scheduleError
+    if (!schedule) {
+      return res.status(404).json({ error: 'NOT_FOUND', message: 'Schedule not found', statusCode: 404 })
+    }
+    // Deleting mid-send would leave messages posted after this call untouched
+    if (schedule.status === 'sending') {
+      return res.status(409).json({
+        error: 'SCHEDULE_SENDING',
+        message: 'This announcement is still being sent. Try again when sending has finished.',
+        statusCode: 409,
+      })
+    }
+
+    const rows = await fetchAllRows<DeliveryLogDeleteRow>((from, to) =>
+      supabaseAdmin
+        .from('announcement_delivery_log')
+        .select('id, channel_type, target_id, status, discord_message_id, deleted_at')
+        .eq('schedule_id', scheduleId)
+        .order('created_at', { ascending: true })
+        .range(from, to)
+    )
+    const scoped = logIdFilter ? rows.filter(row => logIdFilter.has(row.id)) : rows
+    const sent = scoped.filter(row => row.status === 'sent')
+    const skippedEmail = sent.filter(row => row.channel_type === 'email').length
+    const eligible = sent.filter(row =>
+      isDiscordChannelType(row.channel_type) && !!row.discord_message_id && !row.deleted_at
+    )
+
+    if (eligible.length === 0) {
+      return res.json({ deleted: 0, failed: 0, skippedEmail, results: [] })
+    }
+
+    const results: MessageDeleteResult[] = []
+    let botFailed = false
+    for (let i = 0; i < eligible.length; i += DELETE_BOT_BATCH_SIZE) {
+      try {
+        results.push(...await callBotDeleteMessages(eligible.slice(i, i + DELETE_BOT_BATCH_SIZE)))
+      } catch (err: unknown) {
+        botFailed = true
+        const reason = err instanceof Error ? err.message : 'Unknown error'
+        console.warn(`[announcements] delete-messages bot call failed: ${reason.replace(/[\r\n]+/g, ' ')}`)
+        break
+      }
+    }
+
+    if (botFailed && results.length === 0) {
+      return res.status(502).json({
+        error: 'BOT_UNAVAILABLE',
+        message: 'The Discord bot is unreachable, so no messages were deleted. Please try again later.',
+        statusCode: 502,
+      })
+    }
+
+    // Persist what the bot processed; rows from an unreached batch stay untouched
+    await persistDeleteResults(scheduleId, results)
+    const processed = new Set(results.map(r => r.id))
+    for (const row of eligible) {
+      if (!processed.has(row.id)) {
+        results.push({ id: row.id, ok: false, error: 'Discord bot became unreachable before this message was processed' })
+      }
+    }
+
+    const deleted = results.filter(r => r.ok).length
+    res.json({ deleted, failed: results.length - deleted, skippedEmail, results })
+  } catch (err: unknown) {
     res.status(500).json({ error: safeErrorMessage(err) })
   }
 })

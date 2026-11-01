@@ -5,6 +5,7 @@ import { Turnstile, type TurnstileInstance } from '@marsidev/react-turnstile'
 import { useAuth } from '../../contexts/AuthContext'
 import { useCaptchaMode } from '../../lib/use-captcha-mode'
 import CardanoWalletButton from '../../components/CardanoWalletButton'
+import { Button } from '../../components/ui'
 
 const TURNSTILE_SITE_KEY = import.meta.env.VITE_TURNSTILE_SITE_KEY
 
@@ -17,6 +18,7 @@ export default function LoginPage() {
   const [captchaFailed, setCaptchaFailed] = useState(false)
   const [captchaReady, setCaptchaReady] = useState(false)
   const [captchaRetryKey, setCaptchaRetryKey] = useState(0)
+  const [rememberMe, setRememberMe] = useState(false)
   const captchaTokenRef = useRef<string | null>(null)
   const turnstileRef = useRef<TurnstileInstance | null>(null)
 
@@ -86,7 +88,7 @@ export default function LoginPage() {
     try {
       // Preserve return path through OAuth redirect
       sessionStorage.setItem('authReturnTo', fromRef.current)
-      await login()
+      await login(rememberMe)
     } catch (err: unknown) {
       // AbortError is expected during OAuth redirect: signInWithOAuth sets
       // window.location.href which unloads the page and aborts in-flight
@@ -107,7 +109,7 @@ export default function LoginPage() {
     }
     setIsLoading(true)
     try {
-      await loginAsTraveler(captchaTokenRef.current || undefined)
+      await loginAsTraveler(captchaTokenRef.current || undefined, rememberMe)
       // Auth state change triggers re-render; the render-time redirect
       // reads authReturnTo and navigates correctly (e.g. back to invite page).
     } catch (err: unknown) {
@@ -122,7 +124,7 @@ export default function LoginPage() {
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-background to-muted flex flex-col">
+    <div className="min-h-screen bg-linear-to-br from-background to-muted flex flex-col">
       {/* Header */}
       <header className="p-6">
         <Link to="/" className="flex items-center gap-2 w-fit">
@@ -144,10 +146,23 @@ export default function LoginPage() {
 
             {/* Error message */}
             {error && (
-              <div className="mb-6 p-3 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-700 dark:text-red-300">
+              <div className="mb-6 p-3 bg-danger-subtle border border-danger-muted rounded-lg text-sm text-danger">
                 {error}
               </div>
             )}
+
+            <label className="mb-5 flex cursor-pointer items-start gap-3 rounded-lg border border-border bg-muted/30 p-3">
+              <input
+                type="checkbox"
+                checked={rememberMe}
+                onChange={(event) => setRememberMe(event.target.checked)}
+                className="mt-0.5 h-4 w-4 rounded border-border text-primary focus:ring-primary"
+              />
+              <span>
+                <span className="block text-sm font-medium text-foreground">Remember me on this device</span>
+                <span className="block text-xs text-muted-foreground">Keep this account available across tabs and browser restarts for up to 14 days of inactivity.</span>
+              </span>
+            </label>
 
             {/* Google Sign In */}
             <button
@@ -193,10 +208,10 @@ export default function LoginPage() {
             <button
               onClick={isUpgradeFlow && isTraveler ? () => navigate(-1) : handleTravelerLogin}
               disabled={isLoading}
-              className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-amber-50/70 dark:bg-amber-950/40 border border-amber-200 dark:border-amber-800 rounded-xl hover:bg-amber-100/80 dark:hover:bg-amber-900/60 transition-colors disabled:opacity-50 disabled:cursor-not-allowed mb-3"
+              className="w-full flex items-center justify-center gap-3 px-4 py-3 bg-warning-subtle border border-warning-muted rounded-xl hover:bg-warning-muted transition-colors disabled:opacity-50 disabled:cursor-not-allowed mb-3"
             >
-              <Compass className="w-5 h-5 text-amber-600 dark:text-amber-400" />
-              <span className="font-medium text-amber-800 dark:text-amber-200">
+              <Compass className="w-5 h-5 text-warning" />
+              <span className="font-medium text-warning">
                 {isLoading ? 'Creating your identity...' : isUpgradeFlow && isTraveler ? 'Keep Traveler Account' : 'Continue as Traveler'}
               </span>
             </button>
@@ -233,6 +248,7 @@ export default function LoginPage() {
               <CardanoWalletButton
                 getCaptchaToken={() => captchaTokenRef.current}
                 isCaptchaReady={!captchaActive || captchaReady}
+                rememberMe={rememberMe}
                 onSuccess={() => {
                   sessionStorage.removeItem('authReturnTo')
                 }}
@@ -247,14 +263,13 @@ export default function LoginPage() {
             {captchaActive && (
               <div className="flex justify-center my-4">
                 {captchaFailed ? (
-                  <button
-                    type="button"
+                  <Button
+                    emphasis="outline"
+                    icon={<RefreshCw className="w-4 h-4" />}
                     onClick={retryCaptcha}
-                    className="flex items-center gap-2 px-4 py-2 text-sm text-muted-foreground border border-border rounded-lg hover:bg-muted transition-colors"
                   >
-                    <RefreshCw className="w-4 h-4" />
                     Security check failed to load — click to retry
-                  </button>
+                  </Button>
                 ) : (
                   <Turnstile
                     key={captchaRetryKey}
@@ -272,7 +287,7 @@ export default function LoginPage() {
             {/* Links */}
             <div className="mt-6 flex justify-center gap-4 text-xs text-muted-foreground">
               <a
-                href="https://github.com/whitevo/Coordination-Manager/blob/main/docs/public/PRIVACY_POLICY.md"
+                href="https://github.com/whitevo/Coordination-Manager-Public-Clean/blob/main/docs/public/PRIVACY_POLICY.md"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="hover:text-foreground"
@@ -281,7 +296,7 @@ export default function LoginPage() {
               </a>
               <span>·</span>
               <a
-                href="https://github.com/whitevo/Coordination-Manager/blob/main/docs/public/TERMS_OF_SERVICE.md"
+                href="https://github.com/whitevo/Coordination-Manager-Public-Clean/blob/main/docs/public/TERMS_OF_SERVICE.md"
                 target="_blank"
                 rel="noopener noreferrer"
                 className="hover:text-foreground"

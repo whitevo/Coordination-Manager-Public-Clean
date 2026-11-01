@@ -218,7 +218,7 @@ router.use((req, res, next) => {
   if (req.path === '/deauthorize' && req.method === 'POST') {
     return next()
   }
-  return authMiddleware(req, res, next)
+  return authMiddleware(req as AuthenticatedRequest, res, next)
 })
 
 // ─── GET /api/zoom/integration — Get connection status ──────────────────────

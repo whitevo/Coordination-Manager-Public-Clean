@@ -1,6 +1,7 @@
 import { Router, Response } from 'express'
 import { supabaseAdmin } from '../supabaseClient.js'
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth.js'
+import { safeErrorMessage } from '../middleware/validation.js'
 
 const router: ReturnType<typeof Router> = Router()
 
@@ -18,7 +19,7 @@ router.get('/', async (req: AuthenticatedRequest, res: Response) => {
       .eq('user_id', req.userId)
       .order('created_at', { ascending: false })
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
     res.json({ subscriptions: data || [] })
   } catch {
     res.status(500).json({ error: 'Failed to fetch subscriptions' })
@@ -81,7 +82,7 @@ router.post('/', async (req: AuthenticatedRequest, res: Response) => {
       .select('id, calendar_id, created_at')
       .single()
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
 
     // Sync Discord DM subscription status so the bot knows this user subscribed.
     // Two-pass update: first match by cm_user_id (populated when Discord was already linked),
@@ -145,7 +146,7 @@ router.delete('/:calendarHash', async (req: AuthenticatedRequest, res: Response)
       .eq('user_id', req.userId)
       .eq('calendar_id', calendar.id)
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
 
     // Sync Discord DM subscription status so the bot knows this user unsubscribed.
     // Two-pass update: match by cm_user_id first, then by recipient_discord_id for
@@ -195,7 +196,7 @@ router.get('/meetings', async (req: AuthenticatedRequest, res: Response) => {
       .select('calendar_id')
       .eq('user_id', req.userId)
 
-    if (subErr) return res.status(400).json({ error: subErr.message })
+    if (subErr) return res.status(400).json({ error: safeErrorMessage(subErr) })
     if (!subs || subs.length === 0) return res.json({ meetings: [] })
 
     const calendarIds = subs.map(s => s.calendar_id)
@@ -215,7 +216,7 @@ router.get('/meetings', async (req: AuthenticatedRequest, res: Response) => {
       .in('calendar_id', calendarIds)
       .order('start_time', { ascending: true })
 
-    if (meetErr) return res.status(400).json({ error: meetErr.message })
+    if (meetErr) return res.status(400).json({ error: safeErrorMessage(meetErr) })
 
     // meetings table uses plain TIMESTAMP (no tz); ensure UTC suffix
     const ensureUTC = (ts: string) =>

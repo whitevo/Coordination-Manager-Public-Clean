@@ -1,5 +1,6 @@
 import { useState, useCallback } from 'react'
-import { Palette, Plus, Trash2, Save, RotateCcw, Check, ChevronDown, ChevronRight, Pencil } from 'lucide-react'
+import { Palette, Plus, Trash2, Save, RotateCcw, Check, Pencil } from 'lucide-react'
+import { Button, Disclosure } from './ui'
 import {
   type ColorTheme,
   type ThemeColors,
@@ -143,7 +144,7 @@ export default function ThemeCreator({
                 </div>
                 <span className="text-xs font-medium truncate w-full text-center">{theme.name}</span>
                 {isActive && (
-                  <span className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-primary text-primary-foreground rounded-full flex items-center justify-center shadow-sm">
+                  <span className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-primary text-primary-foreground rounded-full flex items-center justify-center shadow-xs">
                     <Check className="w-3 h-3" />
                   </span>
                 )}
@@ -212,7 +213,7 @@ export default function ThemeCreator({
                         }}
                         onClick={e => e.stopPropagation()}
                         autoFocus
-                        className="text-xs w-full text-center bg-transparent border-b border-primary outline-none py-0.5"
+                        className="text-xs w-full text-center bg-transparent border-b border-primary outline-hidden py-0.5"
                       />
                     ) : (
                       <span className="text-xs font-medium truncate w-full text-center">{theme.name}</span>
@@ -220,36 +221,43 @@ export default function ThemeCreator({
                   </button>
                   {/* Active badge */}
                   {isActive && (
-                    <span className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-primary text-primary-foreground rounded-full flex items-center justify-center shadow-sm">
+                    <span className="absolute -top-1.5 -right-1.5 w-5 h-5 bg-primary text-primary-foreground rounded-full flex items-center justify-center shadow-xs">
                       <Check className="w-3 h-3" />
                     </span>
                   )}
                   {/* Action buttons bar */}
                   <div className="flex border-t border-border divide-x divide-border">
-                    <button
+                    <Button
+                      emphasis="ghost"
+                      size="compact"
                       onClick={() => startEdit(theme)}
-                      className="flex-1 flex items-center justify-center gap-1 py-1.5 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+                      className="flex-1"
                       title="Edit colors"
+                      icon={<Pencil className="w-3 h-3" />}
                     >
-                      <Pencil className="w-3 h-3" />
                       Edit
-                    </button>
-                    <button
+                    </Button>
+                    <Button
+                      emphasis="ghost"
+                      size="compact"
                       onClick={() => { setRenamingId(theme.id); setRenameValue(theme.name) }}
-                      className="flex-1 flex items-center justify-center gap-1 py-1.5 text-xs text-muted-foreground hover:text-foreground hover:bg-muted/50 transition-colors"
+                      className="flex-1"
                       title="Rename"
+                      icon={<span className="text-xs font-bold">A</span>}
                     >
-                      <span className="text-xs font-bold">A</span>
                       Name
-                    </button>
-                    <button
+                    </Button>
+                    <Button
+                      emphasis="ghost"
+                      intent="danger"
+                      size="compact"
                       onClick={() => onDeleteCustomTheme(theme.id)}
-                      className="flex-1 flex items-center justify-center gap-1 py-1.5 text-xs text-muted-foreground hover:text-destructive hover:bg-destructive/10 transition-colors"
+                      className="flex-1"
                       title="Delete this theme to free up the slot"
+                      icon={<Trash2 className="w-3 h-3" />}
                     >
-                      <Trash2 className="w-3 h-3" />
                       Delete
-                    </button>
+                    </Button>
                   </div>
                 </div>
               )
@@ -278,13 +286,13 @@ export default function ThemeCreator({
 
       {/* ── Reset to Default ──────────────────────────────────── */}
       {activeThemeId && !isCreating && (
-        <button
+        <Button
+          emphasis="outline"
           onClick={() => onApplyTheme(null)}
-          className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg border border-border text-muted-foreground hover:bg-muted transition-colors"
+          icon={<RotateCcw className="w-4 h-4" />}
         >
-          <RotateCcw className="w-4 h-4" />
           Reset to Default Colors ({isDark ? 'Dark' : 'Light'} mode)
-        </button>
+        </Button>
       )}
 
       {/* ── Theme Editor ──────────────────────────────────────── */}
@@ -308,7 +316,7 @@ export default function ThemeCreator({
               value={themeName}
               onChange={e => setThemeName(e.target.value)}
               placeholder={`Custom Theme ${customThemes.length + 1}`}
-              className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+              className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
             />
           </div>
 
@@ -318,14 +326,15 @@ export default function ThemeCreator({
               <p className="text-xs text-muted-foreground mb-2">Start from a preset:</p>
               <div className="flex flex-wrap gap-1.5">
                 {PRESET_THEMES.map(p => (
-                  <button
+                  <Button
                     key={p.id}
+                    emphasis="outline"
+                    size="micro"
                     onClick={() => startFromPreset(p)}
-                    className="flex items-center gap-1 px-2 py-1 text-xs rounded border border-border hover:border-primary/50 hover:bg-muted/50 transition-colors"
+                    icon={<span className="w-3 h-3 rounded-full" style={{ backgroundColor: `hsl(${p.colors.primary})` }} />}
                   >
-                    <span className="w-3 h-3 rounded-full" style={{ backgroundColor: `hsl(${p.colors.primary})` }} />
                     {p.name}
-                  </button>
+                  </Button>
                 ))}
               </div>
             </div>
@@ -336,31 +345,27 @@ export default function ThemeCreator({
             {COLOR_GROUPS.map(group => {
               const isExpanded = expandedGroup === group.label
               return (
-                <div key={group.label} className="border border-border rounded-lg overflow-hidden">
-                  <button
-                    onClick={() => setExpandedGroup(isExpanded ? null : group.label)}
-                    className="w-full flex items-center justify-between px-3 py-2.5 bg-muted/30 hover:bg-muted/50 transition-colors"
-                  >
-                    <div className="flex items-center gap-2">
-                      <span className="text-sm font-medium">{group.label}</span>
-                      <span className="text-xs text-muted-foreground">{group.description}</span>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      {/* Mini preview of group colors */}
-                      <div className="flex gap-0.5">
-                        {group.keys.map(key => (
-                          <span
-                            key={key}
-                            className="w-3 h-3 rounded-full border border-border/50"
-                            style={{ backgroundColor: `hsl(${editColors[key]})` }}
-                          />
-                        ))}
-                      </div>
-                      {isExpanded ? <ChevronDown className="w-4 h-4 text-muted-foreground" /> : <ChevronRight className="w-4 h-4 text-muted-foreground" />}
-                    </div>
-                  </button>
-                  {isExpanded && (
-                    <div className="px-3 py-3 space-y-3 bg-card">
+                <Disclosure
+                  key={group.label}
+                  className="border border-border rounded-lg overflow-hidden"
+                  title={group.label}
+                  description={group.description}
+                  expanded={isExpanded}
+                  onToggle={next => setExpandedGroup(next ? group.label : null)}
+                  panelClassName="px-3 py-3 space-y-3 bg-card"
+                  trailing={
+                    /* Mini preview of group colors */
+                    <span className="flex gap-0.5 mr-2">
+                      {group.keys.map(key => (
+                        <span
+                          key={key}
+                          className="w-3 h-3 rounded-full border border-border/50"
+                          style={{ backgroundColor: `hsl(${editColors[key]})` }}
+                        />
+                      ))}
+                    </span>
+                  }
+                >
                       {group.keys.map(key => (
                         <div key={key} className="flex items-center gap-3">
                           <label
@@ -394,9 +399,7 @@ export default function ThemeCreator({
                           </div>
                         </div>
                       ))}
-                    </div>
-                  )}
-                </div>
+                </Disclosure>
               )
             })}
           </div>
@@ -477,26 +480,15 @@ export default function ThemeCreator({
 
           {/* Action buttons */}
           <div className="flex gap-2 pt-2 border-t border-border">
-            <button
-              onClick={handleSave}
-              className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
-            >
-              <Save className="w-4 h-4" />
+            <Button intent="primary" onClick={handleSave} icon={<Save className="w-4 h-4" />}>
               {editingTheme ? 'Update Theme' : 'Save Theme'}
-            </button>
-            <button
-              onClick={handleReset}
-              className="flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg border border-border text-muted-foreground hover:bg-muted transition-colors"
-            >
-              <RotateCcw className="w-4 h-4" />
+            </Button>
+            <Button emphasis="outline" onClick={handleReset} icon={<RotateCcw className="w-4 h-4" />}>
               Reset to Defaults
-            </button>
-            <button
-              onClick={handleCancel}
-              className="px-4 py-2 text-sm font-medium rounded-lg text-muted-foreground hover:text-foreground transition-colors"
-            >
+            </Button>
+            <Button emphasis="ghost" onClick={handleCancel}>
               Cancel
-            </button>
+            </Button>
           </div>
         </div>
       )}

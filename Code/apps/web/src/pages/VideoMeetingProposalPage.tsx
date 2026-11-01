@@ -99,8 +99,8 @@ export default function VideoMeetingProposalPage() {
           <h2 className="text-xl font-semibold mb-3">Feedback</h2>
           <p className="text-sm text-muted-foreground leading-relaxed">
             Have thoughts on this proposal? Share them via the{' '}
-            <Link to="/feedback" className="text-blue-600 hover:underline">feedback page</Link> or email{' '}
-            <a href="mailto:hello@coordinationmanager.com" className="text-blue-600 hover:underline">hello@coordinationmanager.com</a>.
+            <Link to="/feedback" className="text-primary hover:underline">feedback page</Link> or email{' '}
+            <a href="mailto:hello@coordinationmanager.com" className="text-primary hover:underline">hello@coordinationmanager.com</a>.
           </p>
         </section>
       </article>

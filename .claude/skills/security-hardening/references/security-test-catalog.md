@@ -1,7 +1,7 @@
 # Security Test Scenarios
 
 Test catalog for validating the Coordination Manager platform resists common attacks.
-All IDs are referenced in the main SKILL.md workflow.
+SKILL.md lists the ID ranges (A1-A6 through W1-W4).
 
 ## Authentication & Authorization
 
@@ -12,6 +12,7 @@ All IDs are referenced in the main SKILL.md workflow.
 | A3 | Access another user's data by modifying user_id in request | Only own data returned (enforced by `.eq('user_id', req.userId!)`) |
 | A4 | Use anon key via PostgREST to query tables | Blocked or limited by RLS |
 | A5 | Read another user's Google refresh token via PostgREST | Blocked by RLS on `calendar_sources` |
+| A6 | Forged `wallet_address` / `redirect_to_user_id` in `user_metadata`; non-aal2 session on admin route | Forged values ignored (identity links only from `app_metadata`); admin route rejected without aal2 |
 
 ## BOLA / Object-Level Authorization
 
@@ -19,7 +20,7 @@ All IDs are referenced in the main SKILL.md workflow.
 |----|----------|----------|
 | B1 | Access another user's calendar by guessing/enumerating hash | Blocked by RLS + API authorization check |
 | B2 | Modify another user's meeting by substituting meeting ID | 403 Forbidden -- ownership check fails |
-| B3 | Delete another user's announcement template via ID swap | 403 Forbidden -- user_id mismatch |
+| B3 | Delete another user's announcement template via ID swap | 404 NOT_FOUND; the row is unchanged (query scoped by `user_id`) |
 | B4 | Brute-force nanoid(10) calendar hashes at rate limit boundary | Rate limited; attempts logged as security signals |
 
 ## Discord Bot Abuse
@@ -29,17 +30,17 @@ All IDs are referenced in the main SKILL.md workflow.
 | D1 | Brute-force `/link` command with random keys | "Invalid or expired link key" -- no info leakage |
 | D2 | Use expired link key | "This link key has expired" |
 | D3 | Announcement containing `@everyone` | Bot suppresses mention via `allowedMentions: { parse: [] }` |
-| D4 | Extremely long announcement (>4000 chars) | Rejected before sending to Discord |
+| D4 | Announcement over the cap (>1800 chars) | Rejected with 400 before sending to Discord |
 | D5 | Call bot internal API from outside private network | Connection refused or 401 |
 
 ## API Abuse
 
 | ID | Scenario | Expected |
 |----|----------|----------|
-| R1 | 200 requests to `/api/auth` in 1 minute | Rate limited after threshold |
-| R2 | 50 requests to `/api/discord/generate-key` in 1 hour | Rate limited after threshold |
-| R3 | POST with 100KB string in title field | Rejected (input too long) |
-| R4 | PUT to another user's template ID | Fails (user_id check) |
+| R1 | 200 requests to `/api/auth/guest` in 1 minute | Rate limited after threshold (120 / 15 min) |
+| R2 | 50 requests to `/api/discord/generate-key` in 1 hour | Rate limited after threshold (20 / hour) |
+| R3 | POST with 100KB string in title field | Rejected: announcement template and calendar titles are capped at 200 chars (`sanitizeString`); calendar config is capped at 20 KB |
+| R4 | PUT to another user's template ID | 404 NOT_FOUND, no row updated |
 | R5 | Malformed JSON body | 400 from express.json() middleware |
 
 ## Data Exposure
@@ -54,9 +55,9 @@ All IDs are referenced in the main SKILL.md workflow.
 
 | ID | Scenario | Expected |
 |----|----------|----------|
-| L1 | Send request with CR/LF in user-supplied field (log injection) | Characters stripped/escaped before logging |
+| L1 | Send request with CR/LF in user-supplied field (log injection) | CR stripped by `sanitizeString`; CR/LF stripped for the logged CORS origin. LF in other fields is NOT stripped, so strip at the log site |
 | L2 | Check production logs for Authorization header values | Never logged -- morgan format excludes auth headers |
-| L3 | Trigger rate limit and verify it appears in security logs | Rate limit event logged with IP (no token/payload) |
+| L3 | Trigger rate limit and verify it appears in security logs | `[rate-limit] <limiter> key=<client ip> <method> <path>` warning (CR/LF stripped, no query/headers/body) |
 
 ## Supply Chain
 

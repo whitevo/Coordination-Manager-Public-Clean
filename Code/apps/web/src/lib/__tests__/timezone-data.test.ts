@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi, afterEach } from 'vitest'
 import {
   getAllTimezones,
   findTimezone,
@@ -13,6 +13,8 @@ import {
   getTimezoneAbbr,
   getTimezoneAbbrOnDate,
   getOffsetOnDate,
+  getBrowserTimezone,
+  getEditingTimezone,
   formatTimeInTimezone,
   formatDateInTimezone,
   formatDateTimeInTimezone,
@@ -749,5 +751,52 @@ describe('multi-timezone simultaneous display', () => {
     expect(nyTime).toContain('10:00')
     // Tokyo (JST = UTC+9): 11:00 PM
     expect(tokyoTime).toContain('11:00')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// 18. Editing timezone resolution (mailbox invitation picker)
+// ---------------------------------------------------------------------------
+
+describe('getBrowserTimezone', () => {
+  it('returns the runtime local IANA timezone', () => {
+    expect(getBrowserTimezone()).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone || null)
+  })
+})
+
+describe('getEditingTimezone', () => {
+  afterEach(() => {
+    vi.unstubAllGlobals()
+  })
+
+  it('prefers the configured primary timezone', () => {
+    vi.stubGlobal('localStorage', {
+      getItem: (key: string) =>
+        key === 'coordination-timezones' ? JSON.stringify({ primary: 'Europe/Tallinn' }) : null,
+    })
+
+    expect(getEditingTimezone()).toBe('Europe/Tallinn')
+  })
+
+  it('respects an explicit UTC primary choice', () => {
+    vi.stubGlobal('localStorage', {
+      getItem: () => JSON.stringify({ primary: 'UTC', additional: [] }),
+    })
+
+    expect(getEditingTimezone()).toBe('UTC')
+  })
+
+  it('falls back to the browser timezone instead of UTC when nothing is stored', () => {
+    vi.stubGlobal('localStorage', { getItem: () => null })
+
+    const browserTz = Intl.DateTimeFormat().resolvedOptions().timeZone
+    expect(getEditingTimezone()).toBe(browserTz || 'UTC')
+  })
+
+  it('falls back to the browser timezone when stored data is corrupt', () => {
+    vi.stubGlobal('localStorage', { getItem: () => '{not json' })
+
+    const browserTz = Intl.DateTimeFormat().resolvedOptions().timeZone
+    expect(getEditingTimezone()).toBe(browserTz || 'UTC')
   })
 })

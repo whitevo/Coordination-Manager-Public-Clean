@@ -104,7 +104,7 @@ Run in a **non-background** terminal, wait for completion.
 Use the repo-root launcher (required):
 
 ```powershell
-Set-Location "C:\Project Folders\Coordination Manager"; .\start.ps1
+.\start.ps1   # from the repository root
 ```
 
 Or npm wrapper:
@@ -124,7 +124,7 @@ This performs required sequence automatically:
 **Preferred: re-run launcher (includes health check):**
 
 ```powershell
-Set-Location "C:\Project Folders\Coordination Manager"; .\start.ps1
+.\start.ps1   # from the repository root
 ```
 
 **Alternative (Code root):**

@@ -79,3 +79,53 @@ export function inferRequestedTimezoneForAiResponse(
 
   return null
 }
+
+export interface AiAccessibleTimeItem {
+  id: string
+  title: string
+  time: {
+    startUtc: string
+    endUtc: string
+  }
+}
+
+export interface AiTimeItemDurationResult {
+  title: string
+  occurrenceCount: number
+  totalMinutes: number
+}
+
+function normalizeSearchText(value: string): string {
+  return value.toLowerCase().replace(/[^a-z0-9]+/g, ' ').trim()
+}
+
+export function findTimeItemDurationByTitle(
+  message: string,
+  items: AiAccessibleTimeItem[],
+): AiTimeItemDurationResult | null {
+  const normalizedMessage = normalizeSearchText(message)
+  const matchingItems = items.filter((item) => {
+    const normalizedTitle = normalizeSearchText(item.title)
+    return normalizedTitle.length > 0 && normalizedMessage.includes(normalizedTitle)
+  })
+
+  if (matchingItems.length === 0) return null
+
+  const uniqueOccurrences = new Map<string, AiAccessibleTimeItem>()
+  for (const item of matchingItems) {
+    const occurrenceKey = `${item.id}:${item.time.startUtc}`
+    if (!uniqueOccurrences.has(occurrenceKey)) uniqueOccurrences.set(occurrenceKey, item)
+  }
+
+  const totalMinutes = Array.from(uniqueOccurrences.values()).reduce((total, item) => {
+    const durationMinutes = (Date.parse(item.time.endUtc) - Date.parse(item.time.startUtc)) / 60000
+    return Number.isFinite(durationMinutes) && durationMinutes > 0 ? total + durationMinutes : total
+  }, 0)
+
+  const title = matchingItems[0].title
+  return {
+    title,
+    occurrenceCount: uniqueOccurrences.size,
+    totalMinutes,
+  }
+}

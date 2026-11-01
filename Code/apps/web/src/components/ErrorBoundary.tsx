@@ -1,8 +1,11 @@
 import React from 'react'
+import { handleAssetError } from '@/lib/asset-recovery'
+import { Button } from './ui'
 
 interface State {
   hasError: boolean
 }
+const ERROR_RELOAD_KEY = 'errorBoundaryAutoReload'
 
 export default class ErrorBoundary extends React.Component<
   { children: React.ReactNode },
@@ -16,6 +19,21 @@ export default class ErrorBoundary extends React.Component<
 
   componentDidCatch(error: Error, info: React.ErrorInfo) {
     console.error('ErrorBoundary caught:', error, info.componentStack)
+    if (handleAssetError(error)) return
+
+    // Any first-render crash on a fresh navigation (stale JS chunk from a new
+    // deploy, or a transient race while auth/session state is still
+    // hydrating on a cold mobile app start) is usually resolved by a single
+    // real reload of the SAME url. Auto-reload once; guard with
+    // sessionStorage so a genuinely broken page doesn't reload-loop forever.
+    try {
+      if (!sessionStorage.getItem(ERROR_RELOAD_KEY)) {
+        sessionStorage.setItem(ERROR_RELOAD_KEY, '1')
+        window.location.reload()
+      }
+    } catch {
+      // ignore storage errors
+    }
   }
 
   render() {
@@ -27,15 +45,17 @@ export default class ErrorBoundary extends React.Component<
             <p className="text-muted-foreground">
               An unexpected error occurred. Please reload the page to continue.
             </p>
-            <button
+            <Button
+              intent="primary"
               onClick={() => {
-                this.setState({ hasError: false })
-                window.location.href = '/'
+                try { sessionStorage.removeItem(ERROR_RELOAD_KEY) } catch { /* ignore */ }
+                // Reload the SAME url (not home) so the user lands back where
+                // they were instead of having to navigate here again.
+                window.location.reload()
               }}
-              className="px-4 py-2 bg-primary text-primary-foreground rounded-lg hover:opacity-90 transition-opacity"
             >
               Reload
-            </button>
+            </Button>
           </div>
         </div>
       )

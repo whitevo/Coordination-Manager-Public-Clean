@@ -2,6 +2,8 @@ import { Router, Response } from 'express';
 import type { Router as RouterType } from 'express';
 import { supabaseAdmin } from '../supabaseClient.js';
 import { optionalAuthMiddleware, authMiddleware, AuthenticatedRequest } from '../middleware/auth.js';
+import { safeErrorMessage } from '../middleware/validation.js';
+import { notifyParticipationChange } from '../services/calendar-notifications.js';
 
 const router: RouterType = Router();
 
@@ -25,7 +27,7 @@ router.post('/', async (req: AuthenticatedRequest, res: Response) => {
     // First get the calendar ID from the hash
     const { data: calendar, error: calendarError } = await supabaseAdmin
       .from('calendars')
-      .select('id')
+      .select('id, created_by, config')
       .eq('hash', calendar_hash)
       .single();
 
@@ -59,6 +61,14 @@ router.post('/', async (req: AuthenticatedRequest, res: Response) => {
         .delete()
         .eq('calendar_id', calendar.id)
         .eq('username', username);
+
+      notifyParticipationChange({
+        calendar,
+        participantName: String(username),
+        before: existing?.time_slots,
+        after: [],
+        actor: { userId: req.userId, email: req.userEmail },
+      });
 
       // Auto-subscribe still applies
       if (req.userId) {
@@ -96,8 +106,16 @@ router.post('/', async (req: AuthenticatedRequest, res: Response) => {
       .single();
 
     if (error) {
-      return res.status(400).json({ error: error.message });
+      return res.status(400).json({ error: safeErrorMessage(error) });
     }
+
+    notifyParticipationChange({
+      calendar,
+      participantName: String(username),
+      before: existing?.time_slots,
+      after: mergedSlots,
+      actor: { userId: req.userId, email: req.userEmail },
+    });
 
     // Auto-subscribe: if the user is logged in, subscribe them to this calendar
     if (req.userId) {
@@ -150,7 +168,7 @@ router.get('/:hash', async (req: AuthenticatedRequest, res: Response) => {
       .order('created_at', { ascending: true });
 
     if (error) {
-      return res.status(400).json({ error: error.message });
+      return res.status(400).json({ error: safeErrorMessage(error) });
     }
 
     res.json(data);
@@ -171,13 +189,20 @@ router.delete('/', async (req: AuthenticatedRequest, res: Response) => {
     // Get calendar ID from hash
     const { data: calendar, error: calendarError } = await supabaseAdmin
       .from('calendars')
-      .select('id')
+      .select('id, created_by, config')
       .eq('hash', calendar_hash)
       .single();
 
     if (calendarError || !calendar) {
       return res.status(404).json({ error: 'Calendar not found' });
     }
+
+    const { data: existing } = await supabaseAdmin
+      .from('availability')
+      .select('time_slots')
+      .eq('calendar_id', calendar.id)
+      .eq('username', username)
+      .maybeSingle();
 
     // Delete availability
     const { error } = await supabaseAdmin
@@ -187,8 +212,16 @@ router.delete('/', async (req: AuthenticatedRequest, res: Response) => {
       .eq('username', username);
 
     if (error) {
-      return res.status(400).json({ error: error.message });
+      return res.status(400).json({ error: safeErrorMessage(error) });
     }
+
+    notifyParticipationChange({
+      calendar,
+      participantName: String(username),
+      before: existing?.time_slots,
+      after: [],
+      actor: { userId: req.userId, email: req.userEmail },
+    });
 
     res.json({ success: true });
   } catch {
@@ -212,7 +245,7 @@ router.get('/user/past', authMiddleware, async (req: AuthenticatedRequest, res: 
       .select('calendar_id, username, time_slots, updated_at')
       .eq('user_id', req.userId);
 
-    if (availErr) return res.status(400).json({ error: availErr.message });
+    if (availErr) return res.status(400).json({ error: safeErrorMessage(availErr) });
     if (!avail || avail.length === 0) return res.json({ entries: [] });
 
     // 2. Collect unique calendar IDs and fetch their details
@@ -223,7 +256,7 @@ router.get('/user/past', authMiddleware, async (req: AuthenticatedRequest, res: 
       .select('id, hash, title, config')
       .in('id', calendarIds);
 
-    if (calErr) return res.status(400).json({ error: calErr.message });
+    if (calErr) return res.status(400).json({ error: safeErrorMessage(calErr) });
     if (!calendars || calendars.length === 0) return res.json({ entries: [] });
 
     const calMap = new Map(calendars.map(c => [c.id, c]));

@@ -62,6 +62,7 @@ export interface CalendarPreferences {
   endHour: number
   weekStartsOn: 0 | 1
   showWeekNumbers: boolean
+  dateFormat?: 'dd.mm.yyyy' | 'mm/dd/yyyy' | 'yyyy-mm-dd'
 }
 
 /** AI model preference (user-selectable) */
@@ -80,6 +81,8 @@ export interface AiSettings {
   preferredModel: AiModelId
   /** Oversight/admin users can enable the sentiment analysis tool on AI chat */
   sentimentToolEnabled?: boolean
+  /** Per-data-source permissions for the Time Management assistant. Defaults off. */
+  timeManagementAiAccess?: Record<string, boolean>
 }
 
 export const AI_MODEL_OPTIONS: AiModelOption[] = [
@@ -149,6 +152,12 @@ export function resolveAiRole(pageContextName: string | null): AiRoleId {
 
 /** Stored in the DB as theme_preferences JSONB */
 export interface ThemePreferences {
+  /**
+   * Light or dark appearance. 'system' is deprecated: the option was removed
+   * from Settings, and ThemeContext migrates a stored 'system' once to the OS
+   * preference at load time. It stays in the type because older localStorage
+   * and account JSONB can still contain it.
+   */
   mode: 'light' | 'dark' | 'system'
   /** Color-theme overlay applied when dark mode is active */
   darkThemeId: string | null
@@ -161,6 +170,29 @@ export interface ThemePreferences {
   calendarSettings?: CalendarPreferences
   /** AI model and behaviour preferences */
   aiSettings?: AiSettings
+  /**
+   * Whether the Theme (palette) button is pinned to the nav menu bar.
+   * Missing means true, so new users and older saved preferences see it.
+   */
+  showNavThemeToggle?: boolean
+}
+
+// --- Defaults for new users ------------------------------------------------
+
+/** Color overlay applied in dark mode for users without a saved preference ("Dark Forest"). */
+export const DEFAULT_DARK_THEME_ID = 'preset-forest'
+
+/** localStorage key holding the resolved overlay so index.html can paint it before React mounts. */
+export const ACTIVE_THEME_CACHE_KEY = 'theme-active-colors'
+
+/** Preferences for a visitor or account that has never saved a theme choice. */
+export function createDefaultThemePreferences(): ThemePreferences {
+  return {
+    mode: 'dark',
+    darkThemeId: DEFAULT_DARK_THEME_ID,
+    lightThemeId: null,
+    customThemes: [],
+  }
 }
 
 // ─── CSS Variable names mapped to ThemeColors keys ────────────────────
@@ -246,17 +278,17 @@ export const DEFAULT_LIGHT: ThemeColors = {
 }
 
 export const DEFAULT_DARK: ThemeColors = {
-  background: '222.2 47.4% 11.2%',
+  background: '222.2 47.4% 10%',
   foreground: '0 0% 98%',
   primary: '0 0% 98%',
   primaryForeground: '222 47% 11%',
-  secondary: '217.2 32.6% 17.5%',
+  secondary: '217.2 32.6% 18.5%',
   secondaryForeground: '0 0% 98%',
-  accent: '217.2 32.6% 17.5%',
+  accent: '217.2 32.6% 22.5%',
   accentForeground: '0 0% 98%',
-  muted: '217.2 32.6% 17.5%',
+  muted: '217.2 32.6% 14.5%',
   mutedForeground: '215 20.2% 65.1%',
-  border: '217.2 32.6% 17.5%',
+  border: '217.2 32.6% 22.5%',
   ring: '215 20.2% 65.1%',
   icon: '0 0% 98%',
 }

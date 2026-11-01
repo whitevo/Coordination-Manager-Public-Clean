@@ -1,10 +1,17 @@
 import { Router, Response } from 'express'
-import { createHmac, randomBytes } from 'crypto'
-import { lookup } from 'dns/promises'
-import { BlockList } from 'net'
+import { createHash, createHmac, randomBytes } from 'crypto'
 import { supabaseAdmin } from '../supabaseClient.js'
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth.js'
-import { safeErrorMessage } from '../middleware/validation.js'
+import { safeErrorMessage, sanitizeUUID } from '../middleware/validation.js'
+import {
+  GOOGLE_CALENDAR_API,
+  buildRecurrenceLines,
+  createGoogleCalendarEvent,
+  ensureFreshAccessToken,
+  GoogleCalendarApiError,
+  type GoogleCalendarEventBody,
+} from '../services/google-calendar-api.js'
+import { fetchPublicCalendarUrl, resolveSafePublicCalendarUrl } from '../services/public-calendar-fetch.js'
 import IcalExpander from 'ical-expander'
 
 const router: ReturnType<typeof Router> = Router()
@@ -14,38 +21,6 @@ const router: ReturnType<typeof Router> = Router()
 const GOOGLE_AUTH_ENDPOINT = 'https://accounts.google.com/o/oauth2/v2/auth'
 const GOOGLE_TOKEN_ENDPOINT = 'https://oauth2.googleapis.com/token'
 const GOOGLE_USERINFO_ENDPOINT = 'https://www.googleapis.com/oauth2/v2/userinfo'
-const PRIVATE_ADDRESS_BLOCKLIST = new BlockList()
-
-PRIVATE_ADDRESS_BLOCKLIST.addSubnet('0.0.0.0', 8, 'ipv4')
-PRIVATE_ADDRESS_BLOCKLIST.addSubnet('10.0.0.0', 8, 'ipv4')
-PRIVATE_ADDRESS_BLOCKLIST.addSubnet('100.64.0.0', 10, 'ipv4')
-PRIVATE_ADDRESS_BLOCKLIST.addSubnet('127.0.0.0', 8, 'ipv4')
-PRIVATE_ADDRESS_BLOCKLIST.addSubnet('169.254.0.0', 16, 'ipv4')
-PRIVATE_ADDRESS_BLOCKLIST.addSubnet('172.16.0.0', 12, 'ipv4')
-PRIVATE_ADDRESS_BLOCKLIST.addSubnet('192.168.0.0', 16, 'ipv4')
-PRIVATE_ADDRESS_BLOCKLIST.addSubnet('198.18.0.0', 15, 'ipv4')
-PRIVATE_ADDRESS_BLOCKLIST.addSubnet('::', 128, 'ipv6')
-PRIVATE_ADDRESS_BLOCKLIST.addSubnet('::1', 128, 'ipv6')
-PRIVATE_ADDRESS_BLOCKLIST.addSubnet('fc00::', 7, 'ipv6')
-PRIVATE_ADDRESS_BLOCKLIST.addSubnet('fe80::', 10, 'ipv6')
-
-const BLOCKED_HOSTNAME_PATTERNS = [
-  /^localhost$/,
-  /^0\.0\.0\.0$/,
-  /^127\.\d+\.\d+\.\d+$/,
-  /^10\.\d+\.\d+\.\d+$/,
-  /^172\.(1[6-9]|2\d|3[01])\.\d+\.\d+$/,
-  /^192\.168\.\d+\.\d+$/,
-  /^169\.254\.\d+\.\d+$/,
-  /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\.\d+\.\d+$/,
-  /^198\.(1[89])\.\d+\.\d+$/,
-  /^::1$/,
-  /^::$/,
-  /\.local$/,
-  /\.internal$/,
-  /\.svc\.cluster\.local$/,
-]
-
 // Scopes needed for both busy-time reads and event export.
 // calendar.events is sufficient for creating events, but busy sync also calls
 // CalendarList and FreeBusy endpoints, which require a read-capable scope.
@@ -143,112 +118,6 @@ interface PublicCalendarValidationResult {
   eventCount: number
 }
 
-// ─── Token refresh helper ───────────────────────────────────
-
-/**
- * Refresh a Google OAuth access token using the stored refresh_token.
- * Updates the DB row with the new access_token and expiry.
- * Returns the new (or current) access_token.
- */
-async function ensureFreshAccessToken(source: {
-  id: string
-  google_access_token: string | null
-  google_refresh_token: string | null
-  token_expires_at: string | null
-}): Promise<string> {
-  // If the token is still valid (with 5-minute buffer), return it as-is
-  if (source.google_access_token && source.token_expires_at) {
-    const expiresAt = new Date(source.token_expires_at).getTime()
-    if (Date.now() < expiresAt - 5 * 60 * 1000) {
-      return source.google_access_token
-    }
-  }
-
-  if (!source.google_refresh_token) {
-    throw new Error('No refresh token available — user must re-authorize')
-  }
-
-  const { clientId, clientSecret } = getGoogleOAuthConfig()
-
-  const tokenRes = await fetch(GOOGLE_TOKEN_ENDPOINT, {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-    body: new URLSearchParams({
-      client_id: clientId,
-      client_secret: clientSecret,
-      refresh_token: source.google_refresh_token,
-      grant_type: 'refresh_token',
-    }),
-  })
-
-  const tokenData = (await tokenRes.json()) as GoogleTokenResponse
-
-  if (!tokenRes.ok || tokenData.error) {
-    throw new Error(tokenData.error_description || tokenData.error || 'Token refresh failed')
-  }
-
-  const newExpiry = new Date(Date.now() + (tokenData.expires_in || 3600) * 1000).toISOString()
-
-  // Persist new token in DB
-  await supabaseAdmin
-    .from('calendar_sources')
-    .update({
-      google_access_token: tokenData.access_token,
-      token_expires_at: newExpiry,
-    })
-    .eq('id', source.id)
-
-  return tokenData.access_token
-}
-
-// ─── Google Calendar API helper ─────────────────────────────
-
-const GOOGLE_CALENDAR_API = 'https://www.googleapis.com/calendar/v3'
-
-interface GoogleCalendarEventBody {
-  summary: string
-  description?: string
-  location?: string
-  start: { dateTime: string; timeZone?: string }
-  end: { dateTime: string; timeZone?: string }
-  recurrence?: string[]
-  source?: { title: string; url: string }
-  reminders?: { useDefault: boolean; overrides?: Array<{ method: string; minutes: number }> }
-}
-
-interface GoogleCalendarEventResponse {
-  id: string
-  htmlLink: string
-  status: string
-  error?: { code: number; message: string }
-}
-
-/**
- * Create an event on the user's primary Google Calendar.
- * Returns the event id and link.
- */
-async function createGoogleCalendarEvent(
-  accessToken: string,
-  event: GoogleCalendarEventBody,
-): Promise<{ eventId: string; htmlLink: string }> {
-  const res = await fetch(`${GOOGLE_CALENDAR_API}/calendars/primary/events`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify(event),
-  })
-
-  const data = (await res.json()) as GoogleCalendarEventResponse
-
-  if (!res.ok || data.error) {
-    throw new Error(data.error?.message || `Google Calendar API error (${res.status})`)
-  }
-
-  return { eventId: data.id, htmlLink: data.htmlLink }
-}
-
 // ─── ICS feed parser (ical-expander) ────────────────────────
 
 /**
@@ -297,99 +166,9 @@ function parseIcsEvents(
   return results
 }
 
-function decodeBase64Url(value: string): string | null {
-  try {
-    const base64 = value.replace(/-/g, '+').replace(/_/g, '/')
-    const padded = base64 + '='.repeat((4 - (base64.length % 4)) % 4)
-    return Buffer.from(padded, 'base64').toString('utf-8')
-  } catch {
-    return null
-  }
-}
-
-function normalizePublicCalendarUrl(inputUrl: string): string {
-  const parsed = new URL(inputUrl)
-
-  if (parsed.hostname.toLowerCase() === 'calendar.google.com') {
-    const cid = parsed.searchParams.get('cid')
-    if (cid) {
-      const decodedCid = decodeBase64Url(cid) || cid
-      const calendarId = decodedCid.trim()
-      if (calendarId) {
-        const encodedId = encodeURIComponent(calendarId)
-        return `https://calendar.google.com/calendar/ical/${encodedId}/public/basic.ics`
-      }
-    }
-  }
-
-  return parsed.toString()
-}
-
-function normalizeHostname(hostname: string): string {
-  return hostname.trim().toLowerCase().replace(/^\[/, '').replace(/\]$/, '').split('%')[0]
-}
-
-function isBlockedIpAddress(address: string): boolean {
-  const normalized = normalizeHostname(address)
-  if (!normalized) return true
-
-  if (normalized.startsWith('::ffff:')) {
-    return isBlockedIpAddress(normalized.slice(7))
-  }
-
-  const family = normalized.includes(':') ? 'ipv6' : 'ipv4'
-  return PRIVATE_ADDRESS_BLOCKLIST.check(normalized, family)
-}
-
-async function assertSafePublicCalendarHost(hostname: string): Promise<void> {
-  const normalizedHostname = normalizeHostname(hostname)
-  if (!normalizedHostname) {
-    throw new Error('Invalid calendar host')
-  }
-
-  if (BLOCKED_HOSTNAME_PATTERNS.some((pattern) => pattern.test(normalizedHostname))) {
-    throw new Error('URLs pointing to private or internal addresses are not allowed')
-  }
-
-  if (isBlockedIpAddress(normalizedHostname)) {
-    throw new Error('URLs pointing to private or internal addresses are not allowed')
-  }
-
-  let resolvedAddresses: Array<{ address: string; family: number }>
-  try {
-    resolvedAddresses = await lookup(normalizedHostname, { all: true as const })
-  } catch {
-    throw new Error('Calendar host could not be resolved')
-  }
-
-  if (!Array.isArray(resolvedAddresses) || resolvedAddresses.length === 0) {
-    throw new Error('Calendar host could not be resolved')
-  }
-
-  if (resolvedAddresses.some((entry) => isBlockedIpAddress(entry.address))) {
-    throw new Error('URLs pointing to private or internal addresses are not allowed')
-  }
-}
-
-async function resolveSafePublicCalendarUrl(inputUrl: string): Promise<string> {
-  let normalizedUrl: URL
-  try {
-    normalizedUrl = new URL(normalizePublicCalendarUrl(inputUrl))
-  } catch {
-    throw new Error('Invalid URL format')
-  }
-
-  if (normalizedUrl.protocol !== 'https:') {
-    throw new Error('Only HTTPS URLs are allowed')
-  }
-
-  await assertSafePublicCalendarHost(normalizedUrl.hostname)
-  return normalizedUrl.toString()
-}
-
 async function validatePublicCalendarFeed(publicUrl: string): Promise<PublicCalendarValidationResult> {
   const normalizedUrl = await resolveSafePublicCalendarUrl(publicUrl)
-  const response = await fetch(normalizedUrl, {
+  const response = await fetchPublicCalendarUrl(normalizedUrl, {
     signal: AbortSignal.timeout(15_000),
     headers: {
       Accept: 'text/calendar, text/plain;q=0.9, */*;q=0.8',
@@ -441,7 +220,7 @@ router.get('/', async (req: AuthenticatedRequest, res: Response) => {
 
     if (error) {
       console.error('Error fetching calendar sources:', error)
-      return res.status(400).json({ error: error.message })
+      return res.status(400).json({ error: safeErrorMessage(error) })
     }
 
     res.json({ sources: data || [] })
@@ -538,7 +317,11 @@ router.get('/google/callback', async (req, res: Response) => {
     const tokenData = await tokenRes.json() as GoogleTokenResponse
 
     if (!tokenRes.ok || tokenData.error) {
-      console.error('Google token exchange failed:', tokenData)
+      console.error(
+        'Google token exchange failed:',
+        String(tokenData.error ?? '').replace(/[\r\n]/g, ' '),
+        String(tokenData.error_description ?? '').replace(/[\r\n]/g, ' '),
+      )
       return errorRedirect(tokenData.error_description || tokenData.error || 'Token exchange failed')
     }
 
@@ -653,7 +436,7 @@ router.post('/public-url', async (req: AuthenticatedRequest, res: Response) => {
         return res.status(409).json({ error: 'This calendar URL is already added' })
       }
       console.error('Error adding public URL source:', error)
-      return res.status(400).json({ error: error.message })
+      return res.status(400).json({ error: safeErrorMessage(error) })
     }
 
     res.status(201).json({ source: data, validation: { eventCount: validatedFeed.eventCount } })
@@ -689,7 +472,7 @@ router.put('/:id', async (req: AuthenticatedRequest, res: Response) => {
 
     if (error) {
       console.error('Error updating calendar source:', error)
-      return res.status(400).json({ error: error.message })
+      return res.status(400).json({ error: safeErrorMessage(error) })
     }
 
     if (!data) {
@@ -719,7 +502,7 @@ router.delete('/:id', async (req: AuthenticatedRequest, res: Response) => {
 
     if (error) {
       console.error('Error deleting calendar source:', error)
-      return res.status(400).json({ error: error.message })
+      return res.status(400).json({ error: safeErrorMessage(error) })
     }
 
     if (!data) {
@@ -745,62 +528,6 @@ router.delete('/:id', async (req: AuthenticatedRequest, res: Response) => {
   }
 })
 
-// ─── Recurrence RRULE builder ───────────────────────────────
-
-interface RecurrenceRule {
-  type: 'none' | 'weekly' | 'biweekly' | 'monthly' | 'custom'
-  interval?: number
-  unit?: 'day' | 'week' | 'month'
-  weekDays?: number[]
-  endType?: 'never' | 'on' | 'after'
-  endDate?: string
-  endCount?: number
-}
-
-/**
- * Build an RFC 5545 RRULE string from a recurrence rule object.
- * Returns null if the type is 'none' or invalid.
- */
-function buildRRuleFromRecurrence(rule: RecurrenceRule, dtStartISO: string): string | null {
-  if (!rule || rule.type === 'none') return null
-  const parts: string[] = []
-  const dayNames = ['MO', 'TU', 'WE', 'TH', 'FR', 'SA', 'SU']
-
-  // Get the weekday index (0=Mon..6=Sun) from the start date
-  function getDayIndex(): number {
-    const d = new Date(dtStartISO)
-    const jsDay = d.getUTCDay() // 0=Sun..6=Sat
-    return jsDay === 0 ? 6 : jsDay - 1
-  }
-
-  if (rule.type === 'weekly') {
-    parts.push('FREQ=WEEKLY', 'INTERVAL=1')
-  } else if (rule.type === 'biweekly') {
-    parts.push('FREQ=WEEKLY', 'INTERVAL=2')
-  } else if (rule.type === 'monthly') {
-    parts.push('FREQ=MONTHLY', 'INTERVAL=1')
-  } else if (rule.type === 'custom') {
-    const unit = rule.unit || 'week'
-    const interval = rule.interval || 1
-    if (unit === 'day') {
-      parts.push('FREQ=DAILY', `INTERVAL=${interval}`)
-    } else if (unit === 'week') {
-      const days = (rule.weekDays || [getDayIndex()]).map(d => dayNames[d]).join(',')
-      parts.push('FREQ=WEEKLY', `INTERVAL=${interval}`, `BYDAY=${days}`)
-    } else {
-      parts.push('FREQ=MONTHLY', `INTERVAL=${interval}`)
-    }
-  }
-
-  if (rule.endType === 'on' && rule.endDate) {
-    parts.push(`UNTIL=${rule.endDate.replace(/-/g, '')}T235959Z`)
-  } else if (rule.endType === 'after' && rule.endCount) {
-    parts.push(`COUNT=${rule.endCount}`)
-  }
-
-  return parts.join(';')
-}
-
 // ─── POST /api/calendar-sources/export ──────────────────────
 // Export confirmed meetings to connected Google Calendar accounts.
 // For each meeting, creates an event on each selected Google Calendar source.
@@ -824,7 +551,7 @@ router.post('/export', async (req: AuthenticatedRequest, res: Response) => {
       .in('id', targetSourceIds)
 
     if (srcError) {
-      return res.status(400).json({ error: srcError.message })
+      return res.status(400).json({ error: safeErrorMessage(srcError) })
     }
 
     const oauthSources = (sources || []).filter(s => s.source_type === 'google_oauth')
@@ -904,9 +631,12 @@ router.post('/export', async (req: AuthenticatedRequest, res: Response) => {
 
           // ── Recurrence RRULE ───────────────────────────────
           if (meeting.recurrenceRule && meeting.recurrenceRule.type && meeting.recurrenceRule.type !== 'none') {
-            const rrule = buildRRuleFromRecurrence(meeting.recurrenceRule, startISO)
-            if (rrule) {
-              eventBody.recurrence = [`RRULE:${rrule}`]
+            const excludedStarts = (Array.isArray(meeting.recurrenceRule.exceptions) ? meeting.recurrenceRule.exceptions : [])
+              .filter((date: unknown): date is string => typeof date === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(date))
+              .map((date: string) => `${date}${startISO.slice(10)}`)
+            const recurrence = buildRecurrenceLines(meeting.recurrenceRule, startISO, excludedStarts)
+            if (recurrence) {
+              eventBody.recurrence = recurrence
             }
           }
 
@@ -957,6 +687,12 @@ router.post('/export', async (req: AuthenticatedRequest, res: Response) => {
 router.post('/add-event', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { event, targetSourceIds } = req.body
+    const idempotencyKey =
+      req.body?.idempotencyKey === undefined ? null : sanitizeUUID(req.body.idempotencyKey)
+
+    if (req.body?.idempotencyKey !== undefined && !idempotencyKey) {
+      return res.status(400).json({ error: 'Invalid idempotency key' })
+    }
 
     if (!event || !event.title || !event.start_time || !event.end_time) {
       return res.status(400).json({ error: 'Event must include title, start_time, and end_time' })
@@ -973,7 +709,7 @@ router.post('/add-event', async (req: AuthenticatedRequest, res: Response) => {
       .in('id', targetSourceIds)
 
     if (srcError) {
-      return res.status(400).json({ error: srcError.message })
+      return res.status(400).json({ error: safeErrorMessage(srcError) })
     }
 
     const oauthSources = (sources || []).filter(s => s.source_type === 'google_oauth')
@@ -994,6 +730,7 @@ router.post('/add-event', async (req: AuthenticatedRequest, res: Response) => {
       success: boolean
       htmlLink?: string
       error?: string
+      retryable?: boolean
     }> = []
 
     for (const source of sourcesWithTokens) {
@@ -1007,6 +744,11 @@ router.post('/add-event', async (req: AuthenticatedRequest, res: Response) => {
           end: { dateTime: event.end_time, timeZone: 'UTC' },
           reminders: { useDefault: false },
         }
+        if (idempotencyKey) {
+          eventBody.id = createHash('sha256')
+            .update(`${idempotencyKey}:${source.id}`)
+            .digest('hex')
+        }
 
         if (event.location) {
           eventBody.location = event.location
@@ -1014,16 +756,23 @@ router.post('/add-event', async (req: AuthenticatedRequest, res: Response) => {
           eventBody.location = event.meeting_link
         }
 
-        if (event.meeting_link && eventBody.description) {
-          eventBody.description += `\n\nMeeting link: ${event.meeting_link}`
-        } else if (event.meeting_link) {
+        if (event.meeting_link && !eventBody.description) {
           eventBody.description = `Meeting link: ${event.meeting_link}`
         }
 
         const { htmlLink } = await createGoogleCalendarEvent(accessToken, eventBody)
         results.push({ sourceId: source.id, googleEmail: source.google_email || 'unknown', success: true, htmlLink })
       } catch (err) {
-        results.push({ sourceId: source.id, googleEmail: source.google_email || 'unknown', success: false, error: safeErrorMessage(err) })
+        results.push({
+          sourceId: source.id,
+          googleEmail: source.google_email || 'unknown',
+          success: false,
+          error: safeErrorMessage(err),
+          retryable:
+            err instanceof GoogleCalendarApiError
+              ? err.retryable
+              : err instanceof TypeError,
+        })
       }
     }
 
@@ -1136,7 +885,7 @@ router.post('/busy', async (req: AuthenticatedRequest, res: Response) => {
       .in('id', sourceIds)
 
     if (srcError) {
-      return res.status(400).json({ error: srcError.message })
+      return res.status(400).json({ error: safeErrorMessage(srcError) })
     }
 
     const oauthSources = (sources || []).filter(
@@ -1311,8 +1060,7 @@ router.post('/busy', async (req: AuthenticatedRequest, res: Response) => {
     // ── Public URL sources: fetch & parse ICS feeds ──
     for (const source of publicUrlSources) {
       try {
-        const safePublicUrl = await resolveSafePublicCalendarUrl(source.public_url)
-        const icsRes = await fetch(safePublicUrl, {
+        const icsRes = await fetchPublicCalendarUrl(source.public_url, {
           signal: AbortSignal.timeout(15_000), // 15s timeout to prevent slow-loris DoS
         })
         if (!icsRes.ok) {

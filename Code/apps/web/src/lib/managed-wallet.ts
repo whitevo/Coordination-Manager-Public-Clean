@@ -169,26 +169,6 @@ async function decryptPrivateKey(
 }
 
 /**
- * Sign a challenge message with the managed wallet's private key.
- * Returns the 64-byte Ed25519 signature as lowercase hex, or null if
- * the blob cannot be decrypted on this device.
- */
-export async function signChallengeWithManagedWallet(
-  encryptedBlob: string,
-  message: string,
-): Promise<string | null> {
-  const deviceKey = getOrCreateDeviceKey()
-  const privateKey = await decryptPrivateKey(encryptedBlob, deviceKey)
-  if (!privateKey) return null
-
-  const data = new TextEncoder().encode(message)
-  const sig = await crypto.subtle.sign({ name: 'Ed25519' }, privateKey, data)
-  return Array.from(new Uint8Array(sig))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('')
-}
-
-/**
  * Export the raw private key bytes as a hex string for backup display.
  * Returns null if this device cannot decrypt the blob.
  */

@@ -1,85 +1,44 @@
 # Supply Chain Security Reference
 
+## Contents
+- pnpm Configuration
+- GitHub Actions Security
+- SBOM Generation
+- Incident Response (Compromised Package)
+- Ongoing Habits
+
 ## pnpm Configuration
 
-### Required settings (in `Code/package.json` under `"pnpm"` key):
+### Required settings (in `Code/pnpm-workspace.yaml`; pnpm 11+ ignores the `"pnpm"` field of `package.json`):
 
-```jsonc
-"pnpm": {
-  "onlyBuiltDependencies": ["esbuild", "chacha-native"],
-  "blockExoticSubdeps": true
-}
+```yaml
+blockExoticSubdeps: true
+allowBuilds:
+  esbuild: true
+  chacha-native: true
 ```
 
-- **onlyBuiltDependencies**: Restricts which packages can run install scripts
-  (postinstall, preinstall). Limits blast radius of supply-chain attacks.
+- **allowBuilds**: Deny-by-default allowlist of packages that may run install scripts
+  (postinstall, preinstall); replaced `onlyBuiltDependencies` in pnpm 11. Limits blast
+  radius of supply-chain attacks.
 - **blockExoticSubdeps**: Prevents transitive dependencies from pulling packages
   from git URLs, direct tarball URLs, or other untrusted locations.
+- **minimumReleaseAge** (`Code/pnpm-workspace.yaml`, minutes; 4320 = 3 days): new
+  versions are not resolved until they are 3 days old, so a hijacked release is
+  usually unpublished before it can land in the lockfile.
 
 ### Override pattern for transitive vulns:
 
-```jsonc
-"pnpm": {
-  "overrides": {
-    "vulnerable-package": ">=2.0.1"
-  }
-}
+```yaml
+# Code/pnpm-workspace.yaml
+overrides:
+  "vulnerable-package@<2.0.1": "2.0.1"
 ```
 
 ## GitHub Actions Security
 
-### Token permissions (minimal by default):
-```yaml
-permissions:
-  contents: read
-
-jobs:
-  check:
-    permissions:
-      contents: read
-      security-events: write  # only if CodeQL needs it
-```
-
-### Pin actions to commit SHAs:
-```yaml
-# GOOD: pinned to immutable SHA
-- uses: actions/checkout@b4ffde65f46336ab88eb53be808477a3936bae11  # v4.1.1
-- uses: pnpm/action-setup@a3252b78c470c02df07e9d59298aecedc3ccdd6d  # v2.4.0
-- uses: actions/setup-node@60edb5dd545a775178f52524783378180af0d1f8  # v4.0.2
-
-# BAD: mutable tag reference
-- uses: actions/checkout@v4
-```
-
-### Fork workflow security:
-- Never use `pull_request_target` with checkout of PR code + secret access
-- Use `pull_request` trigger for untrusted code (no secret access)
-- Two-workflow pattern if secrets needed: `pull_request` (no secrets) + `workflow_run` (trusted)
-
-## CodeQL Configuration
-
-```yaml
-name: CodeQL Analysis
-on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
-  schedule:
-    - cron: '0 6 * * 1'  # Weekly Monday 6am
-
-jobs:
-  analyze:
-    runs-on: ubuntu-latest
-    permissions:
-      security-events: write
-    steps:
-      - uses: actions/checkout@SHA
-      - uses: github/codeql-action/init@SHA
-        with:
-          languages: javascript-typescript
-      - uses: github/codeql-action/analyze@SHA
-```
+- Pin every action to a 40-hex commit SHA, never a mutable tag. Current SHAs: copy from `.github/workflows/*.yml` (see github-workflow `references/ci-workflows.md`). Verify pins when updating CI.
+- Token permissions, CodeQL workflow YAML, and fork-PR rules (`pull_request` vs `pull_request_target`, two-workflow pattern): github-workflow `references/ci-workflows.md`.
 
 ## SBOM Generation
 
@@ -88,6 +47,7 @@ jobs:
 npx @cyclonedx/cyclonedx-npm --output-file sbom.json --output-format json
 ```
 
+- Pin the `@cyclonedx/cyclonedx-npm` version in the command (npx otherwise fetches latest)
 - Formats: CycloneDX (JSON/XML) or SPDX
 - Include in release artifacts alongside the build
 - SLSA Level 1+: locked dependencies (`--frozen-lockfile`), provenance metadata
@@ -95,7 +55,7 @@ npx @cyclonedx/cyclonedx-npm --output-file sbom.json --output-format json
 ## Incident Response (Compromised Package)
 
 1. Check exposure: `pnpm why <package>`
-2. Pin to known-good version via `pnpm.overrides`
+2. Pin to known-good version via `overrides` in `Code/pnpm-workspace.yaml`
 3. Verify integrity: `pnpm install --frozen-lockfile`
 4. Check for postinstall scripts in the compromised package
 5. Rotate credentials if package could access env vars during install
@@ -106,10 +66,11 @@ npx @cyclonedx/cyclonedx-npm --output-file sbom.json --output-format json
 
 | Habit | Frequency |
 |-------|-----------|
-| Run `pnpm audit` | Every CI run |
-| Review Dependabot alerts | Weekly |
+| Run the audit | Every CI run (OSV check via `scripts/security-check.ps1`, blocking) |
 | Update dependencies | Monthly (patch), quarterly (minor/major) |
 | Regenerate SBOM | Each release |
-| Review pnpm.overrides | Monthly (remove stale overrides) |
-| Check OpenSSF Scorecard | Weekly (automated in CI) |
+| Review pnpm overrides | Monthly (remove stale overrides) |
+| Check OpenSSF Scorecard | Manual; no workflow in repo |
 | Verify action SHA pins | When updating CI workflows |
+
+Weekly Dependabot and Scorecard review cadence: security-hardening.

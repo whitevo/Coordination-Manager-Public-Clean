@@ -22,6 +22,7 @@ import { promises as fs } from 'fs'
 import { existsSync, readFileSync } from 'fs'
 import path from 'path'
 import { randomBytes } from 'crypto'
+import { getSupabaseSecretKeyName, getSupabaseServerKey, SUPABASE_SERVER_KEY_NAMES } from './supabase-key.js'
 
 // ---------------------------------------------------------------------------
 // Paths
@@ -116,10 +117,6 @@ export async function writeLocalConfig(patch: Partial<LocalConfig>): Promise<Loc
   return next
 }
 
-export function invalidateLocalConfigCache(): void {
-  _cached = null
-}
-
 // ---------------------------------------------------------------------------
 // Required env detection
 // ---------------------------------------------------------------------------
@@ -139,7 +136,7 @@ export const REQUIRED_WEB_KEYS = ['VITE_SUPABASE_URL', 'VITE_SUPABASE_ANON_KEY']
  * Optional keys grouped by feature -- presented in the wizard as feature toggles.
  */
 export const OPTIONAL_FEATURE_KEYS = {
-  admin: ['SUPABASE_SERVICE_ROLE_KEY'],
+  get admin() { return [getSupabaseSecretKeyName()] },
   jwt: ['JWT_SECRET'],
   google: ['GOOGLE_CLIENT_ID', 'GOOGLE_CLIENT_SECRET'],
   discord: ['DISCORD_BOT_TOKEN', 'DISCORD_CLIENT_ID'],
@@ -156,6 +153,7 @@ export const OPTIONAL_FEATURE_KEYS = {
 export const WRITABLE_API_ENV_KEYS = new Set<string>([
   ...REQUIRED_API_KEYS,
   ...Object.values(OPTIONAL_FEATURE_KEYS).flat(),
+  ...SUPABASE_SERVER_KEY_NAMES,
   'PORT',
   'FRONTEND_URL',
   'NODE_ENV',
@@ -184,7 +182,7 @@ export const WRITABLE_BOT_ENV_KEYS = new Set<string>([
   'API_URL',
   'FRONTEND_URL',
   'SUPABASE_URL',
-  'SUPABASE_SERVICE_ROLE_KEY',
+  ...SUPABASE_SERVER_KEY_NAMES,
 ])
 
 /**
@@ -196,7 +194,7 @@ export const WRITABLE_GUARDIAN_ENV_KEYS = new Set<string>([
   'DISCORD_BOT_TOKEN',
   'DISCORD_CLIENT_ID',
   'SUPABASE_URL',
-  'SUPABASE_SERVICE_ROLE_KEY',
+  ...SUPABASE_SERVER_KEY_NAMES,
   'GUARDIAN_FORCE_TAKEOVER',
   'GUARDIAN_INSTANCE_LABEL',
   'DISABLE_BOT',
@@ -295,7 +293,10 @@ export function getOptionalFeatureStatus(): Record<keyof typeof OPTIONAL_FEATURE
   for (const [feature, keys] of Object.entries(OPTIONAL_FEATURE_KEYS) as Array<
     [keyof typeof OPTIONAL_FEATURE_KEYS, readonly string[]]
   >) {
-    if (feature === 'discord') {
+    if (feature === 'admin') {
+      const { name, value } = getSupabaseServerKey()
+      out[feature] = isMeaningfulEnvValue(name, value)
+    } else if (feature === 'discord') {
       // Bot process loads its own .env; consider Discord configured if either
       // the API env (mirrored) OR the bot's own .env has the required keys.
       out[feature] = keys.every(k => isMeaningfulEnvValue(k, process.env[k]) || isMeaningfulEnvValue(k, botEnv[k]))
@@ -397,7 +398,7 @@ function parseDotenv(text: string): Record<string, string> {
  * `whitelist` MUST be enforced by the caller -- this function trusts its input.
  */
 async function updateEnvFile(file: string, updates: Record<string, string>): Promise<void> {
-  let existing = ''
+  let existing: string
   try {
     existing = await fs.readFile(file, 'utf8')
   } catch {
@@ -540,7 +541,6 @@ const NON_SECRET_KEYS = new Set<string>([
   'BOT_API_URL', 'AI_PROVIDER', 'AI_MODEL', 'AI_BASE_URL',
   'ASI_BASE_URL', 'ASI_MODEL',
   'ZOOM_CLIENT_ID', 'ZOOM_REDIRECT_URI',
-  'FIGMA_TEAM_ID',
 ])
 
 function maskValue(key: string, value: string): string {

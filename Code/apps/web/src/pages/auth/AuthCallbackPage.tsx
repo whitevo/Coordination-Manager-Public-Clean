@@ -3,11 +3,16 @@ import { useNavigate } from 'react-router-dom'
 import { Calendar } from 'lucide-react'
 import { supabase } from '../../lib/supabase'
 import { clearStaleAuthState } from '../../lib/auth-service'
+import { Button } from '../../components/ui'
 
 /**
  * OAuth callback page.
- * Supabase handles the token exchange automatically via the URL hash/params.
- * This page waits for the session to be established before redirecting.
+ * Google OAuth uses the PKCE flow: the provider redirects here with a `?code=`
+ * query param and supabase-js (detectSessionInUrl) exchanges it for a session
+ * automatically on client init. This page only waits for that session to be
+ * established before redirecting, and surfaces `error` / `error_description`
+ * params (query or legacy hash) as a failure. Legacy hash tokens are still
+ * handled by supabase-js and need no special handling here.
  */
 export default function AuthCallbackPage() {
   const navigate = useNavigate()
@@ -37,10 +42,11 @@ export default function AuthCallbackPage() {
 
     const returnTo = sessionStorage.getItem('authReturnTo') || '/'
 
-    // Wait for Supabase to process the OAuth callback and establish a session
+    // Wait for Supabase to exchange the ?code= param and establish a session
+    // (getSession() awaits the client's initial URL processing).
     const checkSession = async () => {
       try {
-        // Give Supabase a moment to process the URL hash tokens
+        // getSession() resolves after supabase-js finishes the code exchange
         const { data: { session }, error: sessionError } = await supabase.auth.getSession()
 
         if (sessionError) {
@@ -78,7 +84,7 @@ export default function AuthCallbackPage() {
       }
     }
 
-    // Small delay to let Supabase client process the URL hash
+    // Small delay to let the Supabase client begin processing the URL
     const timer = setTimeout(checkSession, 500)
     return () => {
       mounted = false
@@ -88,26 +94,23 @@ export default function AuthCallbackPage() {
 
   if (error) {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-background to-muted flex flex-col items-center justify-center px-4">
+      <div className="min-h-screen bg-linear-to-br from-background to-muted flex flex-col items-center justify-center px-4">
         <div className="bg-card text-card-foreground rounded-2xl shadow-xl border border-border p-8 max-w-md w-full text-center">
-          <div className="w-12 h-12 rounded-full bg-red-100 dark:bg-red-950 flex items-center justify-center mx-auto mb-4">
-            <span className="text-red-600 dark:text-red-400 text-xl">!</span>
+          <div className="w-12 h-12 rounded-full bg-danger-subtle flex items-center justify-center mx-auto mb-4">
+            <span className="text-danger text-xl">!</span>
           </div>
           <h2 className="text-xl font-bold mb-2">Authentication Failed</h2>
           <p className="text-muted-foreground mb-6">{error}</p>
-          <button
-            onClick={() => navigate('/auth/login', { replace: true })}
-            className="px-6 py-2.5 bg-primary hover:bg-primary/90 text-primary-foreground font-medium rounded-lg transition-colors"
-          >
+          <Button intent="primary" onClick={() => navigate('/auth/login', { replace: true })}>
             Back to Login
-          </button>
+          </Button>
         </div>
       </div>
     )
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-background to-muted flex flex-col items-center justify-center px-4">
+    <div className="min-h-screen bg-linear-to-br from-background to-muted flex flex-col items-center justify-center px-4">
       <div className="flex flex-col items-center gap-4">
         <Calendar className="h-10 w-10 text-primary animate-pulse" />
         <div className="w-8 h-8 border-4 border-primary border-t-transparent rounded-full animate-spin" />

@@ -2,7 +2,7 @@
 
 **Coordination Manager**
 *Effective Date: February 7, 2026*
-*Last Updated: February 7, 2026*
+*Last Updated: September 13, 2026*
 
 ---
 
@@ -14,12 +14,17 @@ By accessing or using Coordination Manager ("the App", "the Service"), you agree
 
 ## 2. Description of Service
 
-Coordination Manager is a web-based scheduling and event coordination application that allows users to:
+Coordination Manager is a web-based coordination application for planning time, scheduling meetings, managing connected mailboxes, distributing messages, and supporting online communities. It allows users to:
 
 - Sign in via Google authentication.
 - Sync and view Google Calendar data.
+- Plan personal time and availability.
 - Manage availability and schedule meetings.
 - Coordinate events with other users.
+- Connect a Gmail or Outlook mailbox, search and organize it, and configure automation rules (including optional AI-assisted rule suggestions and email scoring).
+- Draft and distribute messages across connected channels.
+- Configure Discord Guardian moderation tools for communities they manage.
+- Use optional AI-assisted features to help draft messages, suggest scheduling, and configure automations.
 
 The Service is provided as an **open-source project** under active development.
 
@@ -29,7 +34,7 @@ The Service is provided as an **open-source project** under active development.
 
 ### 3.1 Google Account
 
-You may sign in with a valid Google account for full feature access. By signing in, you authorise the App to access your basic profile information and, if you choose, your Google Calendar data.
+You may sign in with a valid Google account for full feature access. By signing in, you authorise the App to access your basic profile information. Google Calendar and Gmail connections are optional, separate consent flows that request the permissions needed for the feature you choose to connect.
 
 ### 3.2 Traveler (Guest) Account
 
@@ -51,6 +56,7 @@ You are responsible for:
 - All activity that occurs under your account within the App.
 - Ensuring your use complies with Google's Terms of Service (if using Google sign-in).
 - Understanding that Traveler account data cannot be recovered once the session is lost.
+- Confirming that you are legally able to use the Service in your jurisdiction. The Service is not directed toward children, and we do not knowingly accept accounts from children under 13 or below the applicable digital-consent age where additional consent is required.
 
 ### 3.4 Account Termination
 
@@ -68,6 +74,8 @@ You agree **not** to:
 - Use automated tools to scrape or extract data from the Service.
 - Impersonate another person or misrepresent your identity.
 - Use the Service to send spam or unsolicited communications.
+- Use Mailbox automation rules, the AI assistant, or the Mailbox send feature to send spam, phishing, or bulk unsolicited email, or to send mail impersonating an address you do not control.
+- Attempt to bypass daily AI usage limits or automation safeguards (for example, scripting requests to exceed the documented per-account limits).
 
 ---
 
@@ -77,17 +85,17 @@ You agree **not** to:
 
 Coordination Manager is developed as an open-source project under the **MIT License**. The public source code is available at:
 
-**[github.com/whitevo/coordination-manager-public](https://github.com/whitevo/coordination-manager-public)**
+**[github.com/whitevo/Coordination-Manager-Public-Clean](https://github.com/whitevo/Coordination-Manager-Public-Clean)**
 
 The production system that runs coordinationmanager.com is maintained in a separate private repository that is not publicly accessible. We selectively merge valuable community contributions from the public repository into production and release appropriate non-sensitive improvements to the public repository.
 
 ### 5.2 Trademarks
 
-"Coordination Manager" and "Voltaire Swarm" are trademarks of Voltaire Swarm OÜ. The MIT license covers the source code only -- it does not grant rights to use these names, logos, or branding. See the project's [TRADEMARKS.md](https://github.com/whitevo/coordination-manager-public/blob/main/TRADEMARKS.md) for details. Forks must rebrand.
+"Coordination Manager" and "Voltaire Swarm" are trademarks of Voltaire Swarm OÜ. The MIT license covers the source code only -- it does not grant rights to use these names, logos, or branding. See the project's [TRADEMARKS.md](https://github.com/whitevo/Coordination-Manager-Public-Clean/blob/main/TRADEMARKS.md) for details. Forks must rebrand.
 
 ### 5.3 Contributions
 
-Code and documentation contributions are accepted under the project's [Contributor Licence Agreement (CLA)](https://github.com/whitevo/coordination-manager-public/blob/main/CLA.md). By submitting a contribution, you confirm you have the right to submit it and you grant Voltaire Swarm OÜ the licence described in the CLA.
+Code and documentation contributions are accepted under the project's [Contributor Licence Agreement (CLA)](https://github.com/whitevo/Coordination-Manager-Public-Clean/blob/main/CLA.md). By submitting a contribution, you confirm you have the right to submit it and you grant Voltaire Swarm OÜ the licence described in the CLA.
 
 ### 5.4 Self-Hosting
 
@@ -144,6 +152,26 @@ If you link a Discord server to the Service or use the Coordination Manager bots
 - Participants interacting with the bot in a moderated server should expect that their relevant interactions may be visible to that server's moderators for moderation purposes.
 - Discord-platform data handling is also governed by [Discord's Terms of Service](https://discord.com/terms) and [Privacy Policy](https://discord.com/privacy).
 
+### 7.4 Mailbox integration (Gmail / Outlook)
+
+If you connect a Gmail or Outlook account to the Mailbox feature:
+
+- You authorise the App to read, organize (archive, trash, label), and send mail through that account via OAuth, only to provide the Mailbox feature you requested.
+- You may configure **automation rules** that act on your mail (for example: tag, archive, or trash matching messages), including rules that use an AI "Assessment Check" to score messages against context and intent you write. You are responsible for the rules you activate; a rule only takes real action once you set its mode to Active.
+- You may only send mail from your own connected account address -- the Service does not allow sending as an address you do not control.
+- You can disconnect a mailbox account at any time from Mailbox Settings. Disconnecting removes our stored copy of that account's data; it never modifies or deletes anything in your actual Gmail/Outlook mailbox.
+- Gmail/Outlook platform data handling is also governed by [Google's Terms of Service](https://policies.google.com/terms) or [Microsoft's Services Agreement](https://www.microsoft.com/en-us/servicesagreement), as applicable.
+
+### 7.5 AI-assisted features
+
+The Service includes optional AI-assisted features (compose help, calendar and availability suggestions, time-management suggestions, and Mailbox automation/assessment), powered by third-party AI providers (OpenAI, with an ASI1-mini fallback from the ASI Alliance / Fetch.ai):
+
+- **AI output may be inaccurate, incomplete, or inappropriate for your situation.** You are responsible for reviewing any AI-generated suggestion, draft, or automation rule before relying on it or activating it.
+- **AI-suggested Mailbox automation rules are never self-activating.** The Service always saves an AI-suggested rule in a trial ("preview only") mode; only you can switch a rule to Active so it takes real action on your mailbox.
+- Daily use of AI-assisted features is limited per account to control cost and prevent abuse.
+- Data sent to AI providers to generate a response is described in the [Privacy Policy](PRIVACY_POLICY.md#39-ai-assistant-interactions).
+- We provide no warranty on the accuracy, availability, or fitness for purpose of any AI-generated content, consistent with Section 8 below.
+
 ---
 
 ## 8. Availability & Warranties
@@ -180,7 +208,7 @@ To the maximum extent permitted by law:
 
 We may update these Terms from time to time. Changes will be reflected in the "Last Updated" date at the top. Continued use of the Service after changes constitutes acceptance of the updated Terms.
 
-Policy-facing and open-source release changes are tracked in our [public repository](https://github.com/whitevo/coordination-manager-public).
+Policy-facing and open-source release changes are tracked in our [public repository](https://github.com/whitevo/Coordination-Manager-Public-Clean).
 
 ---
 
@@ -202,9 +230,9 @@ Registered in Estonia
 - **General contact:** tevo@coordinationmanager.com
 - **Privacy & data requests:** privacy@coordinationmanager.com
 - **Legal & trademark:** legal@coordinationmanager.com
-- **Security:** security@coordinationmanager.com (see [SECURITY.md](https://github.com/whitevo/coordination-manager-public/blob/main/SECURITY.md))
-- **Public issues:** [github.com/whitevo/coordination-manager-public/issues](https://github.com/whitevo/coordination-manager-public/issues)
+- **Security:** security@coordinationmanager.com (see [SECURITY.md](https://github.com/whitevo/Coordination-Manager-Public-Clean/blob/main/SECURITY.md))
+- **Public issues:** [github.com/whitevo/Coordination-Manager-Public-Clean/issues](https://github.com/whitevo/Coordination-Manager-Public-Clean/issues)
 
 ---
 
-*Coordination Manager is an open-source project stewarded by Voltaire Swarm OÜ. Public source code is available under the MIT License at [github.com/whitevo/coordination-manager-public](https://github.com/whitevo/coordination-manager-public).*
+*Coordination Manager is an open-source project stewarded by Voltaire Swarm OÜ. Public source code is available under the MIT License at [github.com/whitevo/Coordination-Manager-Public-Clean](https://github.com/whitevo/Coordination-Manager-Public-Clean).*

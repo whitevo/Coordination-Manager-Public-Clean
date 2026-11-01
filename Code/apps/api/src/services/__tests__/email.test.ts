@@ -10,16 +10,18 @@
 
 import { describe, it, expect } from 'vitest'
 import dotenv from 'dotenv'
+import { getTestEmailRecipient } from './helpers/test-email.js'
 
 // Load .env BEFORE the email module is imported (it reads env at top level)
-dotenv.config()
+dotenv.config({ quiet: true })
 
 // Dynamic import so env vars are available when the module initializes
 const emailMod = await import('../email.js')
 const { sendEmail, getPlatformSmtpConfig } = emailMod
 type SmtpConfig = import('../email.js').SmtpConfig
 
-const TEST_RECIPIENT = 'tevosaks@gmail.com'
+// Real sends go here when SMTP is configured; EMAIL_TEST_RECIPIENT configures the inbox.
+const TEST_RECIPIENT = getTestEmailRecipient()
 
 // ─── Unit tests (no emails sent) ────────────────────────────
 

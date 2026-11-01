@@ -1,5 +1,17 @@
 # Gitleaks -- Tool Rationale
 
+## Contents
+- What it is
+- What it adds over homegrown checks
+- Scanning modes
+- Baseline workflow
+- CI integration approach
+- Where this fits the project
+- Where it is used
+- Installation (Windows)
+- Trust model
+- References
+
 ## What it is
 
 Gitleaks is a SAST tool for detecting hardcoded secrets (passwords, API keys, tokens,
@@ -7,7 +19,7 @@ private keys, HTTP auth headers, bearer tokens) in Git repositories and local di
 It is open source (MIT), maintained by Gitleaks LLC / Zachary Rice, and distributed via
 official GitHub releases and the winget package `Gitleaks.Gitleaks`.
 
-Current version in use: 8.30.1 (checked 2026-06-12)
+Pinned version: see `VERSION=` in `.github/workflows/gitleaks.yml` (do not hardcode it here).
 
 ## What it adds over homegrown checks
 
@@ -58,14 +70,22 @@ gitleaks detect --source . --baseline-path .gitleaks-baseline.json --verbose
 2. Review the output. Rotate any real secrets found. Document known false positives.
 3. Commit `.gitleaks-baseline.json` to the repo.
 4. Add a `.gitleaks.toml` config with allowlist rules for confirmed non-secrets.
-5. All subsequent CI runs use `--baseline-path` so only new findings fail the build.
+5. Baseline is optional and currently absent: CI does not pass `--baseline-path`; only
+   `scripts/security-check.ps1` uses it, and only if `.gitleaks-baseline.json` exists.
 6. Rotate the baseline (regenerate) at each public release milestone.
 
 ## CI integration approach
 
+The `discord-client-id` rule has a narrow exception for the two synthetic Discord
+user IDs in `Code/packages/database/tests/guardian-ban-time-check.sql`. Both the
+exact test-file path and one of the two exact fixture values must match. Other
+values, files, and secret-detection rules remain active. This configuration also
+applies to historical commits; changing only the fixture would not clear a
+PR-delta scan of the original commit.
+
 The Gitleaks CLI is MIT-licensed and can be invoked inside any standard GitHub Actions job
 (e.g. `run: gitleaks detect ...` after installing the binary). This is the approach used
-in the CI workflow for this project.
+in `gitleaks.yml` for this project.
 
 The official Gitleaks GitHub Action (`gitleaks/gitleaks-action`) requires a
 `GITLEAKS_LICENSE` for organization-owned repositories. To avoid this dependency, the
@@ -89,7 +109,7 @@ Gitleaks is a good fit for Coordination Manager because:
 | Location | Purpose |
 |----------|---------|
 | `scripts/security-check.ps1` | Local developer gate; invoked by `pnpm security:check` |
-| `.github/workflows/ci.yml` | CI gate on every PR and push to `main` |
+| `.github/workflows/gitleaks.yml` | PR and push delta scans plus weekly full-history scan (CLI 8.30.1, SHA256-verified) |
 | Pre-release checklist | One-time full-history scan before public milestone sync |
 
 ## Installation (Windows)

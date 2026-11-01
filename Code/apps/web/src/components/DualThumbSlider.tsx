@@ -20,6 +20,17 @@ interface DualThumbSliderProps {
   className?: string
 }
 
+interface SliderDrag {
+  thumb: 'start' | 'end'
+  pointerId: number
+  element: HTMLElement
+  rect: DOMRect
+  offset: number
+  start: number
+  end: number
+  pushed: boolean
+}
+
 export default function DualThumbSlider({
   min,
   max,
@@ -36,7 +47,9 @@ export default function DualThumbSlider({
   className = '',
 }: DualThumbSliderProps) {
   const trackRef = useRef<HTMLDivElement>(null)
-  const draggingRef = useRef<'start' | 'end' | null>(null)
+  const draggingRef = useRef<SliderDrag | null>(null)
+  const suppressClickRef = useRef(false)
+  const [dragPosition, setDragPosition] = useState<{ thumb: 'start' | 'end'; value: number } | null>(null)
   const [hoveredThumb, setHoveredThumb] = useState<'start' | 'end' | null>(null)
 
   const totalRange = max - min
@@ -47,73 +60,105 @@ export default function DualThumbSlider({
     [min, totalRange]
   )
 
-  // Convert a pixel position on the track to a value (snapped to integer)
+  // Freeze track geometry while dragging so grid reflow cannot move the pointer's target.
   const positionToValue = useCallback(
-    (clientX: number, clientY: number) => {
+    (clientX: number, clientY: number, drag?: SliderDrag) => {
       const track = trackRef.current
       if (!track) return min
-      const rect = track.getBoundingClientRect()
+      const rect = drag?.rect ?? track.getBoundingClientRect()
 
       let ratio: number
       if (orientation === 'vertical') {
         // For vertical: top = min, bottom = max
-        ratio = (clientY - rect.top) / rect.height
+        ratio = (clientY - rect.top - (drag?.offset ?? 0)) / rect.height
       } else {
-        ratio = (clientX - rect.left) / rect.width
+        ratio = (clientX - rect.left - (drag?.offset ?? 0)) / rect.width
       }
 
       ratio = Math.max(0, Math.min(1, ratio))
-      return Math.round(min + ratio * totalRange)
+      return min + ratio * totalRange
     },
     [min, totalRange, orientation]
   )
 
   const handlePointerDown = useCallback(
-    (e: React.PointerEvent, thumb: 'start' | 'end') => {
+    (e: React.PointerEvent<HTMLDivElement>, thumb: 'start' | 'end') => {
+      if (e.button !== 0 || draggingRef.current || !trackRef.current) return
       e.preventDefault()
       e.stopPropagation()
-      draggingRef.current = thumb
-      ;(e.target as HTMLElement).setPointerCapture(e.pointerId)
+      const rect = trackRef.current.getBoundingClientRect()
+      const value = thumb === 'start' ? startValue : endValue
+      const ratio = (value - min) / totalRange
+      const offset = orientation === 'vertical'
+        ? e.clientY - (rect.top + rect.height * ratio)
+        : e.clientX - (rect.left + rect.width * ratio)
+      draggingRef.current = {
+        thumb, pointerId: e.pointerId, element: e.currentTarget, rect, offset,
+        start: startValue, end: endValue, pushed: false,
+      }
+      suppressClickRef.current = true
+      setDragPosition({ thumb, value })
+      e.currentTarget.setPointerCapture(e.pointerId)
     },
-    []
+    [startValue, endValue, min, totalRange, orientation]
   )
 
   const handlePointerMove = useCallback(
     (e: React.PointerEvent) => {
-      if (!draggingRef.current) return
+      const drag = draggingRef.current
+      if (!drag || drag.pointerId !== e.pointerId) return
       e.preventDefault()
 
-      const raw = positionToValue(e.clientX, e.clientY)
+      const raw = positionToValue(e.clientX, e.clientY, drag)
 
-      if (draggingRef.current === 'start') {
-        const clamped = Math.max(min, Math.min(raw, max - minGap))
-        onStartChange(clamped)
+      if (drag.thumb === 'start') {
+        const visual = Math.max(min, Math.min(raw, max - minGap))
+        const clamped = Math.round(visual)
+        setDragPosition({ thumb: 'start', value: visual })
+        if (clamped !== drag.start) {
+          drag.start = clamped
+          onStartChange(clamped)
+        }
         // Push end if start would cross
-        if (clamped + minGap > endValue) {
-          onEndChange(clamped + minGap)
+        if (clamped + minGap > drag.end) {
+          drag.end = clamped + minGap
+          drag.pushed = true
+          onEndChange(drag.end)
         }
       } else {
-        const clamped = Math.min(max, Math.max(raw, min + minGap))
-        onEndChange(clamped)
+        const visual = Math.min(max, Math.max(raw, min + minGap))
+        const clamped = Math.round(visual)
+        setDragPosition({ thumb: 'end', value: visual })
+        if (clamped !== drag.end) {
+          drag.end = clamped
+          onEndChange(clamped)
+        }
         // Push start if end would cross
-        if (clamped - minGap < startValue) {
-          onStartChange(clamped - minGap)
+        if (clamped - minGap < drag.start) {
+          drag.start = clamped - minGap
+          drag.pushed = true
+          onStartChange(drag.start)
         }
       }
     },
-    [positionToValue, min, max, minGap, startValue, endValue, onStartChange, onEndChange]
+    [positionToValue, min, max, minGap, onStartChange, onEndChange]
   )
 
   const handlePointerUp = useCallback(
     (e: React.PointerEvent) => {
-      if (!draggingRef.current) return
-      ;(e.target as HTMLElement).releasePointerCapture(e.pointerId)
-      if (draggingRef.current === 'start') {
+      const drag = draggingRef.current
+      if (!drag || drag.pointerId !== e.pointerId) return
+      draggingRef.current = null
+      setDragPosition(null)
+      if (drag.element.hasPointerCapture(e.pointerId)) {
+        drag.element.releasePointerCapture(e.pointerId)
+      }
+      if (drag.thumb === 'start' || drag.pushed) {
         onStartRelease()
-      } else {
+      }
+      if (drag.thumb === 'end' || drag.pushed) {
         onEndRelease()
       }
-      draggingRef.current = null
     },
     [onStartRelease, onEndRelease]
   )
@@ -121,8 +166,11 @@ export default function DualThumbSlider({
   // Also handle track clicks to jump the nearest thumb
   const handleTrackClick = useCallback(
     (e: React.MouseEvent) => {
-      if (draggingRef.current) return // ignore during drag
-      const raw = positionToValue(e.clientX, e.clientY)
+      if (draggingRef.current || suppressClickRef.current) {
+        suppressClickRef.current = false
+        return
+      }
+      const raw = Math.round(positionToValue(e.clientX, e.clientY))
 
       const distToStart = Math.abs(raw - startValue)
       const distToEnd = Math.abs(raw - endValue)
@@ -147,8 +195,8 @@ export default function DualThumbSlider({
     }
   }, [])
 
-  const startPercent = valueToPercent(startValue)
-  const endPercent = valueToPercent(endValue)
+  const startPercent = valueToPercent(dragPosition?.thumb === 'start' ? dragPosition.value : startValue)
+  const endPercent = valueToPercent(dragPosition?.thumb === 'end' ? dragPosition.value : endValue)
 
   const isVertical = orientation === 'vertical'
 
@@ -176,8 +224,13 @@ export default function DualThumbSlider({
         ref={trackRef}
         className="dual-thumb-track-container"
         onClick={handleTrackClick}
+        onPointerDownCapture={() => {
+          if (!draggingRef.current) suppressClickRef.current = false
+        }}
         onPointerMove={handlePointerMove}
         onPointerUp={handlePointerUp}
+        onPointerCancel={handlePointerUp}
+        onLostPointerCapture={handlePointerUp}
       >
         {/* Background track */}
         <div className="dual-thumb-track" />
@@ -194,7 +247,7 @@ export default function DualThumbSlider({
 
         {/* Start thumb */}
         <div
-          className={`dual-thumb-handle dual-thumb-start ${draggingRef.current === 'start' ? 'active' : ''} ${hoveredThumb === 'start' ? 'hovered' : ''}`}
+          className={`dual-thumb-handle dual-thumb-start ${dragPosition?.thumb === 'start' ? 'active' : ''} ${hoveredThumb === 'start' ? 'hovered' : ''}`}
           style={isVertical ? { top: `${startPercent}%` } : { left: `${startPercent}%` }}
           onPointerDown={(e) => handlePointerDown(e, 'start')}
           onMouseEnter={() => setHoveredThumb('start')}
@@ -204,6 +257,7 @@ export default function DualThumbSlider({
           aria-valuemin={min}
           aria-valuemax={endValue - minGap}
           aria-valuenow={startValue}
+          aria-orientation={orientation}
           tabIndex={0}
         >
           <span className="dual-thumb-tooltip">{startValue.toString().padStart(2, '0')}:00</span>
@@ -211,7 +265,7 @@ export default function DualThumbSlider({
 
         {/* End thumb */}
         <div
-          className={`dual-thumb-handle dual-thumb-end ${draggingRef.current === 'end' ? 'active' : ''} ${hoveredThumb === 'end' ? 'hovered' : ''}`}
+          className={`dual-thumb-handle dual-thumb-end ${dragPosition?.thumb === 'end' ? 'active' : ''} ${hoveredThumb === 'end' ? 'hovered' : ''}`}
           style={isVertical ? { top: `${endPercent}%` } : { left: `${endPercent}%` }}
           onPointerDown={(e) => handlePointerDown(e, 'end')}
           onMouseEnter={() => setHoveredThumb('end')}
@@ -221,6 +275,7 @@ export default function DualThumbSlider({
           aria-valuemin={startValue + minGap}
           aria-valuemax={max}
           aria-valuenow={endValue}
+          aria-orientation={orientation}
           tabIndex={0}
         >
           <span className="dual-thumb-tooltip">{endValue.toString().padStart(2, '0')}:00</span>

@@ -2,18 +2,24 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
+import { discoveryPlugin } from './scripts/discovery-plugin.ts'
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), discoveryPlugin('web')],
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src'),
+      '@': path.resolve(import.meta.dirname, './src'),
     },
   },
   test: {
     globals: true,
     environment: 'jsdom',
     include: ['src/**/*.test.{ts,tsx}'],
+    // Rich-text editor suites become CPU-bound when many JSDOM workers run together.
+    maxWorkers: 1,
+    // Node 25+ exposes an experimental global localStorage that is undefined without
+    // --localstorage-file and shadows the JSDOM Storage implementation.
+    execArgv: ['--no-experimental-webstorage'],
   },
   server: {
     port: 5173,
@@ -46,6 +52,10 @@ export default defineConfig({
           }
           if (/[\\/]node_modules[\\/](date-fns|axios|lucide-react)[\\/]/.test(id)) {
             return 'vendor-utils'
+          }
+          // Rich-text editor stack (loaded when Time Management opens its note composer).
+          if (/[\\/]node_modules[\\/](@tiptap[\\/][^\\/]+|prosemirror-[^\\/]+|linkifyjs|rope-sequence|orderedmap|w3c-keyname)[\\/]/.test(id)) {
+            return 'vendor-editor'
           }
         },
       },

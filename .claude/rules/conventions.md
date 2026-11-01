@@ -17,7 +17,9 @@
 - Import icons from lucide-react
 - Use @/ alias for imports (resolves to src/)
 - Lazy load pages with React.lazy() and Suspense
-- Early returns for loading and error states
+- Early returns for initial loading/error only when no usable content exists
+- Background refresh loading/errors preserve usable content, local drafts, selection, and viewport
+- Refresh/mutation changes use the shared reconciliation contracts; animation never controls persisted data
 
 ## Express (apps/api)
 - Route files in src/routes/{feature}.ts
