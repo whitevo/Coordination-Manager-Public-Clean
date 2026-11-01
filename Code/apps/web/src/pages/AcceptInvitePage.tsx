@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { useParams, useNavigate } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { apiClient } from '../lib/api-client'
+import { Button } from '../components/ui'
 import { CheckCircle2, XCircle, Loader2, Users } from 'lucide-react'
 
 export default function AcceptInvitePage() {
@@ -71,21 +72,21 @@ export default function AcceptInvitePage() {
             <p className="text-sm text-muted-foreground">
               You need to be signed in to accept a friend invite. After signing in you will be redirected back here.
             </p>
-            <button
+            <Button
+              intent="primary"
               onClick={() => {
                 sessionStorage.setItem('authReturnTo', '/join/invite/' + (code || ''))
                 navigate('/auth/login')
               }}
-              className="px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors font-medium"
             >
               Sign In
-            </button>
+            </Button>
           </>
         )}
 
         {status === 'success' && (
           <>
-            <CheckCircle2 className="w-12 h-12 text-green-500 mx-auto" />
+            <CheckCircle2 className="w-12 h-12 text-success mx-auto" />
             <h2 className="text-xl font-semibold">Friend Added!</h2>
             <p className="text-sm text-muted-foreground">
               They have been added to your friend list. Redirecting...
@@ -95,15 +96,12 @@ export default function AcceptInvitePage() {
 
         {status === 'error' && (
           <>
-            <XCircle className="w-12 h-12 text-red-500 mx-auto" />
+            <XCircle className="w-12 h-12 text-danger mx-auto" />
             <h2 className="text-xl font-semibold">Could not accept invite</h2>
             <p className="text-sm text-muted-foreground">{errorMsg}</p>
-            <button
-              onClick={() => navigate('/')}
-              className="px-6 py-2.5 bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors font-medium"
-            >
+            <Button intent="primary" onClick={() => navigate('/')}>
               Go Home
-            </button>
+            </Button>
           </>
         )}
       </div>

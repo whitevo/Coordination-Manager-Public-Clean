@@ -1,3 +1,6 @@
+# Publication workflow, NOT a local-only validator or dry run.
+# Even with both skip switches (release:loop:prep), this installs dependencies,
+# commits shared working changes, pushes private/public branches, and opens a PR.
 param(
   [switch]$SkipGitHubActionsCheck,
   [switch]$SkipLiveApiCheck,
@@ -28,6 +31,31 @@ if (-not $Branch) {
 }
 
 $stageIndex = 0
+
+# Keep removal and post-removal assertions on the same policy patterns.
+$publicSyncExclusionPatterns = @(
+  '(?i)(^|/)\.env($|\.((?!example$).+))',
+  '^\.vscode/',
+  '^\.idea/',
+  '^workspace\.code-workspace$',
+  '^\.claude/settings\.local\.json$',
+  '^\.claude/session/',
+  '^memories/',
+  '^tools/(improvmx-mcp|test-runner-mcp)/',
+  '^\.mcp\.json$',
+  '^docs/private/',
+  '^Code/apps/api/_.*\.(cjs|js)$',
+  '^_test\.js$',
+  '^_test_wrap\.txt$',
+  '^_sync-report-.*\.md$',
+  '(^|/)CHANGELOG_.*\.md$',
+  '(?i)\.pem$',
+  '(?i)\.key$',
+  '(?i)(^|/)serviceAccount[^/]*\.json$',
+  '(^|/).*-REVIEW\.md$',
+  '(^|/).*-INTERNAL\.md$',
+  '^Code/apps/web/(playwright-report|test-results)/'
+)
 
 function Write-Stage {
   param([string]$Name)
@@ -129,9 +157,9 @@ function Invoke-OpenSourceReadinessChecks {
   Assert-NoMatches -Name 'No VS Code MCP token file tracked' -Pattern '^\.vscode/mcp\.json$'
 
   # These may exist in private and are expected to be excluded during curated public sync.
-  Show-MatchesAsInfo -Name 'Leading underscore API scripts' -Pattern '^Code/apps/api/_.*'
-  Show-MatchesAsInfo -Name 'Private improvmx MCP tooling' -Pattern '^tools/improvmx-mcp/'
-  Show-MatchesAsInfo -Name 'Private docs folder files' -Pattern '^docs/private/'
+  foreach ($pattern in $publicSyncExclusionPatterns) {
+    Show-MatchesAsInfo -Name ('Public sync exclusion: {0}' -f $pattern) -Pattern $pattern
+  }
 }
 
 function Wait-ForGitHubActionsSuccess {
@@ -272,22 +300,6 @@ function Invoke-PublicSyncPrCreation {
   $reportPath = Join-Path $root $reportFileName
   $originalBranch = (& git rev-parse --abbrev-ref HEAD).Trim()
   $publicPrUrl = $null
-  $exclusionPatterns = @(
-    '(?i)(^|/)\.env($|\.((?!example$).+))',
-    '^\.vscode/',
-    '^\.idea/',
-    '^workspace\.code-workspace$',
-    '^tools/improvmx-mcp/',
-    '^docs/private/',
-    '^Code/apps/api/_.*\.(cjs|js)$',
-    '^_test\.js$',
-    '^_test_wrap\.txt$',
-    '(?i)\.pem$',
-    '(?i)\.key$',
-    '(?i)serviceAccount.*\.json$',
-    '(^|/).*-REVIEW\.md$',
-    '(^|/).*-INTERNAL\.md$'
-  )
 
   try {
     & git fetch $PublicRemote
@@ -311,13 +323,11 @@ function Invoke-PublicSyncPrCreation {
       throw ('Failed to snapshot private branch {0} into sync branch.' -f $privateSourceBranch)
     }
 
-    Remove-TrackedFilesMatchingPatterns -Patterns $exclusionPatterns
+    Remove-TrackedFilesMatchingPatterns -Patterns $publicSyncExclusionPatterns
 
-    Assert-NoMatches -Name 'No non-example env files tracked in sync branch' -Pattern '(?i)(^|/)\.env($|\.((?!example$).+))'
-    Assert-NoMatches -Name 'No VS Code MCP token file tracked in sync branch' -Pattern '^\.vscode/mcp\.json$'
-    Assert-NoMatches -Name 'No leading underscore API scripts tracked in sync branch' -Pattern '^Code/apps/api/_.*'
-    Assert-NoMatches -Name 'No private improvmx MCP tooling tracked in sync branch' -Pattern '^tools/improvmx-mcp/'
-    Assert-NoMatches -Name 'No private docs tracked in sync branch' -Pattern '^docs/private/'
+    foreach ($pattern in $publicSyncExclusionPatterns) {
+      Assert-NoMatches -Name ('No public sync exclusion tracked: {0}' -f $pattern) -Pattern $pattern
+    }
 
     & git add -A
     if ($LASTEXITCODE -ne 0) {
@@ -432,11 +442,10 @@ function Commit-WorkingTreeIfNeeded {
 
 try {
   Write-Host 'Open-source release loop started.' -ForegroundColor Cyan
+  Write-Warning 'NOT LOCAL ONLY: all variants, including release:loop:prep, install dependencies, commit working changes, push branches, and create a public PR. Skip switches only skip CI/live API checks.'
   Write-Host ('Branch: {0}' -f $Branch)
 
-  Invoke-CheckedCommand -Name 'Test existing version (testing-strategy)' -Command 'pnpm test'
-  Invoke-CheckedCommand -Name 'Build deployment artifacts (monorepo-conventions)' -Command 'pnpm build'
-  Invoke-CheckedCommand -Name 'Security gate and hardening checks (security-hardening)' -Command 'pnpm security:check'
+  Invoke-CheckedCommand -Name 'Release preflight (install, typecheck, lint, test, security, build)' -Command 'pnpm verify:release'
 
   Invoke-OpenSourceReadinessChecks
 

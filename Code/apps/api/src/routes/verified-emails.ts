@@ -44,7 +44,7 @@ router.post('/send-code', async (req: AuthenticatedRequest, res: Response) => {
     const emailLower = email.toLowerCase().trim()
 
     // Validate email format
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailLower) || emailLower.length > 320) {
+    if (!/^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/.test(emailLower) || emailLower.length > 320) {
       return res.status(400).json({ error: 'Invalid email address' })
     }
 

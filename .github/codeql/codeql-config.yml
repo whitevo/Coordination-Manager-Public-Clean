@@ -1,0 +1,14 @@
+# CodeQL configuration for Coordination Manager.
+# Excludes generated build output (scanned bundles produce third-party noise)
+# and test files (fixtures intentionally contain patterns that trip rules).
+name: Coordination Manager CodeQL config
+
+paths-ignore:
+  - '**/dist'
+  - '**/build'
+  - '**/node_modules'
+  - '**/__tests__'
+  - '**/*.test.ts'
+  - '**/*.test.tsx'
+  - '**/playwright-report'
+  - '**/test-results'

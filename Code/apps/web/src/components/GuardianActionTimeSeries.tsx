@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from 'react'
+import { endOfDay, parseISO } from 'date-fns'
 import {
   AreaChart,
   Area,
@@ -32,6 +33,7 @@ interface Props {
   dateRange: '1d' | '7d' | '30d' | 'all' | 'custom'
   filterSince?: string
   filterUntil?: string
+  resolveDateBounds?: () => { since: string; until: string }
 }
 
 function formatLabel(time: string, mode: Mode): string {
@@ -55,7 +57,7 @@ export interface GuardianActionTimeSeriesRef {
   refresh: () => Promise<void>
 }
 const GuardianActionTimeSeries = forwardRef<GuardianActionTimeSeriesRef, Props>(
-({ dateRange, filterSince, filterUntil }, ref) => {
+({ dateRange, filterSince, filterUntil, resolveDateBounds }, ref) => {
   const [data, setData] = useState<ActionTimeSeriesData | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
@@ -90,9 +92,13 @@ const GuardianActionTimeSeries = forwardRef<GuardianActionTimeSeriesRef, Props>(
     setError(null)
     try {
       const params = new URLSearchParams()
-      if (filterSince && filterUntil) {
-        params.set('since', new Date(filterSince).toISOString())
-        params.set('until', new Date(filterUntil + 'T23:59:59').toISOString())
+      const bounds = resolveDateBounds?.() ?? {
+        since: filterSince ? parseISO(filterSince).toISOString() : '',
+        until: filterUntil ? endOfDay(parseISO(filterUntil)).toISOString() : '',
+      }
+      if (bounds.since && bounds.until) {
+        params.set('since', bounds.since)
+        params.set('until', bounds.until)
       } else if (dateRange !== 'all') {
         params.set('range', dateRange)
       } else {
@@ -106,7 +112,7 @@ const GuardianActionTimeSeries = forwardRef<GuardianActionTimeSeriesRef, Props>(
       await new Promise(res => setTimeout(res, 1500))
       setLoading(false)
     }
-  }, [dateRange, filterSince, filterUntil])
+  }, [dateRange, filterSince, filterUntil, resolveDateBounds])
 
   useImperativeHandle(ref, () => ({ refresh: fetchTimeseries }), [fetchTimeseries])
   useEffect(() => { fetchTimeseries() }, [fetchTimeseries])
@@ -137,13 +143,13 @@ const GuardianActionTimeSeries = forwardRef<GuardianActionTimeSeriesRef, Props>(
         <h3 className="text-sm font-medium text-foreground">Moderation Actions Over Time</h3>
         <div className="flex items-center gap-3 text-xs text-muted-foreground">
           <span className="inline-flex items-center gap-1">
-            <Trash2 className="h-3.5 w-3.5 text-amber-500" /> Deletes: <strong className="text-foreground">{totals.delete}</strong>
+            <Trash2 className="h-3.5 w-3.5 text-warning" /> Deletes: <strong className="text-foreground">{totals.delete}</strong>
           </span>
           <span className="inline-flex items-center gap-1">
-            <MicOff className="h-3.5 w-3.5 text-yellow-500" /> Mutes: <strong className="text-foreground">{totals.mute}</strong>
+            <MicOff className="h-3.5 w-3.5 text-warning" /> Mutes: <strong className="text-foreground">{totals.mute}</strong>
           </span>
           <span className="inline-flex items-center gap-1">
-            <Ban className="h-3.5 w-3.5 text-red-500" /> Bans: <strong className="text-foreground">{totals.ban}</strong>
+            <Ban className="h-3.5 w-3.5 text-danger" /> Bans: <strong className="text-foreground">{totals.ban}</strong>
           </span>
         </div>
       </div>

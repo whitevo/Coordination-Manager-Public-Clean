@@ -29,8 +29,27 @@ function getSocketAddress(req: express.Request): string | null {
   return null
 }
 
+/**
+ * Per-client rate-limit key.
+ *
+ * Behind Railway the TCP peer (req.socket.remoteAddress) is the edge proxy, so
+ * keying on it would put every user in one shared bucket. When Express trusts
+ * the proxy (production: `trust proxy` = 1), req.ip is the client address the
+ * proxy appended to X-Forwarded-For; earlier, client-supplied entries are
+ * ignored, so it cannot be spoofed. Without a trusted proxy (local dev) the
+ * socket address is the real client. ipKeyGenerator groups IPv6 by /56.
+ */
 export function getRateLimitKey(req: express.Request): string {
+  const trustsProxy = Boolean(req.app?.get?.('trust proxy'))
+  if (trustsProxy && req.ip) return ipKeyGenerator(req.ip)
   return getSocketAddress(req) ?? ipKeyGenerator(req.ip ?? '')
+}
+
+const stripLineBreaks = (value: string): string => value.replace(/[\r\n]+/g, ' ').slice(0, 200)
+
+/** Security signal for a limit hit: limiter label, client key, method and path (no query, headers, or body). */
+export function logRateLimitHit(label: string, req: express.Request): void {
+  console.warn(`[rate-limit] ${stripLineBreaks(label)} key=${stripLineBreaks(getRateLimitKey(req))} ${req.method} ${stripLineBreaks(req.path)}`)
 }
 
 function applyLimiter(app: express.Express, limiter: ReturnType<typeof rateLimit>, mount: LimiterMount): void {
@@ -51,6 +70,10 @@ function createLimiter(
     standardHeaders: true,
     legacyHeaders: false,
     message: definition.message,
+    handler: (req, res, _next, options) => {
+      logRateLimitHit(definition.message.error, req)
+      res.status(options.statusCode).json(options.message)
+    },
   })
 }
 
@@ -75,6 +98,7 @@ export function registerRateLimiters({ app, skipLocalhost }: RegisterRateLimiter
     standardHeaders: true,
     legacyHeaders: false,
     handler: (req, res) => {
+      logRateLimitHit('health', req)
       const rateLimitState = (req as express.Request & {
         rateLimit?: { limit?: number; current?: number }
       }).rateLimit
@@ -115,6 +139,12 @@ export function registerRateLimiters({ app, skipLocalhost }: RegisterRateLimiter
   const limiterDefinitions: LimiterDefinition[] = [
     {
       windowMs: 15 * 60 * 1000,
+      max: 8,
+      message: { error: 'Too many event reports. Please wait before trying again.' },
+      mounts: [{ method: 'post', path: '/api/event-flags' }],
+    },
+    {
+      windowMs: 15 * 60 * 1000,
       max: 240,
       message: { error: 'Too many requests, please try again later.' },
       mounts: [
@@ -135,13 +165,14 @@ export function registerRateLimiters({ app, skipLocalhost }: RegisterRateLimiter
       mounts: [
         { method: 'use', path: '/api/announcements/send-now' },
         { method: 'post', path: '/api/announcements/schedules' },
+        { method: 'post', path: '/api/announcements/schedules/:id/delete-messages' },
       ],
     },
     {
       windowMs: 15 * 60 * 1000,
       max: 800,
       message: { error: 'Too many announcement status requests.' },
-      mounts: [{ method: 'get', path: '/api/announcements/schedules/*' }],
+      mounts: [{ method: 'get', path: '/api/announcements/schedules/*splat' }],
     },
     {
       windowMs: 15 * 60 * 1000,
@@ -157,12 +188,6 @@ export function registerRateLimiters({ app, skipLocalhost }: RegisterRateLimiter
       max: 480,
       message: { error: 'Too many AI chat requests, please try again later.' },
       mounts: [{ method: 'use', path: '/api/ai-chat' }],
-    },
-    {
-      windowMs: 15 * 60 * 1000,
-      max: 240,
-      message: { error: 'Too many Figma API requests, please try again later.' },
-      mounts: [{ method: 'use', path: '/api/figma' }],
     },
     {
       windowMs: 15 * 60 * 1000,
@@ -196,6 +221,15 @@ export function registerRateLimiters({ app, skipLocalhost }: RegisterRateLimiter
       ],
     },
     {
+      windowMs: 15 * 60 * 1000,
+      max: 60,
+      message: { error: 'Too many Guardian undo requests, please try again later.' },
+      mounts: [
+        { method: 'post', path: '/api/guardian/flagged/:id/unban' },
+        { method: 'post', path: '/api/guardian/flagged/:id/untimeout' },
+      ],
+    },
+    {
       windowMs: 60 * 60 * 1000,
       max: 20,
       message: { error: 'Too many invite generation requests. Please wait before trying again.' },
@@ -212,6 +246,39 @@ export function registerRateLimiters({ app, skipLocalhost }: RegisterRateLimiter
       max: 240,
       message: { error: 'Too many time-management requests, please try again later.' },
       mounts: [{ method: 'use', path: '/api/time-management' }],
+    },
+    {
+      windowMs: 15 * 60 * 1000,
+      max: 600,
+      message: { error: 'Too many mailbox requests, please try again later.' },
+      mounts: [{ method: 'use', path: '/api/mailbox' }],
+    },
+    {
+      windowMs: 15 * 60 * 1000,
+      max: 20,
+      message: { error: 'Too many mailbox import/sync requests. Please wait before importing again.' },
+      mounts: [{ method: 'post', path: '/api/mailbox/accounts/:id/sync' }],
+    },
+    {
+      windowMs: 15 * 60 * 1000,
+      max: 40,
+      message: { error: 'Too many outgoing mailbox messages. Please wait before sending more.' },
+      mounts: [{ method: 'post', path: '/api/mailbox/drafts/:id/send' }],
+    },
+    {
+      windowMs: 15 * 60 * 1000,
+      max: 60,
+      message: { error: 'Too many automation run requests, please try again later.' },
+      mounts: [
+        { method: 'post', path: '/api/mailbox/rules/run' },
+        { method: 'post', path: '/api/mailbox/messages/bulk-action' },
+      ],
+    },
+    {
+      windowMs: 15 * 60 * 1000,
+      max: 30,
+      message: { error: 'Too many AI draft requests, please try again later.' },
+      mounts: [{ method: 'post', path: '/api/mailbox/messages/:id/draft-suggestion' }],
     },
   ]
 

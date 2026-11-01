@@ -1,9 +1,15 @@
-import { useState, useEffect, useRef, useCallback } from 'react'
+import { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useParams, Link } from 'react-router-dom'
 import { format, startOfWeek, addDays, addWeeks, subWeeks, isWithinInterval, isSameDay, parse, isValid } from 'date-fns'
 import { ChevronLeft, ChevronRight, Calendar, Check, X, Sparkles, PartyPopper, ArrowRight, Users, Clock, Sun, Moon, ExternalLink } from 'lucide-react'
 import { apiClient } from '../lib/api-client'
 import { isSafeUrl } from '../lib/calendar-utils'
+import { createTouchSelectGate } from '../lib/touch-select-gate'
+import { useAuth } from '../contexts/AuthContext'
+import { Button, IconButton } from '../components/ui'
+import TimezoneSelector from '../components/TimezoneSelector'
+import { useTimezones } from '../lib/use-timezones'
+import { convertUtcTimeToTimezoneOnDate, detectDstTransitions, findTimezone, getCurrentTimeInTimezone, getTimezoneAbbrOnDate, type DstTransition } from '../lib/timezone-data'
 
 type TimeInterval = 15 | 30 | 60
 
@@ -21,6 +27,27 @@ type TimeInterval = 15 | 30 | 60
  */
 export default function GuestBookingPage() {
   const { hash } = useParams<{ hash: string }>()
+  const { user, isAuthenticated, isLoading: authLoading } = useAuth()
+  const timezones = useTimezones(undefined, {
+    initialState: { primary: 'UTC', additional: [] },
+    persist: false,
+  })
+  const timezone = timezones.primary
+  const [now, setNow] = useState(() => new Date())
+  useEffect(() => {
+    const interval = setInterval(() => setNow(new Date()), 1000)
+    return () => clearInterval(interval)
+  }, [])
+  const localSlotFormatter = useMemo(() => new Intl.DateTimeFormat('en-GB', {
+    timeZone: timezone,
+    weekday: 'short',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
+    timeZoneName: 'shortOffset',
+  }), [timezone])
 
   // --- Theme ---
   const [isDark, setIsDark] = useState(() => {
@@ -53,6 +80,7 @@ export default function GuestBookingPage() {
   const [onboardingUrl, setOnboardingUrl] = useState('')
   const [participantCount, setParticipantCount] = useState(0)
   const [confirmedMeetingCount, setConfirmedMeetingCount] = useState(0)
+  const [availabilityLoaded, setAvailabilityLoaded] = useState(false)
 
   // --- Week navigation ---
   const [currentWeekStart, setCurrentWeekStart] = useState(() => startOfWeek(new Date(), { weekStartsOn: 1 }))
@@ -63,11 +91,17 @@ export default function GuestBookingPage() {
 
   // --- Selection ---
   const [currentSelection, setCurrentSelection] = useState<Set<string>>(new Set())
+  const [selectionOwner, setSelectionOwner] = useState('')
   const [savedSelections, setSavedSelections] = useState<Map<string, Set<string>>>(new Map())
   const [isDragging, setIsDragging] = useState(false)
   const [dragStart, setDragStart] = useState<string | null>(null)
   const [isRemoving, setIsRemoving] = useState(false)
   const [isSaving, setIsSaving] = useState(false)
+
+  // Long-press gate: touch presses must hold before the grid enters select mode,
+  // so quick touches scroll instead of painting cells
+  const touchSelectGateRef = useRef(createTouchSelectGate())
+  useEffect(() => () => touchSelectGateRef.current.dispose(), [])
 
   // --- Mobile ---
   const [isMobile, setIsMobile] = useState(() => {
@@ -166,6 +200,7 @@ export default function GuestBookingPage() {
         setParticipantCount(map.size)
       })
       .catch(() => {})
+      .finally(() => setAvailabilityLoaded(true))
 
     meetingsPromise
       .then(res => {
@@ -180,6 +215,22 @@ export default function GuestBookingPage() {
       setTimeout(() => nameInputRef.current?.focus(), 300)
     }
   }, [step])
+
+  // Already-authenticated users skip the name prompt entirely -- assign their
+  // account name and jump straight to picking times. A page refresh resets this,
+  // but pressing Back sets isEditingName so they can change the name manually.
+  const [isEditingName, setIsEditingName] = useState(false)
+  useEffect(() => {
+    if (isEditingName) return
+    if (step !== 'name' || authLoading || !isAuthenticated || !user || !availabilityLoaded) return
+    const name = (user.displayName || user.travelerName || user.email || '').trim()
+    if (!name) return
+    setUsername(name)
+    const existing = savedSelections.get(name)
+    if (existing) setCurrentSelection(new Set(existing))
+    setSelectionOwner(name)
+    setStep('pick')
+  }, [step, authLoading, isAuthenticated, user, availabilityLoaded, savedSelections, isEditingName])
 
   // ------------------------------------------------------------------
   // Grid helpers (minimal reimplementation)
@@ -213,9 +264,23 @@ export default function GuestBookingPage() {
   const visibleDays = isMobile
     ? mobileEligibleDays.slice(mobileDayOffset, mobileDayOffset + MOBILE_DAYS_COUNT)
     : weekDays
-  const timeColWidth = isMobile ? (isLandscape ? '50px' : '40px') : '60px'
-  const dayCount = isMobile ? MOBILE_DAYS_COUNT : 7
-  const gridStyle = { gridTemplateColumns: `${timeColWidth} repeat(${dayCount}, 1fr)` }
+  const timeColWidth = isMobile ? '50px' : '60px'
+  const dstColWidth = isMobile ? '48px' : '62px'
+  const timezoneColumns = [...timezones.additional, timezone]
+  const dstTransitions = detectDstTransitions(timezones.all, visibleDays)
+  const daySlots: Array<{ type: 'day'; day: Date } | { type: 'dst'; transition: DstTransition }> = []
+  visibleDays.forEach((day, dayIndex) => {
+    dstTransitions.filter(transition => transition.transitionDayIndex === dayIndex)
+      .forEach(transition => daySlots.push({ type: 'dst', transition }))
+    daySlots.push({ type: 'day', day })
+  })
+  const gridStyle = {
+    gridTemplateColumns: `${timezones.additional.map(() => dstColWidth).join(' ')} ${timeColWidth} ${daySlots.map(slot => slot.type === 'dst' ? dstColWidth : 'minmax(80px, 1fr)').join(' ')}`.trim(),
+  }
+  const gridMinWidth = Math.max(
+    isMobile ? 0 : 640,
+    parseInt(timeColWidth) + (timezones.additional.length + dstTransitions.length) * parseInt(dstColWidth) + visibleDays.length * 80,
+  )
 
   const isDateInRange = (date: Date) => {
     if (!customStartDate || !customEndDate) return false
@@ -226,6 +291,17 @@ export default function GuestBookingPage() {
   }
 
   const isDaySkipped = (date: Date) => skippedDays.has(format(date, 'yyyy-MM-dd'))
+
+  const todayUtc = now.toISOString().slice(0, 10)
+  const nowMinutes = now.getUTCHours() * 60 + now.getUTCMinutes()
+  const lastTime = timeSlots[timeSlots.length - 1]
+  const [lastHour = startHour, lastMinute = 0] = lastTime?.split(':').map(Number) ?? []
+  const hasToday = visibleDays.some(day =>
+    format(day, 'yyyy-MM-dd') === todayUtc && isDateInRange(day) && !isDaySkipped(day),
+  )
+  const nowPosition = timeSlots.length > 0 && hasToday && nowMinutes >= startHour * 60 && nowMinutes < lastHour * 60 + lastMinute + timeInterval
+    ? (nowMinutes - startHour * 60) / timeInterval * 32
+    : null
 
   const getCellId = (date: Date, time: string) => `${format(date, 'yyyy-MM-dd')}_${time}`
 
@@ -400,10 +476,14 @@ export default function GuestBookingPage() {
   // Proceed from name → pick
   // ------------------------------------------------------------------
   const handleNameContinue = () => {
-    if (username.trim().length < 1) return
-    // If user already has saved availability, load it
-    const existing = savedSelections.get(username.trim())
-    if (existing) setCurrentSelection(new Set(existing))
+    const name = username.trim()
+    if (name.length < 1) return
+    // Only reload from saved data when the name changed -- otherwise keep any
+    // in-progress picks the user made before pressing Back.
+    if (name !== selectionOwner) {
+      setCurrentSelection(new Set(savedSelections.get(name) ?? []))
+      setSelectionOwner(name)
+    }
     setStep('pick')
   }
 
@@ -426,8 +506,8 @@ export default function GuestBookingPage() {
     return (
       <div className="min-h-screen flex flex-col items-center justify-center bg-background text-foreground p-6">
         <div className="text-center max-w-md">
-          <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-red-100 dark:bg-red-950 flex items-center justify-center">
-            <X className="w-8 h-8 text-red-600 dark:text-red-400" />
+          <div className="w-16 h-16 mx-auto mb-4 rounded-full bg-danger-subtle flex items-center justify-center">
+            <X className="w-8 h-8 text-danger" />
           </div>
           <h1 className="text-2xl font-bold mb-2">Event Not Found</h1>
           <p className="text-muted-foreground mb-6">
@@ -470,8 +550,8 @@ export default function GuestBookingPage() {
 
         <div className="text-center max-w-lg relative z-10">
           {/* Big party icon */}
-          <div className="w-20 h-20 mx-auto mb-6 rounded-full bg-gradient-to-br from-green-400 to-emerald-500 flex items-center justify-center shadow-lg shadow-green-200 dark:shadow-green-900/30">
-            <PartyPopper className="w-10 h-10 text-white" />
+          <div className="w-20 h-20 mx-auto mb-6 rounded-full bg-success flex items-center justify-center shadow-lg shadow-success/30">
+            <PartyPopper className="w-10 h-10 text-success-foreground" />
           </div>
 
           <h1 className="text-3xl md:text-4xl font-bold mb-3">You're in!</h1>
@@ -486,8 +566,8 @@ export default function GuestBookingPage() {
           {isSafeUrl(onboardingUrl) && (
             <div className="bg-card border border-border rounded-xl p-6 mb-6 text-left">
               <div className="flex items-start gap-3 mb-4">
-                <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-green-500 to-emerald-500 flex items-center justify-center shrink-0">
-                  <ArrowRight className="w-5 h-5 text-white" />
+                <div className="w-10 h-10 rounded-lg bg-success flex items-center justify-center shrink-0">
+                  <ArrowRight className="w-5 h-5 text-success-foreground" />
                 </div>
                 <div>
                   <h2 className="font-semibold text-base mb-1">What's Next?</h2>
@@ -511,8 +591,8 @@ export default function GuestBookingPage() {
           {/* Explore the application */}
           <div className="bg-card border border-border rounded-xl p-6 mb-6 text-left">
             <div className="flex items-start gap-3 mb-4">
-              <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-purple-500 to-blue-500 flex items-center justify-center shrink-0">
-                <Sparkles className="w-5 h-5 text-white" />
+              <div className="w-10 h-10 rounded-lg bg-primary flex items-center justify-center shrink-0">
+                <Sparkles className="w-5 h-5 text-primary-foreground" />
               </div>
               <div>
                 <h2 className="font-semibold text-base mb-1">Explore Coordination Manager</h2>
@@ -551,19 +631,18 @@ export default function GuestBookingPage() {
       <div className="min-h-screen flex flex-col bg-background text-foreground">
         {/* Minimal top bar — just theme toggle */}
         <div className="flex justify-end p-3">
-          <button
+          <IconButton
+            label={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
+            icon={isDark ? <Sun /> : <Moon />}
+            size="standard"
             onClick={toggleDark}
-            className="p-2 rounded-lg text-muted-foreground hover:bg-accent/50 hover:text-accent-foreground transition-colors"
-            title={isDark ? 'Switch to light mode' : 'Switch to dark mode'}
-          >
-            {isDark ? <Sun className="h-5 w-5" /> : <Moon className="h-5 w-5" />}
-          </button>
+          />
         </div>
 
         <div className="flex-1 flex flex-col items-center justify-center px-6 pb-20">
           {/* Event badge */}
-          <div className="w-14 h-14 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center mb-6 shadow-lg shadow-blue-200 dark:shadow-blue-900/30">
-            <Calendar className="w-7 h-7 text-white" />
+          <div className="w-14 h-14 rounded-xl bg-primary flex items-center justify-center mb-6 shadow-lg shadow-primary/30">
+            <Calendar className="w-7 h-7 text-primary-foreground" />
           </div>
 
           <p className="text-sm text-muted-foreground mb-1 uppercase tracking-wide font-medium">You're invited to</p>
@@ -602,17 +681,19 @@ export default function GuestBookingPage() {
               onChange={e => setUsername(e.target.value)}
               onKeyDown={e => { if (e.key === 'Enter') handleNameContinue() }}
               placeholder="Enter your name..."
-              className="w-full px-4 py-3 border border-border rounded-xl text-base bg-background text-foreground text-center focus:ring-2 focus:ring-primary focus:border-primary outline-none transition-shadow"
+              className="w-full px-4 py-3 border border-border rounded-xl text-base bg-background text-foreground text-center focus:ring-2 focus:ring-primary focus:border-primary outline-hidden transition-shadow"
               autoComplete="off"
             />
-            <button
+            <Button
+              intent="primary"
+              fullWidth
               onClick={handleNameContinue}
               disabled={!username.trim()}
-              className="w-full mt-4 px-6 py-3 bg-primary text-primary-foreground rounded-xl hover:bg-primary/90 disabled:opacity-40 disabled:cursor-not-allowed font-semibold text-base transition-all flex items-center justify-center gap-2"
+              className="mt-4"
             >
               Pick your times
               <ArrowRight className="w-4 h-4" />
-            </button>
+            </Button>
           </div>
 
           <p className="text-xs text-muted-foreground mt-4 text-center max-w-xs">
@@ -640,10 +721,10 @@ export default function GuestBookingPage() {
   return (
     <div className="min-h-screen flex flex-col bg-background text-foreground">
       {/* Minimal top bar */}
-      <div className="flex items-center justify-between px-4 py-2 border-b border-border bg-background/95 backdrop-blur-sm sticky top-0 z-30">
-        <div className="flex items-center gap-3 min-w-0">
-          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center shrink-0">
-            <Calendar className="w-4 h-4 text-white" />
+      <div className="relative flex items-center justify-center px-4 py-2 border-b border-border bg-background/95 backdrop-blur-xs sticky top-0 z-30">
+        <div className="flex items-center gap-3 min-w-0 max-w-[70%]">
+          <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center shrink-0">
+            <Calendar className="w-4 h-4 text-primary-foreground" />
           </div>
           <div className="min-w-0">
             <h1 className="text-sm font-semibold truncate">{eventName}</h1>
@@ -652,79 +733,68 @@ export default function GuestBookingPage() {
             </p>
           </div>
         </div>
-        <div className="flex items-center gap-2">
-          <button
-            onClick={toggleDark}
-            className="p-1.5 rounded-lg text-muted-foreground hover:bg-accent/50 transition-colors"
-            title={isDark ? 'Light mode' : 'Dark mode'}
-          >
-            {isDark ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-          </button>
-        </div>
-      </div>
-
-      {/* Instruction banner */}
-      <div className="px-4 py-3 bg-purple-50 dark:bg-purple-950/30 border-b border-purple-200 dark:border-purple-800/50">
-        <p className="text-sm text-center text-purple-700 dark:text-purple-300 font-medium">
-          Drag or tap to select when you're available, then confirm below
-        </p>
+        <IconButton
+          label={isDark ? 'Light mode' : 'Dark mode'}
+          icon={isDark ? <Sun /> : <Moon />}
+          onClick={toggleDark}
+          className="absolute right-4"
+        />
       </div>
 
       {/* Calendar content */}
-      <div className="flex-1 flex flex-col p-2 md:p-4 max-w-[1200px] mx-auto w-full overflow-hidden">
+      <div className="flex flex-col p-2 md:p-4 max-w-[1200px] mx-auto w-full overflow-hidden">
+        <div className="mb-1">
+          <TimezoneSelector timezones={timezones} compact />
+        </div>
         {/* Week navigation */}
         <div className="flex items-center justify-between mb-2">
-          <button
+          <IconButton
+            label="Previous week"
+            icon={<ChevronLeft />}
             onClick={() => {
               const w = subWeeks(currentWeekStart, 1)
               setCurrentWeekStart(w)
             }}
             disabled={isPrevDisabled}
-            className="p-1.5 rounded-lg hover:bg-muted disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-          >
-            <ChevronLeft className="w-5 h-5" />
-          </button>
+          />
           <span className="text-sm font-medium">
             {format(currentWeekStart, 'MMM d')} – {format(addDays(currentWeekStart, 6), 'MMM d, yyyy')}
           </span>
-          <button
+          <IconButton
+            label="Next week"
+            icon={<ChevronRight />}
             onClick={() => {
               const w = addWeeks(currentWeekStart, 1)
               setCurrentWeekStart(w)
             }}
             disabled={isNextDisabled}
-            className="p-1.5 rounded-lg hover:bg-muted disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-          >
-            <ChevronRight className="w-5 h-5" />
-          </button>
+          />
         </div>
 
         {/* Mobile day pager */}
         {isMobile && MOBILE_DAYS_COUNT < 7 && mobileEligibleDays.length > MOBILE_DAYS_COUNT && (
           <div className="flex items-center justify-between px-2 py-1.5 bg-card border border-border rounded-lg mb-1">
-            <button
+            <IconButton
+              label="Previous days"
+              icon={<ChevronLeft />}
               onClick={() => setMobileDayOffset(Math.max(0, mobileDayOffset - 1))}
               disabled={mobileDayOffset === 0}
-              className="p-1 rounded hover:bg-muted disabled:opacity-30"
-            >
-              <ChevronLeft className="w-4 h-4" />
-            </button>
+            />
             <span className="text-xs font-medium">
               {format(visibleDays[0], 'EEE d')} – {format(visibleDays[visibleDays.length - 1], 'EEE d MMM')}
             </span>
-            <button
+            <IconButton
+              label="Next days"
+              icon={<ChevronRight />}
               onClick={() => setMobileDayOffset(Math.min(mobileMaxOffset, mobileDayOffset + 1))}
               disabled={mobileDayOffset >= mobileMaxOffset}
-              className="p-1 rounded hover:bg-muted disabled:opacity-30"
-            >
-              <ChevronRight className="w-4 h-4" />
-            </button>
+            />
           </div>
         )}
 
         {/* Grid */}
         <div
-          className="flex-1 overflow-auto relative"
+          className="overflow-auto relative"
           style={{
             maxHeight: isMobile ? 'calc(100vh - 260px)' : 'calc(100vh - 280px)',
             minHeight: '200px',
@@ -734,12 +804,50 @@ export default function GuestBookingPage() {
           onPointerCancel={handlePointerEnd}
           onPointerLeave={handlePointerEnd}
         >
-          <div style={{ minWidth: isMobile ? undefined : '640px' }}>
+          <div style={{ minWidth: gridMinWidth }}>
             {/* Day headers */}
             <div className="sticky top-0 z-20 bg-card border-b border-border">
               <div className="grid" style={gridStyle}>
-                <div className="p-1 md:p-2" />
-                {visibleDays.map(day => {
+                {timezoneColumns.map(iana => {
+                  const isPrimary = iana === timezone
+                  const entry = findTimezone(iana)
+                  const label = iana === 'UTC' ? 'UTC' : (entry?.city ?? iana)
+                  const abbr = getTimezoneAbbrOnDate(iana, visibleDays[0] ?? currentWeekStart)
+                  return (
+                    <div
+                      key={iana}
+                      className={isPrimary
+                        ? 'p-1 text-xs text-right pr-2 border-r border-border flex flex-col items-end justify-between text-primary'
+                        : 'p-1 text-xs text-muted-foreground text-center border-r border-border/50 flex flex-col items-center justify-between'}
+                      title={iana}
+                      aria-label={`Time column: ${abbr}`}
+                    >
+                      <span className={isPrimary ? 'text-[10px] font-bold' : 'text-[9px] font-semibold opacity-60 truncate max-w-full'}>{label}</span>
+                      {iana !== 'UTC' && <span className="text-[9px] opacity-70">{abbr}</span>}
+                      <span className={`font-mono tabular-nums ${isPrimary ? 'font-semibold' : 'text-[10px]'}`} aria-label={`Current time in ${iana}`}>
+                        {getCurrentTimeInTimezone(iana)}
+                      </span>
+                    </div>
+                  )
+                })}
+                {daySlots.map((slot, slotIndex) => {
+                  if (slot.type === 'dst') {
+                    const transition = slot.transition
+                    const offsetBefore = transition.offsetBefore >= 0 ? `+${transition.offsetBefore / 60}` : `${transition.offsetBefore / 60}`
+                    const offsetAfter = transition.offsetAfter >= 0 ? `+${transition.offsetAfter / 60}` : `${transition.offsetAfter / 60}`
+                    return (
+                      <div
+                        key={`dst-header-${slotIndex}`}
+                        className="p-1 text-center border-l border-warning-muted bg-warning-subtle flex flex-col items-center justify-center text-warning"
+                        aria-label={`Daylight-saving change: ${transition.abbrBefore} to ${transition.abbrAfter}`}
+                      >
+                        <span className="text-[8px] font-semibold truncate max-w-full">{findTimezone(transition.iana)?.city ?? transition.iana}</span>
+                        <span className="text-[9px] font-bold">GMT</span>
+                        <span className="text-[9px] font-bold">{offsetBefore} to {offsetAfter}</span>
+                      </div>
+                    )
+                  }
+                  const day = slot.day
                   const inRange = isDateInRange(day)
                   const isToday = isSameDay(day, today)
                   const isSkipped = isDaySkipped(day)
@@ -748,8 +856,8 @@ export default function GuestBookingPage() {
                       key={day.toISOString()}
                       className={`p-1 md:p-2 text-center font-semibold border-l border-border ${
                         isSkipped ? 'bg-muted text-muted-foreground line-through'
-                        : inRange ? 'bg-green-50 dark:bg-green-950/30 text-green-700 dark:text-green-400'
-                        : isToday ? 'bg-blue-50 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400'
+                        : inRange ? 'bg-success-subtle text-success'
+                        : isToday ? 'bg-info-subtle text-primary'
                         : 'text-foreground'
                       }`}
                     >
@@ -762,16 +870,45 @@ export default function GuestBookingPage() {
             </div>
 
             {/* Time slots */}
+            <div className="relative">
             {timeSlots.map((time, index) => (
               <div
                 key={time}
                 className={`grid hover:bg-muted/30 ${index === timeSlots.length - 1 ? 'border-b-2 border-border' : ''}`}
                 style={gridStyle}
               >
-                <div className="p-1 text-xs text-muted-foreground text-right pr-2 border-r border-border">
-                  {time}
-                </div>
-                {visibleDays.map(day => {
+                {timezoneColumns.map(iana => (
+                  <div
+                    key={iana}
+                    className={iana === timezone
+                      ? 'p-1 text-xs text-right pr-2 border-r border-border font-mono tabular-nums font-semibold text-primary'
+                      : 'p-1 text-[10px] text-muted-foreground text-center border-r border-border/50 font-mono tabular-nums flex items-center justify-center'}
+                  >
+                    {visibleDays[0] ? convertUtcTimeToTimezoneOnDate(time, iana, visibleDays[0]) : time}
+                  </div>
+                ))}
+                {daySlots.map((slot, slotIndex) => {
+                  if (slot.type === 'dst') {
+                    const transition = slot.transition
+                    const transitionDay = visibleDays[transition.transitionDayIndex]
+                    const beforeDay = visibleDays[transition.transitionDayIndex - 1]
+                    const dstTime = convertUtcTimeToTimezoneOnDate(time, transition.iana, transitionDay)
+                    const previousTime = convertUtcTimeToTimezoneOnDate(time, transition.iana, beforeDay)
+                    return (
+                      <div
+                        key={`dst-time-${slotIndex}`}
+                        aria-label={`Daylight-saving time: ${dstTime}`}
+                        className={`p-1 text-[10px] text-center border-l border-warning-muted font-mono tabular-nums flex items-center justify-center ${
+                          dstTime !== previousTime
+                            ? 'bg-warning-subtle text-warning font-semibold'
+                            : 'text-muted-foreground/40'
+                        }`}
+                      >
+                        {dstTime}
+                      </div>
+                    )
+                  }
+                  const day = slot.day
                   const inRange = isDateInRange(day)
                   const isSkipped = isDaySkipped(day)
                   const cellId = getCellId(day, time)
@@ -781,25 +918,39 @@ export default function GuestBookingPage() {
                   const heatmap = getHeatmapColor(count)
                   const purple = getPurpleGradient(count)
                   const isSelectable = inRange && !isSkipped
+                  const slotDate = new Date(`${format(day, 'yyyy-MM-dd')}T${time}:00Z`)
+                  const localSlotLabel = localSlotFormatter.format(slotDate)
 
                   return (
                     <div
                       key={`${day.toISOString()}-${time}`}
                       data-cell-id={cellId}
                       data-selectable={isSelectable ? 'true' : 'false'}
+                      aria-label={localSlotLabel}
+                      title={localSlotLabel}
                       className={`border-l border-b border-border h-[32px] select-none relative ${
                         isSkipped || !inRange
-                          ? 'bg-gray-400/70 dark:bg-[hsla(222,47%,11%,0.7)] cursor-not-allowed'
+                          ? 'bg-neutral/50 dark:bg-[hsla(222,47%,11%,0.7)] cursor-not-allowed'
                           : isSelected
                           ? `${purple} cursor-pointer`
                           : count > 0
                           ? `${heatmap} cursor-pointer`
                           : inRange
-                          ? 'bg-green-50/30 dark:bg-green-950/10 cursor-pointer'
+                          ? 'bg-success-subtle cursor-pointer'
                           : ''
-                      } touch-none`}
+                      }`}
+                      // Cells keep native panning so a quick touch scrolls the grid;
+                      // the long-press gate blocks scrolling once select mode activates.
+                      style={{ touchAction: 'pan-x pan-y pinch-zoom' }}
                       onPointerDown={(e) => {
                         if (!isSelectable) return
+                        // Touch: require a deliberate hold before select mode begins,
+                        // so quick touches keep scrolling the grid.
+                        if (e.pointerType === 'touch') {
+                          const beginSelection = () => handleCellPointerDown(day, time)
+                          touchSelectGateRef.current.pressStart(e, { onActivate: beginSelection, onTap: beginSelection })
+                          return
+                        }
                         e.preventDefault()
                         handleCellPointerDown(day, time)
                       }}
@@ -809,45 +960,59 @@ export default function GuestBookingPage() {
                 })}
               </div>
             ))}
+            {nowPosition !== null && (
+              <div
+                aria-label="Current time indicator"
+                className="absolute left-0 right-0 pointer-events-none h-[3px] bg-danger shadow-[0_0_6px] shadow-danger/60"
+                style={{ top: nowPosition }}
+              >
+                <div
+                  className="absolute -top-1 w-2 h-2 bg-danger rounded-full shadow-[0_0_6px] shadow-danger/60"
+                  style={{ left: parseInt(timeColWidth) + timezones.additional.length * parseInt(dstColWidth) }}
+                />
+              </div>
+            )}
+            </div>
           </div>
+        </div>
+
+        {/* Instruction banner -- sits directly under the grid */}
+        <div className="mt-2 px-4 py-2 rounded-lg bg-muted border border-border/50">
+          <p className="text-sm text-center text-foreground font-medium">
+            {isMobile
+              ? 'Tap a time slot, or press and hold then drag to select a range'
+              : 'Drag or tap to select when you\'re available, then confirm below'}
+          </p>
         </div>
 
         {/* Bottom action bar */}
         <div className="pt-3 pb-2 flex flex-col sm:flex-row items-center gap-3 border-t border-border mt-2 bg-background">
           <div className="flex items-center gap-3 text-sm text-muted-foreground">
-            {currentSelection.size > 0 ? (
-              <span className="inline-flex items-center gap-1.5 text-purple-600 dark:text-purple-400 font-medium">
+            {currentSelection.size > 0 && (
+              <span className="inline-flex items-center gap-1.5 text-feature-ai font-medium">
                 <Check className="w-4 h-4" />
                 {currentSelection.size} slot{currentSelection.size !== 1 ? 's' : ''} selected
               </span>
-            ) : (
-              <span>Drag or tap on the grid to select times</span>
             )}
           </div>
           <div className="flex-1" />
-          <button
-            onClick={() => { setStep('name'); setCurrentSelection(new Set()) }}
-            className="w-full sm:w-auto px-4 py-2.5 text-sm text-muted-foreground hover:text-foreground hover:bg-muted rounded-lg transition-colors"
+          <Button
+            emphasis="ghost"
+            onClick={() => { setIsEditingName(true); setStep('name') }}
+            className="w-full sm:w-auto"
           >
             Back
-          </button>
-          <button
+          </Button>
+          <Button
+            intent="primary"
             onClick={handleSubmit}
-            disabled={currentSelection.size === 0 || isSaving}
-            className="w-full sm:w-auto px-6 py-2.5 bg-green-600 hover:bg-green-700 text-white rounded-xl font-semibold text-sm disabled:opacity-40 disabled:cursor-not-allowed transition-all flex items-center justify-center gap-2 shadow-md shadow-green-200 dark:shadow-green-900/30"
+            disabled={currentSelection.size === 0}
+            loading={isSaving}
+            icon={<Check className="w-4 h-4" />}
+            className="w-full sm:w-auto"
           >
-            {isSaving ? (
-              <>
-                <div className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-                Saving...
-              </>
-            ) : (
-              <>
-                <Check className="w-4 h-4" />
-                Confirm Availability
-              </>
-            )}
-          </button>
+            {isSaving ? 'Saving...' : 'Confirm Availability'}
+          </Button>
         </div>
       </div>
     </div>

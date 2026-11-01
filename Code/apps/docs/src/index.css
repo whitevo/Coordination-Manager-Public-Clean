@@ -1,6 +1,196 @@
-@tailwind base;
-@tailwind components;
-@tailwind utilities;
+@import 'tailwindcss' source('./');
+@import '../../web/src/theme-tokens.css';
+
+@config '../tailwind.config.ts';
+@source '../../web/src';
+
+/* CSS-defined keyframes retain source filenames for Vite's asset rewriting. */
+@theme {
+  @keyframes unmarked-pulse {
+    0%, 100% {
+      box-shadow: 0 0 4px rgba(251,191,36,0.3);
+      border-color: rgb(251,191,36);
+    }
+    50% {
+      box-shadow: 0 0 12px rgba(251,191,36,0.6);
+      border-color: rgb(245,158,11);
+    }
+  }
+  @keyframes cyan-pulse {
+    0%, 100% {
+      box-shadow: 0 0 0 2px rgba(34,211,238,0.25), 0 0 6px rgba(34,211,238,0.35);
+    }
+    50% {
+      box-shadow: 0 0 0 3px rgba(34,211,238,0.45), 0 0 16px rgba(34,211,238,0.65);
+    }
+  }
+  @keyframes emerald-pulse {
+    0%, 100% {
+      border-color: rgba(16,185,129,0.55);
+      box-shadow: 0 0 0 1px rgba(16,185,129,0.3), 0 0 6px rgba(16,185,129,0.35);
+    }
+    50% {
+      border-color: rgb(5,150,105);
+      box-shadow: 0 0 0 3px rgba(16,185,129,0.55), 0 0 18px rgba(16,185,129,0.7);
+    }
+  }
+  @keyframes attachment-pulse {
+    0%, 100% {
+      background-color: rgba(249,115,22,0.18);
+      border-color: rgba(249,115,22,0.55);
+      box-shadow: 0 0 0 1px rgba(249,115,22,0.25), 0 0 6px rgba(249,115,22,0.35);
+    }
+    50% {
+      background-color: rgba(249,115,22,0.32);
+      border-color: rgb(249,115,22);
+      box-shadow: 0 0 0 2px rgba(249,115,22,0.5), 0 0 16px rgba(249,115,22,0.7);
+    }
+  }
+  @keyframes spin-once {
+    from { transform: rotate(0deg); }
+    to { transform: rotate(360deg); }
+  }
+  @keyframes gradient-shift {
+    0%, 100% { background-position: 0% 50%; }
+    50% { background-position: 100% 50%; }
+  }
+  @keyframes indeterminate {
+    0% { transform: translateX(-100%) scaleX(1); }
+    50% { transform: translateX(100%) scaleX(1.5); }
+    100% { transform: translateX(300%) scaleX(1); }
+  }
+  @keyframes slide-in-right {
+    0% { opacity: 0; transform: translateX(100%); }
+    100% { opacity: 1; transform: translateX(0); }
+  }
+  @keyframes fade-in-up {
+    0% { opacity: 0; transform: translateY(24px); }
+    100% { opacity: 1; transform: translateY(0); }
+  }
+}
+
+/*
+  The default border color has changed to `currentcolor` in Tailwind CSS v4,
+  so we've added these compatibility styles to make sure everything still
+  looks the same as it did with Tailwind CSS v3.
+
+  If we ever want to remove these styles, we need to add an explicit border
+  color utility to any element that depends on these defaults.
+*/
+@layer base {
+  *,
+  ::after,
+  ::before,
+  ::backdrop,
+  ::file-selector-button {
+    border-color: var(--color-gray-200, currentcolor);
+  }
+}
+
+@utility prose-docs {
+  @apply leading-7 text-gray-300;
+  & h1 {
+    @apply text-3xl font-bold text-white mb-4 mt-0;
+  }
+  & h2 {
+    @apply text-2xl font-semibold text-white mt-10 mb-4 pb-2 border-b border-surface-700;
+  }
+  & h3 {
+    @apply text-xl font-semibold text-gray-100 mt-8 mb-3;
+  }
+  & h4 {
+    @apply text-lg font-medium text-gray-200 mt-6 mb-2;
+  }
+  & p {
+    @apply mb-4;
+  }
+  & a {
+    @apply text-brand-400 hover:text-brand-300 no-underline;
+  }
+  & ul {
+    @apply list-disc pl-6 mb-4 space-y-1;
+  }
+  & ol {
+    @apply list-decimal pl-6 mb-4 space-y-1;
+  }
+  & li {
+    @apply text-gray-300;
+  }
+  & code {
+    @apply font-mono text-sm bg-surface-800 text-brand-300 px-1.5 py-0.5 rounded;
+  }
+  & pre {
+    @apply bg-surface-850 border border-surface-700 rounded-lg p-4 mb-4 overflow-x-auto;
+  }
+  & pre code {
+    @apply bg-transparent p-0 text-gray-200;
+  }
+  & table {
+    @apply w-full border-collapse mb-6;
+  }
+  & thead {
+    @apply border-b-2 border-surface-700;
+  }
+  & th {
+    @apply text-left text-sm font-semibold text-gray-200 py-2 px-3;
+  }
+  & td {
+    @apply text-sm text-gray-300 py-2 px-3 border-b border-surface-700/50;
+  }
+  & blockquote {
+    @apply border-l-4 border-brand-500 pl-4 italic text-gray-400 my-4;
+  }
+}
+
+@utility callout {
+  @apply rounded-lg border p-4 mb-4;
+}
+
+@utility callout-info {
+  @apply bg-blue-950/30 border-blue-800/50 text-blue-200;
+}
+
+@utility callout-warning {
+  @apply bg-amber-950/30 border-amber-800/50 text-amber-200;
+}
+
+@utility callout-tip {
+  @apply bg-emerald-950/30 border-emerald-800/50 text-emerald-200;
+}
+
+@utility callout-danger {
+  @apply bg-red-950/30 border-red-800/50 text-red-200;
+}
+
+@utility endpoint {
+  @apply border border-surface-700 rounded-lg mb-6 overflow-hidden;
+}
+
+@utility endpoint-header {
+  @apply flex items-center gap-3 px-4 py-3 bg-surface-800;
+}
+
+@utility endpoint-body {
+  @apply p-4 bg-surface-850;
+}
+
+@utility method-get {
+  @apply bg-emerald-900/60 text-emerald-300 text-xs font-bold px-2 py-1 rounded uppercase tracking-wider;
+}
+
+@utility method-post {
+  @apply bg-blue-900/60 text-blue-300 text-xs font-bold px-2 py-1 rounded uppercase tracking-wider;
+}
+
+@utility animate-search-entrance {
+  /* AI Search entrance animation */
+  animation: search-entrance 0.45s ease-out both;
+}
+
+@utility animate-search-pulse {
+  /* AI Search "you are already here" pulse */
+  animation: search-pulse 0.7s ease-in-out;
+}
 
 @layer base {
   * {
@@ -17,105 +207,6 @@
   }
   ::-webkit-scrollbar-thumb {
     @apply bg-surface-700 rounded-full;
-  }
-}
-
-@layer components {
-  .prose-docs {
-    @apply leading-7 text-gray-300;
-  }
-  .prose-docs h1 {
-    @apply text-3xl font-bold text-white mb-4 mt-0;
-  }
-  .prose-docs h2 {
-    @apply text-2xl font-semibold text-white mt-10 mb-4 pb-2 border-b border-surface-700;
-  }
-  .prose-docs h3 {
-    @apply text-xl font-semibold text-gray-100 mt-8 mb-3;
-  }
-  .prose-docs h4 {
-    @apply text-lg font-medium text-gray-200 mt-6 mb-2;
-  }
-  .prose-docs p {
-    @apply mb-4;
-  }
-  .prose-docs a {
-    @apply text-brand-400 hover:text-brand-300 no-underline;
-  }
-  .prose-docs ul {
-    @apply list-disc pl-6 mb-4 space-y-1;
-  }
-  .prose-docs ol {
-    @apply list-decimal pl-6 mb-4 space-y-1;
-  }
-  .prose-docs li {
-    @apply text-gray-300;
-  }
-  .prose-docs code {
-    @apply font-mono text-sm bg-surface-800 text-brand-300 px-1.5 py-0.5 rounded;
-  }
-  .prose-docs pre {
-    @apply bg-surface-850 border border-surface-700 rounded-lg p-4 mb-4 overflow-x-auto;
-  }
-  .prose-docs pre code {
-    @apply bg-transparent p-0 text-gray-200;
-  }
-  .prose-docs table {
-    @apply w-full border-collapse mb-6;
-  }
-  .prose-docs thead {
-    @apply border-b-2 border-surface-700;
-  }
-  .prose-docs th {
-    @apply text-left text-sm font-semibold text-gray-200 py-2 px-3;
-  }
-  .prose-docs td {
-    @apply text-sm text-gray-300 py-2 px-3 border-b border-surface-700/50;
-  }
-  .prose-docs blockquote {
-    @apply border-l-4 border-brand-500 pl-4 italic text-gray-400 my-4;
-  }
-
-  .callout {
-    @apply rounded-lg border p-4 mb-4;
-  }
-  .callout-info {
-    @apply bg-blue-950/30 border-blue-800/50 text-blue-200;
-  }
-  .callout-warning {
-    @apply bg-amber-950/30 border-amber-800/50 text-amber-200;
-  }
-  .callout-tip {
-    @apply bg-emerald-950/30 border-emerald-800/50 text-emerald-200;
-  }
-  .callout-danger {
-    @apply bg-red-950/30 border-red-800/50 text-red-200;
-  }
-
-  .endpoint {
-    @apply border border-surface-700 rounded-lg mb-6 overflow-hidden;
-  }
-  .endpoint-header {
-    @apply flex items-center gap-3 px-4 py-3 bg-surface-800;
-  }
-  .endpoint-body {
-    @apply p-4 bg-surface-850;
-  }
-  .method-get {
-    @apply bg-emerald-900/60 text-emerald-300 text-xs font-bold px-2 py-1 rounded uppercase tracking-wider;
-  }
-  .method-post {
-    @apply bg-blue-900/60 text-blue-300 text-xs font-bold px-2 py-1 rounded uppercase tracking-wider;
-  }
-
-  /* AI Search entrance animation */
-  .animate-search-entrance {
-    animation: search-entrance 0.45s ease-out both;
-  }
-
-  /* AI Search "you are already here" pulse */
-  .animate-search-pulse {
-    animation: search-pulse 0.7s ease-in-out;
   }
 }
 
@@ -144,5 +235,164 @@
     outline: 2px solid transparent;
     outline-offset: 8px;
     box-shadow: 0 0 0 0 transparent;
+  }
+}
+
+/* ─── Design catalog preview surface ───────────────────────────────────
+   Defines the web-app HSL token contract locally so real recipes
+   (bg-primary, bg-card, border-border, ...) render faithfully inside the
+   catalog. Values mirror Code/apps/web/src/index.css. The `.cm-dark`
+   modifier flips the same surface to dark independent of the docs theme. */
+.cm-preview {
+  color-scheme: light;
+  --background: 0 0% 100%;
+  --foreground: 222.2 47.4% 11.2%;
+  --card: 0 0% 100%;
+  --card-foreground: 222.2 47.4% 11.2%;
+  --popover: 0 0% 100%;
+  --popover-foreground: 222.2 47.4% 11.2%;
+  --primary: 222 47% 11%;
+  --primary-foreground: 0 0% 98%;
+  --secondary: 210 40% 96.1%;
+  --secondary-foreground: 222.2 47.4% 11.2%;
+  --muted: 210 40% 96.1%;
+  --muted-foreground: 215.4 16.3% 46.9%;
+  --accent: 210 40% 96.1%;
+  --accent-foreground: 222.2 47.4% 11.2%;
+  --destructive: 0 84% 60%;
+  --destructive-foreground: 0 0% 98%;
+  --info: 221 83% 53%;
+  --info-subtle: 214 95% 93%;
+  --info-muted: 213 97% 87%;
+  --info-foreground: 0 0% 100%;
+  --success: 142 71% 45%;
+  --success-subtle: 141 84% 93%;
+  --success-muted: 142 77% 73%;
+  --success-foreground: 0 0% 100%;
+  --warning: 38 92% 50%;
+  --warning-subtle: 48 96% 89%;
+  --warning-muted: 46 97% 65%;
+  --warning-foreground: 20 14% 10%;
+  --danger: 0 72% 51%;
+  --danger-subtle: 0 93% 94%;
+  --danger-muted: 0 94% 82%;
+  --danger-foreground: 0 0% 100%;
+  --neutral: 215 16% 47%;
+  --neutral-subtle: 210 40% 96%;
+  --neutral-muted: 214 32% 91%;
+  --neutral-foreground: 0 0% 100%;
+  --feature-ai: 258 90% 66%;
+  --feature-chat: 199 89% 48%;
+  --feature-support: 221 83% 53%;
+  --feature-feedback: 38 92% 50%;
+  --feature-commons: 347 77% 50%;
+  --border: 214.3 31.8% 91.4%;
+  --input: 214.3 31.8% 91.4%;
+  --ring: 215 20.2% 65.1%;
+  --icon: 222.2 47.4% 11.2%;
+  --radius: 0.5rem;
+  background-color: hsl(var(--background));
+  color: hsl(var(--foreground));
+}
+
+.cm-preview.cm-dark {
+  color-scheme: dark;
+  --background: 222.2 47.4% 10%;
+  --foreground: 0 0% 98%;
+  --card: 222.2 47.4% 13%;
+  --card-foreground: 0 0% 98%;
+  --popover: 222.2 47.4% 15%;
+  --popover-foreground: 0 0% 98%;
+  --primary: 0 0% 98%;
+  --primary-foreground: 222 47% 11%;
+  --secondary: 217.2 32.6% 18.5%;
+  --secondary-foreground: 0 0% 98%;
+  --muted: 217.2 32.6% 14.5%;
+  --muted-foreground: 215 20.2% 65.1%;
+  --accent: 217.2 32.6% 22.5%;
+  --accent-foreground: 0 0% 98%;
+  --destructive: 0 62.8% 30.6%;
+  --destructive-foreground: 0 0% 98%;
+  --info: 213 94% 68%;
+  --info-subtle: 224 76% 15%;
+  --info-muted: 216 50% 35%;
+  --info-foreground: 222 47% 11%;
+  --success: 142 69% 58%;
+  --success-subtle: 144 61% 12%;
+  --success-muted: 142 40% 30%;
+  --success-foreground: 144 61% 8%;
+  --warning: 43 96% 56%;
+  --warning-subtle: 22 78% 10%;
+  --warning-muted: 32 55% 28%;
+  --warning-foreground: 20 14% 10%;
+  --danger: 0 91% 71%;
+  --danger-subtle: 0 63% 15%;
+  --danger-muted: 0 45% 35%;
+  --danger-foreground: 0 63% 10%;
+  --neutral: 215 20% 65%;
+  --neutral-subtle: 217 33% 17%;
+  --neutral-muted: 215 25% 27%;
+  --neutral-foreground: 222 47% 11%;
+  --feature-ai: 258 90% 76%;
+  --feature-chat: 199 89% 68%;
+  --feature-support: 213 94% 68%;
+  --feature-feedback: 43 96% 56%;
+  --feature-commons: 347 87% 66%;
+  --border: 217.2 32.6% 22.5%;
+  --input: 217.2 32.6% 17.5%;
+  --ring: 215 20.2% 65.1%;
+  --icon: 0 0% 98%;
+}
+
+/* Lucide icons inside a preview follow the web-app icon token. */
+.cm-preview .lucide {
+  color: hsl(var(--icon));
+}
+
+/* Subtle checkerboard so transparent/edge cases read clearly. */
+.cm-preview-frame {
+  background-image:
+    linear-gradient(45deg, rgba(148, 163, 184, 0.12) 25%, transparent 25%),
+    linear-gradient(-45deg, rgba(148, 163, 184, 0.12) 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, rgba(148, 163, 184, 0.12) 75%),
+    linear-gradient(-45deg, transparent 75%, rgba(148, 163, 184, 0.12) 75%);
+  background-size: 16px 16px;
+  background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+}
+
+/* Time Manager keyframes mirrored from the web app so arbitrary
+   animate-[...] recipes resolve inside catalog previews. */
+@keyframes time-item-selection-pulse {
+  0% {
+    box-shadow: 0 0 0 0 hsl(var(--primary) / 0.6);
+  }
+  55% {
+    box-shadow: 0 0 0 5px hsl(var(--primary) / 0.25);
+  }
+  100% {
+    box-shadow: 0 0 0 0 hsl(var(--primary) / 0);
+  }
+}
+
+@keyframes selection-time-pulse {
+  0%,
+  100% {
+    opacity: 0.55;
+    transform: scaleX(1);
+  }
+  50% {
+    opacity: 1;
+    transform: scaleX(1.08);
+  }
+}
+
+@keyframes unsaved-pop-in {
+  0% {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  100% {
+    opacity: 1;
+    transform: translateY(0) scale(1);
   }
 }

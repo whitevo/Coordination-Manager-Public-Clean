@@ -1,14 +1,17 @@
 import { Router, Response, NextFunction } from 'express'
-import { randomUUID } from 'crypto'
+import { randomBytes, randomUUID } from 'crypto'
 import { supabaseAdmin } from '../supabaseClient.js'
-import { createClient } from '@supabase/supabase-js'
-import { authMiddleware, AuthenticatedRequest } from '../middleware/auth.js'
+import { authMiddleware, createIsolatedAuthClient, getTrustedAuthMetadata, AuthenticatedRequest } from '../middleware/auth.js'
 import { ValidationError, UnauthorizedError, ApplicationError } from '../middleware/error-handler.js'
-import { createMergeToken, mergeTokenStore, mergeAccounts } from '../services/account-merge.js'
+import { createMergeToken, consumeMergeToken, mergeAccounts } from '../services/account-merge.js'
 import { verifyCaptcha } from '../services/captcha.js'
 import { recordSignup, getCaptchaStatus, getSignupSource } from '../services/signup-rate-tracker.js'
 
 const router: ReturnType<typeof Router> = Router()
+
+/** Traveler (guest) accounts expire after this many days. */
+const TRAVELER_EXPIRY_DAYS = 64
+const TRAVELER_EXPIRY_MS = TRAVELER_EXPIRY_DAYS * 24 * 60 * 60 * 1000
 
 // ── Traveler name generator ──────────────────────────────────────────
 
@@ -44,7 +47,7 @@ router.post('/guest', async (req, res: Response, next: NextFunction) => {
 
     const travelerId = randomUUID()
     const tempEmail = `traveler-${travelerId}@guest.local`
-    const tempPassword = `traveler-${travelerId}-${Date.now()}`
+    const tempPassword = randomBytes(32).toString('hex')
     const travelerName = generateTravelerName()
 
     // Create user with a generated email/password
@@ -56,6 +59,7 @@ router.post('/guest', async (req, res: Response, next: NextFunction) => {
         account_type: 'traveler',
         display_name: travelerName,
       },
+      app_metadata: { account_type: 'traveler' },
     })
 
     if (error || !data.user) {
@@ -68,8 +72,7 @@ router.post('/guest', async (req, res: Response, next: NextFunction) => {
     }
 
     // Create user profile in our users table
-    const expiresAt = new Date()
-    expiresAt.setDate(expiresAt.getDate() + 64)
+    const expiresAt = new Date(Date.now() + TRAVELER_EXPIRY_MS)
 
     const newProfile: Record<string, unknown> = {
       id: data.user.id,
@@ -100,10 +103,7 @@ router.post('/guest', async (req, res: Response, next: NextFunction) => {
     // Use the service-role key so the request bypasses Supabase's built-in
     // CAPTCHA enforcement — our own verifyCaptcha() already consumed the
     // one-time Turnstile token earlier in this handler.
-    const tempClient = createClient(
-      process.env.SUPABASE_URL as string,
-      (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY) as string
-    )
+    const tempClient = createIsolatedAuthClient()
     const { data: signInData, error: signInError } = await tempClient.auth.signInWithPassword({
       email: tempEmail,
       password: tempPassword,
@@ -172,7 +172,8 @@ router.get('/me', authMiddleware, async (req: AuthenticatedRequest, res: Respons
         throw new UnauthorizedError('User not found')
       }
 
-      const walletAddr = authUser.user.user_metadata?.wallet_address as string | undefined
+      const trustedMeta = getTrustedAuthMetadata(authUser.user)
+      const walletAddr = trustedMeta.wallet_address as string | undefined
       if (walletAddr) {
         const { data: walletOwner } = await supabaseAdmin
           .from('users')
@@ -194,10 +195,10 @@ router.get('/me', authMiddleware, async (req: AuthenticatedRequest, res: Respons
         }
       }
 
-      const metaAccountType = authUser.user.user_metadata?.account_type as string | undefined
+      const metaAccountType = trustedMeta.account_type as string | undefined
       const isTraveler = metaAccountType === 'traveler'
       const isCardano = metaAccountType === 'cardano' || metaAccountType === 'managed_cardano'
-      const expiresAt = isTraveler ? new Date(Date.now() + 64 * 24 * 60 * 60 * 1000).toISOString() : null
+      const expiresAt = isTraveler ? new Date(Date.now() + TRAVELER_EXPIRY_MS).toISOString() : null
 
       const newProfile: Record<string, unknown> = {
         id: userId,
@@ -215,7 +216,7 @@ router.get('/me', authMiddleware, async (req: AuthenticatedRequest, res: Respons
       }
 
       if (isCardano) {
-        newProfile.wallet_address = authUser.user.user_metadata?.wallet_address || null
+        newProfile.wallet_address = walletAddr || null
       }
 
       // Use insert instead of upsert to avoid overwriting existing data (like role).
@@ -296,7 +297,7 @@ router.put('/profile', authMiddleware, async (req: AuthenticatedRequest, res: Re
         throw new ValidationError('Email must be a string or null')
       }
       if (typeof email === 'string' && email.trim().length > 0) {
-        const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+        const emailRegex = /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/
         if (!emailRegex.test(email.trim())) {
           throw new ValidationError('Invalid email address')
         }
@@ -383,7 +384,8 @@ router.post('/logout', authMiddleware, async (req: AuthenticatedRequest, res: Re
     const token = req.accessToken
     // Only attempt signOut if the token looks like a valid JWT (3 dot-separated segments)
     if (token && token.split('.').length === 3) {
-      const { error } = await supabaseAdmin.auth.admin.signOut(token)
+      // 'local' scope: only revoke this session's refresh token, not every device the user is signed into.
+      const { error } = await supabaseAdmin.auth.admin.signOut(token, 'local')
       if (error) {
         console.warn(`Failed to invalidate session for user ${userId}:`, error.message)
       }
@@ -547,7 +549,7 @@ router.post('/account/prepare-link', authMiddleware, async (req: AuthenticatedRe
 
     if (!user) throw new Error('User not found')
 
-    const token = createMergeToken(userId, user.account_type || 'google')
+    const token = await createMergeToken(userId, user.account_type || 'google')
 
     res.json({
       success: true,
@@ -577,27 +579,27 @@ router.post('/account/complete-link', authMiddleware, async (req: AuthenticatedR
       throw new ValidationError('mergeToken is required')
     }
 
-    const pending = mergeTokenStore.get(mergeToken)
+    if (typeof mergeToken !== 'string') {
+      throw new ValidationError('mergeToken is required')
+    }
+
+    // Single-use: consuming deletes the token from the store
+    const pending = await consumeMergeToken(mergeToken)
 
     if (!pending) {
       throw new UnauthorizedError('Invalid or expired merge token')
     }
 
-    if (pending.expiresAt < Date.now()) {
-      mergeTokenStore.delete(mergeToken)
+    if (pending.expired) {
       throw new UnauthorizedError('Merge token has expired. Please try linking again.')
     }
 
     if (pending.sourceUserId === targetUserId) {
-      mergeTokenStore.delete(mergeToken)
       throw new ValidationError('Cannot merge an account with itself')
     }
 
     // The initiating account's settings take precedence
     await mergeAccounts(pending.sourceUserId, targetUserId, /* keepSettingsFromSource */ true)
-
-    // Consume the token
-    mergeTokenStore.delete(mergeToken)
 
     // Return updated profile
     const { data: updatedUser } = await supabaseAdmin

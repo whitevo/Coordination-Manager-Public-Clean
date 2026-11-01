@@ -50,11 +50,15 @@ See the README for environment variable setup.
 ### 4. Follow the project conventions
 
 - **TypeScript strict mode** across all packages; no `any`.
-- **Function components + hooks** on the frontend (React 18, TailwindCSS).
+- **Function components + hooks** on the frontend (React 19, TailwindCSS).
 - **async/await** for asynchronous code.
 - **Input validation at the API boundary** using the sanitize helpers.
 - **ASCII-safe text** in source files (no smart quotes or em dashes).
 - **No secrets** in commits, ever.
+- **Vite config compatibility**: use `import.meta.dirname` and explicit `.ts`
+  extensions for local TypeScript imports in configs and their dependencies.
+  Shared discovery code has its own ESM boundary in `Code/shared/package.json`;
+  keep it compatible with Vite's native config loader.
 
 Run before pushing:
 
@@ -112,5 +116,5 @@ Decisions are made openly on GitHub. The current governance model is documented 
 
 ## Questions
 
-- **Discussions:** <https://github.com/whitevo/Coordination-Manager/discussions>
+- **Discussions:** <https://github.com/whitevo/Coordination-Manager-Public-Clean/discussions>
 - **Email:** tevo@coordinationmanager.com

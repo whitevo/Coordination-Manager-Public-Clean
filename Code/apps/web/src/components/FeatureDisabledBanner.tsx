@@ -2,6 +2,7 @@ import { useMemo, useState, useEffect } from 'react'
 import { Link } from 'react-router-dom'
 import { AlertTriangle, X } from 'lucide-react'
 import type { SetupStatus, FeatureFlag } from '../lib/setup-api'
+import { IconButton } from './ui'
 
 // Human-readable labels for each optional feature returned by /api/setup/status.
 const FEATURE_LABELS: Record<FeatureFlag, string> = {
@@ -96,24 +97,24 @@ export function FeatureDisabledBanner({ status }: Props) {
   }
 
   return (
-    <div className="border-b border-amber-300 bg-amber-50 dark:border-amber-700 dark:bg-amber-950/40">
-      <div className="container mx-auto flex items-start gap-3 px-4 py-2 text-sm text-amber-900 dark:text-amber-100">
-        <AlertTriangle className="mt-0.5 h-4 w-4 flex-shrink-0" aria-hidden="true" />
+    <div className="border-b border-warning-muted bg-warning-subtle">
+      <div className="container mx-auto flex items-start gap-3 px-4 py-2 text-sm text-foreground">
+        <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0" aria-hidden="true" />
         <div className="flex-1">
           <span className="font-medium">Some features are disabled:</span>{' '}
           <span>{missing.map((f) => FEATURE_LABELS[f]).join(', ')}.</span>{' '}
-          <Link to={`/setup#${FEATURE_TO_SETUP_HASH[missing[0]]}`} className="underline underline-offset-2 hover:text-amber-700 dark:hover:text-amber-200">
+          <Link to={`/setup#${FEATURE_TO_SETUP_HASH[missing[0]]}`} className="underline underline-offset-2 hover:text-warning">
             Configure in Setup
           </Link>
         </div>
-        <button
-          type="button"
+        <IconButton
+          label="Dismiss notice"
+          icon={<X />}
+          intent="warning"
+          showTitle={false}
           onClick={handleDismiss}
-          className="rounded p-1 hover:bg-amber-100 dark:hover:bg-amber-900/40"
-          aria-label="Dismiss notice"
-        >
-          <X className="h-4 w-4" />
-        </button>
+          className="-my-1"
+        />
       </div>
     </div>
   )

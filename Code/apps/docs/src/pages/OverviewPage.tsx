@@ -4,6 +4,7 @@ import { Link } from 'react-router-dom'
 import { ArrowRight, ShieldCheck, Scale, Shield, FileText } from 'lucide-react'
 import { Callout } from '../components/Callout'
 import { overviewCapabilities, sectionNavigation } from '../docs-content'
+import { SITE_TAGLINE } from '../../../../shared/site-discovery'
 
 type OverlaySide = 'left' | 'right'
 
@@ -78,10 +79,19 @@ export function OverviewPage() {
   return (
     <div className="prose-docs">
       <h1>Coordination Manager</h1>
+      <p className="text-lg text-gray-400 mb-4">{SITE_TAGLINE}</p>
       <p className="text-lg text-gray-400 mb-8">
-        An open-source platform for collaborative scheduling, meeting coordination, and
-        community announcements -- with an API that AI agents can use to interact with
-        the Coordination Manager tool.
+        An{' '}
+        <a
+          href="https://github.com/whitevo/Coordination-Manager-Public-Clean"
+          target="_blank"
+          rel="noopener noreferrer"
+        >
+          open-source platform
+        </a>{' '}
+        for personal time planning, shared availability, meeting coordination, mailbox conversations,
+        invitations, and community message distribution -- with
+        an API that AI agents can use to interact with the Coordination Manager tool.
       </p>
 
       <Callout variant="tip" title="Agent API available">
@@ -183,7 +193,7 @@ export function OverviewPage() {
 
       {hoverPreview ? (
         <div
-          className="pointer-events-none fixed z-[60]"
+          className="pointer-events-none fixed z-60"
           style={{
             top: hoverPreview.top,
             left: hoverPreview.left,
@@ -289,6 +299,7 @@ const quickLinks = [
   { path: '/api/meetings', label: 'Meetings', sublabel: 'Create meeting drafts and list scheduled meetings' },
   { path: '/api/announcements', label: 'Announcements', sublabel: 'Draft announcement templates with optional poll support' },
   { path: '/api/discord', label: 'Discord', sublabel: 'List servers, channels, and DM-eligible members' },
+  { path: '/api/mailbox', label: 'Mailbox', sublabel: 'Sync mail accounts, messages, drafts, and automation rules' },
   { path: '/api/feedback', label: 'Feedback', sublabel: 'Submit and list feedback' },
   { path: '/examples', label: 'Code Examples', sublabel: 'Python, cURL, and JavaScript examples for common workflows' },
 ]

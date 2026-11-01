@@ -179,7 +179,7 @@ router.get('/', async (req: AuthenticatedRequest, res: Response) => {
 
     // Warn if the query returned 0 rows — may indicate RLS / service-role-key issue
     if (paginatedData.length === 0 && isAdmin) {
-      console.warn('Feedback GET returned 0 rows for admin — if feedback exists in the DB, check that SUPABASE_SERVICE_ROLE_KEY is set.')
+      console.warn('Feedback GET returned 0 rows for admin - if feedback exists in the DB, check the environment-selected SUPABASE_SECRET_KEY_LOCALHOST / SUPABASE_SECRET_KEY_PRODUCTION.')
     }
 
     // Flatten user join into top-level fields

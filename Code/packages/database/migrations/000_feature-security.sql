@@ -140,62 +140,44 @@ END $$;
 -- 3. FIX RLS POLICIES WITH USING(true) / WITH CHECK(true)
 -- ────────────────────────────────────────────────────────────
 
--- 3a. availability ──────────────────────────────────────────
--- Replace blanket USING(true) INSERT/UPDATE/DELETE with a
--- check that the referenced calendar actually exists.
-
+-- 3a. availability and meetings ────────────────────────────
+-- Hash-link reads and guest participation are routed through the
+-- API, which verifies the calendar hash and uses supabaseAdmin.
+-- No direct Data API role can read or mutate these tables.
+DROP POLICY IF EXISTS "Availability is viewable for accessible calendars" ON public.availability;
 DROP POLICY IF EXISTS "Users can insert availability" ON public.availability;
-CREATE POLICY "Users can insert availability" ON public.availability
-  FOR INSERT WITH CHECK (
-    calendar_id IS NOT NULL
-    AND EXISTS (SELECT 1 FROM public.calendars WHERE id = calendar_id)
-  );
-
 DROP POLICY IF EXISTS "Users can update availability" ON public.availability;
-CREATE POLICY "Users can update availability" ON public.availability
-  FOR UPDATE USING (
-    calendar_id IS NOT NULL
-    AND EXISTS (SELECT 1 FROM public.calendars WHERE id = calendar_id)
-  );
-
 DROP POLICY IF EXISTS "Users can delete availability" ON public.availability;
-CREATE POLICY "Users can delete availability" ON public.availability
-  FOR DELETE USING (
-    calendar_id IS NOT NULL
-    AND EXISTS (SELECT 1 FROM public.calendars WHERE id = calendar_id)
-  );
+DROP POLICY IF EXISTS "Deny direct client access to availability" ON public.availability;
+CREATE POLICY "Deny direct client access to availability" ON public.availability
+  FOR ALL TO anon, authenticated USING (false) WITH CHECK (false);
+REVOKE ALL PRIVILEGES ON TABLE public.availability FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.availability TO service_role;
 
--- 3b. meetings ──────────────────────────────────────────────
--- Similarly validate the calendar exists for INSERT/UPDATE/DELETE.
-
+DROP POLICY IF EXISTS "Meetings viewable for calendar members" ON public.meetings;
 DROP POLICY IF EXISTS "Authenticated users can create meetings" ON public.meetings;
-CREATE POLICY "Authenticated users can create meetings" ON public.meetings
-  FOR INSERT TO authenticated WITH CHECK (
-    calendar_id IS NOT NULL
-    AND EXISTS (SELECT 1 FROM public.calendars WHERE id = calendar_id)
-  );
-
 DROP POLICY IF EXISTS "Users can update meetings" ON public.meetings;
-CREATE POLICY "Users can update meetings" ON public.meetings
-  FOR UPDATE TO authenticated USING (
-    calendar_id IS NOT NULL
-    AND EXISTS (SELECT 1 FROM public.calendars WHERE id = calendar_id)
-  );
-
 DROP POLICY IF EXISTS "Users can delete meetings" ON public.meetings;
-CREATE POLICY "Users can delete meetings" ON public.meetings
-  FOR DELETE TO authenticated USING (
-    calendar_id IS NOT NULL
-    AND EXISTS (SELECT 1 FROM public.calendars WHERE id = calendar_id)
-  );
+DROP POLICY IF EXISTS "Deny direct client access to meetings" ON public.meetings;
+CREATE POLICY "Deny direct client access to meetings" ON public.meetings
+  FOR ALL TO anon, authenticated USING (false) WITH CHECK (false);
+REVOKE ALL PRIVILEGES ON TABLE public.meetings FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.meetings TO service_role;
 
--- 3c. users ─────────────────────────────────────────────────
--- "Service role can insert profiles" uses WITH CHECK(true),
--- allowing ANY user to insert arbitrary rows. The service_role
--- bypasses RLS entirely, so this policy is unnecessary.
+-- 3b. users ─────────────────────────────────────────────────
+-- Profile reads stay subject to the own/admin SELECT policy. Profile
+-- creation and edits go through authenticated API routes using service role.
+DROP POLICY IF EXISTS "Users can update own profile" ON public.users;
+DROP POLICY IF EXISTS "Users can insert own profile" ON public.users;
 DROP POLICY IF EXISTS "Service role can insert profiles" ON public.users;
+DROP POLICY IF EXISTS "Deny direct client writes to user profiles" ON public.users;
+CREATE POLICY "Deny direct client writes to user profiles" ON public.users
+  FOR ALL TO anon, authenticated USING (false) WITH CHECK (false);
+REVOKE ALL PRIVILEGES ON TABLE public.users FROM PUBLIC, anon, authenticated;
+GRANT SELECT ON TABLE public.users TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.users TO service_role;
 
--- 3d. wallet_challenges ─────────────────────────────────────
+-- 3c. wallet_challenges ─────────────────────────────────────
 -- "Service role manages wallet challenges" uses FOR ALL
 -- USING(true) WITH CHECK(true), giving everyone full access.
 -- service_role bypasses RLS, so drop the policy — only the
@@ -204,6 +186,274 @@ DROP POLICY IF EXISTS "Service role manages wallet challenges" ON public.wallet_
 
 
 -- END SOURCE: 012_security_hardening.sql
+
+-- BEGIN SOURCE: 019_optimize_rls_policies.sql
+-- Optimize authenticated RLS policies so Supabase auth helpers are evaluated
+-- once per statement instead of once per candidate row.
+
+CREATE SCHEMA IF NOT EXISTS private;
+REVOKE ALL ON SCHEMA private FROM PUBLIC, anon;
+REVOKE CREATE ON SCHEMA private FROM authenticated;
+GRANT USAGE ON SCHEMA private TO authenticated, service_role;
+
+CREATE OR REPLACE FUNCTION private.current_user_has_role(check_role TEXT)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.users
+    WHERE id = (SELECT auth.uid())
+      AND roles @> to_jsonb(check_role)
+  );
+$$;
+
+REVOKE ALL ON FUNCTION private.current_user_has_role(TEXT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION private.current_user_has_role(TEXT) TO authenticated, service_role;
+
+DO $migration$
+DECLARE
+  policy_record RECORD;
+  optimized_qual TEXT;
+  optimized_check TEXT;
+  alter_statement TEXT;
+BEGIN
+  FOR policy_record IN
+    SELECT schemaname, tablename, policyname, qual, with_check
+    FROM pg_policies
+    WHERE schemaname = 'public'
+      AND (
+        COALESCE(qual, '') ~ 'auth\.(uid|jwt|role|email)\(\)'
+        OR COALESCE(with_check, '') ~ 'auth\.(uid|jwt|role|email)\(\)'
+      )
+      AND COALESCE(qual, '') !~ '\( SELECT auth\.(uid|jwt|role|email)\(\)'
+      AND COALESCE(with_check, '') !~ '\( SELECT auth\.(uid|jwt|role|email)\(\)'
+  LOOP
+    optimized_qual := policy_record.qual;
+    optimized_check := policy_record.with_check;
+
+    IF optimized_qual IS NOT NULL THEN
+      optimized_qual := regexp_replace(
+        optimized_qual,
+        'auth\.(uid|jwt|role|email)\(\)',
+        '(SELECT auth.\1())',
+        'g'
+      );
+    END IF;
+
+    IF optimized_check IS NOT NULL THEN
+      optimized_check := regexp_replace(
+        optimized_check,
+        'auth\.(uid|jwt|role|email)\(\)',
+        '(SELECT auth.\1())',
+        'g'
+      );
+    END IF;
+
+    alter_statement := format(
+      'ALTER POLICY %I ON %I.%I TO authenticated',
+      policy_record.policyname,
+      policy_record.schemaname,
+      policy_record.tablename
+    );
+
+    IF optimized_qual IS NOT NULL THEN
+      alter_statement := alter_statement || format(' USING (%s)', optimized_qual);
+    END IF;
+
+    IF optimized_check IS NOT NULL THEN
+      alter_statement := alter_statement || format(' WITH CHECK (%s)', optimized_check);
+    END IF;
+
+    EXECUTE alter_statement;
+  END LOOP;
+END
+$migration$;
+
+-- Consolidate SELECT policies that grant overlapping access. PostgreSQL ORs
+-- permissive policies, so each replacement keeps the same combined predicate.
+
+DROP POLICY IF EXISTS "Users can view own profile" ON public.users;
+DROP POLICY IF EXISTS "Admins can view all profiles" ON public.users;
+DROP POLICY IF EXISTS "Users or admins can view profiles" ON public.users;
+CREATE POLICY "Users or admins can view profiles" ON public.users
+  FOR SELECT TO authenticated
+  USING (
+    id = (SELECT auth.uid())
+    OR private.current_user_has_role('admin')
+  );
+
+DROP POLICY IF EXISTS "Users view own feedback" ON public.feedback;
+DROP POLICY IF EXISTS "Admins view all feedback" ON public.feedback;
+DROP POLICY IF EXISTS "Admin users can view all feedback" ON public.feedback;
+DROP POLICY IF EXISTS "Users or admins view feedback" ON public.feedback;
+CREATE POLICY "Users or admins view feedback" ON public.feedback
+  FOR SELECT TO authenticated
+  USING (
+    user_id = (SELECT auth.uid())
+    OR private.current_user_has_role('admin')
+  );
+
+DROP POLICY IF EXISTS "Users view own ai feedback" ON public.ai_feedback;
+DROP POLICY IF EXISTS "Admins view all ai feedback" ON public.ai_feedback;
+DROP POLICY IF EXISTS "Oversight view all ai feedback" ON public.ai_feedback;
+DROP POLICY IF EXISTS "Users, admins, or oversight view ai feedback" ON public.ai_feedback;
+CREATE POLICY "Users, admins, or oversight view ai feedback" ON public.ai_feedback
+  FOR SELECT TO authenticated
+  USING (
+    user_id = (SELECT auth.uid())
+    OR private.current_user_has_role('admin')
+    OR private.current_user_has_role('oversight')
+  );
+
+DROP POLICY IF EXISTS "Senders manage own invites" ON public.connection_invites;
+DROP POLICY IF EXISTS "Recipients view own invites" ON public.connection_invites;
+DROP POLICY IF EXISTS "Participants view own invites" ON public.connection_invites;
+DROP POLICY IF EXISTS "Senders insert own invites" ON public.connection_invites;
+DROP POLICY IF EXISTS "Senders update own invites" ON public.connection_invites;
+DROP POLICY IF EXISTS "Senders delete own invites" ON public.connection_invites;
+CREATE POLICY "Participants view own invites" ON public.connection_invites
+  FOR SELECT TO authenticated
+  USING (
+    sender_user_id = (SELECT auth.uid())
+    OR used_by_user_id = (SELECT auth.uid())
+  );
+CREATE POLICY "Senders insert own invites" ON public.connection_invites
+  FOR INSERT TO authenticated
+  WITH CHECK (sender_user_id = (SELECT auth.uid()));
+CREATE POLICY "Senders update own invites" ON public.connection_invites
+  FOR UPDATE TO authenticated
+  USING (sender_user_id = (SELECT auth.uid()))
+  WITH CHECK (sender_user_id = (SELECT auth.uid()));
+CREATE POLICY "Senders delete own invites" ON public.connection_invites
+  FOR DELETE TO authenticated
+  USING (sender_user_id = (SELECT auth.uid()));
+
+DROP POLICY IF EXISTS "Users can manage own events" ON public.user_events;
+DROP POLICY IF EXISTS "Public events are viewable" ON public.user_events;
+DROP POLICY IF EXISTS "Public or owned events are viewable" ON public.user_events;
+DROP POLICY IF EXISTS "Users can insert own events" ON public.user_events;
+DROP POLICY IF EXISTS "Users can update own events" ON public.user_events;
+DROP POLICY IF EXISTS "Users can delete own events" ON public.user_events;
+CREATE POLICY "Public or owned events are viewable" ON public.user_events
+  FOR SELECT TO public
+  USING (
+    is_public = TRUE
+    OR user_id = (SELECT auth.uid())
+  );
+CREATE POLICY "Users can insert own events" ON public.user_events
+  FOR INSERT TO authenticated
+  WITH CHECK (user_id = (SELECT auth.uid()));
+CREATE POLICY "Users can update own events" ON public.user_events
+  FOR UPDATE TO authenticated
+  USING (user_id = (SELECT auth.uid()))
+  WITH CHECK (user_id = (SELECT auth.uid()));
+CREATE POLICY "Users can delete own events" ON public.user_events
+  FOR DELETE TO authenticated
+  USING (user_id = (SELECT auth.uid()));
+
+-- Remove both historical generations before installing one policy per command.
+DROP POLICY IF EXISTS "Admins update feedback responses" ON public.feedback_responses;
+DROP POLICY IF EXISTS "Admins update own responses" ON public.feedback_responses;
+DROP POLICY IF EXISTS "Admins delete feedback responses" ON public.feedback_responses;
+DROP POLICY IF EXISTS "Admins delete own responses" ON public.feedback_responses;
+CREATE POLICY "Admins update own responses" ON public.feedback_responses
+  FOR UPDATE TO authenticated
+  USING (
+    admin_id = (SELECT auth.uid())
+    AND private.current_user_has_role('admin')
+  )
+  WITH CHECK (
+    admin_id = (SELECT auth.uid())
+    AND private.current_user_has_role('admin')
+  );
+CREATE POLICY "Admins delete own responses" ON public.feedback_responses
+  FOR DELETE TO authenticated
+  USING (
+    admin_id = (SELECT auth.uid())
+    AND private.current_user_has_role('admin')
+  );
+
+DROP INDEX IF EXISTS public.idx_dm_calendar_invites_discord_user;
+-- END SOURCE: 019_optimize_rls_policies.sql
+
+-- BEGIN SOURCE: 029_database_advisor_hardening.sql
+-- Run as the database owner after the mailbox and 019 RLS migrations.
+-- Keep private out of the Supabase Data API exposed schemas.
+BEGIN;
+
+CREATE SCHEMA IF NOT EXISTS private;
+REVOKE ALL ON SCHEMA private FROM PUBLIC, anon;
+REVOKE CREATE ON SCHEMA private FROM authenticated;
+GRANT USAGE ON SCHEMA private TO authenticated, service_role;
+
+DO $migration$
+BEGIN
+  IF to_regprocedure('public.current_user_has_role(text)') IS NOT NULL THEN
+    IF to_regprocedure('private.current_user_has_role(text)') IS NOT NULL THEN
+      RAISE EXCEPTION 'Both public and private role helpers exist; resolve dependencies before migrating';
+    END IF;
+    -- Moving the existing object preserves the OID referenced by RLS policies.
+    ALTER FUNCTION public.current_user_has_role(TEXT) SET SCHEMA private;
+  ELSIF to_regprocedure('private.current_user_has_role(text)') IS NULL THEN
+    RAISE EXCEPTION 'Role helper missing; apply 019_optimize_rls_policies.sql first';
+  END IF;
+END
+$migration$;
+
+CREATE OR REPLACE FUNCTION private.current_user_has_role(check_role TEXT)
+RETURNS BOOLEAN
+LANGUAGE sql
+STABLE
+SECURITY DEFINER
+SET search_path = ''
+AS $$
+  SELECT EXISTS (
+    SELECT 1
+    FROM public.users
+    WHERE id = (SELECT auth.uid())
+      AND roles @> to_jsonb(check_role)
+  );
+$$;
+
+REVOKE ALL ON FUNCTION private.current_user_has_role(TEXT) FROM PUBLIC, anon;
+GRANT EXECUTE ON FUNCTION private.current_user_has_role(TEXT) TO authenticated, service_role;
+
+ALTER FUNCTION public.set_first_mail_account_primary() SET search_path = '';
+
+CREATE SCHEMA IF NOT EXISTS extensions;
+REVOKE CREATE ON SCHEMA extensions FROM PUBLIC, anon, authenticated;
+GRANT USAGE ON SCHEMA extensions TO anon, authenticated, service_role;
+
+DO $migration$
+DECLARE
+  extension_schema TEXT;
+  extension_relocatable BOOLEAN;
+BEGIN
+  SELECT n.nspname, e.extrelocatable
+    INTO extension_schema, extension_relocatable
+  FROM pg_extension e
+  JOIN pg_namespace n ON n.oid = e.extnamespace
+  WHERE e.extname = 'pg_trgm';
+
+  IF extension_schema IS NULL THEN
+    RAISE EXCEPTION 'pg_trgm missing; apply the mailbox feature schema first';
+  END IF;
+  IF extension_schema <> 'extensions' THEN
+    IF NOT extension_relocatable THEN
+      RAISE EXCEPTION 'Installed pg_trgm is not relocatable';
+    END IF;
+    ALTER EXTENSION pg_trgm SET SCHEMA extensions;
+  END IF;
+END
+$migration$;
+
+COMMIT;
+-- END SOURCE: 029_database_advisor_hardening.sql
+
 
 -- ============================================================
 -- BEGIN SOURCE: 034_enable_rls_missing_tables.sql
@@ -553,6 +803,30 @@ DO $$ BEGIN
   END IF;
 END $$;
 
+-- ── 3. Per-feature usage category, so each AI feature (chat, mailbox
+--      assessment, etc.) gets its own independent daily quota instead of
+--      sharing one global counter. Existing rows default to 'chat'. ──
+
+ALTER TABLE ai_prompt_usage
+  ADD COLUMN IF NOT EXISTS category TEXT NOT NULL DEFAULT 'chat';
+
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ai_prompt_usage_category_check') THEN
+    ALTER TABLE ai_prompt_usage
+      ADD CONSTRAINT ai_prompt_usage_category_check
+      CHECK (category IN ('chat', 'mailbox_assessment'));
+  END IF;
+END $$;
+
+-- Add 'mailbox_draft' (AI reply-draft generation) to the allowed categories.
+ALTER TABLE ai_prompt_usage DROP CONSTRAINT IF EXISTS ai_prompt_usage_category_check;
+ALTER TABLE ai_prompt_usage ADD CONSTRAINT ai_prompt_usage_category_check
+  CHECK (category IN ('chat', 'mailbox_assessment', 'mailbox_draft'));
+
+DROP INDEX IF EXISTS idx_ai_prompt_usage_user_day;
+CREATE INDEX IF NOT EXISTS idx_ai_prompt_usage_user_category_day
+  ON ai_prompt_usage(user_id, category, created_at DESC);
+
 
 -- END SOURCE: 056_security_hardening_round2.sql
 
@@ -711,3 +985,66 @@ GRANT EXECUTE ON FUNCTION public.increment_agent_key_usage(UUID) TO service_role
 
 -- END SOURCE: 069_revoke_agent_key_usage_from_anon_authenticated.sql
 
+-- ============================================================
+-- BEGIN SOURCE: 041_deny_direct_user_calendar_access.sql
+-- ============================================================
+-- Existing hash-link availability/meeting workflows and profile edits
+-- are performed by authenticated API routes using supabaseAdmin. The
+-- service role bypasses RLS; direct Data API roles receive no write
+-- privileges on profiles and no privileges on availability/meetings.
+
+DROP POLICY IF EXISTS "Users can update own profile" ON public.users;
+DROP POLICY IF EXISTS "Users can insert own profile" ON public.users;
+DROP POLICY IF EXISTS "Service role can insert profiles" ON public.users;
+DROP POLICY IF EXISTS "Deny direct client writes to user profiles" ON public.users;
+CREATE POLICY "Deny direct client writes to user profiles" ON public.users
+  FOR ALL TO anon, authenticated USING (false) WITH CHECK (false);
+REVOKE ALL PRIVILEGES ON TABLE public.users FROM PUBLIC, anon, authenticated;
+GRANT SELECT ON TABLE public.users TO authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.users TO service_role;
+
+DROP POLICY IF EXISTS "Availability is viewable for accessible calendars" ON public.availability;
+DROP POLICY IF EXISTS "Users can insert availability" ON public.availability;
+DROP POLICY IF EXISTS "Users can update availability" ON public.availability;
+DROP POLICY IF EXISTS "Users can delete availability" ON public.availability;
+DROP POLICY IF EXISTS "Deny direct client access to availability" ON public.availability;
+CREATE POLICY "Deny direct client access to availability" ON public.availability
+  FOR ALL TO anon, authenticated USING (false) WITH CHECK (false);
+REVOKE ALL PRIVILEGES ON TABLE public.availability FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.availability TO service_role;
+
+DROP POLICY IF EXISTS "Meetings viewable for calendar members" ON public.meetings;
+DROP POLICY IF EXISTS "Authenticated users can create meetings" ON public.meetings;
+DROP POLICY IF EXISTS "Users can update meetings" ON public.meetings;
+DROP POLICY IF EXISTS "Users can delete meetings" ON public.meetings;
+DROP POLICY IF EXISTS "Deny direct client access to meetings" ON public.meetings;
+CREATE POLICY "Deny direct client access to meetings" ON public.meetings
+  FOR ALL TO anon, authenticated USING (false) WITH CHECK (false);
+REVOKE ALL PRIVILEGES ON TABLE public.meetings FROM PUBLIC, anon, authenticated;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE public.meetings TO service_role;
+
+DO $$
+DECLARE
+  table_name TEXT;
+  column_name TEXT;
+BEGIN
+  FOREACH table_name IN ARRAY ARRAY['users', 'availability', 'meetings'] LOOP
+    FOR column_name IN
+      SELECT attname
+      FROM pg_attribute
+      WHERE attrelid = format('public.%I', table_name)::regclass
+        AND attnum > 0
+        AND NOT attisdropped
+    LOOP
+      EXECUTE format(
+        'REVOKE SELECT (%1$I), INSERT (%1$I), UPDATE (%1$I), REFERENCES (%1$I) ON TABLE public.%2$I FROM PUBLIC, anon, authenticated',
+        column_name, table_name
+      );
+    END LOOP;
+  END LOOP;
+END
+$$;
+
+GRANT SELECT ON TABLE public.users TO authenticated;
+
+-- END SOURCE: 041_deny_direct_user_calendar_access.sql

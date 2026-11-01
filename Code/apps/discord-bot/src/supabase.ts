@@ -1,19 +1,26 @@
 import dotenv from 'dotenv'
-dotenv.config()
+dotenv.config({ quiet: true })
 
 import { createClient } from '@supabase/supabase-js'
 
 const supabaseUrl = process.env.SUPABASE_URL
-const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY
+const secretKeyName = process.env.NODE_ENV === 'production'
+  ? 'SUPABASE_SECRET_KEY_PRODUCTION'
+  : 'SUPABASE_SECRET_KEY_LOCALHOST'
+const supabaseServerKey = process.env[secretKeyName]
+if (supabaseServerKey !== undefined && !supabaseServerKey.trim()) {
+  throw new Error(`${secretKeyName} is empty`)
+}
 
 export const missingSupabaseEnvVars: string[] = [
   ...(!supabaseUrl ? ['SUPABASE_URL'] : []),
-  ...(!supabaseServiceRoleKey ? ['SUPABASE_SERVICE_ROLE_KEY'] : []),
+  ...(!supabaseServerKey ? [secretKeyName] : []),
 ]
 
 export const isSupabaseConfigured = missingSupabaseEnvVars.length === 0
 
-// Bot always uses service role (server-side, no user context)
 export const supabase = isSupabaseConfigured
-  ? createClient(supabaseUrl as string, supabaseServiceRoleKey as string)
+  ? createClient(supabaseUrl as string, supabaseServerKey as string, {
+    auth: { autoRefreshToken: false, persistSession: false },
+  })
   : null

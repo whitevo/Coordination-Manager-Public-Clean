@@ -1,11 +1,15 @@
 import { useEffect, useState, useMemo, useRef, useCallback } from 'react';
 import { apiClient } from '../lib/api-client';
+import { isAdminMfaRequiredError } from '../lib/admin-mfa';
+import { OVERLAY_LAYER_CLASS } from '../lib/overlay-layers';
 import { Link, useLocation } from 'react-router-dom';
 import { getPrimaryTimezone, formatDateInTimezone } from '../lib/timezone-data';
 import LearnerHelpIcon from '../components/LearnerHelpIcon';
 import { useLearnerMode } from '../contexts/LearnerModeContext';
-import { Plus, Trash2, Lock, Globe, CalendarDays, User, Search, X, ChevronDown, ShieldAlert, Copy, Repeat2, Star, Loader2 } from 'lucide-react';
+import { Plus, Trash2, Lock, Globe, CalendarDays, User, Search, X, ChevronDown, ShieldAlert, Copy, Repeat2, Star, Loader2, Archive } from 'lucide-react';
 import { useAuth } from '../contexts/AuthContext';
+import { isAnyWeekCalendar, isCalendarArchived } from '../lib/calendar-listing';
+import { Button, Disclosure, IconButton } from '../components/ui';
 
 type CalendarConfig = {
   customStartDate?: string;
@@ -24,6 +28,7 @@ type Calendar = {
   creator_display_name?: string;
   visibility?: string;
   created_at?: string;
+  archived_at?: string | null;
   has_recurring_meetings?: boolean;
 };
 
@@ -58,7 +63,7 @@ function useCollapsedState(key: string, defaultCollapsed = false): [boolean, (v:
 
 function SkeletonCard() {
   return (
-    <div className="border border-border rounded-lg p-4 shadow animate-pulse">
+    <div className="border border-border rounded-lg p-4 shadow-sm animate-pulse">
       <div className="h-6 bg-muted rounded w-3/4 mb-3" />
       <div className="flex flex-col gap-2 mt-1">
         <div className="h-4 bg-muted rounded w-1/2" />
@@ -274,15 +279,17 @@ export default function EventsPage() {
       if (adminDeletePower && !isOwner(calendar)) {
         // Admin force-delete via admin API
         if (!session?.access_token) throw new Error('Not authenticated');
-        await apiClient.delete(`/api/admin/calendars/${calendar.hash}`, {
-          headers: { Authorization: `Bearer ${session.access_token}` },
-        });
+        await apiClient.delete(`/api/admin/calendars/${calendar.hash}`);
       } else {
         await apiClient.delete(`/api/calendars/${calendar.hash}`);
       }
       setCalendars(prev => prev.filter(c => c.id !== calendar.id));
       setDeleteConfirm(null);
     } catch (err) {
+      if (isAdminMfaRequiredError(err)) {
+        alert('Admin MFA verification is required before force-deleting calendars. Open the admin user list or oversight page to verify this session, then retry.')
+        return
+      }
       alert((err as { response?: { data?: { error?: string } } }).response?.data?.error || 'Failed to delete calendar');
     } finally {
       setIsDeleting(false);
@@ -291,18 +298,11 @@ export default function EventsPage() {
 
   // A calendar is "recurring" if it uses general weekly availability (hideDateNumbers)
   // or has recurring meetings in the database
-  const isRecurring = (calendar: Calendar): boolean => {
-    return !!calendar.config?.hideDateNumbers || !!calendar.has_recurring_meetings;
-  };
+  const isRecurring = (calendar: Calendar): boolean => isAnyWeekCalendar(calendar);
 
-  // Determine if a calendar is "archived" (its end date is in the past)
-  // Recurring calendars are never archived — they're still active
-  const isArchived = (calendar: Calendar): boolean => {
-    if (isRecurring(calendar)) return false;
-    const end = calendar.config?.customEndDate;
-    if (!end) return false;
-    return new Date(end + 'T23:59:59') < new Date();
-  };
+  // Determine if a calendar is "archived": either auto-archived by the listing
+  // rules (any-week calendars with no upcoming meeting) or past its end date
+  const isArchived = (calendar: Calendar): boolean => isCalendarArchived(calendar);
 
   // Get the "sort date" for a calendar — prefer the end date of the calendar range, fall back to created_at
   const getSortDate = (calendar: Calendar): number => {
@@ -411,63 +411,64 @@ export default function EventsPage() {
   }, [calendars, searchQuery, selectedMonth, subscribedCalendarIds]);
 
   const renderCalendarCard = (calendar: Calendar, index: number, opts?: { showSubscribeButton?: boolean }) => {
+    const archived = isArchived(calendar);
+    const statusCardClass = archived
+      ? 'border-border bg-muted/40 opacity-75 hover:opacity-100 hover:bg-accent/50'
+      : 'border-border bg-card hover:bg-accent/50';
     return (
     <div
       key={`${calendar.id}-${opts?.showSubscribeButton ? 'public' : 'subscribed'}`}
-      className={`relative bg-card border border-border rounded-lg p-4 shadow hover:bg-accent/50 transition-all duration-300 ease-out animate-in fade-in slide-in-from-bottom-2 ${isArchived(calendar) ? 'opacity-70' : ''}`}
+      className={`relative border rounded-lg p-4 shadow-sm transition-all duration-300 ease-out animate-in fade-in slide-in-from-bottom-2 ${statusCardClass}`}
       style={{ animationDelay: `${index * 50}ms`, animationFillMode: 'backwards' }}
     >
       <div className="absolute top-3 right-3 z-10 flex flex-col items-center gap-0.5">
         <LearnerHelpIcon
-          description={<><p className="font-semibold text-blue-700 dark:text-blue-300 mb-1">Coordination Calendar</p><p className="mb-1.5">This card represents a single event-planning calendar. Open it to see who has signed up and which time slots work best.</p><p><strong>Tip:</strong> Share the calendar link with participants so they can mark their available times.</p></>}
+          description={<><p className="font-semibold text-info mb-1">Coordination Calendar</p><p className="mb-1.5">This card represents a single event-planning calendar. Open it to see who has signed up and which time slots work best.</p><p><strong>Tip:</strong> Share the calendar link with participants so they can mark their available times.</p></>}
           size={4}
         />
         {(isOwner(calendar) || adminDeletePower) && (
           <>
-            <button
+            <IconButton
               onClick={(e) => {
                 e.preventDefault();
                 e.stopPropagation();
                 setDeleteConfirm(deleteConfirm?.id === calendar.id ? null : calendar);
               }}
-              className={`p-2 rounded-md transition-colors ${
-                !isOwner(calendar) && adminDeletePower
-                  ? 'text-red-400 hover:text-red-600 dark:text-red-500 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950'
-                  : 'text-muted-foreground hover:text-red-600 dark:hover:text-red-400 hover:bg-red-50 dark:hover:bg-red-950'
-              }`}
-              aria-label={!isOwner(calendar) ? 'Admin delete calendar' : 'Delete calendar'}
+              intent={!isOwner(calendar) && adminDeletePower ? 'danger' : 'neutral'}
+              label={!isOwner(calendar) ? 'Admin delete calendar' : 'Delete calendar'}
               title={!isOwner(calendar) ? 'Admin: Delete calendar' : 'Delete calendar'}
-            >
-              {!isOwner(calendar) && adminDeletePower ? (
+              icon={!isOwner(calendar) && adminDeletePower ? (
                 <ShieldAlert className="w-4 h-4" />
               ) : (
                 <Trash2 className="w-4 h-4" />
               )}
-            </button>
+            />
             {deleteConfirm?.id === calendar.id && (
               <div
                 ref={deletePopoverRef}
                 onClick={(e) => e.stopPropagation()}
-                className="absolute right-0 top-full mt-1 w-64 bg-card text-card-foreground rounded-lg p-4 shadow-xl border border-border z-50"
+                className={`absolute right-0 top-full mt-1 w-64 bg-card text-card-foreground rounded-lg p-4 shadow-xl border border-border ${OVERLAY_LAYER_CLASS.popover}`}
               >
                 <p className="text-sm text-muted-foreground mb-3">
                   Delete <strong>"{calendar.title}"</strong>? This cannot be undone.
                 </p>
                 <div className="flex gap-2 justify-end">
-                  <button
+                  <Button
+                    emphasis="ghost"
+                    size="compact"
                     onClick={(e) => { e.preventDefault(); e.stopPropagation(); setDeleteConfirm(null); }}
                     disabled={isDeleting}
-                    className="px-3 py-1.5 text-xs font-medium text-muted-foreground bg-muted rounded-md hover:bg-muted/80 transition-colors"
                   >
                     Cancel
-                  </button>
-                  <button
+                  </Button>
+                  <Button
+                    intent="danger"
+                    size="compact"
                     onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleDelete(calendar); }}
                     disabled={isDeleting}
-                    className="px-3 py-1.5 text-xs font-medium text-white bg-red-600 rounded-md hover:bg-red-700 transition-colors disabled:opacity-50"
                   >
                     {isDeleting ? 'Deleting...' : 'Delete'}
-                  </button>
+                  </Button>
                 </div>
               </div>
             )}
@@ -497,7 +498,7 @@ export default function EventsPage() {
                 <User className="w-3.5 h-3.5" />
                 <span className="underline decoration-dotted group-hover:decoration-solid">{getCreatorDisplayName(calendar)}</span>
                 {copiedUserId === calendar.created_by ? (
-                  <span className="text-xs text-green-600 dark:text-green-400">Copied!</span>
+                  <span className="text-xs text-success">Copied!</span>
                 ) : (
                   <Copy className="w-3 h-3 opacity-0 group-hover:opacity-100 transition-opacity" />
                 )}
@@ -517,47 +518,49 @@ export default function EventsPage() {
           )}
           <div className="flex items-center gap-2 mt-0.5 flex-wrap">
             {calendar.visibility === 'unlisted' && (
-              <span className="inline-flex items-center gap-1 text-xs font-medium text-amber-700 dark:text-amber-400 bg-amber-100 dark:bg-amber-900/50 border border-amber-300 dark:border-amber-700 px-2 py-0.5 rounded-full">
+              <span className="inline-flex items-center gap-1 text-xs font-medium text-warning bg-warning-subtle border border-warning-muted px-2 py-0.5 rounded-full">
                 <Lock className="w-3 h-3" />
                 Unlisted
               </span>
             )}
             {calendar.visibility === 'public' && (
-              <span className="inline-flex items-center gap-1 text-xs font-medium text-emerald-700 dark:text-emerald-400 bg-emerald-100 dark:bg-emerald-900/50 border border-emerald-300 dark:border-emerald-700 px-2 py-0.5 rounded-full">
+              <span className="inline-flex items-center gap-1 text-xs font-medium text-success bg-success-subtle border border-success-muted px-2 py-0.5 rounded-full">
                 <Globe className="w-3 h-3" />
                 Public
               </span>
             )}
             {isRecurring(calendar) && (
-              <span className="inline-flex items-center gap-1 text-xs font-medium text-blue-700 dark:text-blue-400 bg-blue-100 dark:bg-blue-900/50 border border-blue-300 dark:border-blue-700 px-2 py-0.5 rounded-full">
+              <span className="inline-flex items-center gap-1 text-xs font-medium text-info bg-info-subtle border border-info-muted px-2 py-0.5 rounded-full">
                 <Repeat2 className="w-3 h-3" />
                 Recurring
               </span>
             )}
-            {isArchived(calendar) && (
-              <span className="inline-flex items-center gap-1 text-xs font-medium text-gray-600 dark:text-gray-400 bg-gray-100 dark:bg-gray-800 border border-gray-300 dark:border-gray-600 px-2 py-0.5 rounded-full">
-                Past
+            {archived && (
+              <span
+                className="inline-flex items-center gap-1 text-xs font-medium text-muted-foreground bg-muted border border-border px-2 py-0.5 rounded-full"
+                title="Archived -- past its date range or with no meeting planned in the listing window"
+              >
+                <Archive className="w-3 h-3" />
+                Archived
               </span>
             )}
             {isAuthenticated && (
-              <button
+              <Button
+                emphasis="outline"
+                size="compact"
                 onClick={(e) => { e.preventDefault(); e.stopPropagation(); handleToggleSubscription(calendar); }}
                 disabled={subscribingId === calendar.id}
-                className={`ml-auto inline-flex items-center gap-1.5 text-xs font-medium px-3 py-1 rounded-full border transition-all duration-300 ${
-                  subscribedCalendarIds.has(calendar.id)
-                    ? 'bg-yellow-50 dark:bg-yellow-950/30 border-yellow-300 dark:border-yellow-700 text-yellow-700 dark:text-yellow-300 hover:bg-red-50 hover:border-red-200 hover:text-red-600 dark:hover:bg-red-950/30 dark:hover:border-red-800 dark:hover:text-red-400'
-                    : 'bg-gray-100 dark:bg-gray-800 border-gray-300 dark:border-gray-600 text-gray-500 dark:text-gray-400 hover:bg-yellow-50 hover:border-yellow-400 hover:text-yellow-700 dark:hover:bg-yellow-950/30 dark:hover:border-yellow-600 dark:hover:text-yellow-300'
-                } disabled:opacity-50`}
+                className="ml-auto"
                 aria-label={subscribedCalendarIds.has(calendar.id) ? 'Unsubscribe from calendar' : 'Subscribe to calendar'}
                 title={subscribedCalendarIds.has(calendar.id) ? 'Unsubscribe -- stop receiving updates' : 'Subscribe -- keep meetings in sync'}
-              >
-                {subscribingId === calendar.id ? (
+                icon={subscribingId === calendar.id ? (
                   <Loader2 className="w-3 h-3 animate-spin" />
                 ) : (
-                  <Star className={`w-3 h-3 ${subscribedCalendarIds.has(calendar.id) ? 'fill-current text-yellow-500' : ''}`} />
+                  <Star className={`w-3 h-3 ${subscribedCalendarIds.has(calendar.id) ? 'fill-current text-warning' : ''}`} />
                 )}
+              >
                 {subscribingId === calendar.id ? 'Saving...' : subscribedCalendarIds.has(calendar.id) ? 'Subscribed' : 'Subscribe'}
-              </button>
+              </Button>
             )}
           </div>
         </div>
@@ -578,26 +581,23 @@ export default function EventsPage() {
         Browse and manage Coordination Calendars -- shared scheduling tools used to find the best meeting times for a group. Subscribe to calendars you want to track.
       </p>
       {learnerMode && (
-        <div className="mb-6 rounded-xl border border-blue-200 dark:border-blue-800/60 bg-blue-50 dark:bg-slate-800 text-slate-700 dark:text-slate-200 text-sm leading-relaxed">
-          <button
-            type="button"
-            onClick={() => setLearnerGuideCollapsed(!learnerGuideCollapsed)}
-            className="w-full flex items-center justify-between px-4 py-2.5 hover:bg-blue-100/50 dark:hover:bg-slate-700/50 rounded-xl transition-colors"
-          >
-            <span className="font-semibold text-blue-700 dark:text-blue-300 flex items-center gap-1.5">
-              Learner Guide
-            </span>
-            <ChevronDown className={`h-4 w-4 text-blue-400 dark:text-blue-500 transition-transform ${learnerGuideCollapsed ? '-rotate-90' : ''}`} />
-          </button>
+        <div className="mb-6 rounded-xl border border-info-muted/60 bg-info-subtle text-foreground text-sm leading-relaxed">
+          <Disclosure
+            className="p-1"
+            title="Learner Guide"
+            expanded={!learnerGuideCollapsed}
+            onToggle={(next) => setLearnerGuideCollapsed(!next)}
+            panelId="events-learner-guide"
+          />
           {!learnerGuideCollapsed && (
-            <div className="px-4 pb-3">
-              <p className="font-semibold text-blue-700 dark:text-blue-300 mb-1.5">What is this page?</p>
+            <div id="events-learner-guide" className="px-4 pb-3">
+              <p className="font-semibold text-info mb-1.5">What is this page?</p>
               <p className="mb-2">
                 This page lists all Coordination Calendars -- tools used to plan meeting times for events and
                 group activities. Each card represents one calendar where participants mark their available time slots
                 so the best meeting time can be identified.
               </p>
-              <p className="font-semibold text-blue-700 dark:text-blue-300 mb-1.5">How to navigate</p>
+              <p className="font-semibold text-info mb-1.5">How to navigate</p>
               <ul className="list-disc list-inside space-y-1 mb-2">
                 <li>Use the <strong>search bar</strong> to find calendars by name, creator, or ID.</li>
                 <li>Filter by <strong>month</strong> to narrow down active or past calendars.</li>
@@ -608,12 +608,20 @@ export default function EventsPage() {
                 Calendars you own or subscribe to appear under <strong>"Subscribed or Your Coordination Calendars"</strong>.
                 All public calendars are also listed under <strong>"Public Coordination Calendars"</strong> -- if you subscribe to one it appears in both sections.
               </p>
+              <p className="font-semibold text-info mt-2 mb-1.5">When calendars are archived</p>
+              <ul className="list-disc list-inside space-y-1">
+                <li>Calendars with a date range are archived once that end date has passed.</li>
+                <li>Any-week calendars (general weekday availability) stay active for 2 weeks after creation, then for 2 weeks after the last planned meeting.</li>
+                <li>With no meeting planned in that window they are archived automatically and drop off the home page, but stay listed here under the past sections.</li>
+                <li>Planning a new meeting re-activates an archived calendar.</li>
+                <li>Owners can also archive an any-week calendar with the <strong>Archive</strong> option in Edit Calendar. It keeps its participation and stays reachable by link or subscription, but is listed under the archived sections.</li>
+              </ul>
             </div>
           )}
         </div>
       )}
       {loading && <SkeletonGrid />}
-      {error && <p className="text-red-500">{error}</p>}
+      {error && <p className="text-danger">{error}</p>}
       
       {!loading && !error && calendars.length === 0 && (
         <div>
@@ -629,16 +637,17 @@ export default function EventsPage() {
 
           {/* -- Subscribed or Your Coordination Calendars (empty state) -- */}
           <div className="mb-8">
-            <button
-              onClick={() => setYourSectionCollapsed(!yourSectionCollapsed)}
-              className="flex items-center gap-2 text-lg font-semibold text-foreground hover:text-primary mb-3 transition-colors"
-            >
-              <ChevronDown className={`w-5 h-5 transition-transform ${yourSectionCollapsed ? '-rotate-90' : 'rotate-0'}`} />
-              Subscribed or Your Coordination Calendars
-              <span className="text-sm font-normal text-muted-foreground">(0)</span>
-            </button>
+            <Disclosure
+              className="mb-3"
+              size="section"
+              headingLevel={2}
+              title={<>Subscribed or Your Coordination Calendars <span className="text-sm font-normal text-muted-foreground">(0)</span></>}
+              expanded={!yourSectionCollapsed}
+              onToggle={(next) => setYourSectionCollapsed(!next)}
+              panelId="events-your-section-empty"
+            />
             {!yourSectionCollapsed && (
-              <p className="text-sm text-muted-foreground py-4 pl-1">
+              <p id="events-your-section-empty" className="text-sm text-muted-foreground py-4 pl-1">
                 {isAuthenticated
                   ? 'No calendars yet. Create one or subscribe to a public calendar to see it here.'
                   : 'Sign in to see your own and subscribed calendars here.'}
@@ -648,16 +657,17 @@ export default function EventsPage() {
 
           {/* -- Public Coordination Calendars (empty state) -- */}
           <div className="mb-8">
-            <button
-              onClick={() => setPublicSectionCollapsed(!publicSectionCollapsed)}
-              className="flex items-center gap-2 text-lg font-semibold text-foreground hover:text-primary mb-3 transition-colors"
-            >
-              <ChevronDown className={`w-5 h-5 transition-transform ${publicSectionCollapsed ? '-rotate-90' : 'rotate-0'}`} />
-              Public Coordination Calendars
-              <span className="text-sm font-normal text-muted-foreground">(0)</span>
-            </button>
+            <Disclosure
+              className="mb-3"
+              size="section"
+              headingLevel={2}
+              title={<>Public Coordination Calendars <span className="text-sm font-normal text-muted-foreground">(0)</span></>}
+              expanded={!publicSectionCollapsed}
+              onToggle={(next) => setPublicSectionCollapsed(!next)}
+              panelId="events-public-section-empty"
+            />
             {!publicSectionCollapsed && (
-              <p className="text-sm text-muted-foreground py-4 pl-1">No public calendars available right now.</p>
+              <p id="events-public-section-empty" className="text-sm text-muted-foreground py-4 pl-1">No public calendars available right now.</p>
             )}
           </div>
         </div>
@@ -685,15 +695,15 @@ export default function EventsPage() {
                 placeholder="Search by name, creator, or ID..."
                 value={searchQuery}
                 onChange={(e) => setSearchQuery(e.target.value)}
-                className="w-full pl-9 pr-8 py-2 border border-border rounded-lg bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/50"
+                className="w-full pl-9 pr-8 py-2 border border-border rounded-lg bg-background text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50"
               />
               {searchQuery && (
-                <button
+                <IconButton
+                  label="Clear search"
                   onClick={() => setSearchQuery('')}
-                  className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 text-muted-foreground hover:text-foreground rounded"
-                >
-                  <X className="w-4 h-4" />
-                </button>
+                  className="absolute right-1 top-1/2 -translate-y-1/2"
+                  icon={<X className="w-4 h-4" />}
+                />
               )}
             </div>
 
@@ -705,7 +715,7 @@ export default function EventsPage() {
                   aria-label="Filter events by month"
                   value={selectedMonth}
                   onChange={(e) => setSelectedMonth(e.target.value)}
-                  className="appearance-none pl-3 pr-8 py-2 border border-border rounded-lg bg-background text-sm focus:outline-none focus:ring-2 focus:ring-primary/50 cursor-pointer"
+                  className="appearance-none pl-3 pr-8 py-2 border border-border rounded-lg bg-background text-sm focus:outline-hidden focus:ring-2 focus:ring-primary/50 cursor-pointer"
                 >
                   <option value="">All time</option>
                   {availableMonths.map(ym => (
@@ -739,16 +749,17 @@ export default function EventsPage() {
 
           {/* -- Subscribed or Your Coordination Calendars -- */}
           <div className="mb-8">
-            <button
-              onClick={() => setYourSectionCollapsed(!yourSectionCollapsed)}
-              className="flex items-center gap-2 text-lg font-semibold text-foreground hover:text-primary mb-3 transition-colors"
-            >
-              <ChevronDown className={`w-5 h-5 transition-transform ${yourSectionCollapsed ? '-rotate-90' : 'rotate-0'}`} />
-              Subscribed or Your Coordination Calendars
-              <span className="text-sm font-normal text-muted-foreground">({yourTotal})</span>
-            </button>
+            <Disclosure
+              className="mb-3"
+              size="section"
+              headingLevel={2}
+              title={<>Subscribed or Your Coordination Calendars <span className="text-sm font-normal text-muted-foreground">({yourTotal})</span></>}
+              expanded={!yourSectionCollapsed}
+              onToggle={(next) => setYourSectionCollapsed(!next)}
+              panelId="events-your-section"
+            />
             {!yourSectionCollapsed && (
-              <div>
+              <div id="events-your-section">
                 {!isAuthenticated && (
                   <p className="text-sm text-muted-foreground py-4 pl-1">Sign in to see your own and subscribed calendars here.</p>
                 )}
@@ -764,15 +775,16 @@ export default function EventsPage() {
                 )}
                 {yourPast.length > 0 && (
                   <div className="mt-4">
-                    <button
-                      onClick={() => setYourPastCollapsed(!yourPastCollapsed)}
-                      className="flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground mb-3 transition-colors"
-                    >
-                      <ChevronDown className={`w-4 h-4 transition-transform ${yourPastCollapsed ? '-rotate-90' : 'rotate-0'}`} />
-                      Past Calendars ({yourPast.length})
-                    </button>
+                    <Disclosure
+                      className="mb-3"
+                      headingLevel={3}
+                      title={`Archived Calendars (${yourPast.length})`}
+                      expanded={!yourPastCollapsed}
+                      onToggle={(next) => setYourPastCollapsed(!next)}
+                      panelId="events-your-archived"
+                    />
                     {!yourPastCollapsed && (
-                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                      <div id="events-your-archived" className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                         {yourPast.map((cal, i) => renderCalendarCard(cal, i))}
                       </div>
                     )}
@@ -784,16 +796,17 @@ export default function EventsPage() {
 
           {/* -- Public Coordination Calendars -- */}
           <div className="mb-8">
-            <button
-              onClick={() => setPublicSectionCollapsed(!publicSectionCollapsed)}
-              className="flex items-center gap-2 text-lg font-semibold text-foreground hover:text-primary mb-3 transition-colors"
-            >
-              <ChevronDown className={`w-5 h-5 transition-transform ${publicSectionCollapsed ? '-rotate-90' : 'rotate-0'}`} />
-              Public Coordination Calendars
-              <span className="text-sm font-normal text-muted-foreground">({publicTotal})</span>
-            </button>
+            <Disclosure
+              className="mb-3"
+              size="section"
+              headingLevel={2}
+              title={<>Public Coordination Calendars <span className="text-sm font-normal text-muted-foreground">({publicTotal})</span></>}
+              expanded={!publicSectionCollapsed}
+              onToggle={(next) => setPublicSectionCollapsed(!next)}
+              panelId="events-public-section"
+            />
             {!publicSectionCollapsed && (
-              <div>
+              <div id="events-public-section">
                 {publicActive.length === 0 && publicPast.length === 0 && (
                   <p className="text-sm text-muted-foreground py-4 pl-1">No public calendars available right now.</p>
                 )}
@@ -806,15 +819,16 @@ export default function EventsPage() {
                 )}
                 {publicPast.length > 0 && (
                   <div className="mt-4">
-                    <button
-                      onClick={() => setPublicPastCollapsed(!publicPastCollapsed)}
-                      className="flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground mb-3 transition-colors"
-                    >
-                      <ChevronDown className={`w-4 h-4 transition-transform ${publicPastCollapsed ? '-rotate-90' : 'rotate-0'}`} />
-                      Past Calendars ({publicPast.length})
-                    </button>
+                    <Disclosure
+                      className="mb-3"
+                      headingLevel={3}
+                      title={`Archived Calendars (${publicPast.length})`}
+                      expanded={!publicPastCollapsed}
+                      onToggle={(next) => setPublicPastCollapsed(!next)}
+                      panelId="events-public-archived"
+                    />
                     {!publicPastCollapsed && (
-                      <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+                      <div id="events-public-archived" className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
                         {publicPast.map((cal, i) => renderCalendarCard(cal, i, { showSubscribeButton: true }))}
                       </div>
                     )}

@@ -1,5 +1,6 @@
 import { CodeBlock } from '../components/CodeBlock'
 import { Callout } from '../components/Callout'
+import { Link } from 'react-router-dom'
 
 export function ArchitecturePage() {
   return (
@@ -12,7 +13,7 @@ export function ArchitecturePage() {
 
       <h2>High-Level Diagram</h2>
       <div className="bg-surface-850 border border-surface-700 rounded-lg p-6 mb-6 font-mono text-sm text-gray-300">
-        <pre className="!bg-transparent !border-0 !p-0 !mb-0">{`
+        <pre className="bg-transparent! border-0! p-0! mb-0!">{`
 ┌─────────────────┐     ┌──────────────────┐     ┌──────────────┐
 │   React Web UI  │────▶│   Express API    │────▶│   Supabase   │
 │   (Vite, TS)    │     │   (Node.js, TS)  │     │  (PostgreSQL)│
@@ -39,13 +40,13 @@ export function ArchitecturePage() {
           </tr>
         </thead>
         <tbody>
-          <tr><td>Frontend</td><td>React 18 + TypeScript + Vite</td><td>Web UI for calendar management, meeting scheduling</td></tr>
+          <tr><td>Frontend</td><td>React 19 + TypeScript + Vite</td><td>Web UI for calendar management, meeting scheduling</td></tr>
           <tr><td>Styling</td><td>TailwindCSS + shadcn/ui</td><td>Component library with dark/light themes</td></tr>
           <tr><td>Backend</td><td>Node.js + Express + TypeScript</td><td>REST API with auth, rate limiting, validation</td></tr>
           <tr><td>Database</td><td>Supabase (PostgreSQL)</td><td>User data, calendars, availability, meetings</td></tr>
           <tr><td>Auth</td><td>Supabase Auth + Agent API Keys</td><td>User sessions + scoped agent tokens</td></tr>
           <tr><td>Integrations</td><td>Discord.js, Google Calendar API</td><td>Notifications and calendar sync</td></tr>
-          <tr><td>AI Agents</td><td>Fetch.ai uAgents (Python)</td><td>Autonomous meeting scheduling agent</td></tr>
+          <tr><td>Agent integrations</td><td>REST Agent API</td><td>External clients using scoped API keys</td></tr>
           <tr><td>Deployment</td><td>Vercel (web) + Railway (API)</td><td>Production hosting</td></tr>
         </tbody>
       </table>
@@ -66,10 +67,6 @@ export function ArchitecturePage() {
 │   │       └── services/
 │   ├── discord-bot/         # Discord bot for notifications
 │   └── docs/                # This documentation site
-├── agents/
-│   └── meeting-scheduler/   # Fetch.ai uAgent (Python)
-│       ├── agent.py
-│       └── requirements.txt
 ├── packages/
 │   ├── database/            # SQL migrations & schema
 │   └── shared/              # Shared types
@@ -101,9 +98,40 @@ export function ArchitecturePage() {
       </ul>
 
       <Callout variant="info" title="Rate Limiting">
-        The API has a global rate limit of 300 requests per 15 minutes per IP, with stricter
-        limits on authentication and write endpoints. Localhost traffic is exempt during development.
+        The API has a global rate limit of 1,200 requests per 15 minutes per socket address, with
+        stricter per-feature limits on authentication, AI, mailbox, and write endpoints. Localhost
+        traffic is exempt during development. See <Link to="/limits">Limits</Link> for the full
+        breakdown, including AI usage quotas.
       </Callout>
+
+      <h2>Production Security Evidence</h2>
+      <p>
+        Production runs with the web app on Vercel and the API on Railway. Security assessment
+        evidence should be collected from the deployed domains, not from localhost, because TLS,
+        DNS, security headers, and deployment secrets are platform-level controls.
+      </p>
+      <ul>
+        <li>
+          <strong>TLS and certificates</strong> -- export Qualys SSL Labs results for the frontend
+          and API domains, showing trusted certificates and TLS 1.2+ support.
+        </li>
+        <li>
+          <strong>Security headers</strong> -- capture deployed response headers showing HSTS,
+          Content Security Policy, <code>X-Frame-Options</code>, and <code>X-Content-Type-Options</code>.
+        </li>
+        <li>
+          <strong>Secrets</strong> -- keep private screenshots or exports showing sensitive values
+          stored in Vercel, Railway, and Supabase secret stores rather than source files.
+        </li>
+        <li>
+          <strong>DNS ownership</strong> -- export DNS records and confirm third-party CNAME targets
+          are claimed and active to prevent subdomain takeover.
+        </li>
+      </ul>
+      <p>
+        The complete security-assessment evidence checklist lives in the
+        <Link to="/legal/security-policy"> Security Policy</Link>.
+      </p>
 
       <h2>Data Flow</h2>
       <ol>

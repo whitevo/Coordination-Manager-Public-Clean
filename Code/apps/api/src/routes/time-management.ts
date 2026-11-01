@@ -1,7 +1,7 @@
 import { Router, Response } from 'express'
 import { supabaseAdmin } from '../supabaseClient.js'
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth.js'
-import { sanitizeString, sanitizeUUID, safeErrorMessage } from '../middleware/validation.js'
+import { sanitizeString, sanitizeUUID, safeExternalErrorMessage } from '../middleware/validation.js'
 
 const router: ReturnType<typeof Router> = Router()
 
@@ -19,6 +19,11 @@ const DEFAULT_CATEGORY_COLOR_DISPLAY_STYLE = 'horizontal'
 const SORT_ORDER_MIN = -10000
 const SORT_ORDER_MAX = 10000
 const MAX_MODE_COUNT = 3
+const TIME_MANAGER_STORAGE_UNAVAILABLE = 'Time Manager storage is temporarily unavailable. Please try again later.'
+
+function timeManagerStorageError(error: unknown): string {
+  return safeExternalErrorMessage(error, TIME_MANAGER_STORAGE_UNAVAILABLE)
+}
 
 type ExternalCalendarKind = 'google_oauth' | 'google_public_url'
 type CategoryColorDisplayStyle = 'horizontal' | 'vertical_left' | 'vertical_right'
@@ -476,7 +481,7 @@ router.get('/modes', async (req: AuthenticatedRequest, res: Response) => {
     const result = await ensureDefaultMode(req.userId)
     res.json(result)
   } catch (err) {
-    res.status(500).json({ error: safeErrorMessage(err) })
+    res.status(500).json({ error: timeManagerStorageError(err) })
   }
 })
 
@@ -509,7 +514,7 @@ router.post('/modes', async (req: AuthenticatedRequest, res: Response) => {
       if (createError?.code === '23505') {
         return res.status(409).json({ error: 'A mode with this name already exists' })
       }
-      return res.status(400).json({ error: createError?.message || 'Failed to create mode' })
+      return res.status(400).json({ error: createError ? timeManagerStorageError(createError) : 'Failed to create mode' })
     }
 
     const createdCategories = await attachImportedCategories(req.userId, createdMode.id, payload.categories)
@@ -518,11 +523,11 @@ router.post('/modes', async (req: AuthenticatedRequest, res: Response) => {
       .from('time_management_prefs')
       .upsert({ user_id: req.userId, active_mode_id: createdMode.id, updated_at: new Date().toISOString() }, { onConflict: 'user_id' })
 
-    if (prefError) return res.status(400).json({ error: prefError.message })
+    if (prefError) return res.status(400).json({ error: timeManagerStorageError(prefError) })
 
     res.status(201).json({ mode: createdMode, activeModeId: createdMode.id, createdCategories })
   } catch (err) {
-    res.status(500).json({ error: safeErrorMessage(err) })
+    res.status(500).json({ error: timeManagerStorageError(err) })
   }
 })
 
@@ -561,7 +566,7 @@ router.put('/modes/:id', async (req: AuthenticatedRequest, res: Response) => {
           .eq('id', id)
           .eq('user_id', req.userId)
           .maybeSingle()
-        if (currentModeError) return res.status(400).json({ error: currentModeError.message })
+        if (currentModeError) return res.status(400).json({ error: timeManagerStorageError(currentModeError) })
         const hasCurrentBackgrounds = normalizeModeTimeBackgrounds(currentMode?.time_backgrounds).length > 0
         const allowEmptyBackgrounds = req.body?.clear_time_backgrounds === true
         if (hasCurrentBackgrounds && !allowEmptyBackgrounds) {
@@ -577,7 +582,7 @@ router.put('/modes/:id', async (req: AuthenticatedRequest, res: Response) => {
         .eq('id', id)
         .eq('user_id', req.userId)
         .maybeSingle()
-      if (currentModeError) return res.status(400).json({ error: currentModeError.message })
+      if (currentModeError) return res.status(400).json({ error: timeManagerStorageError(currentModeError) })
       const timeBackgrounds = normalizeModeTimeBackgrounds(currentMode?.time_backgrounds)
       updates.collapsed_background_ids = normalizeCollapsedBackgroundIds(req.body.collapsed_background_ids, timeBackgrounds)
     }
@@ -590,7 +595,7 @@ router.put('/modes/:id', async (req: AuthenticatedRequest, res: Response) => {
           .eq('id', id)
           .eq('user_id', req.userId)
           .maybeSingle()
-        if (currentModeError) return res.status(400).json({ error: currentModeError.message })
+        if (currentModeError) return res.status(400).json({ error: timeManagerStorageError(currentModeError) })
         const hasCurrentQuickTemplates = normalizeQuickTemplates(currentMode?.quick_templates).length > 0
         const allowEmptyQuickTemplates = req.body?.clear_quick_templates === true
         if (hasCurrentQuickTemplates && !allowEmptyQuickTemplates) {
@@ -618,12 +623,12 @@ router.put('/modes/:id', async (req: AuthenticatedRequest, res: Response) => {
       if (error.code === '23505') {
         return res.status(409).json({ error: 'A mode with this name already exists' })
       }
-      return res.status(400).json({ error: error.message })
+      return res.status(400).json({ error: timeManagerStorageError(error) })
     }
     if (!data) return res.status(404).json({ error: 'Mode not found' })
     res.json({ mode: data })
   } catch (err) {
-    res.status(500).json({ error: safeErrorMessage(err) })
+    res.status(500).json({ error: timeManagerStorageError(err) })
   }
 })
 
@@ -639,17 +644,17 @@ router.post('/modes/:id/activate', async (req: AuthenticatedRequest, res: Respon
       .eq('user_id', req.userId)
       .maybeSingle()
 
-    if (modeError) return res.status(400).json({ error: modeError.message })
+    if (modeError) return res.status(400).json({ error: timeManagerStorageError(modeError) })
     if (!mode) return res.status(404).json({ error: 'Mode not found' })
 
     const { error } = await supabaseAdmin
       .from('time_management_prefs')
       .upsert({ user_id: req.userId, active_mode_id: id, updated_at: new Date().toISOString() }, { onConflict: 'user_id' })
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: timeManagerStorageError(error) })
     res.json({ activeModeId: id })
   } catch (err) {
-    res.status(500).json({ error: safeErrorMessage(err) })
+    res.status(500).json({ error: timeManagerStorageError(err) })
   }
 })
 
@@ -680,7 +685,7 @@ router.delete('/modes/:id', async (req: AuthenticatedRequest, res: Response) => 
       .eq('source_type', 'manual')
       .eq('source_id', id)
 
-    if (sourceEventsError) return res.status(400).json({ error: sourceEventsError.message })
+    if (sourceEventsError) return res.status(400).json({ error: timeManagerStorageError(sourceEventsError) })
 
     const manualEvents = sourceEvents || []
     if (manualEvents.length > 0 && !transferToModeId && !deleteItems) {
@@ -702,7 +707,7 @@ router.delete('/modes/:id', async (req: AuthenticatedRequest, res: Response) => 
         .eq('source_type', 'manual')
         .eq('source_id', transferToModeId)
 
-      if (targetEventsError) return res.status(400).json({ error: targetEventsError.message })
+      if (targetEventsError) return res.status(400).json({ error: timeManagerStorageError(targetEventsError) })
 
       const targetSignatures = new Set((targetEvents || []).map(buildManualEventSignature))
       for (const event of manualEvents) {
@@ -718,7 +723,7 @@ router.delete('/modes/:id', async (req: AuthenticatedRequest, res: Response) => 
           .eq('id', event.id)
           .eq('user_id', req.userId)
 
-        if (updateError) return res.status(400).json({ error: updateError.message })
+        if (updateError) return res.status(400).json({ error: timeManagerStorageError(updateError) })
         targetSignatures.add(signature)
         transferredItems += 1
       }
@@ -731,7 +736,7 @@ router.delete('/modes/:id', async (req: AuthenticatedRequest, res: Response) => 
         .eq('source_id', id)
         .select('id')
 
-      if (deleteItemsError) return res.status(400).json({ error: deleteItemsError.message })
+      if (deleteItemsError) return res.status(400).json({ error: timeManagerStorageError(deleteItemsError) })
       deletedItems = deletedRows?.length || 0
     }
 
@@ -741,7 +746,7 @@ router.delete('/modes/:id', async (req: AuthenticatedRequest, res: Response) => 
       .eq('id', id)
       .eq('user_id', req.userId)
 
-    if (deleteModeError) return res.status(400).json({ error: deleteModeError.message })
+    if (deleteModeError) return res.status(400).json({ error: timeManagerStorageError(deleteModeError) })
 
     const nextActiveModeId = activeModeId === id
       ? transferToModeId || modes.find((mode) => mode.id !== id)?.id || null
@@ -751,7 +756,7 @@ router.delete('/modes/:id', async (req: AuthenticatedRequest, res: Response) => 
       const { error: prefError } = await supabaseAdmin
         .from('time_management_prefs')
         .upsert({ user_id: req.userId, active_mode_id: nextActiveModeId, updated_at: new Date().toISOString() }, { onConflict: 'user_id' })
-      if (prefError) return res.status(400).json({ error: prefError.message })
+      if (prefError) return res.status(400).json({ error: timeManagerStorageError(prefError) })
     }
 
     res.json({
@@ -762,7 +767,7 @@ router.delete('/modes/:id', async (req: AuthenticatedRequest, res: Response) => 
       skippedDuplicates,
     })
   } catch (err) {
-    res.status(500).json({ error: safeErrorMessage(err) })
+    res.status(500).json({ error: timeManagerStorageError(err) })
   }
 })
 
@@ -771,20 +776,29 @@ router.delete('/modes/:id', async (req: AuthenticatedRequest, res: Response) => 
 router.get('/categories', async (req: AuthenticatedRequest, res: Response) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'Unauthorized' })
-    const activeModeId = await resolveActiveModeId(req.userId)
 
-    const { data, error } = await supabaseAdmin
+    let query = supabaseAdmin
       .from('time_management_categories')
-      .select('id, label, color, font_color, background_opacity, item_opacity, sort_order, created_at, updated_at')
+      .select('id, mode_id, label, color, font_color, background_opacity, item_opacity, sort_order, created_at, updated_at')
       .eq('user_id', req.userId)
-      .eq('mode_id', activeModeId)
+
+    if (req.query.all_modes === 'true' || req.query.all_modes === '1') {
+      // Fetch categories across all modes
+    } else if (req.query.mode_id) {
+      query = query.eq('mode_id', String(req.query.mode_id))
+    } else {
+      const activeModeId = await resolveActiveModeId(req.userId)
+      query = query.eq('mode_id', activeModeId)
+    }
+
+    const { data, error } = await query
       .order('sort_order', { ascending: true })
       .order('created_at', { ascending: true })
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: timeManagerStorageError(error) })
     res.json({ categories: data || [] })
   } catch (err) {
-    res.status(500).json({ error: safeErrorMessage(err) })
+    res.status(500).json({ error: timeManagerStorageError(err) })
   }
 })
 
@@ -838,11 +852,11 @@ router.post('/categories', async (req: AuthenticatedRequest, res: Response) => {
       if (error.code === '23505') {
         return res.status(409).json({ error: 'A category with this label already exists' })
       }
-      return res.status(400).json({ error: error.message })
+      return res.status(400).json({ error: timeManagerStorageError(error) })
     }
     res.status(201).json({ category: data })
   } catch (err) {
-    res.status(500).json({ error: safeErrorMessage(err) })
+    res.status(500).json({ error: timeManagerStorageError(err) })
   }
 })
 
@@ -909,12 +923,12 @@ router.put('/categories/:id', async (req: AuthenticatedRequest, res: Response) =
       if (error.code === '23505') {
         return res.status(409).json({ error: 'A category with this label already exists' })
       }
-      return res.status(400).json({ error: error.message })
+      return res.status(400).json({ error: timeManagerStorageError(error) })
     }
     if (!data) return res.status(404).json({ error: 'Category not found' })
     res.json({ category: data })
   } catch (err) {
-    res.status(500).json({ error: safeErrorMessage(err) })
+    res.status(500).json({ error: timeManagerStorageError(err) })
   }
 })
 
@@ -945,7 +959,7 @@ router.delete('/categories/:id', async (req: AuthenticatedRequest, res: Response
           .eq('id', row.id)
           .eq('user_id', req.userId)
         if (updateError) {
-          return res.status(400).json({ error: updateError.message })
+          return res.status(400).json({ error: timeManagerStorageError(updateError) })
         }
       }
     }
@@ -959,11 +973,11 @@ router.delete('/categories/:id', async (req: AuthenticatedRequest, res: Response
       .select()
       .single()
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: timeManagerStorageError(error) })
     if (!data) return res.status(404).json({ error: 'Category not found' })
     res.json({ message: 'Category deleted' })
   } catch (err) {
-    res.status(500).json({ error: safeErrorMessage(err) })
+    res.status(500).json({ error: timeManagerStorageError(err) })
   }
 })
 
@@ -977,7 +991,7 @@ router.get('/prefs', async (req: AuthenticatedRequest, res: Response) => {
       .eq('user_id', req.userId)
       .maybeSingle()
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: timeManagerStorageError(error) })
 
     res.json({
       prefs: data || {
@@ -988,7 +1002,7 @@ router.get('/prefs', async (req: AuthenticatedRequest, res: Response) => {
       },
     })
   } catch (err) {
-    res.status(500).json({ error: safeErrorMessage(err) })
+    res.status(500).json({ error: timeManagerStorageError(err) })
   }
 })
 
@@ -1021,7 +1035,7 @@ router.put('/prefs', async (req: AuthenticatedRequest, res: Response) => {
           .eq('id', activeModeId)
           .eq('user_id', req.userId)
           .maybeSingle()
-        if (activeModeError) return res.status(400).json({ error: activeModeError.message })
+        if (activeModeError) return res.status(400).json({ error: timeManagerStorageError(activeModeError) })
         if (!activeMode) return res.status(400).json({ error: 'active_mode_id does not belong to the user' })
         updates.active_mode_id = activeModeId
       } else {
@@ -1035,10 +1049,10 @@ router.put('/prefs', async (req: AuthenticatedRequest, res: Response) => {
       .select('main_color, main_label, active_mode_id, updated_at')
       .single()
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: timeManagerStorageError(error) })
     res.json({ prefs: data })
   } catch (err) {
-    res.status(500).json({ error: safeErrorMessage(err) })
+    res.status(500).json({ error: timeManagerStorageError(err) })
   }
 })
 

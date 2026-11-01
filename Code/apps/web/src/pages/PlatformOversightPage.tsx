@@ -2,6 +2,9 @@ import { useState, useEffect, useCallback, useMemo } from 'react'
 import { useNavigate, Link } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
 import { apiClient } from '../lib/api-client'
+import { AdminMfaPrompt } from '../components/AdminMfaPrompt'
+import { isAdminMfaRequiredError } from '../lib/admin-mfa'
+import { Button, Disclosure, SegmentedControl, ToggleButton } from '../components/ui'
 import { getPrimaryTimezone, formatDateInTimezone, formatTimeInTimezone } from '../lib/timezone-data'
 import {
   AreaChart,
@@ -16,8 +19,6 @@ import {
   Activity,
   AlertTriangle,
   Calendar,
-  ChevronDown,
-  ChevronRight,
   Clock,
   Eye,
   EyeOff,
@@ -92,6 +93,10 @@ interface TimeseriesApiPoint extends Partial<Omit<TimeseriesPoint, 'date'>> {
 
 type DateRange = '1d' | '7d' | '30d' | 'all'
 
+// Maps the period filter to how many days of timeseries data to request/display.
+// Backend clamps the "days" query param between 7 and 90, so 'all' uses the max allowed.
+const RANGE_TO_DAYS: Record<DateRange, number> = { '1d': 1, '7d': 7, '30d': 30, all: 90 }
+
 // ─── Access gate ──────────────────────────────────────────────────────
 
 function AccessDenied() {
@@ -115,22 +120,17 @@ function ExpandableSection({ title, icon, children, defaultOpen = false, badge }
   defaultOpen?: boolean
   badge?: React.ReactNode
 }) {
-  const [open, setOpen] = useState(defaultOpen)
   return (
-    <div className="border border-border rounded-lg bg-card">
-      <button
-        onClick={() => setOpen(o => !o)}
-        className="w-full flex items-center gap-3 px-5 py-4 text-left hover:bg-accent/30 transition-colors rounded-lg"
-      >
-        {open ? <ChevronDown className="w-4 h-4 text-muted-foreground shrink-0" /> : <ChevronRight className="w-4 h-4 text-muted-foreground shrink-0" />}
-        <span className="flex items-center gap-2 font-semibold text-sm">
-          {icon}
-          {title}
-        </span>
-        {badge && <span className="ml-auto">{badge}</span>}
-      </button>
-      {open && <div className="px-5 pb-5 pt-1">{children}</div>}
-    </div>
+    <Disclosure
+      title={title}
+      icon={icon}
+      trailing={badge ? <span className="mr-2">{badge}</span> : undefined}
+      defaultExpanded={defaultOpen}
+      className="border border-border rounded-lg bg-card p-2"
+      panelClassName="px-3 pb-3 pt-1"
+    >
+      {children}
+    </Disclosure>
   )
 }
 
@@ -150,14 +150,14 @@ function MiniBarChart({ data, label }: { data: { date: string; count: number }[]
               <div
                 className={`w-full min-h-[2px] rounded-t transition-all ${
                   isHot
-                    ? 'bg-red-500 dark:bg-red-400'
+                    ? 'bg-danger'
                     : d.count > 0
-                      ? 'bg-blue-500 dark:bg-blue-400'
+                      ? 'bg-info'
                       : 'bg-muted'
                 }`}
                 style={{ height: `${Math.max(pct, 3)}%` }}
               />
-              <div className="absolute bottom-full mb-1 hidden group-hover:block bg-popover text-popover-foreground text-[10px] px-1.5 py-0.5 rounded shadow border border-border whitespace-nowrap z-10">
+              <div className="absolute bottom-full mb-1 hidden group-hover:block bg-popover text-popover-foreground text-[10px] px-1.5 py-0.5 rounded shadow-sm border border-border whitespace-nowrap z-10">
                 {d.date}: {d.count}
               </div>
             </div>
@@ -236,21 +236,21 @@ function InteractionTimeseries({ data }: { data: TimeseriesPoint[] }) {
       {/* Toggle buttons */}
       <div className="flex flex-wrap gap-1.5">
         {SERIES_CONFIG.map(s => (
-          <button
+          <ToggleButton
             key={s.key}
-            onClick={() => toggleSeries(s.key)}
-            className={`flex items-center gap-1.5 px-2 py-1 text-xs rounded-md border transition-colors ${
-              hiddenSeries.has(s.key)
-                ? 'border-border text-muted-foreground opacity-50'
-                : 'border-border text-foreground'
-            }`}
+            size="micro"
+            intent="neutral"
+            pressed={!hiddenSeries.has(s.key)}
+            onPressedChange={() => toggleSeries(s.key)}
+            icon={
+              <span
+                className="w-2.5 h-2.5 rounded-sm shrink-0"
+                style={{ backgroundColor: hiddenSeries.has(s.key) ? 'transparent' : s.color, border: `1.5px solid ${s.color}` }}
+              />
+            }
           >
-            <span
-              className="w-2.5 h-2.5 rounded-sm shrink-0"
-              style={{ backgroundColor: hiddenSeries.has(s.key) ? 'transparent' : s.color, border: `1.5px solid ${s.color}` }}
-            />
             {s.label}
-          </button>
+          </ToggleButton>
         ))}
       </div>
 
@@ -318,19 +318,19 @@ function AccountBadge({ account }: { account: AccountRecord }) {
     case 'cardano':
     case 'linked':
       return (
-        <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300">
+        <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-info-subtle text-info">
           <Wallet className="w-3 h-3" />{type === 'linked' ? 'Linked' : 'Cardano'}
         </span>
       )
     case 'traveler':
       return (
-        <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-300">
+        <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-warning-subtle text-warning">
           <Compass className="w-3 h-3" />Traveler
         </span>
       )
     default:
       return (
-        <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300">
+        <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-success-subtle text-success">
           <Mail className="w-3 h-3" />Google
         </span>
       )
@@ -343,13 +343,13 @@ function SourceBadge({ source }: { source: string | null }) {
   switch (source) {
     case 'production':
       return (
-        <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300">
+        <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-success-subtle text-success">
           <Globe className="w-3 h-3" />Prod
         </span>
       )
     case 'localhost':
       return (
-        <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-orange-100 dark:bg-orange-900 text-orange-700 dark:text-orange-300">
+        <span className="inline-flex items-center gap-1 text-xs px-1.5 py-0.5 rounded-full bg-warning-subtle text-warning">
           <Monitor className="w-3 h-3" />Local
         </span>
       )
@@ -379,6 +379,7 @@ export default function PlatformOversightPage() {
   // ─── State ────────────────────────────────────────────────────────
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const [adminMfaRequired, setAdminMfaRequired] = useState(false)
 
   // Account log
   const [accounts, setAccounts] = useState<AccountRecord[]>([])
@@ -403,11 +404,6 @@ export default function PlatformOversightPage() {
   // Date range filter (default: 1 week)
   const [dateRange, setDateRange] = useState<DateRange>('7d')
 
-  const headers = useMemo(
-    () => (session?.access_token ? { Authorization: `Bearer ${session.access_token}` } : undefined),
-    [session?.access_token]
-  )
-
   // ─── Fetch all data ───────────────────────────────────────────────
   const fetchAll = useCallback(async () => {
     if (!session?.access_token) return
@@ -416,20 +412,24 @@ export default function PlatformOversightPage() {
     try {
       const [accountRes, captchaRes, healthRes] = await Promise.all([
         apiClient.get('/api/admin/oversight/account-log', {
-          headers,
           params: { excludeLocalhost: excludeLocalhostData ? 'true' : 'false' },
         }),
-        apiClient.get('/api/admin/oversight/captcha', { headers }),
+        apiClient.get('/api/admin/oversight/captcha'),
         apiClient.get('/api/admin/oversight/health-signals', {
-          headers,
           params: { excludeLocalhost: excludeLocalhostData ? 'true' : 'false' },
         }),
       ])
+      setAdminMfaRequired(false)
       setAccounts(accountRes.data.accounts || [])
       setDailyCounts(accountRes.data.dailyCounts || {})
       setCaptcha(captchaRes.data)
       setHealth(healthRes.data)
     } catch (err: unknown) {
+      if (isAdminMfaRequiredError(err)) {
+        setAdminMfaRequired(true)
+        setError(null)
+        return
+      }
       const msg = (err as { response?: { data?: { error?: string } }; message?: string })?.response?.data?.error
         || (err as { message?: string })?.message || 'Failed to load oversight data'
       setError(msg)
@@ -439,15 +439,15 @@ export default function PlatformOversightPage() {
 
     // Fetch timeseries separately -- gracefully degrades if endpoint not yet deployed
     try {
+      const requestedDays = RANGE_TO_DAYS[dateRange]
       const tsRes = await apiClient.get('/api/admin/oversight/interaction-timeseries', {
-        headers,
         params: {
-          days: 30,
+          days: Math.max(7, requestedDays),
           excludeLocalhost: excludeLocalhostData ? 'true' : 'false',
         },
       })
       const rawSeries: TimeseriesApiPoint[] = Array.isArray(tsRes.data?.series) ? tsRes.data.series : []
-      setTimeseries(rawSeries.map((point) => ({
+      const mapped = rawSeries.map((point) => ({
         date: point.date,
         calendars: point.calendars ?? 0,
         meetings: point.meetings ?? 0,
@@ -456,19 +456,25 @@ export default function PlatformOversightPage() {
         announcements: point.announcements ?? 0,
         feedback: point.feedback ?? 0,
         account_deletions: point.account_deletions ?? 0,
-      })))
+      }))
+      // Backend enforces a minimum of 7 days, so trim to the requested window client-side
+      setTimeseries(requestedDays < mapped.length ? mapped.slice(-requestedDays) : mapped)
     } catch {
       // Endpoint may not exist on production yet -- silently skip
     }
-  }, [excludeLocalhostData, session?.access_token, headers])
+  }, [excludeLocalhostData, dateRange, session?.access_token])
 
   useEffect(() => { fetchAll() }, [fetchAll])
+
+  if (adminMfaRequired) {
+    return <AdminMfaPrompt onVerified={() => { setAdminMfaRequired(false); fetchAll() }} onCancel={() => navigate('/settings?tab=profile')} />
+  }
 
   // ─── Captcha toggle ───────────────────────────────────────────────
   const setCaptchaMode = async (mode: 'on' | 'off' | 'auto') => {
     setCaptchaLoading(true)
     try {
-      const res = await apiClient.post('/api/admin/oversight/captcha', { mode }, { headers })
+      const res = await apiClient.post('/api/admin/oversight/captcha', { mode })
       setCaptcha(res.data)
     } catch { /* ignore */ }
     finally { setCaptchaLoading(false) }
@@ -523,20 +529,21 @@ export default function PlatformOversightPage() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <Eye className="w-6 h-6 text-purple-600 dark:text-purple-400" />
+          <Eye className="w-6 h-6 text-feature-ai" />
           <div>
             <h1 className="text-xl font-bold">Platform Oversight</h1>
             <p className="text-xs text-muted-foreground">Admin dashboards, logs, and health signals</p>
           </div>
         </div>
-        <button
+        <Button
+          emphasis="outline"
+          size="compact"
           onClick={fetchAll}
           disabled={loading}
-          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-md border border-border hover:bg-accent/50 transition-colors disabled:opacity-50"
+          icon={<RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />}
         >
-          <RefreshCw className={`w-3.5 h-3.5 ${loading ? 'animate-spin' : ''}`} />
           Refresh
-        </button>
+        </Button>
       </div>
 
       {error && (
@@ -555,42 +562,35 @@ export default function PlatformOversightPage() {
           {/* ═══ Date Range Filter ════════════════════════════════════ */}
           <div className="flex items-center gap-2">
             <span className="text-xs text-muted-foreground font-medium">Period:</span>
-            {([
-              { key: '1d' as DateRange, label: '1 Day' },
-              { key: '7d' as DateRange, label: '1 Week' },
-              { key: '30d' as DateRange, label: '1 Month' },
-              { key: 'all' as DateRange, label: 'All' },
-            ]).map(f => (
-              <button
-                key={f.key}
-                onClick={() => setDateRange(f.key)}
-                className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-colors ${
-                  dateRange === f.key
-                    ? 'bg-primary text-primary-foreground border-primary'
-                    : 'border-border text-muted-foreground hover:bg-accent/50'
-                }`}
-              >
-                {f.label}
-              </button>
-            ))}
-            <button
-              onClick={() => setExcludeLocalhostData(v => !v)}
-              className={`ml-1 px-3 py-1.5 text-xs font-medium rounded-md border transition-colors ${
-                excludeLocalhostData
-                  ? 'bg-emerald-100 dark:bg-emerald-900 border-emerald-300 dark:border-emerald-700 text-emerald-700 dark:text-emerald-300'
-                  : 'border-border text-muted-foreground hover:bg-accent/50'
-              }`}
+            <SegmentedControl<DateRange>
+              label="Period"
+              size="compact"
+              value={dateRange}
+              onChange={setDateRange}
+              options={[
+                { value: '1d', label: '1 Day' },
+                { value: '7d', label: '1 Week' },
+                { value: '30d', label: '1 Month' },
+                { value: 'all', label: 'All' },
+              ]}
+            />
+            <ToggleButton
+              size="compact"
+              intent="success"
+              pressed={excludeLocalhostData}
+              onPressedChange={() => setExcludeLocalhostData(v => !v)}
+              className="ml-1"
               title="Exclude localhost-sourced account events from oversight metrics"
             >
               {excludeLocalhostData ? 'Excluding Localhost' : 'Include Localhost'}
-            </button>
+            </ToggleButton>
           </div>
 
           {/* ═══ 1. Health / Liveliness Signals ═══════════════════════ */}
           {health && (
             <div className="grid grid-cols-2 md:grid-cols-3 gap-3">
               <StatCard
-                icon={<Users className="w-4 h-4 text-blue-500" />}
+                icon={<Users className="w-4 h-4 text-muted-foreground" />}
                 label="Users"
                 total={getValueForRange(health.users)}
                 sub={[
@@ -599,7 +599,7 @@ export default function PlatformOversightPage() {
                 ]}
               />
               <StatCard
-                icon={<AlertTriangle className="w-4 h-4 text-red-500" />}
+                icon={<AlertTriangle className="w-4 h-4 text-danger" />}
                 label="Account Deletions"
                 total={getValueForRange(health.accountDeletions)}
                 sub={[
@@ -608,7 +608,7 @@ export default function PlatformOversightPage() {
                 ]}
               />
               <StatCard
-                icon={<Calendar className="w-4 h-4 text-purple-500" />}
+                icon={<Calendar className="w-4 h-4 text-muted-foreground" />}
                 label="Calendars Created"
                 total={getValueForRange(health.calendars)}
                 sub={[
@@ -617,7 +617,7 @@ export default function PlatformOversightPage() {
                 ]}
               />
               <StatCard
-                icon={<UserPlus className="w-4 h-4 text-teal-500" />}
+                icon={<UserPlus className="w-4 h-4 text-muted-foreground" />}
                 label="Participations"
                 total={getValueForRange(health.meetings)}
                 sub={[
@@ -626,7 +626,7 @@ export default function PlatformOversightPage() {
                 ]}
               />
               <StatCard
-                icon={<Clock className="w-4 h-4 text-orange-500" />}
+                icon={<Clock className="w-4 h-4 text-muted-foreground" />}
                 label="Availability Responses"
                 total={getValueForRange(health.availability)}
                 sub={[
@@ -635,7 +635,7 @@ export default function PlatformOversightPage() {
                 ]}
               />
               <StatCard
-                icon={<Megaphone className="w-4 h-4 text-pink-500" />}
+                icon={<Megaphone className="w-4 h-4 text-muted-foreground" />}
                 label="Announcements"
                 total={getValueForRange(health.announcements)}
                 sub={[
@@ -644,7 +644,7 @@ export default function PlatformOversightPage() {
                 ]}
               />
               <StatCard
-                icon={<MessageSquare className="w-4 h-4 text-yellow-500" />}
+                icon={<MessageSquare className="w-4 h-4 text-warning" />}
                 label="Feedback"
                 total={getValueForRange(health.feedback)}
                 sub={[
@@ -659,7 +659,7 @@ export default function PlatformOversightPage() {
           {timeseries.length > 0 && (
             <ExpandableSection
               title="User Interactions Over Time"
-              icon={<Activity className="w-4 h-4 text-indigo-600 dark:text-indigo-400" />}
+              icon={<Activity className="w-4 h-4 text-muted-foreground" />}
               defaultOpen={true}
             >
               <InteractionTimeseries data={timeseries} />
@@ -669,14 +669,14 @@ export default function PlatformOversightPage() {
           {/* ═══ 2. Account Creation Log ══════════════════════════════ */}
           <ExpandableSection
             title="Account Creation Log"
-            icon={<TrendingUp className="w-4 h-4 text-blue-600 dark:text-blue-400" />}
+            icon={<TrendingUp className="w-4 h-4 text-primary" />}
             defaultOpen={false}
             badge={
               <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${
                 totalToday >= 5
-                  ? 'bg-red-100 dark:bg-red-900 text-red-700 dark:text-red-300'
+                  ? 'bg-danger-subtle text-danger'
                   : totalToday > 0
-                    ? 'bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300'
+                    ? 'bg-info-subtle text-info'
                     : 'bg-muted text-muted-foreground'
               }`}>
                 {totalToday} today
@@ -686,14 +686,16 @@ export default function PlatformOversightPage() {
             <div className="space-y-4">
               {/* PII visibility toggle */}
               <div className="flex items-center justify-end">
-                <button
-                  onClick={() => setShowPII(v => !v)}
-                  className="flex items-center gap-1.5 px-2.5 py-1 text-xs rounded-md border border-border hover:bg-accent/50 transition-colors text-muted-foreground"
+                <ToggleButton
+                  size="micro"
+                  intent="neutral"
+                  pressed={showPII}
+                  onPressedChange={() => setShowPII(v => !v)}
                   title={showPII ? 'Hide names & emails' : 'Show names & emails'}
+                  icon={showPII ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
                 >
-                  {showPII ? <Eye className="w-3.5 h-3.5" /> : <EyeOff className="w-3.5 h-3.5" />}
                   {showPII ? 'Visible' : 'Hidden'}
-                </button>
+                </ToggleButton>
               </div>
 
               {/* 30-day bar chart */}
@@ -708,38 +710,25 @@ export default function PlatformOversightPage() {
                   value={accountSearch}
                   onChange={e => setAccountSearch(e.target.value)}
                   placeholder="Search accounts by name, email, type..."
-                  className="flex-1 px-3 py-2 text-sm rounded-md border border-border bg-background placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                  className="flex-1 px-3 py-2 text-sm rounded-md border border-border bg-background placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
                 />
-                <div className="flex gap-1">
-                  {[
-                    { key: 'all', label: 'All', icon: null },
+                <SegmentedControl
+                  label="Account source"
+                  size="compact"
+                  className="shrink-0 self-start"
+                  value={sourceFilter}
+                  onChange={setSourceFilter}
+                  options={[
+                    { key: 'all', label: 'All', icon: undefined },
                     { key: 'production', label: 'Prod', icon: <Globe className="w-3 h-3" /> },
                     { key: 'localhost', label: 'Local', icon: <Monitor className="w-3 h-3" /> },
-                    { key: 'unknown', label: '?', icon: null },
-                  ].map(f => {
+                    { key: 'unknown', label: '?', icon: undefined },
+                  ].flatMap(f => {
                     const count = f.key === 'all' ? accounts.length : (sourceCounts[f.key] || 0)
-                    if (f.key !== 'all' && count === 0) return null
-                    return (
-                      <button
-                        key={f.key}
-                        onClick={() => setSourceFilter(f.key)}
-                        className={`flex items-center gap-1 px-2 py-1.5 text-xs rounded-md border transition-colors whitespace-nowrap ${
-                          sourceFilter === f.key
-                            ? f.key === 'production'
-                              ? 'bg-green-100 dark:bg-green-900 border-green-300 dark:border-green-700 text-green-700 dark:text-green-300'
-                              : f.key === 'localhost'
-                                ? 'bg-orange-100 dark:bg-orange-900 border-orange-300 dark:border-orange-700 text-orange-700 dark:text-orange-300'
-                                : 'bg-accent border-border text-foreground'
-                            : 'border-border text-muted-foreground hover:bg-accent/50'
-                        }`}
-                      >
-                        {f.icon}
-                        {f.label}
-                        <span className="text-[10px] opacity-70">{count}</span>
-                      </button>
-                    )
+                    if (f.key !== 'all' && count === 0) return []
+                    return [{ value: f.key, label: `${f.label} ${count}`, icon: f.icon }]
                   })}
-                </div>
+                />
               </div>
 
               {/* Table */}
@@ -765,16 +754,16 @@ export default function PlatformOversightPage() {
                           key={a.id}
                           className={`hover:bg-accent/30 transition-colors ${
                             isRecent
-                              ? 'bg-red-50 dark:bg-red-950/30'
+                              ? 'bg-danger-subtle'
                               : isToday
-                                ? 'bg-blue-50/50 dark:bg-blue-950/20'
+                                ? 'bg-info-subtle'
                                 : ''
                           }`}
                         >
                           <td className="px-3 py-2 whitespace-nowrap">
                             <div className="flex items-center gap-1.5">
-                              {isRecent && <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />}
-                              <span className={`text-xs ${isRecent ? 'font-semibold text-red-600 dark:text-red-400' : 'text-muted-foreground'}`}>
+                              {isRecent && <span className="w-2 h-2 rounded-full bg-danger animate-pulse" />}
+                              <span className={`text-xs ${isRecent ? 'font-semibold text-danger' : 'text-muted-foreground'}`}>
                                 {formatDateInTimezone(createdDate, getPrimaryTimezone()).replace(/,? \d{4}$/, '')} {formatTimeInTimezone(createdDate, getPrimaryTimezone())}
                               </span>
                             </div>
@@ -817,15 +806,15 @@ export default function PlatformOversightPage() {
           {/* ═══ 3. Captcha Control ═══════════════════════════════════ */}
           <ExpandableSection
             title="Captcha Mode Control"
-            icon={<Shield className="w-4 h-4 text-red-600 dark:text-red-400" />}
+            icon={<Shield className="w-4 h-4 text-danger" />}
             defaultOpen={false}
             badge={
               <span className={`text-xs font-medium px-2 py-0.5 rounded-full ${
                 captcha.available === false
-                  ? 'bg-slate-200 dark:bg-slate-800 text-slate-600 dark:text-slate-300'
+                  ? 'bg-muted text-muted-foreground'
                   : captcha.required
-                  ? 'bg-red-100 dark:bg-red-900 text-red-700 dark:text-red-300'
-                  : 'bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300'
+                  ? 'bg-danger-subtle text-danger'
+                  : 'bg-success-subtle text-success'
               }`}>
                 {captcha.available === false ? 'Unavailable' : captcha.required ? 'Active' : 'Inactive'}
               </span>
@@ -834,7 +823,7 @@ export default function PlatformOversightPage() {
             <div className="space-y-4">
               {/* Unavailable notice */}
               {captcha.available === false && (
-                <div className="flex items-start gap-2 px-3 py-2 rounded-md bg-amber-50 dark:bg-amber-950/40 border border-amber-300 dark:border-amber-700 text-xs text-amber-900 dark:text-amber-100">
+                <div className="flex items-start gap-2 px-3 py-2 rounded-md bg-warning-subtle border border-warning-muted text-xs text-foreground">
                   <AlertTriangle className="w-4 h-4 mt-0.5 shrink-0" />
                   <div>
                     {captcha.unavailableReason === 'disabled' ? (
@@ -860,11 +849,11 @@ export default function PlatformOversightPage() {
 
               {/* Status */}
               <div className="flex items-center gap-3 text-sm">
-                <span className={`w-3 h-3 rounded-full ${captcha.required ? 'bg-red-500 animate-pulse' : 'bg-green-500'}`} />
+                <span className={`w-3 h-3 rounded-full ${captcha.required ? 'bg-danger animate-pulse' : 'bg-success'}`} />
                 <span>
                   Captcha is <span className="font-semibold">{captcha.required ? 'required' : 'not required'}</span>
                   {captcha.manualOverride !== null && (
-                    <span className="ml-1 text-amber-600 dark:text-amber-400">(manual override: {captcha.manualOverride ? 'forced on' : 'forced off'})</span>
+                    <span className="ml-1 text-warning">(manual override: {captcha.manualOverride ? 'forced on' : 'forced off'})</span>
                   )}
                 </span>
               </div>
@@ -877,44 +866,44 @@ export default function PlatformOversightPage() {
 
               {/* Controls */}
               <div className="flex flex-wrap gap-2">
-                <button
-                  onClick={() => setCaptchaMode('on')}
-                  disabled={captchaLoading || captcha.available === false}
-                  title={captcha.available === false ? 'Captcha is unavailable -- cannot force on.' : undefined}
-                  className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-md border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
-                    captcha.manualOverride === true && captcha.available !== false
-                      ? 'bg-red-100 dark:bg-red-900 border-red-300 dark:border-red-700 text-red-700 dark:text-red-300'
-                      : 'border-border hover:bg-accent/50'
-                  }`}
-                >
-                  <ToggleRight className="w-3.5 h-3.5" />
-                  Force ON
-                </button>
-                <button
-                  onClick={() => setCaptchaMode('off')}
-                  disabled={captchaLoading}
-                  className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-md border transition-colors ${
+                <SegmentedControl<'on' | 'off' | 'auto' | 'none'>
+                  label="Captcha mode"
+                  size="compact"
+                  value={
                     captcha.manualOverride === false
-                      ? 'bg-green-100 dark:bg-green-900 border-green-300 dark:border-green-700 text-green-700 dark:text-green-300'
-                      : 'border-border hover:bg-accent/50'
-                  }`}
-                >
-                  <ToggleLeft className="w-3.5 h-3.5" />
-                  Force OFF
-                </button>
-                <button
-                  onClick={() => setCaptchaMode('auto')}
-                  disabled={captchaLoading || captcha.available === false}
-                  title={captcha.available === false ? 'Captcha is unavailable -- auto detection has nothing to enable.' : undefined}
-                  className={`flex items-center gap-1.5 px-3 py-2 text-xs font-medium rounded-md border transition-colors disabled:opacity-50 disabled:cursor-not-allowed ${
-                    captcha.manualOverride === null && captcha.available !== false
-                      ? 'bg-blue-100 dark:bg-blue-900 border-blue-300 dark:border-blue-700 text-blue-700 dark:text-blue-300'
-                      : 'border-border hover:bg-accent/50'
-                  }`}
-                >
-                  <Activity className="w-3.5 h-3.5" />
-                  Auto (spike detection)
-                </button>
+                      ? 'off'
+                      : captcha.available === false
+                        ? 'none'
+                        : captcha.manualOverride === true
+                          ? 'on'
+                          : 'auto'
+                  }
+                  onChange={mode => {
+                    if (mode !== 'none') setCaptchaMode(mode)
+                  }}
+                  options={[
+                    {
+                      value: 'on',
+                      label: 'Force ON',
+                      icon: <ToggleRight className="w-3.5 h-3.5" />,
+                      disabled: captchaLoading || captcha.available === false,
+                      title: captcha.available === false ? 'Captcha is unavailable -- cannot force on.' : undefined,
+                    },
+                    {
+                      value: 'off',
+                      label: 'Force OFF',
+                      icon: <ToggleLeft className="w-3.5 h-3.5" />,
+                      disabled: captchaLoading,
+                    },
+                    {
+                      value: 'auto',
+                      label: 'Auto (spike detection)',
+                      icon: <Activity className="w-3.5 h-3.5" />,
+                      disabled: captchaLoading || captcha.available === false,
+                      title: captcha.available === false ? 'Captcha is unavailable -- auto detection has nothing to enable.' : undefined,
+                    },
+                  ]}
+                />
                 {captchaLoading && <Loader2 className="w-4 h-4 animate-spin text-muted-foreground self-center" />}
               </div>
 

@@ -80,6 +80,7 @@ vi.mock('@meshsdk/core', () => ({
 
 vi.stubEnv('SUPABASE_URL', 'https://test.supabase.co')
 vi.stubEnv('SUPABASE_KEY', 'test-anon-key')
+vi.stubEnv('SUPABASE_SECRET_KEY_LOCALHOST', 'sb_secret_offline-wallet-credential')
 
 // ─── Test constants ─────────────────────────────────────────
 
@@ -519,6 +520,74 @@ describe('Wallet Auth Routes', () => {
 
       // Should NOT have called createUser since user already exists
       expect(mockCreateUser).not.toHaveBeenCalled()
+    })
+
+    it('stale-credential recovery keeps redirect_to_user_id for a merged wallet user (#35)', async () => {
+      const GOOGLE_USER_ID = '7d9f0c1e-2b3a-4c5d-8e6f-a1b2c3d4e5f6'
+      mockCheckSignature.mockReturnValue(true)
+
+      // Derived credential no longer matches (e.g. JWT_SECRET rotated)
+      mockSignInWithPassword.mockResolvedValueOnce({
+        data: { session: null, user: null },
+        error: { message: 'Invalid login credentials' },
+      })
+      // Wallet is owned by the surviving Google account
+      mockMaybeSingle.mockResolvedValue({
+        data: { id: GOOGLE_USER_ID, display_name: 'Google User', account_type: 'google', email: 'g@example.com', wallet_address: VALID_MAINNET_ADDR, roles: ['user'] },
+        error: null,
+      })
+      mockCreateUser.mockResolvedValue({
+        data: { user: null },
+        error: { code: 'email_exists', message: 'already registered' },
+      })
+      mockGenerateLink.mockResolvedValue({
+        data: {
+          user: {
+            id: MOCK_USER_ID,
+            app_metadata: {
+              provider: 'email',
+              account_type: 'cardano',
+              wallet_address: VALID_MAINNET_ADDR,
+              redirect_to_user_id: GOOGLE_USER_ID,
+            },
+          },
+        },
+        error: null,
+      })
+      mockUpdateUserById.mockResolvedValue({ data: { user: { id: MOCK_USER_ID } }, error: null })
+      mockUpdate.mockReturnThis()
+      mockEq.mockReturnThis()
+      mockSignInWithPassword.mockResolvedValueOnce({
+        data: {
+          session: {
+            access_token: 'recovered-access-token',
+            refresh_token: 'recovered-refresh-token',
+            expires_in: 3600,
+            expires_at: Math.floor(Date.now() / 1000) + 3600,
+          },
+          user: { id: MOCK_USER_ID },
+        },
+        error: null,
+      })
+
+      const res = await request(app)
+        .post('/api/auth/wallet/verify')
+        .send({
+          address: VALID_MAINNET_ADDR,
+          nonce: challengeNonce,
+          signature: MOCK_SIGNATURE,
+          key: MOCK_KEY,
+        })
+
+      expect(res.status).toBe(200)
+      expect(res.body.session.access_token).toBe('recovered-access-token')
+      expect(mockUpdateUserById).toHaveBeenCalledTimes(1)
+      const [updatedId, attrs] = mockUpdateUserById.mock.calls[0] as [string, { password?: unknown; app_metadata?: Record<string, unknown> }]
+      expect(updatedId).toBe(MOCK_USER_ID)
+      expect(typeof attrs.password).toBe('string')
+      expect(attrs.app_metadata?.redirect_to_user_id).toBe(GOOGLE_USER_ID)
+      expect(attrs.app_metadata?.wallet_address).toBe(VALID_MAINNET_ADDR)
+      expect(attrs.app_metadata?.account_type).toBe('cardano')
     })
 
     it('should pass the correct signed message to checkSignature', async () => {

@@ -95,3 +95,87 @@ ALTER TABLE public.users
 
 -- END SOURCE: 059_managed_wallet.sql
 
+
+-- BEGIN SOURCE: 033_account_merge_tokens.sql
+-- Single-use, short-lived account merge tokens. Only a SHA-256 hash of the token is stored.
+CREATE TABLE IF NOT EXISTS public.account_merge_tokens (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  token_hash TEXT NOT NULL UNIQUE,
+  source_user_id UUID NOT NULL REFERENCES public.users(id) ON DELETE CASCADE,
+  source_account_type TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_account_merge_tokens_expires_at
+  ON public.account_merge_tokens(expires_at);
+CREATE INDEX IF NOT EXISTS idx_account_merge_tokens_source_user_id
+  ON public.account_merge_tokens(source_user_id);
+
+ALTER TABLE public.account_merge_tokens ENABLE ROW LEVEL SECURITY;
+REVOKE ALL ON public.account_merge_tokens FROM anon, authenticated;
+GRANT SELECT, INSERT, DELETE ON public.account_merge_tokens TO service_role;
+
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE schemaname = 'public' AND tablename = 'account_merge_tokens'
+      AND policyname = 'Deny direct client access to account merge tokens'
+  ) THEN
+    CREATE POLICY "Deny direct client access to account merge tokens"
+      ON public.account_merge_tokens FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $$;
+-- END SOURCE: 033_account_merge_tokens.sql
+
+-- BEGIN SOURCE: 031_auth_trusted_app_metadata.sql
+-- Backfill identity-linking fields into auth.users.raw_app_meta_data.
+--
+-- The API now reads wallet_address, account_type and redirect_to_user_id ONLY from
+-- app_metadata (service-role writable). raw_user_meta_data is user-writable through
+-- supabase.auth.updateUser, so it is never copied as-is: every value below comes from
+-- server-controlled data (public.users rows, or the server-generated account emails).
+--
+-- Legacy redirect_to_user_id values in raw_user_meta_data are intentionally NOT copied.
+-- Those came from wallets unlinked while signed in with the wallet session; such
+-- sessions must sign in with Google again.
+--
+-- Run as the database owner (Supabase SQL editor). Idempotent: only fills missing keys.
+
+DO $$
+BEGIN
+  -- 1. Accounts with a profile row: account_type and wallet_address from public.users.
+  UPDATE auth.users AS au
+  SET raw_app_meta_data = COALESCE(au.raw_app_meta_data, '{}'::jsonb)
+    || jsonb_build_object('account_type', u.account_type)
+    || CASE WHEN u.wallet_address IS NOT NULL
+         THEN jsonb_build_object('wallet_address', u.wallet_address)
+         ELSE '{}'::jsonb END
+  FROM public.users AS u
+  WHERE u.id = au.id
+    AND u.account_type IS NOT NULL
+    AND NOT (COALESCE(au.raw_app_meta_data, '{}'::jsonb) ? 'account_type');
+
+  -- 2. Merged wallet logins (no profile row of their own): keep the wallet link only when
+  --    the server-generated email matches the wallet and a surviving profile owns it.
+  UPDATE auth.users AS au
+  SET raw_app_meta_data = COALESCE(au.raw_app_meta_data, '{}'::jsonb)
+    || jsonb_build_object('account_type', 'cardano', 'wallet_address', au.raw_user_meta_data->>'wallet_address')
+  WHERE au.email = 'wallet-' || left(au.raw_user_meta_data->>'wallet_address', 20) || '@cardano.wallet'
+    AND NOT EXISTS (SELECT 1 FROM public.users u WHERE u.id = au.id)
+    AND EXISTS (SELECT 1 FROM public.users u WHERE u.wallet_address = au.raw_user_meta_data->>'wallet_address')
+    AND NOT (COALESCE(au.raw_app_meta_data, '{}'::jsonb) ? 'wallet_address');
+
+  -- 3. Server-created accounts that have not created a profile yet: type from the email.
+  UPDATE auth.users AS au
+  SET raw_app_meta_data = COALESCE(au.raw_app_meta_data, '{}'::jsonb)
+    || jsonb_build_object('account_type',
+         CASE
+           WHEN au.email LIKE 'traveler-%@guest.local' THEN 'traveler'
+           WHEN au.email LIKE 'managed-%@wallet.local' THEN 'managed_cardano'
+         END)
+  WHERE (au.email LIKE 'traveler-%@guest.local' OR au.email LIKE 'managed-%@wallet.local')
+    AND NOT EXISTS (SELECT 1 FROM public.users u WHERE u.id = au.id)
+    AND NOT (COALESCE(au.raw_app_meta_data, '{}'::jsonb) ? 'account_type');
+END $$;
+-- END SOURCE: 031_auth_trusted_app_metadata.sql

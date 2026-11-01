@@ -1,200 +1,127 @@
 ---
 name: open-source-pipeline
-description: Manage the curated private -> public repo sync pipeline for occasional open-source releases
+description: Runs the curated private to public repo sync for occasional open-source releases of Coordination Manager - sync ledger, exclusion list, scrub and safety greps, sync branch and public PR, divergence rules. Use when asked to publish a public release, sync the public repo, open-source the latest version, add a private-only exclusion pattern, audit what a sync would expose, or investigate a sync leak. Not for private branching (github-workflow), history scrubbing or first-release readiness checklists (security-hardening), or dependency hygiene (supply-chain-security).
 ---
 
 # open-source-pipeline
 
-## Purpose
+Private repo `whitevo/Coordination-Manager` drives production. Public repo
+`whitevo/Coordination-Manager-Public-Clean` is a curated snapshot, not a mirror. Sync is
+occasional and milestone-driven (typically every 4-12 weeks or per grant deliverable);
+every release is a reviewed PR from one sync branch `sync/public-YYYY-MM-DD-HHmmss`.
 
-Coordination Manager is developed in a private repo (`whitevo/Coordination-Manager`) that
-drives the live production deployment. The public repo
-(`whitevo/coordination-manager-public`) is a **curated snapshot**, not a continuous
-mirror -- published occasionally to share new features and demonstrate the platform's
-architecture to the open-source / Cardano governance audience.
+## Local-only safety boundary
 
-This skill owns that release pipeline: when to publish, what to exclude, how to scrub,
-how to push, and how to keep the two repos diverging safely.
+`scripts/release-open-source-loop.ps1` is the publication workflow, not a dry run.
+All aliases (`prepare:public-pr`, `release:loop`, `release:loop:no-ci`,
+`release:loop:prep`) install dependencies, commit working changes, push private and
+public branches, and create a public PR. The prep variant only skips GitHub Actions
+and live API checks; it STILL pushes.
 
-## Current Reference Sources
-
-- Public sync exclusions: [references/public-sync-exclusions.md](references/public-sync-exclusions.md)
-- Public sync ledger: [references/public-sync-ledger.md](references/public-sync-ledger.md)
-- Open-source checklist: [.claude/skills/security-hardening/references/open-source-checklist.md](../security-hardening/references/open-source-checklist.md)
-- Security test catalog: [.claude/skills/security-hardening/references/security-test-catalog.md](../security-hardening/references/security-test-catalog.md)
-- Platform settings: [.claude/skills/security-hardening/references/platform-settings.md](../security-hardening/references/platform-settings.md)
-- Gitleaks rationale: [.claude/skills/security-hardening/references/gitleaks-rationale.md](../security-hardening/references/gitleaks-rationale.md)
-
-Use those files as the current source of truth when preparing a first public release.
-
-## Sync Ledger (Required)
-
-Maintain [references/public-sync-ledger.md](references/public-sync-ledger.md) as the anchor
-for each release cycle. This avoids re-reviewing the full repository every time.
-
-Each row records:
-- last private base SHA reviewed for public release planning
-- sync branch used for that cycle
-- private commit used as snapshot source
-- resulting public PR and merge SHA (once merged)
-- net added/removed file counts and notes
-
-Before starting a new public sync:
-- read the latest ledger row
-- use that row's `private_base_sha` as the lower bound for file-diff and exclusion review
-- only audit newly added paths since that SHA
-
-## When to Use
-
-- User asks to "publish a public release", "sync the public repo", "open-source the latest version"
-- Preparing a milestone snapshot for governance / grant deliverables
-- Adding a new private-only file pattern that must be excluded from future syncs
-- Auditing what would be exposed if a sync ran today
-- Onboarding a contributor to the public/private split
-- Investigating a leak or near-leak from a previous sync
-
-Do NOT use this skill for: routine private-repo branching (use `github-workflow`),
-secret scrubbing in git history (use `security-hardening`), or dependency hygiene
-(use `supply-chain-security`).
-
-## Inputs
-
-| Input | Source | Required |
-|-------|--------|----------|
-| Trigger | Milestone release, feature showcase, or governance deliverable | yes |
-| Source commit | Private `main` short SHA | yes |
-| New exclusion patterns | Files added since last sync that are private-only | no |
-| Public-only files to preserve | LICENSE, CONTRIBUTING.md, .github templates | yes (auto) |
-
-## Release Cadence
-
-- **Driver**: live production updates land on private `main` continuously
-- **Public sync**: occasional, milestone-driven (typically every 4-12 weeks or per grant deliverable)
-- **NOT a mirror**: never auto-push private commits; every public release is a reviewed PR
-- **Single sync branch per release**: `sync/public-YYYY-MM`
+For local-only hygiene use read-only git inspection and
+`powershell -NoProfile -ExecutionPolicy Bypass -File scripts/test-public-sync-exclusions.ps1`.
+Do not run the release loop, switch branches, or stage unrelated changes on a shared
+dirty worktree. Publication steps below require separate authorization.
 
 ## Workflow
 
-1. **Pre-flight checks** (on private `main`):
-   - Confirm clean working tree: `git status`
-   - Confirm CI green on latest `main`
-   - Run `gitleaks detect` against the working tree (not just history)
-    - Read last entry in [references/public-sync-ledger.md](references/public-sync-ledger.md)
-       and set `LAST_SYNC_PRIVATE_SHA=<private_base_sha>`
-   - Review file additions since last sync:
+Checklist (copy and tick):
+
+```
+- [ ] 1 Pre-flight (clean tree, CI green, gitleaks, ledger read, new-file review)
+- [ ] 2 Exclusion list updated and committed to private main
+- [ ] 3 Public-only divergences resolved
+- [ ] 4 Publication workflow run (authorized only), all safety greps return zero
+- [ ] 5 Post-merge tasks and ledger row
+```
+
+1. **Pre-flight** (private `main`):
+   - Confirm clean tree (`git status`) and CI green on latest `main`.
+   - Run `gitleaks detect` against the working tree, not just history. Any finding: STOP and remediate.
+   - Read the latest row of [references/public-sync-ledger.md](references/public-sync-ledger.md);
+     set `LAST_SYNC_PRIVATE_SHA=<private_base_sha>` as the lower bound for review. A provisional
+     baseline is not proof of a previous safety review, so also check the whole curated index
+     against current policy.
+   - List new files:
      ```powershell
-       git log --name-only --pretty=format: <LAST_SYNC_PRIVATE_SHA>..HEAD | Sort-Object -Unique
+     git log --name-only --pretty=format: <LAST_SYNC_PRIVATE_SHA>..HEAD | Sort-Object -Unique
      ```
-   - For each new file, decide: ship publicly OR add to
-     [references/public-sync-exclusions.md](references/public-sync-exclusions.md)
+   - For each new file: ship publicly OR add to
+     [references/public-sync-exclusions.md](references/public-sync-exclusions.md).
 
-2. **Update the exclusion list FIRST** if any new private-only patterns exist:
-   - Edit [references/public-sync-exclusions.md](references/public-sync-exclusions.md)
-   - Add pattern + reason to the matching category
-   - Add a corresponding safety-check grep at the bottom
-   - Commit to private `main` BEFORE starting the sync branch
+2. **Update the exclusion list FIRST** if new private-only patterns exist:
+   - Edit [references/public-sync-exclusions.md](references/public-sync-exclusions.md): add pattern + reason
+     to the matching category, plus a corresponding safety-check grep at the bottom.
+   - Update the matching pattern in `scripts/release-open-source-loop.ps1` and regression
+     cases in `scripts/test-public-sync-exclusions.ps1`.
+   - Commit to private `main` BEFORE starting an authorized publication.
 
-3. **Create the sync branch from the public repo**:
+3. **Resolve explicit public-only divergences before publication**:
+   - Private source is authoritative for governance files (`LICENSE`, `CONTRIBUTING.md`,
+     `.github` workflows/templates). Nothing is restored from `public/main` by default; never
+     restore the whole `.github` folder over private source.
+   - If a divergence is listed in the exclusions reference, STOP and arrange a reviewed,
+     narrowly scoped preservation step. The script does not implement divergence restoration.
+
+4. **Run the authorized publication workflow** from a dedicated clean worktree:
    ```powershell
-   git fetch public
-   git checkout -b sync/public-YYYY-MM public/main
+   pnpm prepare:public-pr
    ```
+   - Script: runs preflight/readiness checks, checkpoints working changes, pushes private
+     source, checks CI/live API status; fetches `public`, creates a timestamped sync branch
+     from `public/main`, clears its tracked tree, snapshots private source; removes
+     exclusions and asserts every configured pattern; then commits, pushes, and creates the PR.
+   - The local `_sync-report-YYYY-MM-DD.md` is the PR description, deleted by script
+     cleanup. It must never be committed (excluded at repo root).
+   - Before pushing any sync branch, run every check in
+     [references/public-sync-exclusions.md](references/public-sync-exclusions.md#safety-checks-before-pushing-the-sync-branch);
+     each must return zero matches, including the content grep for personal emails and
+     absolute local paths (fix or scrub hits). Confirm `.env.example` files are complete and accurate for
+     public consumers (see `environment-variables`). Also spot check that no PR diff file matches an exclusion
+     and the sync report lists added/removed/preserved files.
+   - If any stage fails, fix and restart from stage 1 (only when publication is authorized).
 
-4. **Snapshot the private tree**:
-   ```powershell
-   # Copy the entire private main on top
-   git checkout main -- .
-   ```
-6. **Restore public-only files**:
-   ```powershell
-   git checkout public/main -- LICENSE CONTRIBUTING.md .github
-   ```
+5. **Post-merge**:
+   - Tag a GitHub Release on the public repo with feature highlights.
+   - Update `docs/public/PRIVACY_POLICY.md` and `TERMS_OF_SERVICE.md` if public-repo link semantics changed.
+   - Re-run `gitleaks detect` on the public repo as a backstop.
+   - Append a ledger row to [references/public-sync-ledger.md](references/public-sync-ledger.md): branch,
+     source SHA, PR URL, public merge SHA, net file counts, review notes. Archive the report locally if needed.
 
-7. **Run all safety checks** from
-   [references/public-sync-exclusions.md](references/public-sync-exclusions.md#safety-checks-before-pushing-the-sync-branch).
-   Each grep must return zero results. If any returns results: STOP, update exclusions, restart from step 3.
+## Shipped publicly (deliberate, currently true)
 
-8. **Write a local sync report** (audit trail, NOT committed):
-   - Filename: `_sync-report-YYYY-MM-DD.md` at repo root (matches `_*` exclusion pattern)
-   - Content: added files, removed files, preserved public-only files, source SHA
-   - Use it as the PR description body
+These are NOT in the exclusion list and ship to the public repo on purpose:
+`.claude/settings.json` and `.claude/skills/**` (incl. this skill and its ledger),
+`.claude/rules/**`, root `CLAUDE.md`, `docs/proposals/**`, `docs/public/**`.
+Do not add them to the exclusions without a user decision. Review each sync for
+private references inside them (see the content grep in the exclusions reference).
+`docs/proposals/` needs a per-sync content review before publication.
 
-9. **Commit and push**:
-   ```powershell
-   git commit -m "sync: bring public up to private @<short-sha>"
-   git push public sync/public-YYYY-MM
-   gh pr create --repo whitevo/coordination-manager-public --base main --head sync/public-YYYY-MM `
-     --title "Public sync YYYY-MM" --body-file _sync-report-YYYY-MM-DD.md
-   ```
+## Divergence rules
 
-10. **Post-merge tasks**:
-    - Tag a GitHub Release on the public repo with feature highlights
-    - Update `docs/public/PRIVACY_POLICY.md` and `TERMS_OF_SERVICE.md` if the public-repo
-      link semantics changed
-    - Record the merged sync SHA in `_sync-report-YYYY-MM-DD.md` and archive locally
-    - Re-run `gitleaks detect` on the public repo as a backstop
-      - Append a new row to [references/public-sync-ledger.md](references/public-sync-ledger.md)
-         with the branch, source SHA, PR URL, public merge SHA, and review notes
+- Governance files live in private source and sync forward; public-only divergences need an
+  explicit exclusions-reference entry and a reviewed preservation step.
+- Private-only files are listed in the exclusions reference and stripped every sync.
+- Shared files flow private -> public only. If a public contributor opens a PR, port the
+  change manually into private `main`; do NOT pull `public/main` into private.
 
-## Divergence Rules
+## Gotchas
 
-- **Public-only files** live ONLY on `public/main` and are restored every sync:
-  `LICENSE`, `CONTRIBUTING.md`, `.github/ISSUE_TEMPLATE/**`, `.github/PULL_REQUEST_TEMPLATE.md`
-- **Private-only files** are listed in
-  [references/public-sync-exclusions.md](references/public-sync-exclusions.md) and stripped every sync
-- **Shared files** (everything else) flow private -> public only, never the reverse
-- If a public contributor opens a PR, port the change manually into private `main` -- do NOT pull `public/main` into private
+- NEVER push private `main` directly to `public`; NEVER force push `public/main`.
+- Treat every sync as irreversible publication; assume it is mirrored elsewhere.
+- Update the exclusions reference before the sync that needs the new pattern.
 
-## Current Repo Surfaces
+## Key files
 
-- Private development source: `Code/`
-- Public-ready docs and release notes: `docs/proposals/`
-- Internal-only release reports: `docs/private/*_REPORT_*.md`
-- Public sync exclusions: `.claude/skills/open-source-pipeline/references/public-sync-exclusions.md`
+- `scripts/release-open-source-loop.ps1` - publication workflow
+- `scripts/test-public-sync-exclusions.ps1` - exclusion regression tests (read-only)
+- `docs/proposals/` - public-ready docs and release notes
+- `docs/private/*_REPORT_*.md` - internal-only release reports
+- `.claude/skills/security-hardening/references/` - `open-source-checklist.md`,
+  `security-test-catalog.md`, `platform-settings.md`, `gitleaks-rationale.md`; source of truth
+  for a first public release (use it instead of this skill for readiness checks)
 
-## Outputs
+## References
 
-| Output | Format | Location |
-|--------|--------|----------|
-| Sync branch | git branch | `public/sync/public-YYYY-MM` |
-| Sync PR | GitHub PR | `whitevo/coordination-manager-public` |
-| Sync report | .md | `_sync-report-YYYY-MM-DD.md` (local, not committed) |
-| Updated exclusion list | .md | [references/public-sync-exclusions.md](references/public-sync-exclusions.md) |
-| Release notes | GitHub Release | Public repo |
-
-## Constraints
-
-- NEVER push private `main` directly to `public` -- always via reviewed sync branch
-- NEVER force push to `public/main`
-- NEVER commit the `_sync-report-*.md` file (the `_*` prefix matches the exclusion convention)
-- NEVER pull from `public/main` into private `main` (one-way flow, except for public-only files restored during sync)
-- ALWAYS update `references/public-sync-exclusions.md` before the sync that needs the new pattern
-- ALWAYS run every safety-check grep before pushing the sync branch
-- If gitleaks reports any finding: STOP and remediate before continuing
-- Treat every sync as an irreversible publication -- once pushed, assume it is mirrored elsewhere
-
-## Self-Validation
-
-### Trigger Indicators
-- User says "sync public", "release public", "open-source update", "publish snapshot"
-- User adds files matching `_*`, `*-REVIEW.md`, `*-INTERNAL.md`, or under `tools/`
-- User asks "what would the public repo see if we synced today?"
-
-### Completion Markers
-- Sync PR opened on public repo with sync report as description
-- All safety-check greps returned zero results
-- Exclusion list updated for any new private-only patterns
-- Public-only files (LICENSE, CONTRIBUTING.md, .github templates) preserved
-
-### Quality Signals
-- Zero gitleaks findings on the pushed branch
-- No file in the PR diff matches an exclusion pattern (spot check)
-- Sync report enumerates added/removed/preserved files
-- Public repo release tagged with human-readable feature summary
-
-## Related Skills
-
-- `security-hardening` -- one-time scrub before the very first public release (git history, secrets)
-- `github-workflow` -- private repo branching, commit conventions
-- `supply-chain-security` -- pin actions, audit dependencies before publishing
-- `environment-variables` -- ensure `.env.example` files are complete and accurate for public consumers
+- [references/public-sync-exclusions.md](references/public-sync-exclusions.md) - read when deciding what to exclude or running safety greps
+- [references/public-sync-ledger.md](references/public-sync-ledger.md) - read when starting or recording a sync

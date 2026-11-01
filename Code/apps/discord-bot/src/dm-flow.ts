@@ -51,7 +51,8 @@ export function wrapUrlsForEmbed(text: string): string {
   // Skip markdown links [text](url) — they don't generate embeds in Discord,
   // and wrapping to [text](<url>) causes the > to leak as visible text in DMs.
   // Only wrap bare URLs (not inside markdown links or already wrapped in <>).
-  const markdownLinkRe = /\[([^\]]*?)\]\((https?:\/\/[^)]+)\)/g
+  // Bracket/paren exclusions keep scanning linear (no catastrophic backtracking).
+  const markdownLinkRe = /\[([^\][]*)\]\((https?:\/\/[^()]+)\)/g
   const placeholders: string[] = []
   let placeholdered = text.replace(markdownLinkRe, (match) => {
     placeholders.push(match)

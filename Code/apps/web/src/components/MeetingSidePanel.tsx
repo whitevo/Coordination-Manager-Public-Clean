@@ -2,24 +2,54 @@ import { useState, useEffect, useRef, useId } from 'react'
 import { format, parse, addWeeks } from 'date-fns'
 import {
   Calendar, ChevronDown, Repeat2, X, Link as LinkIcon,
-  FileText, Copy, Clock, Check, ExternalLink, Loader2, Video, AlertCircle, Pencil
+  FileText, Copy, Clock, Check, ExternalLink, Loader2, Video, AlertCircle, Pencil, Trash2
 } from 'lucide-react'
 import { apiClient } from '../lib/api-client'
 import { isSafeUrl } from '../lib/calendar-utils'
+import { OVERLAY_BASE_Z, OVERLAY_LAYER_CLASS } from '../lib/overlay-layers'
 import { useAuth } from '../contexts/AuthContext'
 import { useTimezones } from '../lib/use-timezones'
 import { formatUtcTimeWithPeriodInTimezone } from '../lib/timezone-data'
 import { getWeekdayIndexFromIsoDate } from '../lib/recurrence'
 import type { RecurrenceRule, RecurrenceType, RecurrenceUnit, RecurrenceEndType } from '../lib/recurrence'
 import LearnerHelpIcon from './LearnerHelpIcon'
+import { useToast } from './Toast'
+import { Button } from './ui/Button'
+import { Disclosure } from './ui/Disclosure'
+import { IconButton } from './ui/IconButton'
+import { SegmentedControl } from './ui/SegmentedControl'
+import { ToggleButton } from './ui/ToggleButton'
 
 // Removed standalone formatTimeWithPeriod -- uses formatUtcTimeWithPeriodInTimezone via hook
+
+const DETAILS_HEIGHT_SESSION_KEY = 'cm-meeting-details-height'
+// Roughly 10 lines of text at the panel font size
+const DETAILS_MIN_HEIGHT_PX = 240
+const DETAILS_MAX_HEIGHT_PX = 520
+
+function clampDetailsHeight(value: number): number {
+  return Math.min(DETAILS_MAX_HEIGHT_PX, Math.max(DETAILS_MIN_HEIGHT_PX, Math.round(value)))
+}
+
+function loadCachedDetailsHeight(): number {
+  try {
+    const saved = sessionStorage.getItem(DETAILS_HEIGHT_SESSION_KEY)
+    if (!saved) return DETAILS_MIN_HEIGHT_PX
+    const parsed = Number(saved)
+    if (!Number.isFinite(parsed)) return DETAILS_MIN_HEIGHT_PX
+    return clampDetailsHeight(parsed)
+  } catch {
+    return DETAILS_MIN_HEIGHT_PX
+  }
+}
 
 interface MeetingSidePanelProps {
   isOpen: boolean
   cellId: string | null
   widthClassName?: string
   mobileOverlay?: boolean
+  /** z-index of the mobile overlay, resolved by the caller's drawer layer claim. */
+  mobileOverlayZ?: number
   title: string
   duration: number
   recurrenceRule: RecurrenceRule
@@ -34,8 +64,10 @@ interface MeetingSidePanelProps {
   defaultGoogleSourceId?: string
   calendarName?: string
   hideDateNumbers?: boolean
+  existingTitles: string[]
   existingLinks: string[]
   existingDescriptions: string[]
+  onClearReusableLinks?: () => void
   onSave: (data: {
     title: string
     duration: number
@@ -52,6 +84,7 @@ export default function MeetingSidePanel({
   cellId,
   widthClassName = 'w-80 min-w-[20rem]',
   mobileOverlay = false,
+  mobileOverlayZ = OVERLAY_BASE_Z.drawer,
   title,
   duration,
   recurrenceRule,
@@ -66,8 +99,10 @@ export default function MeetingSidePanel({
   defaultGoogleSourceId,
   calendarName,
   hideDateNumbers,
+  existingTitles,
   existingLinks,
   existingDescriptions,
+  onClearReusableLinks,
   onSave,
   onCancel,
   onCellIdChange,
@@ -88,7 +123,9 @@ export default function MeetingSidePanel({
   const [localRecurrenceRule, setLocalRecurrenceRule] = useState<RecurrenceRule>(recurrenceRule)
   const [localLink, setLocalLink] = useState(meetingLink)
   const [localDescription, setLocalDescription] = useState(description)
+  const [detailsHeightPx, setDetailsHeightPx] = useState<number>(loadCachedDetailsHeight)
   const [showRecurrence, setShowRecurrence] = useState(recurrenceRule.type !== 'none')
+  const detailsTextareaRef = useRef<HTMLTextAreaElement>(null)
 
   // ─── Google Meet generation state ────────────────────────────
   const effectiveSourceId = defaultGoogleSourceId || (googleOAuthSources.length > 0 ? googleOAuthSources[0].id : '')
@@ -171,6 +208,10 @@ export default function MeetingSidePanel({
     // eslint-disable-next-line react-hooks/exhaustive-deps -- intentionally re-sync local state when the selected meeting is opened
   }, [cellId, isOpen])
 
+  useEffect(() => {
+    setLocalLink(meetingLink)
+  }, [meetingLink])
+
   // Sync duration when it changes externally (e.g. user drags on grid to extend)
   useEffect(() => {
     setLocalDuration(duration)
@@ -241,10 +282,60 @@ export default function MeetingSidePanel({
   const [localDate, setLocalDate] = useState(dateStr)
   const [localTime, setLocalTime] = useState(timeStr)
   const dateInputRef = useRef<HTMLInputElement>(null)
+  const timeInputRef = useRef<HTMLInputElement>(null)
+  const timePickerRef = useRef<HTMLDivElement>(null)
+  const timePickerButtonRef = useRef<HTMLButtonElement>(null)
+  const [isTimePickerOpen, setIsTimePickerOpen] = useState(false)
+  const { showToast } = useToast()
+  const hasDatePicker = typeof HTMLInputElement !== 'undefined' && 'showPicker' in HTMLInputElement.prototype
+  const hasDateTimeChanges = localDate !== dateStr || localTime !== timeStr
+  const isLocalTimeValid = /^([01]\d|2[0-3]):[0-5]\d$/.test(localTime)
+  const canApplyDateTime = hasDateTimeChanges && Boolean(localDate && isLocalTimeValid && onCellIdChange)
+  const [selectedHour = '00', selectedMinute = '00'] = (isLocalTimeValid ? localTime : timeStr).split(':')
+  const minuteOffset = Number(timeStr.split(':')[1]) % timeInterval
+  const minuteOptions = Array.from(
+    { length: Math.ceil((60 - minuteOffset) / timeInterval) },
+    (_, index) => String(minuteOffset + index * timeInterval).padStart(2, '0'),
+  )
   const meetingDate = parse(dateStr, 'yyyy-MM-dd', new Date())
+
+  const closeTimePicker = () => {
+    setIsTimePickerOpen(false)
+    timePickerButtonRef.current?.focus()
+  }
+
+  useEffect(() => {
+    if (!isTimePickerOpen) return
+
+    timePickerRef.current?.querySelector<HTMLButtonElement>('[aria-pressed="true"]')?.focus()
+    const dismissOutside = (event: PointerEvent) => {
+      if (event.target instanceof Node && !timePickerRef.current?.contains(event.target) && !timePickerButtonRef.current?.contains(event.target)) {
+        setIsTimePickerOpen(false)
+      }
+    }
+    document.addEventListener('pointerdown', dismissOutside)
+    return () => document.removeEventListener('pointerdown', dismissOutside)
+  }, [isTimePickerOpen])
+
+  useEffect(() => {
+    setIsTimePickerOpen(false)
+  }, [cellId, isOpen, isEditingDateTime])
 
   // Check if the current displayed date+time is in the past
   const isDateInPast = new Date(`${dateStr}T${timeStr}:00Z`) < new Date()
+
+  const persistDetailsHeight = () => {
+    const currentHeight = detailsTextareaRef.current?.clientHeight
+    if (!currentHeight) return
+
+    const nextHeight = clampDetailsHeight(currentHeight)
+    setDetailsHeightPx(nextHeight)
+    try {
+      sessionStorage.setItem(DETAILS_HEIGHT_SESSION_KEY, String(nextHeight))
+    } catch {
+      // ignore storage failures (private mode / quota / policy)
+    }
+  }
 
   const handleSave = () => {
     const roundedDuration = Math.max(timeInterval, Math.round(localDuration / timeInterval) * timeInterval)
@@ -262,10 +353,11 @@ export default function MeetingSidePanel({
       className={`
         overflow-hidden transition-all duration-300 ease-in-out
         ${mobileOverlay
-          ? `fixed inset-y-0 left-0 z-[94] h-screen w-screen transform ${isOpen ? 'translate-x-0 pointer-events-auto' : '-translate-x-full pointer-events-none'}`
+          ? `fixed inset-y-0 left-0 h-screen w-screen transform ${isOpen ? 'translate-x-0 pointer-events-auto' : '-translate-x-full pointer-events-none'}`
           : `shrink-0 sticky top-0 h-screen ${isOpen ? widthClassName : 'w-0'}`
         }
       `}
+      style={mobileOverlay ? { zIndex: mobileOverlayZ } : undefined}
     >
       <div className={`${mobileOverlay ? 'w-screen min-w-full' : widthClassName} h-full flex flex-col bg-card border-r-2 border-primary/40 shadow-xl`}>
       {/* Header */}
@@ -273,97 +365,215 @@ export default function MeetingSidePanel({
         <h3 className="text-sm font-bold text-foreground flex items-center gap-2">
           <Calendar className="w-4 h-4 text-primary" />
           {isEditing ? 'Edit Meeting' : 'New Meeting'}
-          <LearnerHelpIcon size={4} description={<><p className="font-semibold text-blue-700 dark:text-blue-300 mb-1">Meeting Configuration</p><p className="mb-1.5">This panel lets you configure a confirmed meeting on the calendar. Meetings are placed on specific time slots that you clicked on the grid.</p><p className="font-semibold text-blue-700 dark:text-blue-300 mb-1">What you can set</p><ul className="list-disc list-inside space-y-0.5"><li><strong>Duration</strong> — how long the meeting lasts.</li><li><strong>Meeting link</strong> — a Zoom, Google Meet, or other URL.</li><li><strong>Description</strong> — agenda or notes for attendees.</li><li><strong>Recurrence</strong> — repeat weekly, biweekly, or monthly.</li></ul></>} />
+          <LearnerHelpIcon size={4} description={<><p className="font-semibold text-info mb-1">Meeting Configuration</p><p className="mb-1.5">This panel lets you configure a confirmed meeting on the calendar. Meetings are placed on specific time slots that you clicked on the grid.</p><p className="font-semibold text-info mb-1">What you can set</p><ul className="list-disc list-inside space-y-0.5"><li><strong>Duration</strong> — how long the meeting lasts.</li><li><strong>Meeting link</strong> — a Zoom, Google Meet, or other URL.</li><li><strong>Description</strong> — agenda or notes for attendees.</li><li><strong>Recurrence</strong> — repeat weekly, biweekly, or monthly.</li></ul></>} />
         </h3>
-        <button
+        <IconButton
           onClick={onCancel}
-          className="p-1 rounded-md hover:bg-muted transition-colors text-muted-foreground hover:text-foreground"
-        >
-          <X className="w-4 h-4" />
-        </button>
+          label="Close"
+          icon={<X className="w-4 h-4" />}
+        />
       </div>
 
       {/* Scrollable body */}
       <div className="flex-1 overflow-y-auto px-4 py-3 space-y-4">
         {/* ── Time summary (with manual edit) ───────────────── */}
-        <div className="p-3 bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 rounded-lg">
+        <div className="p-3 bg-info-subtle border border-info-muted rounded-lg">
           {isEditingDateTime ? (
             <div className="space-y-2">
               <div>
-                <label htmlFor={dateFieldId} className="block text-[10px] font-medium text-blue-700 dark:text-blue-300 mb-0.5">Date</label>
-                <input
-                  ref={dateInputRef}
-                  id={dateFieldId}
-                  name="meetingDate"
-                  type="date"
-                  value={localDate}
-                  onChange={(e) => setLocalDate(e.target.value)}
-                  className="w-full px-2 py-1 text-sm border border-blue-300 dark:border-blue-700 rounded bg-white dark:bg-blue-950/50 text-blue-900 dark:text-blue-100 focus:ring-2 focus:ring-primary"
-                />
+                <label htmlFor={dateFieldId} className="block text-[10px] font-medium text-info mb-0.5">Date</label>
+                <div className="meeting-editor-pair flex items-center gap-1">
+                  <div className="meeting-editor-control relative min-w-0 flex-1 rounded">
+                    <input
+                      ref={dateInputRef}
+                      id={dateFieldId}
+                      name="meetingDate"
+                      type="date"
+                      value={localDate}
+                      onChange={(e) => setLocalDate(e.target.value)}
+                      required
+                      className={`${hasDatePicker ? 'meeting-editor-native-input ' : ''}w-full min-w-0 px-2 py-1 text-sm border border-info-muted rounded bg-background text-foreground focus:ring-2 focus:ring-primary`}
+                    />
+                    <span aria-hidden="true" className="switch-card-trace pointer-events-none absolute inset-0 rounded text-primary" />
+                  </div>
+                  {hasDatePicker && (
+                    <div className="meeting-editor-control relative rounded-md">
+                      <IconButton
+                        label="Open date picker"
+                        icon={<Calendar />}
+                        onClick={() => {
+                          setIsTimePickerOpen(false)
+                          try {
+                            dateInputRef.current?.showPicker()
+                          } catch {
+                            showToast('The browser could not open the date picker. Enter the date manually.', 'error')
+                            dateInputRef.current?.focus()
+                          }
+                        }}
+                      />
+                      <span aria-hidden="true" className="switch-card-trace pointer-events-none absolute inset-0 rounded-md text-primary" />
+                    </div>
+                  )}
+                </div>
               </div>
               <div>
-                <label htmlFor={timeFieldId} className="block text-[10px] font-medium text-blue-700 dark:text-blue-300 mb-0.5">Time (UTC)</label>
-                <input
-                  id={timeFieldId}
-                  name="meetingTimeUtc"
-                  type="time"
-                  value={localTime}
-                  step={timeInterval * 60}
-                  onChange={(e) => setLocalTime(e.target.value)}
-                  className="w-full px-2 py-1 text-sm border border-blue-300 dark:border-blue-700 rounded bg-white dark:bg-blue-950/50 text-blue-900 dark:text-blue-100 focus:ring-2 focus:ring-primary"
-                />
+                <label htmlFor={timeFieldId} className="block text-[10px] font-medium text-info mb-0.5">Time (UTC)</label>
+                <div className="meeting-editor-pair flex items-center gap-1">
+                  <div className="meeting-editor-control relative min-w-0 flex-1 rounded">
+                    <input
+                      ref={timeInputRef}
+                      id={timeFieldId}
+                      name="meetingTimeUtc"
+                      type="text"
+                      value={localTime}
+                      pattern="([01][0-9]|2[0-3]):[0-5][0-9]"
+                      placeholder="HH:mm"
+                      aria-describedby={`${timeFieldId}-format`}
+                      onChange={(e) => setLocalTime(e.target.value)}
+                      onKeyDown={(event) => {
+                        if ((event.altKey && event.key === 'ArrowDown') || event.key === 'F4') {
+                          event.preventDefault()
+                          setIsTimePickerOpen(true)
+                        }
+                      }}
+                      required
+                      className="w-full min-w-0 px-2 py-1 text-sm border border-info-muted rounded bg-background text-foreground focus:ring-2 focus:ring-primary"
+                    />
+                    <span aria-hidden="true" className="switch-card-trace pointer-events-none absolute inset-0 rounded text-primary" />
+                  </div>
+                  <div className="meeting-editor-control relative rounded-md">
+                    <IconButton
+                      ref={timePickerButtonRef}
+                      label="Open time picker"
+                      aria-expanded={isTimePickerOpen}
+                      aria-controls={`${timeFieldId}-picker`}
+                      icon={<Clock />}
+                      onClick={() => setIsTimePickerOpen((open) => !open)}
+                    />
+                    <span aria-hidden="true" className="switch-card-trace pointer-events-none absolute inset-0 rounded-md text-primary" />
+                  </div>
+                </div>
+                <p id={`${timeFieldId}-format`} className="mt-1 text-[10px] text-muted-foreground">
+                  Enter UTC time as HH:mm (24-hour format).
+                </p>
+                {isTimePickerOpen && (
+                  <div
+                    ref={timePickerRef}
+                    id={`${timeFieldId}-picker`}
+                    role="group"
+                    aria-label="Choose time (UTC)"
+                    className="mt-2 grid grid-cols-2 gap-2 rounded-md border border-border bg-card p-2"
+                    onKeyDown={(event) => {
+                      if (event.key === 'Escape') {
+                        event.preventDefault()
+                        event.stopPropagation()
+                        closeTimePicker()
+                      }
+                    }}
+                    onBlur={(event) => {
+                      if (!event.currentTarget.contains(event.relatedTarget) && event.relatedTarget !== timePickerButtonRef.current) {
+                        setIsTimePickerOpen(false)
+                      }
+                    }}
+                  >
+                    <div role="group" aria-label="Hour">
+                      <p className="mb-1 text-xs font-medium text-muted-foreground">Hour</p>
+                      <div className="grid grid-cols-3 gap-1">
+                        {Array.from({ length: 24 }, (_, hour) => String(hour).padStart(2, '0')).map((hour) => (
+                          <ToggleButton
+                            key={hour}
+                            size="compact"
+                            pressed={hour === selectedHour}
+                            aria-label={`Select hour ${hour}`}
+                            onPressedChange={() => {
+                              setLocalTime(`${hour}:${selectedMinute}`)
+                              closeTimePicker()
+                            }}
+                          >
+                            {hour}
+                          </ToggleButton>
+                        ))}
+                      </div>
+                    </div>
+                    <div role="group" aria-label="Minute">
+                      <p className="mb-1 text-xs font-medium text-muted-foreground">Minute</p>
+                      <div className="grid grid-cols-2 gap-1">
+                        {minuteOptions.map((minute) => (
+                          <ToggleButton
+                            key={minute}
+                            size="compact"
+                            pressed={minute === selectedMinute}
+                            aria-label={`Select minute ${minute}`}
+                            onPressedChange={() => {
+                              setLocalTime(`${selectedHour}:${minute}`)
+                              closeTimePicker()
+                            }}
+                          >
+                            {minute}
+                          </ToggleButton>
+                        ))}
+                      </div>
+                    </div>
+                  </div>
+                )}
               </div>
               <div className="flex gap-2">
-                <button
+                <Button
+                  size="compact"
+                  intent={hasDateTimeChanges ? 'primary' : 'neutral'}
+                  disabled={!canApplyDateTime}
                   onClick={() => {
+                    if (!dateInputRef.current?.reportValidity() || !timeInputRef.current?.reportValidity()) return
                     if (localDate && localTime && onCellIdChange) {
                       setUserOverrodeDate(true)
                       const newCellId = `${localDate}_${localTime}`
                       onCellIdChange(newCellId)
                     }
                     setIsEditingDateTime(false)
+                    setIsTimePickerOpen(false)
                   }}
-                  className="flex-1 px-2 py-1 text-xs font-medium bg-blue-600 text-white rounded hover:bg-blue-700 transition-colors"
+                  className="flex-1"
                 >
                   Apply
-                </button>
-                <button
+                </Button>
+                <Button
+                  emphasis="ghost"
+                  size="compact"
                   onClick={() => {
                     setLocalDate(dateStr)
                     setLocalTime(timeStr)
                     setIsEditingDateTime(false)
+                    setIsTimePickerOpen(false)
                   }}
-                  className="flex-1 px-2 py-1 text-xs text-blue-700 dark:text-blue-300 border border-blue-300 dark:border-blue-700 rounded hover:bg-blue-100 dark:hover:bg-blue-900 transition-colors"
+                  className="flex-1"
                 >
                   Cancel
-                </button>
+                </Button>
               </div>
             </div>
           ) : (
             <div className="flex items-start justify-between">
               <div>
-                <div className="font-semibold text-blue-900 dark:text-blue-100 text-sm">
+                <div className="font-semibold text-foreground text-sm">
                   {format(meetingDate, 'EEEE, MMMM d, yyyy')}
                 </div>
-                <div className="text-blue-700 dark:text-blue-300 text-sm mt-0.5">
+                <div className="text-info text-sm mt-0.5">
                   at {formatUtcTimeWithPeriodInTimezone(timeStr, tzState.primary)}
                 </div>
               </div>
-              <button
+              <IconButton
                 onClick={() => {
                   setLocalDate(dateStr)
                   setLocalTime(timeStr)
                   setIsEditingDateTime(true)
                 }}
-                className="p-1 rounded hover:bg-blue-200 dark:hover:bg-blue-800 transition-colors text-blue-600 dark:text-blue-400"
-                title="Edit date and time manually"
-              >
-                <Pencil className="w-3.5 h-3.5" />
-              </button>
+                label="Edit date and time manually"
+                icon={<Pencil className="w-3.5 h-3.5" />}
+              />
             </div>
           )}
           {wasAutoAdvanced && !isEditingDateTime && (
-            <div className="mt-2 flex items-start gap-1.5 text-blue-600 dark:text-blue-400">
+            <div className="mt-2 flex items-start gap-1.5 text-primary">
               <AlertCircle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
               <span className="text-[11px] leading-tight">
                 Auto-advanced to next {format(meetingDate, 'EEEE')} (original week date was in the past).
@@ -371,7 +581,7 @@ export default function MeetingSidePanel({
             </div>
           )}
           {isDateInPast && !isEditingDateTime && (
-            <div className="mt-2 flex items-start gap-1.5 text-amber-700 dark:text-amber-400">
+            <div className="mt-2 flex items-start gap-1.5 text-warning">
               <AlertCircle className="w-3.5 h-3.5 mt-0.5 shrink-0" />
               <span className="text-[11px] leading-tight">
                 This date and time is in the past.
@@ -386,6 +596,15 @@ export default function MeetingSidePanel({
             <Calendar className="w-3.5 h-3.5 inline mr-1 text-muted-foreground" />
             Custom Meeting Name
           </label>
+          <div className="flex items-center justify-end mb-1">
+            {existingTitles.length > 0 && (
+              <ReuseDropdown
+                label="Reuse"
+                items={existingTitles}
+                onSelect={(meetingTitle) => setLocalTitle(meetingTitle)}
+              />
+            )}
+          </div>
           <input
             id={titleFieldId}
             name="meetingTitle"
@@ -425,56 +644,48 @@ export default function MeetingSidePanel({
 
         {/* ── Recurrence ──────────────────────────────────────── */}
         <div className="border border-border rounded-lg overflow-hidden">
-          <button
-            type="button"
-            onClick={() => setShowRecurrence(v => !v)}
-            className="w-full flex items-center justify-between px-3 py-2 text-xs font-medium text-foreground bg-muted/50 hover:bg-muted transition-colors"
-          >
-            <span className="flex items-center gap-1.5">
-              <Repeat2 className="w-3.5 h-3.5 text-muted-foreground" />
-              Recurrence
-              {localRecurrenceRule.type !== 'none' && (
-                <span className="px-1.5 py-0.5 text-[10px] font-semibold bg-blue-100 dark:bg-blue-900 text-blue-700 dark:text-blue-300 rounded-full">
-                  {localRecurrenceRule.type === 'weekly' ? 'Weekly' :
-                   localRecurrenceRule.type === 'biweekly' ? 'Bi-weekly' :
-                   localRecurrenceRule.type === 'monthly' ? 'Monthly' : 'Custom'}
-                </span>
-              )}
-            </span>
-            <ChevronDown className={`w-3.5 h-3.5 text-muted-foreground transition-transform ${showRecurrence ? 'rotate-180' : ''}`} />
-          </button>
+          <Disclosure
+            size="compact"
+            title="Recurrence"
+            icon={<Repeat2 />}
+            trailing={localRecurrenceRule.type !== 'none' ? (
+              <span className="px-1.5 py-0.5 text-[10px] font-semibold bg-info-subtle text-info rounded-full">
+                {localRecurrenceRule.type === 'weekly' ? 'Weekly' :
+                 localRecurrenceRule.type === 'biweekly' ? 'Bi-weekly' :
+                 localRecurrenceRule.type === 'monthly' ? 'Monthly' : 'Custom'}
+              </span>
+            ) : undefined}
+            expanded={showRecurrence}
+            onToggle={(next) => setShowRecurrence(next)}
+            panelId="meeting-side-panel-recurrence"
+          />
 
           {showRecurrence && (
-            <div className="p-3 space-y-3 bg-card">
+            <div id="meeting-side-panel-recurrence" className="p-3 space-y-3 bg-card">
               {/* Recurrence type chooser */}
-              <div className="grid grid-cols-3 gap-1">
-                {(['none', 'weekly', 'biweekly', 'monthly', 'custom'] as RecurrenceType[]).map(t => (
-                  <button
-                    key={t}
-                    type="button"
-                    onClick={() => setLocalRecurrenceRule(prev => ({
-                      ...prev,
-                      type: t,
-                      ...(t === 'custom' ? {
-                        interval: prev.interval || 1,
-                        unit: prev.unit || 'week',
-                        weekDays: prev.weekDays || [getWeekdayIndexFromIsoDate(dateStr)],
-                        endType: prev.endType || 'never',
-                      } : {}),
-                    }))}
-                    className={`px-1.5 py-1 text-[11px] rounded-md border transition-colors ${
-                      localRecurrenceRule.type === t
-                        ? 'bg-primary text-primary-foreground border-primary'
-                        : 'bg-background text-foreground border-border hover:bg-muted'
-                    }`}
-                  >
-                    {t === 'none' ? 'None' :
-                     t === 'weekly' ? 'Weekly' :
-                     t === 'biweekly' ? 'Bi-wkly' :
-                     t === 'monthly' ? 'Monthly' : 'Custom'}
-                  </button>
-                ))}
-              </div>
+              <SegmentedControl<RecurrenceType>
+                label="Recurrence type"
+                size="compact"
+                className="flex-wrap"
+                options={[
+                  { value: 'none', label: 'None' },
+                  { value: 'weekly', label: 'Weekly' },
+                  { value: 'biweekly', label: 'Bi-wkly' },
+                  { value: 'monthly', label: 'Monthly' },
+                  { value: 'custom', label: 'Custom' },
+                ]}
+                value={localRecurrenceRule.type}
+                onChange={t => setLocalRecurrenceRule(prev => ({
+                  ...prev,
+                  type: t,
+                  ...(t === 'custom' ? {
+                    interval: prev.interval || 1,
+                    unit: prev.unit || 'week',
+                    weekDays: prev.weekDays || [getWeekdayIndexFromIsoDate(dateStr)],
+                    endType: prev.endType || 'never',
+                  } : {}),
+                }))}
+              />
 
               {/* Custom options */}
               {localRecurrenceRule.type === 'custom' && (() => {
@@ -518,25 +729,21 @@ export default function MeetingSidePanel({
                           {DAY_LABELS.map((label, idx) => {
                             const isSelected = (rule.weekDays || []).includes(idx)
                             return (
-                              <button
+                              <ToggleButton
                                 key={idx}
-                                type="button"
+                                size="compact"
                                 title={DAY_FULL[idx]}
-                                onClick={() => {
+                                pressed={isSelected}
+                                onPressedChange={() => {
                                   const current = rule.weekDays || []
                                   const next = isSelected
                                     ? current.filter(d => d !== idx)
                                     : [...current, idx].sort((a, b) => a - b)
                                   updateRule({ weekDays: next.length > 0 ? next : [idx] })
                                 }}
-                                className={`w-7 h-7 rounded-full text-[10px] font-medium border transition-colors ${
-                                  isSelected
-                                    ? 'bg-primary text-primary-foreground border-primary'
-                                    : 'bg-background text-foreground border-border hover:bg-muted'
-                                }`}
                               >
                                 {label}
-                              </button>
+                              </ToggleButton>
                             )
                           })}
                         </div>
@@ -573,6 +780,7 @@ export default function MeetingSidePanel({
                 label="Reuse"
                 items={existingLinks}
                 onSelect={(link) => { setLocalLink(link); setMeetLinkGeneratedHere(false) }}
+                onClearAll={onClearReusableLinks}
               />
             )}
           </div>
@@ -594,9 +802,16 @@ export default function MeetingSidePanel({
             <div className="space-y-1">
               {hasGoogleOAuth ? (
                 <>
-                  <button
-                    type="button"
-                    disabled={isGeneratingMeet}
+                  <Button
+                    emphasis="outline"
+                    intent={hasMeetLink ? 'success' : 'info'}
+                    fullWidth
+                    loading={isGeneratingMeet}
+                    icon={hasMeetLink ? (
+                      <Check className="w-4 h-4" />
+                    ) : (
+                      <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="7" width="15" height="10" rx="2"/><path d="m17 9 5-3v12l-5-3z"/></svg>
+                    )}
                     onClick={async () => {
                       if (!effectiveSourceId) return
                       setIsGeneratingMeet(true)
@@ -611,45 +826,32 @@ export default function MeetingSidePanel({
                         setIsGeneratingMeet(false)
                       }
                     }}
-                    className={`w-full flex items-center gap-2 px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors ${
-                      isGeneratingMeet
-                        ? 'text-muted-foreground bg-muted/30 border-border cursor-not-allowed opacity-50'
-                        : hasMeetLink
-                          ? 'text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-950/50 border-green-200 dark:border-green-800 hover:bg-green-100 dark:hover:bg-green-900/50'
-                          : 'text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950/50 border-blue-200 dark:border-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900/50'
-                    }`}
                   >
-                    {isGeneratingMeet ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : hasMeetLink ? (
-                      <Check className="w-4 h-4" />
-                    ) : (
-                      <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><rect x="2" y="7" width="15" height="10" rx="2"/><path d="m17 9 5-3v12l-5-3z"/></svg>
-                    )}
-                    <span className="flex flex-col items-start min-w-0 flex-1">
+                    <span className="flex flex-col items-start min-w-0 flex-1 text-xs">
                       <span>{isGeneratingMeet ? 'Generating...' : hasMeetLink ? 'Google Meet ✓' : 'Google Meet'}</span>
                       {effectiveSource && (!hasMeetLink || meetLinkGeneratedHere) && (
-                        <span className="text-[9px] font-normal text-muted-foreground truncate w-full -ml-3" title={effectiveSource.google_email || undefined}>
+                        <span className="text-[9px] font-normal text-muted-foreground truncate w-full" title={effectiveSource.google_email || undefined}>
                           via {effectiveSource.google_email || effectiveSource.display_name}
                         </span>
                       )}
                     </span>
-                  </button>
+                  </Button>
                   {meetError && (
-                    <p className="text-[11px] text-red-500 dark:text-red-400">{meetError}</p>
+                    <p className="text-[11px] text-danger">{meetError}</p>
                   )}
                 </>
               ) : (
                 <>
-                  <button
-                    type="button"
-                    onClick={() => window.open('/settings?tab=calendar&section=connections', '_blank')}
-                    className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-[11px] font-medium text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900/30 transition-colors"
+                  <Button
+                    emphasis="outline"
+                    size="compact"
+                    fullWidth
+                    onClick={() => window.open('/settings?tab=calendar&section=connections', '_blank', 'noopener,noreferrer')}
+                    icon={<LinkIcon className="w-3 h-3" />}
                   >
-                    <LinkIcon className="w-3 h-3" />
                     Integrate Google Meet
                     <ExternalLink className="w-2.5 h-2.5 ml-auto" />
-                  </button>
+                  </Button>
                   <p className="text-[10px] text-muted-foreground">Opens settings in a new tab — your progress is preserved.</p>
                 </>
               )}
@@ -659,22 +861,27 @@ export default function MeetingSidePanel({
             <div className="space-y-1">
               {window.location.hostname === 'localhost' ? (
                 <div className="space-y-1">
-                  <button
-                    type="button"
+                  <Button
+                    emphasis="outline"
+                    size="compact"
+                    fullWidth
                     disabled
-                    className="w-full flex items-center gap-2 px-3 py-2 text-xs font-medium rounded-lg border transition-colors text-muted-foreground bg-muted/30 border-border cursor-not-allowed opacity-50"
+                    icon={<Video className="w-4 h-4" />}
                   >
-                    <Video className="w-4 h-4" />
                     Zoom
-                    <span className="ml-auto text-[10px] text-amber-500">(disabled on localhost)</span>
-                  </button>
-                  <p className="text-[10px] text-amber-600 dark:text-amber-400">Zoom requires a fully qualified domain name for OAuth. Use the production site to connect Zoom.</p>
+                    <span className="ml-auto text-[10px] text-warning">(disabled on localhost)</span>
+                  </Button>
+                  <p className="text-[10px] text-warning">Zoom requires a fully qualified domain name for OAuth. Use the production site to connect Zoom.</p>
                 </div>
               ) : zoomConnected ? (
                 <>
-                  <button
-                    type="button"
-                    disabled={isGeneratingZoom}
+                  <Button
+                    emphasis="outline"
+                    intent={hasZoomLink ? 'success' : 'info'}
+                    size="compact"
+                    fullWidth
+                    loading={isGeneratingZoom}
+                    icon={hasZoomLink ? <Check className="w-4 h-4" /> : <Video className="w-4 h-4" />}
                     onClick={async () => {
                       setIsGeneratingZoom(true)
                       setZoomError(null)
@@ -696,45 +903,35 @@ export default function MeetingSidePanel({
                         setIsGeneratingZoom(false)
                       }
                     }}
-                    className={`w-full flex items-center gap-2 px-3 py-2 text-xs font-medium rounded-lg border transition-colors ${
-                      isGeneratingZoom
-                        ? 'text-muted-foreground bg-muted/30 border-border cursor-not-allowed opacity-50'
-                        : hasZoomLink
-                          ? 'text-green-700 dark:text-green-300 bg-green-50 dark:bg-green-950/50 border-green-200 dark:border-green-800 hover:bg-green-100 dark:hover:bg-green-900/50'
-                          : 'text-blue-700 dark:text-blue-300 bg-blue-50 dark:bg-blue-950/50 border-blue-200 dark:border-blue-800 hover:bg-blue-100 dark:hover:bg-blue-900/50'
-                    }`}
                   >
-                    {isGeneratingZoom ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : hasZoomLink ? (
-                      <Check className="w-4 h-4" />
-                    ) : (
-                      <Video className="w-4 h-4" />
-                    )}
-                    {isGeneratingZoom ? 'Generating...' : hasZoomLink ? 'Zoom \u2713' : 'Zoom'}
-                  </button>
+                    <span className="flex-1 text-left">
+                      {isGeneratingZoom ? 'Generating...' : hasZoomLink ? 'Zoom \u2713' : 'Zoom'}
+                    </span>
+                  </Button>
                   {zoomError && (
-                    <p className="text-[11px] text-red-500 dark:text-red-400">{zoomError}</p>
+                    <p className="text-[11px] text-danger">{zoomError}</p>
                   )}
                 </>
               ) : (
                 <>
-                  <button
-                    type="button"
+                  <Button
+                    emphasis="outline"
+                    size="compact"
+                    fullWidth
                     onClick={() => setShowZoomSetup(v => !v)}
-                    className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-[11px] font-medium text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900/30 transition-colors"
+                    icon={<LinkIcon className="w-3 h-3" />}
                   >
-                    <LinkIcon className="w-3 h-3" />
                     Integrate Zoom
                     <ChevronDown className={`w-3 h-3 ml-auto transition-transform ${showZoomSetup ? 'rotate-180' : ''}`} />
-                  </button>
+                  </Button>
                   {showZoomSetup && (
                     <div className="p-2 space-y-2 bg-muted/20 border border-border rounded-lg">
                       <p className="text-[10px] text-muted-foreground">
                         Connect your Zoom account to generate meeting links.
                       </p>
-                      <button
-                        type="button"
+                      <Button
+                        size="compact"
+                        fullWidth
                         disabled={inlineZoomConnecting}
                         onClick={async () => {
                           setInlineZoomConnecting(true)
@@ -743,7 +940,7 @@ export default function MeetingSidePanel({
                             const returnTo = window.location.pathname + window.location.search
                             const res = await apiClient.get('/api/zoom/auth-url', { params: { returnTo } })
                             if (res.data?.url && isSafeUrl(res.data.url)) {
-                              window.open(res.data.url, '_blank')
+                              window.open(res.data.url, '_blank', 'noopener,noreferrer')
                             } else {
                               setInlineZoomError('Failed to get Zoom authorization URL.')
                             }
@@ -753,14 +950,15 @@ export default function MeetingSidePanel({
                             setInlineZoomConnecting(false)
                           }
                         }}
-                        className="w-full flex items-center justify-center gap-1.5 px-2 py-1.5 text-[11px] font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-md transition-colors disabled:opacity-50"
+                        icon={inlineZoomConnecting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Video className="w-3 h-3" />}
                       >
-                        {inlineZoomConnecting ? <Loader2 className="w-3 h-3 animate-spin" /> : <Video className="w-3 h-3" />}
                         Connect Zoom Account
-                      </button>
+                      </Button>
                       <p className="text-[10px] text-muted-foreground">Opens Zoom authorization in a new tab. After connecting, click Refresh.</p>
-                      <button
-                        type="button"
+                      <Button
+                        emphasis="ghost"
+                        size="compact"
+                        fullWidth
                         onClick={async () => {
                           try {
                             const check = await apiClient.get('/api/zoom/integration')
@@ -774,12 +972,11 @@ export default function MeetingSidePanel({
                             setInlineZoomError('Failed to check connection status.')
                           }
                         }}
-                        className="w-full flex items-center justify-center gap-1.5 px-2 py-1 text-[10px] font-medium text-muted-foreground border border-border rounded-md hover:bg-muted transition-colors"
                       >
                         Refresh Connection Status
-                      </button>
+                      </Button>
                       {inlineZoomError && (
-                        <p className="text-[10px] text-red-500">{inlineZoomError}</p>
+                        <p className="text-[10px] text-danger">{inlineZoomError}</p>
                       )}
                     </div>
                   )}
@@ -799,37 +996,38 @@ export default function MeetingSidePanel({
                     : 'text-muted-foreground bg-muted/30 border-border cursor-not-allowed opacity-50'
                 }`}
               >
-                <span className="w-4 h-4 bg-gradient-to-br from-orange-400 to-pink-500 rounded flex items-center justify-center shrink-0">
+                <span className="w-4 h-4 bg-linear-to-br from-orange-400 to-pink-500 rounded flex items-center justify-center shrink-0">
                   <span className="text-white text-[7px] font-bold">Lu</span>
                 </span>
                 Luma
                 {lumaPublished && (
-                  <span className="ml-auto px-1.5 py-0.5 text-[10px] font-semibold bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-300 rounded-full">
+                  <span className="ml-auto px-1.5 py-0.5 text-[10px] font-semibold bg-success-subtle text-success rounded-full">
                     Published
                   </span>
                 )}
               </button>
               {!lumaConnected && (
                 <>
-                  <button
-                    type="button"
+                  <Button
+                    emphasis="outline"
+                    size="compact"
+                    fullWidth
                     onClick={() => setShowLumaSetup(v => !v)}
-                    className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-[11px] font-medium text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 rounded-lg hover:bg-blue-100 dark:hover:bg-blue-900/30 transition-colors"
+                    icon={<LinkIcon className="w-3 h-3" />}
                   >
-                    <LinkIcon className="w-3 h-3" />
                     Integrate Luma
                     <ChevronDown className={`w-3 h-3 ml-auto transition-transform ${showLumaSetup ? 'rotate-180' : ''}`} />
-                  </button>
+                  </Button>
                   {showLumaSetup && (
                     <div className="p-2 space-y-2 bg-muted/20 border border-border rounded-lg">
                       <p className="text-[10px] text-muted-foreground">
                         Connect with an API key from{' '}
-                        <a href="https://luma.com/settings/api" target="_blank" rel="noopener noreferrer" className="text-blue-600 dark:text-blue-400 hover:underline">
+                        <a href="https://luma.com/settings/api" target="_blank" rel="noopener noreferrer" className="text-primary hover:underline">
                           luma.com/settings/api <ExternalLink className="w-2.5 h-2.5 inline" />
                         </a>
                       </p>
-                      <p className="text-[10px] text-amber-600 dark:text-amber-400 flex items-start gap-1">
-                        <AlertCircle className="w-3 h-3 mt-0.5 flex-shrink-0" />
+                      <p className="text-[10px] text-warning flex items-start gap-1">
+                        <AlertCircle className="w-3 h-3 mt-0.5 shrink-0" />
                         <span>Requires <strong>Luma Plus</strong> (paid) subscription.</span>
                       </p>
                       <div className="flex gap-1.5">
@@ -841,7 +1039,7 @@ export default function MeetingSidePanel({
                           value={inlineLumaApiKey}
                           onChange={(e) => setInlineLumaApiKey(e.target.value)}
                           placeholder="Luma API key"
-                          className="flex-1 px-2 py-1 text-[11px] border border-border rounded-md bg-background text-foreground focus:ring-1 focus:ring-ring focus:border-ring outline-none"
+                          className="flex-1 px-2 py-1 text-[11px] border border-border rounded-md bg-background text-foreground focus:ring-1 focus:ring-ring focus:border-ring outline-hidden"
                         />
                         <button
                           type="button"
@@ -860,14 +1058,14 @@ export default function MeetingSidePanel({
                               setInlineLumaConnecting(false)
                             }
                           }}
-                          className="flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-white bg-gradient-to-r from-orange-500 to-pink-500 rounded-md hover:from-orange-600 hover:to-pink-600 transition-colors disabled:opacity-50"
+                          className="flex items-center gap-1 px-2 py-1 text-[11px] font-medium text-white bg-linear-to-r from-orange-500 to-pink-500 rounded-md hover:from-orange-600 hover:to-pink-600 transition-colors disabled:opacity-50"
                         >
                           {inlineLumaConnecting ? <Loader2 className="w-3 h-3 animate-spin" /> : <LinkIcon className="w-3 h-3" />}
                           Connect
                         </button>
                       </div>
                       {inlineLumaError && (
-                        <p className="text-[10px] text-red-500">{inlineLumaError}</p>
+                        <p className="text-[10px] text-danger">{inlineLumaError}</p>
                       )}
                     </div>
                   )}
@@ -877,7 +1075,7 @@ export default function MeetingSidePanel({
                 <div className="p-2 space-y-2 bg-muted/20 border border-border rounded-lg">
                   {lumaPublished ? (
                     <div className="space-y-1.5">
-                      <div className="flex items-center gap-2 text-xs text-green-600 dark:text-green-400">
+                      <div className="flex items-center gap-2 text-xs text-success">
                         <Check className="w-3.5 h-3.5" />
                         <span>Published to Luma</span>
                       </div>
@@ -886,7 +1084,7 @@ export default function MeetingSidePanel({
                           href={lumaPublished.luma_event_url ?? undefined}
                           target="_blank"
                           rel="noopener noreferrer"
-                          className="flex items-center gap-1.5 text-xs text-blue-600 hover:text-blue-800 transition-colors"
+                          className="flex items-center gap-1.5 text-xs text-primary hover:opacity-80 transition-colors"
                         >
                           <ExternalLink className="w-3 h-3" />
                           View on Luma
@@ -897,25 +1095,19 @@ export default function MeetingSidePanel({
                     <div className="space-y-2">
                       <div>
                         <label className="text-[11px] text-muted-foreground mb-1 block">Visibility</label>
-                        <div className="flex gap-1">
-                          {(['public', 'members-only', 'private'] as const).map(v => (
-                            <button
-                              key={v}
-                              type="button"
-                              onClick={() => setLumaVisibility(v)}
-                              className={`px-2 py-1 text-[10px] rounded-md border transition-colors ${
-                                lumaVisibility === v
-                                  ? 'bg-primary text-primary-foreground border-primary'
-                                  : 'bg-background text-foreground border-border hover:bg-muted'
-                              }`}
-                            >
-                              {v === 'members-only' ? 'Members' : v.charAt(0).toUpperCase() + v.slice(1)}
-                            </button>
-                          ))}
-                        </div>
+                        <SegmentedControl
+                          label="Luma visibility"
+                          size="compact"
+                          options={(['public', 'members-only', 'private'] as const).map(v => ({
+                            value: v,
+                            label: v === 'members-only' ? 'Members' : v.charAt(0).toUpperCase() + v.slice(1),
+                          }))}
+                          value={lumaVisibility}
+                          onChange={setLumaVisibility}
+                        />
                       </div>
                       {lumaError && (
-                        <p className="text-[11px] text-red-500">{lumaError}</p>
+                        <p className="text-[11px] text-danger">{lumaError}</p>
                       )}
                       <button
                         type="button"
@@ -944,7 +1136,7 @@ export default function MeetingSidePanel({
                             setLumaPublishing(false)
                           }
                         }}
-                        className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-gradient-to-r from-orange-500 to-pink-500 rounded-lg hover:from-orange-600 hover:to-pink-600 transition-colors disabled:opacity-50"
+                        className="w-full flex items-center justify-center gap-1.5 px-3 py-1.5 text-xs font-medium text-white bg-linear-to-r from-orange-500 to-pink-500 rounded-lg hover:from-orange-600 hover:to-pink-600 transition-colors disabled:opacity-50"
                       >
                         {lumaPublishing ? (
                           <><Loader2 className="w-3.5 h-3.5 animate-spin" /> Publishing...</>
@@ -978,13 +1170,18 @@ export default function MeetingSidePanel({
             )}
           </div>
           <textarea
+            ref={detailsTextareaRef}
             id={detailsFieldId}
             name="meetingDetails"
             value={localDescription}
             onChange={(e) => setLocalDescription(e.target.value)}
+            onMouseUp={persistDetailsHeight}
+            onTouchEnd={persistDetailsHeight}
+            onBlur={persistDetailsHeight}
             placeholder="Agenda, instructions, notes..."
-            rows={3}
-            className="w-full px-3 py-1.5 text-sm border border-border rounded-lg bg-background text-foreground focus:ring-2 focus:ring-primary focus:border-primary resize-none transition-colors"
+            rows={10}
+            className="w-full min-h-60 max-h-130 px-3 py-1.5 text-sm border border-border rounded-lg bg-background text-foreground focus:ring-2 focus:ring-primary focus:border-primary resize-y overflow-y-auto transition-colors"
+            style={{ height: `${detailsHeightPx}px` }}
           />
         </div>
 
@@ -993,20 +1190,23 @@ export default function MeetingSidePanel({
 
       {/* Footer actions */}
       <div className="px-4 py-3 border-t border-border bg-muted/20 space-y-2">
-        <button
+        <Button
+          intent="primary"
+          fullWidth
           data-meeting-confirm-btn
           onClick={handleSave}
-          className="w-full px-4 py-2 bg-green-600 text-white text-sm font-semibold rounded-lg hover:bg-green-700 transition-colors flex items-center justify-center gap-2"
+          icon={<Check className="w-4 h-4" />}
         >
-          <Check className="w-4 h-4" />
           {isEditing ? 'Update Meeting' : 'Confirm Meeting'}
-        </button>
-        <button
+        </Button>
+        <Button
+          emphasis="outline"
+          size="compact"
+          fullWidth
           onClick={onCancel}
-          className="w-full px-3 py-1.5 text-xs text-muted-foreground border border-border rounded-lg hover:bg-muted transition-colors"
         >
           Cancel
-        </button>
+        </Button>
       </div>
       </div>
     </aside>
@@ -1027,7 +1227,7 @@ function RecurrenceEndOptions({ rule, updateRule }: {
               type="radio"
               name="recEndType"
               checked={(rule.endType || 'never') === et}
-              onChange={() => updateRule({ endType: et })}
+              onChange={() => updateRule(et === 'after' ? { endType: et, endCount: rule.endCount || 13 } : { endType: et })}
               className="text-primary accent-primary"
             />
             <span className="text-[11px] flex items-center gap-1">
@@ -1040,7 +1240,7 @@ function RecurrenceEndOptions({ rule, updateRule }: {
                     aria-label="Recurrence end date"
                     type="date"
                     value={rule.endDate || ''}
-                    onChange={e => updateRule({ endDate: e.target.value })}
+                    onChange={e => updateRule({ endDate: e.target.value, endType: 'on' })}
                     onClick={() => updateRule({ endType: 'on' })}
                     className="px-1 py-0.5 text-[11px] border border-border rounded bg-background text-foreground"
                   />
@@ -1056,8 +1256,8 @@ function RecurrenceEndOptions({ rule, updateRule }: {
                     min={1}
                     max={999}
                     value={rule.endCount || 13}
-                    onChange={e => updateRule({ endCount: Math.max(1, parseInt(e.target.value) || 1) })}
-                    onClick={() => updateRule({ endType: 'after' })}
+                    onChange={e => updateRule({ endCount: Math.max(1, parseInt(e.target.value) || 1), endType: 'after' })}
+                    onClick={() => updateRule({ endType: 'after', endCount: rule.endCount || 13 })}
                     className="w-12 px-1 py-0.5 text-[11px] border border-border rounded bg-background text-foreground text-center"
                   />
                   times
@@ -1072,11 +1272,12 @@ function RecurrenceEndOptions({ rule, updateRule }: {
 }
 
 /* ── Dropdown to reuse existing links/descriptions ──────────────────────── */
-function ReuseDropdown({ label, items, onSelect, truncateLength }: {
+function ReuseDropdown({ label, items, onSelect, truncateLength, onClearAll }: {
   label: string
   items: string[]
   onSelect: (item: string) => void
   truncateLength?: number
+  onClearAll?: () => void
 }) {
   const [open, setOpen] = useState(false)
 
@@ -1084,7 +1285,7 @@ function ReuseDropdown({ label, items, onSelect, truncateLength }: {
     <div className="relative">
       <button
         type="button"
-        className="flex items-center gap-0.5 text-[10px] text-blue-600 hover:text-blue-800 transition-colors"
+        className="flex items-center gap-0.5 text-[10px] text-primary hover:opacity-80 transition-colors"
         onClick={() => setOpen(v => !v)}
       >
         <Copy className="w-3 h-3" />
@@ -1093,7 +1294,7 @@ function ReuseDropdown({ label, items, onSelect, truncateLength }: {
       {open && (
         <>
           <div className="fixed inset-0 z-40" onClick={() => setOpen(false)} />
-          <div className="absolute right-0 top-full mt-1 z-50 bg-popover border border-border rounded-lg shadow-lg min-w-[180px] max-w-[280px] py-1">
+          <div className={`absolute right-0 top-full mt-1 ${OVERLAY_LAYER_CLASS.popover} bg-popover border border-border rounded-lg shadow-lg min-w-[180px] max-w-[280px] py-1`}>
             {items.map((item, i) => (
               <button
                 key={i}
@@ -1108,6 +1309,21 @@ function ReuseDropdown({ label, items, onSelect, truncateLength }: {
                 {truncateLength && item.length > truncateLength ? item.slice(0, truncateLength) + '\u2026' : item}
               </button>
             ))}
+            {onClearAll && items.length > 0 && (
+              <div className="mt-1 border-t border-border pt-1">
+                <button
+                  type="button"
+                  className="w-full flex items-center gap-2 px-3 py-1.5 text-[11px] text-danger hover:bg-danger-subtle transition-colors"
+                  onClick={() => {
+                    setOpen(false)
+                    onClearAll()
+                  }}
+                >
+                  <Trash2 className="w-3 h-3 shrink-0" />
+                  Clear all links from meetings
+                </button>
+              </div>
+            )}
           </div>
         </>
       )}

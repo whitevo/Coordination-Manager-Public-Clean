@@ -1,6 +1,6 @@
-import '@testing-library/jest-dom'
+import '@testing-library/jest-dom/vitest'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { render, screen, waitFor } from '@testing-library/react'
+import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter, Route, Routes } from 'react-router-dom'
 import AnnouncementsPage from '../AnnouncementsPage'
 import { apiClient } from '../../lib/api-client'
@@ -47,13 +47,13 @@ vi.mock('../../components/announcements/EmojiPicker', () => ({
   default: () => null,
 }))
 
-function mockAnnouncementsApiDefaults(): void {
+function mockAnnouncementsApiDefaults(aiAvailable = false): void {
   vi.mocked(apiClient.get).mockImplementation(async (url: string) => {
     if (url === '/api/discord/integration') return { data: { integration: null } }
     if (url === '/api/announcements/templates') return { data: { templates: [] } }
     if (url === '/api/announcements/schedules') return { data: { schedules: [] } }
     if (url === '/api/notification-preferences') return { data: { preferences: null } }
-    if (url === '/api/ai-chat/status') return { data: { available: false } }
+    if (url === '/api/ai-chat/status') return { data: { available: aiAvailable } }
     if (url === '/api/email-contacts') return { data: { contacts: [] } }
     if (url === '/api/connections') return { data: { connections: [] } }
     if (url === '/api/verified-emails') return { data: { emails: [] } }
@@ -96,6 +96,22 @@ describe('AnnouncementsPage prefill fallback', () => {
     })
 
     mockAnnouncementsApiDefaults()
+  })
+
+  it('uses an AI-tinted context header rather than the theme accent and preserves its draft', async () => {
+    mockAnnouncementsApiDefaults(true)
+    renderAnnouncementsPage()
+    const toggle = await screen.findByRole('button', { name: 'AI Context' })
+    expect(toggle.parentElement).toHaveClass('bg-feature-ai-subtle', 'text-foreground')
+    expect(toggle.parentElement).not.toHaveClass('bg-accent')
+    if (toggle.getAttribute('aria-expanded') !== 'true') fireEvent.click(toggle)
+    const field = screen.getByPlaceholderText(/Provide background context for the AI/)
+    expect(field).toHaveClass('bg-card', 'text-foreground', 'border-border')
+    fireEvent.change(field, { target: { value: 'Audience: calendar organizers' } })
+    fireEvent.click(toggle)
+    expect(toggle).toHaveAttribute('aria-expanded', 'false')
+    fireEvent.click(toggle)
+    expect(screen.getByPlaceholderText(/Provide background context for the AI/)).toHaveValue('Audience: calendar organizers')
   })
 
   it('applies title/body prefill from session storage when URL prefill params are missing', async () => {

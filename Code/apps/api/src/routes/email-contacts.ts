@@ -10,7 +10,7 @@ const router: RouterType = Router()
 router.use(authMiddleware)
 
 // Simple email format check (not exhaustive, just a sanity guard)
-const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/
+const EMAIL_RE = /^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/
 
 // Sanitize a tags array: lowercase, trim, dedupe, limit length
 const sanitizeTags = (raw: unknown): string[] => {

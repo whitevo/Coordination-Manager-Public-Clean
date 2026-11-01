@@ -5,7 +5,16 @@ import { sectionLandingPages, type SectionId } from '../docs-content'
 const DEFAULT_SECTION: SectionId = 'general'
 
 function isSectionId(value: string | undefined): value is SectionId {
-  return value === 'general' || value === 'api' || value === 'guides' || value === 'legal' || value === 'proposals'
+  return (
+    value === 'general' ||
+    value === 'api' ||
+    value === 'guides' ||
+    value === 'legal' ||
+    value === 'proposals' ||
+    value === 'design' ||
+    value === 'risk' ||
+    value === 'marketing'
+  )
 }
 
 export function SectionLandingPage() {

@@ -2,38 +2,56 @@
 <html lang="en">
   <head>
     <meta charset="UTF-8" />
+    <script src="/asset-recovery.js"></script>
     <script>
       (function () {
+        // First-paint theme. Mirrors ThemeContext (loadLocal + createDefaultThemePreferences).
+        // Editing this script changes its CSP hash: update script-src in vercel.json.
+        var root = document.documentElement
+        var forest = {
+          '--background': '160 40% 7%', '--foreground': '140 15% 93%',
+          '--primary': '150 60% 40%', '--primary-foreground': '0 0% 100%',
+          '--secondary': '155 35% 14%', '--secondary-foreground': '140 15% 90%',
+          '--accent': '130 50% 45%', '--accent-foreground': '0 0% 100%',
+          '--muted': '155 30% 16%', '--muted-foreground': '150 15% 55%',
+          '--border': '155 30% 20%', '--ring': '150 40% 50%', '--icon': '140 15% 88%'
+        }
         try {
-          var p = JSON.parse(localStorage.getItem('theme-preferences') || '{}')
-          var m = p.mode || 'dark'
-          if (m === 'dark' || (m === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)) {
-            document.documentElement.classList.add('dark')
+          var raw = localStorage.getItem('theme-preferences')
+          var legacyMode = localStorage.getItem('theme-mode')
+          var p = raw ? JSON.parse(raw) : null
+          var isNew = !p && !legacyMode && !localStorage.getItem('active-color-theme')
+          var m = (p && p.mode) || legacyMode || 'dark'
+          var dark = m === 'dark' || (m === 'system' && window.matchMedia('(prefers-color-scheme: dark)').matches)
+          if (dark) root.classList.add('dark')
+          var id = isNew ? 'preset-forest' : p ? (dark ? p.darkThemeId : p.lightThemeId) : null
+          if (!id) return
+          var vars = id === 'preset-forest' ? forest : null
+          if (!vars) {
+            var cached = JSON.parse(localStorage.getItem('theme-active-colors') || 'null')
+            if (cached && cached.id === id) vars = cached.vars
           }
-        } catch (e) {}
+          for (var k in vars) {
+            if (Object.prototype.hasOwnProperty.call(vars, k)) root.style.setProperty(k, vars[k])
+          }
+        } catch (e) {
+          root.classList.add('dark')
+        }
       })()
     </script>
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
-    <title>Coordination Manager</title>
-
-    <!-- Open Graph / Discord Embed -->
-    <meta property="og:type" content="website" />
-    <meta property="og:url" content="https://coordinationmanager.com" />
-    <meta property="og:title" content="Coordination Manager" />
-    <meta property="og:description" content="Coordinate community announcements, meetings, and governance across Discord servers - all from one dashboard." />
-    <meta property="og:image" content="https://coordinationmanager.com/og-image.png" />
-    <meta property="og:site_name" content="Coordination Manager" />
-    <meta name="theme-color" content="#7c3aed" />
-
-    <!-- Twitter / X -->
-    <meta name="twitter:card" content="summary_large_image" />
-    <meta name="twitter:title" content="Coordination Manager" />
-    <meta name="twitter:description" content="Coordinate community announcements, meetings, and governance across Discord servers - all from one dashboard." />
-    <meta name="twitter:image" content="https://coordinationmanager.com/og-image.png" />
+    <!-- discovery-head:start -->
+    <!-- Metadata is generated from the shared site-discovery manifest. -->
+    <!-- discovery-head:end -->
+    <meta name="theme-color" content="#0b1914" />
   </head>
   <body>
-    <div id="root"></div>
+    <div id="root">
+      <!-- discovery-body:start -->
+      <!-- Public copy and links are generated here for non-JavaScript readers. -->
+      <!-- discovery-body:end -->
+    </div>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>

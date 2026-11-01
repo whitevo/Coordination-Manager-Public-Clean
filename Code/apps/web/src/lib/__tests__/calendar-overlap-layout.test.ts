@@ -19,6 +19,16 @@ function makeEvent(id: string, startHour: number, endHour: number): LayoutEvent 
 // ---------------------------------------------------------------------------
 
 describe('computeDayLayout - empty', () => {
+  it('keeps existing priority when events end and start at the same boundary', () => {
+    const result = computeDayLayout([
+      makeEvent('continuing', 9, 12), makeEvent('ending', 9, 10), makeEvent('starting', 10, 11),
+    ], DAY_START, DAY_END, SLOT_HEIGHT, SLOT_DURATION)
+    expect(result.eventSegments.map(segment => [segment.eventId, segment.leftPercent, segment.widthPercent])).toEqual([
+      ['continuing', 0, 50], ['ending', 50, 50],
+      ['continuing', 0, 50], ['starting', 50, 50],
+      ['continuing', 0, 100],
+    ])
+  })
   it('returns empty layout for no events', () => {
     const result = computeDayLayout([], DAY_START, DAY_END, SLOT_HEIGHT, SLOT_DURATION)
     expect(result.eventSegments).toEqual([])

@@ -232,21 +232,6 @@ console.log('Template updated:', updated.template.updated_at)`}</CodeBlock>
   -H "Content-Type: application/json" \
   -d '{"message": "Great API!"}' | jq`}</CodeBlock>
 
-      <h2>Fetch.ai uAgent Example</h2>
-      <p>
-        The Coordination Manager ships with a reference <strong>Fetch.ai uAgent</strong> implementation
-        in <code>agents/meeting-scheduler/</code>. It demonstrates:
-      </p>
-      <ul>
-        <li>Message models for typed inter-agent communication</li>
-        <li>Protocol-based handlers (list calendars, get availability, propose meeting, create calendar)</li>
-        <li>Availability overlap analysis and optimal time selection</li>
-        <li>API connection verification on startup</li>
-      </ul>
-      <p>
-        See the <a href="https://github.com/your-org/coordination-manager/tree/main/Code/agents/meeting-scheduler" target="_blank" rel="noopener">meeting-scheduler agent README</a> for setup instructions.
-      </p>
-
       <h2>OpenAPI Spec</h2>
       <p>
         The Agent API serves an OpenAPI 3.0 specification that can be imported into tools like

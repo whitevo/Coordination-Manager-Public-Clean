@@ -3,6 +3,10 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@12.15.0",
+  "engines": {
+    "node": ">=26.12.1"
+  },
   "scripts": {
     "dev": "tsx watch src/index.ts",
     "build": "tsc",
@@ -11,14 +15,14 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "discord.js": "^14.16.3",
-    "@supabase/supabase-js": "^2.39.3",
-    "dotenv": "^16.3.1"
+    "@supabase/supabase-js": "^2.118.0",
+    "discord.js": "^14.27.0",
+    "dotenv": "^18.0.8"
   },
   "devDependencies": {
-    "@types/node": "^20.10.0",
-    "tsx": "^4.7.0",
-    "typescript": "~5.3.3",
-    "vitest": "^4.1.0"
+    "@types/node": "^26.6.5",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3",
+    "vitest": "^5.0.5"
   }
 }

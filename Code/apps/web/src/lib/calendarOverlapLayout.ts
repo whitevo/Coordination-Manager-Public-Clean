@@ -111,14 +111,40 @@ export function computeDayLayout(
   const eventSegments: EventSegment[] = []
   const overflowSegments: OverflowSegment[] = []
   const seenEventIds = new Set<string>()
+  const starts = new Map<number, number[]>()
+  const ends = new Map<number, number[]>()
+  for (let index = 0; index < clampedEvents.length; index++) {
+    const event = clampedEvents[index]
+    const starting = starts.get(event.start) ?? []
+    starting.push(index)
+    starts.set(event.start, starting)
+    const ending = ends.get(event.end) ?? []
+    ending.push(index)
+    ends.set(event.end, ending)
+  }
+  // Indices retain the existing start/duration priority for visual columns.
+  const activeIndices: number[] = []
 
   for (let i = 0; i < changePoints.length - 1; i++) {
     const intervalStart = changePoints[i]
     const intervalEnd = changePoints[i + 1]
+    for (const index of ends.get(intervalStart) ?? []) {
+      const position = activeIndices.indexOf(index)
+      if (position !== -1) activeIndices.splice(position, 1)
+    }
+    for (const index of starts.get(intervalStart) ?? []) {
+      let low = 0
+      let high = activeIndices.length
+      while (low < high) {
+        const middle = (low + high) >>> 1
+        if (activeIndices[middle] < index) low = middle + 1
+        else high = middle
+      }
+      activeIndices.splice(low, 0, index)
+    }
     if (intervalStart >= intervalEnd) continue
 
-    // Active events in this interval (already sorted by start time from above)
-    const active = clampedEvents.filter(e => e.start < intervalEnd && e.end > intervalStart)
+    const active = activeIndices.map(index => clampedEvents[index])
     if (active.length === 0) continue
 
     const top = ((intervalStart - dayStartMs) / totalDayMs) * totalHeightPx

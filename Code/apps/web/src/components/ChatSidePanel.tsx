@@ -2,7 +2,10 @@ import { useState } from 'react'
 import { X, MessageCircle, Vote, CheckCircle } from 'lucide-react'
 import LearnerHelpIcon from './LearnerHelpIcon'
 import MobilePanelSwitcher from './MobilePanelSwitcher'
-import type { PanelId } from './FloatingPanels'
+import CalendarQuickButtonToggle from './CalendarQuickButtonToggle'
+import type { PanelId } from './panel-types'
+import { SHELL_LAYER_CLASS } from '../lib/overlay-layers'
+import { Button, IconButton } from './ui'
 
 interface ChatSidePanelProps {
   isOpen: boolean
@@ -30,35 +33,33 @@ export function ChatSidePanel({ isOpen, onClose, onPanelChange }: ChatSidePanelP
   return (
     <aside
       className={`
-        fixed inset-y-0 right-0 z-50 w-screen transition-transform duration-300 ease-in-out
-        ${isOpen ? 'translate-x-0 pointer-events-auto sm:w-[22rem] md:w-96' : 'translate-x-full pointer-events-none sm:w-0'}
+        fixed inset-y-0 right-0 ${SHELL_LAYER_CLASS.sidePanel} w-screen transition-transform duration-300 ease-in-out
+        ${isOpen ? 'translate-x-0 pointer-events-auto sm:w-88 md:w-96' : 'translate-x-full pointer-events-none sm:w-0'}
         sm:sticky sm:top-0 sm:h-screen sm:shrink-0 sm:overflow-hidden sm:translate-x-0 sm:pointer-events-auto
       `}
     >
-      <div className={`ml-auto h-full w-screen flex flex-col bg-card border-l-2 border-sky-400 dark:border-sky-500 shadow-xl sm:w-[22rem] sm:min-w-[22rem] md:w-96 md:min-w-[24rem]`}>
+      <div className={`ml-auto h-full w-screen flex flex-col bg-card border-l-2 border-feature-chat shadow-xl sm:w-88 sm:min-w-88 md:w-96 md:min-w-[24rem]`}>
       {/* ── Header ──────────────────────────────────────────────────────── */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-border bg-sky-50 dark:bg-sky-950/40">
+      <div className="flex shrink-0 items-center justify-between px-4 py-3 border-b border-border bg-muted/40">
         <div className="flex items-center gap-2">
-          <MessageCircle className="h-5 w-5 text-sky-500" />
+          <MessageCircle className="h-5 w-5 text-feature-chat" />
           <h2 className="font-semibold text-sm">Chat</h2>
-          <LearnerHelpIcon size={4} description={<><p className="font-semibold text-blue-700 dark:text-blue-300 mb-1">Side Panel — Chat</p><p className="mb-1.5">Side panels slide in from the right on every page, giving you quick access to conversational tools without leaving what you’re doing.</p><p className="mb-1.5">The <strong>Chat panel</strong> is a place to communicate with other users on the platform — share ideas, coordinate plans, or ask questions in real time.</p><p><strong>Coming soon:</strong> This feature is currently gathering interest. Vote below to help shape its development!</p></>} />
+          <LearnerHelpIcon size={4} description={<><p className="font-semibold text-info mb-1">Side Panel — Chat</p><p className="mb-1.5">Side panels slide in from the right on every page, giving you quick access to conversational tools without leaving what you’re doing.</p><p className="mb-1.5">The <strong>Chat panel</strong> is a place to communicate with other users on the platform — share ideas, coordinate plans, or ask questions in real time.</p><p><strong>Coming soon:</strong> This feature is currently gathering interest. Vote below to help shape its development!</p></>} />
         </div>
-        <button
-          onClick={onClose}
-          className="p-1.5 rounded-md text-muted-foreground hover:bg-accent/50 transition-colors"
-        >
-          <X className="h-4 w-4" />
-        </button>
+        <div className="flex items-center gap-1">
+          <CalendarQuickButtonToggle toolKey="chat" label="Chat" />
+          <IconButton label="Close" icon={<X />} onClick={onClose} />
+        </div>
       </div>
       <MobilePanelSwitcher activePanel="chat" onPanelChange={onPanelChange} />
 
       {/* ── Body ────────────────────────────────────────────────────────── */}
-      <div className="flex-1 overflow-y-auto p-5 flex flex-col items-center justify-center text-center gap-6">
+      <div className="min-h-0 flex-1 overflow-y-auto p-5 flex flex-col items-center justify-center-safe text-center gap-6 *:shrink-0">
         {!submitted ? (
           <>
             <div className="space-y-3">
-              <div className="w-16 h-16 mx-auto rounded-full bg-sky-100 dark:bg-sky-900/40 flex items-center justify-center">
-                <Vote className="h-8 w-8 text-sky-500" />
+              <div className="w-16 h-16 mx-auto rounded-full bg-muted flex items-center justify-center">
+                <Vote className="h-8 w-8 text-feature-chat" />
               </div>
               <h3 className="text-lg font-semibold">Coming Soon — Maybe!</h3>
               <p className="text-sm text-muted-foreground leading-relaxed max-w-[280px] mx-auto">
@@ -74,8 +75,8 @@ export function ChatSidePanel({ isOpen, onClose, onPanelChange }: ChatSidePanelP
                   onClick={() => setSelectedOption(opt.id)}
                   className={`w-full text-left px-4 py-3 rounded-lg border text-sm transition-all duration-150 ${
                     selectedOption === opt.id
-                      ? 'border-sky-400 bg-sky-50 dark:bg-sky-900/30 ring-1 ring-sky-300'
-                      : 'border-border hover:border-sky-300 hover:bg-accent/30'
+                      ? 'border-primary-muted bg-primary-subtle ring-1 ring-primary-muted'
+                      : 'border-border hover:border-primary-muted hover:bg-accent/30'
                   }`}
                 >
                   <span className="mr-2">{opt.emoji}</span>
@@ -84,22 +85,14 @@ export function ChatSidePanel({ isOpen, onClose, onPanelChange }: ChatSidePanelP
               ))}
             </div>
 
-            <button
-              onClick={handleVote}
-              disabled={!selectedOption}
-              className={`px-6 py-2.5 rounded-lg text-sm font-medium text-white transition-all duration-200 ${
-                selectedOption
-                  ? 'bg-sky-500 hover:bg-sky-600 shadow-md'
-                  : 'bg-sky-300 dark:bg-sky-800 cursor-not-allowed'
-              }`}
-            >
+            <Button intent="primary" onClick={handleVote} disabled={!selectedOption}>
               Submit Vote
-            </button>
+            </Button>
           </>
         ) : (
           <div className="space-y-4">
-            <div className="w-16 h-16 mx-auto rounded-full bg-emerald-100 dark:bg-emerald-900/30 flex items-center justify-center">
-              <CheckCircle className="h-8 w-8 text-emerald-500" />
+            <div className="w-16 h-16 mx-auto rounded-full bg-success-subtle flex items-center justify-center">
+              <CheckCircle className="h-8 w-8 text-success" />
             </div>
             <h3 className="text-lg font-semibold">Thanks for your input!</h3>
             <p className="text-sm text-muted-foreground max-w-[280px] mx-auto leading-relaxed">

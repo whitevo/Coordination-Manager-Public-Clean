@@ -17,42 +17,80 @@
 import crypto from 'crypto'
 import { supabaseAdmin } from '../supabaseClient.js'
 
-// ── Merge-token store (in-memory with 10-minute TTL) ──────────────────
+// ── Merge-token store (DB-backed, 10-minute TTL, single use) ──────────
+//
+// Tokens live in `account_merge_tokens` so they survive restarts and work
+// across multiple API instances. Only a SHA-256 hash of the token is stored.
 
 export interface MergeToken {
-  token: string
   sourceUserId: string
   sourceAccountType: string
-  createdAt: number
   expiresAt: number
+  /** True when the token existed but was past its TTL (it is consumed either way). */
+  expired: boolean
 }
 
-export const mergeTokenStore = new Map<string, MergeToken>()
 const MERGE_TOKEN_TTL_MS = 10 * 60 * 1000 // 10 minutes
 
-// Clean up expired tokens every 60 s
-setInterval(() => {
-  const now = Date.now()
-  for (const [key, val] of mergeTokenStore) {
-    if (val.expiresAt < now) mergeTokenStore.delete(key)
-  }
-}, 60_000)
+function hashMergeToken(token: string): string {
+  return crypto.createHash('sha256').update(token).digest('hex')
+}
 
 /**
  * Create a merge token for the given source user.
- * The token is stored in memory and is single-use / time-limited.
+ * Only the token hash is persisted; the token is single-use / time-limited.
  */
-export function createMergeToken(sourceUserId: string, sourceAccountType: string): string {
+export async function createMergeToken(sourceUserId: string, sourceAccountType: string): Promise<string> {
   const token = `${crypto.randomUUID()}-${crypto.randomUUID()}`
   const now = Date.now()
-  mergeTokenStore.set(token, {
-    token,
-    sourceUserId,
-    sourceAccountType,
-    createdAt: now,
-    expiresAt: now + MERGE_TOKEN_TTL_MS,
+
+  const { error } = await supabaseAdmin.from('account_merge_tokens').insert({
+    token_hash: hashMergeToken(token),
+    source_user_id: sourceUserId,
+    source_account_type: sourceAccountType,
+    expires_at: new Date(now + MERGE_TOKEN_TTL_MS).toISOString(),
   })
+  if (error) {
+    throw new Error('Failed to create merge token')
+  }
+
+  // Best-effort cleanup of expired tokens (never blocks token creation)
+  try {
+    await supabaseAdmin
+      .from('account_merge_tokens')
+      .delete()
+      .lt('expires_at', new Date(now).toISOString())
+  } catch {
+    // Best-effort
+  }
+
   return token
+}
+
+/**
+ * Consume a merge token (delete-and-return, so it can only be used once).
+ * Returns null when the token is unknown or already used.
+ */
+export async function consumeMergeToken(token: string): Promise<MergeToken | null> {
+  const { data, error } = await supabaseAdmin
+    .from('account_merge_tokens')
+    .delete()
+    .eq('token_hash', hashMergeToken(token))
+    .select('source_user_id, source_account_type, expires_at')
+    .maybeSingle()
+
+  if (error) {
+    throw new Error('Failed to verify merge token')
+  }
+  if (!data) return null
+
+  const expiresAt = new Date(data.expires_at as string).getTime()
+  return {
+    sourceUserId: data.source_user_id as string,
+    sourceAccountType: data.source_account_type as string,
+    expiresAt,
+    expired: expiresAt < Date.now(),
+  }
 }
 
 /**

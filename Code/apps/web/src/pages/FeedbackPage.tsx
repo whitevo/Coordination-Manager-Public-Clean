@@ -1,11 +1,26 @@
-import { useState, useEffect, useCallback, useRef } from 'react'
+import { useState, useEffect, useCallback, useRef, useId } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { useSearchParams } from 'react-router-dom'
 import { apiClient } from '../lib/api-client'
 import { getPrimaryTimezone, formatDateTimeInTimezone } from '../lib/timezone-data'
+import { rollbackResourcePatch } from '../lib/resource-reconciliation'
+import { useResourceReconciliation } from '../hooks/use-resource-reconciliation'
+import { useListPresence } from '../hooks/use-list-presence'
+import {
+  planFeedbackStatusMove,
+  feedbackPageKey,
+  FEEDBACK_STATUS_HOLD_MS,
+  FEEDBACK_MOVE_MS,
+  FEEDBACK_EXIT_MS,
+  FEEDBACK_ENTER_MS,
+  FEEDBACK_FLASH_MS,
+  FEEDBACK_PAGE_CACHE_TTL_MS,
+} from './feedback-list-motion'
 import LearnerHelpIcon from '../components/LearnerHelpIcon'
 import { MessageSquare, Send, CheckCircle, AlertTriangle, Shield, ChevronDown, ChevronUp, Filter, Reply, Circle, CheckCircle2, XCircle, Eye, UserCheck, Globe, GripVertical, BarChart3, LifeBuoy, Paperclip, ImageIcon, X as XIcon, Trash2, ZoomIn } from 'lucide-react'
 import AiFeedbackPage from './AiFeedbackPage'
+import { Button, Disclosure, IconButton, Lightbox, SegmentedControl } from '../components/ui'
+import AnimatedTabBar from '../components/AnimatedTabBar'
 
 interface FeedbackResponseItem {
   id: string
@@ -30,6 +45,24 @@ interface FeedbackItem {
   created_at: string
   attachments?: string[]
   feedback_responses: FeedbackResponseItem[]
+}
+
+interface FeedbackPageData {
+  feedback?: FeedbackItem[]
+  total?: number
+  statusCounts?: { open: number; reviewed: number }
+  savedStatusOrder?: string[]
+  isAdmin?: boolean
+}
+
+interface CachedFeedbackPage {
+  data: FeedbackPageData
+  fetchedAt: number
+}
+
+function prefersReducedMotion(): boolean {
+  return typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+    && window.matchMedia('(prefers-reduced-motion: reduce)').matches
 }
 
 export default function FeedbackPage() {
@@ -63,12 +96,6 @@ export default function FeedbackPage() {
 
   // ── Image lightbox ──
   const [previewSrc, setPreviewSrc] = useState<string | null>(null)
-  useEffect(() => {
-    if (!previewSrc) return
-    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') setPreviewSrc(null) }
-    window.addEventListener('keydown', handler)
-    return () => window.removeEventListener('keydown', handler)
-  }, [previewSrc])
 
   // ── Feedback list ──
   const [feedbackList, setFeedbackList] = useState<FeedbackItem[]>([])
@@ -88,7 +115,6 @@ export default function FeedbackPage() {
   const DEFAULT_STATUS_ORDER = ['open', 'reviewed', 'affirmed', 'resolved', 'dismissed']
   const [statusOrder, setStatusOrder] = useState<string[]>(DEFAULT_STATUS_ORDER)
   const statusOrderInitialisedRef = useRef(false)
-  const skipStatusOrderFetchRef = useRef(false)
   const [draggedStatus, setDraggedStatus] = useState<string | null>(null)
   // Use API-returned isAdmin (authoritative from DB) with auth context as fallback
   const [isAdminFromApi, setIsAdminFromApi] = useState<boolean | null>(null)
@@ -96,47 +122,152 @@ export default function FeedbackPage() {
 
   // Admin: All Feedback section is collapsed by default (contains private info)
   const [allFeedbackExpanded, setAllFeedbackExpanded] = useState(false)
+  const feedbackListPanelId = `${useId()}-feedback-list`
 
-  const fetchFeedback = useCallback(async () => {
-    // Skip this invocation if it was triggered by our own status-order initialisation
-    if (skipStatusOrderFetchRef.current) {
-      skipStatusOrderFetchRef.current = false
-      return
+  // -- Reconciliation, page cache, and status-move motion --
+  const guard = useResourceReconciliation('feedback')
+  const pageCacheRef = useRef(new Map<string, CachedFeedbackPage>())
+  const latestRequestRef = useRef(0)
+  const feedbackListRef = useRef<FeedbackItem[]>(feedbackList)
+  feedbackListRef.current = feedbackList
+  const [flashingIds, setFlashingIds] = useState<Set<string>>(() => new Set())
+  const [enteringIds, setEnteringIds] = useState<Set<string>>(() => new Set())
+  const [activeMotions, setActiveMotions] = useState(0)
+  const activeMotionsRef = useRef(0)
+  const motionTimersRef = useRef(new Set<ReturnType<typeof setTimeout>>())
+  const [statusError, setStatusError] = useState('')
+  // Ghost exits only while a status move is animating; page changes swap instantly
+  const presence = useListPresence(feedbackList, activeMotions > 0, FEEDBACK_EXIT_MS, FEEDBACK_MOVE_MS)
+
+  useEffect(() => {
+    const timers = motionTimersRef.current
+    return () => {
+      for (const timer of timers) clearTimeout(timer)
+      timers.clear()
     }
-    setLoading(true)
-    setLoadError('')
+  }, [])
+
+  const wait = useCallback((ms: number) => new Promise<void>(resolve => {
+    const timer = setTimeout(() => {
+      motionTimersRef.current.delete(timer)
+      resolve()
+    }, ms)
+    motionTimersRef.current.add(timer)
+  }), [])
+
+  const markTransient = useCallback((setter: React.Dispatch<React.SetStateAction<Set<string>>>, id: string, ms: number) => {
+    setter(prev => new Set(prev).add(id))
+    void wait(ms).then(() => setter(prev => {
+      if (!prev.has(id)) return prev
+      const next = new Set(prev)
+      next.delete(id)
+      return next
+    }))
+  }, [wait])
+
+  const queryKeyFor = useCallback((targetPage: number) => feedbackPageKey({
+    tab: feedbackTab, statusFilter, statusOrder, pageSize, page: targetPage,
+  }), [feedbackTab, statusFilter, statusOrder, pageSize])
+  const currentQueryKey = queryKeyFor(page)
+  const currentQueryKeyRef = useRef(currentQueryKey)
+  currentQueryKeyRef.current = currentQueryKey
+
+  const loadPage = useCallback(async (targetPage: number): Promise<FeedbackPageData> => {
+    const params: Record<string, string> = { page: String(targetPage), limit: String(pageSize), statusOrder: JSON.stringify(statusOrder) }
+    if (statusFilter !== 'all') params.status = statusFilter
+    // Filter by category based on active tab
+    params.category = feedbackTab === 'support' ? 'support' : '!support'
+    const response = await apiClient.get('/api/feedback', { params })
+    return (response?.data ?? {}) as FeedbackPageData
+  }, [pageSize, statusOrder, statusFilter, feedbackTab])
+
+  const getFreshCachedPage = useCallback((key: string): CachedFeedbackPage | undefined => {
+    const cached = pageCacheRef.current.get(key)
+    if (!cached) return undefined
+    if (Date.now() - cached.fetchedAt > FEEDBACK_PAGE_CACHE_TTL_MS) {
+      pageCacheRef.current.delete(key)
+      return undefined
+    }
+    return cached
+  }, [])
+
+  /** Warm the cache for the page after `fromPage` so Next renders without a DB round-trip. */
+  const prefetchNextPage = useCallback((fromPage: number, totalCount: number) => {
+    if (fromPage * pageSize >= totalCount) return
+    const nextPage = fromPage + 1
+    const key = queryKeyFor(nextPage)
+    if (getFreshCachedPage(key)) return
+    guard.read(key, () => loadPage(nextPage))
+      .then(({ data }) => { pageCacheRef.current.set(key, { data, fetchedAt: Date.now() }) })
+      .catch(() => { /* prefetch is best-effort */ })
+  }, [pageSize, queryKeyFor, getFreshCachedPage, guard, loadPage])
+
+  const applyPageMeta = useCallback((data: FeedbackPageData) => {
+    setTotal(data.total || 0)
+    if (data.statusCounts) setStatusCounts(data.statusCounts)
+    // Restore once; a changed order must reload the server-paginated list.
+    if (!statusOrderInitialisedRef.current) {
+      statusOrderInitialisedRef.current = true
+      if (data.savedStatusOrder) {
+        const savedOrder = data.savedStatusOrder
+        setStatusOrder(current => (
+          current.length === savedOrder.length && current.every((status, index) => status === savedOrder[index])
+            ? current
+            : savedOrder
+        ))
+      }
+    }
+    // The API tells us authoritatively whether we're admin
+    if (typeof data.isAdmin === 'boolean') {
+      setIsAdminFromApi(data.isAdmin)
+    }
+  }, [])
+
+  /**
+   * Load the current page. `silent` keeps the rendered list (no loading state)
+   * and merges the server result through the reconciliation guard.
+   */
+  const fetchFeedback = useCallback(async (options: { silent?: boolean } = {}) => {
+    const silent = options.silent === true
+    const key = queryKeyFor(page)
+    const requestId = ++latestRequestRef.current
+
+    if (!silent) {
+      const cached = getFreshCachedPage(key)
+      if (cached) {
+        setLoadError('')
+        setFeedbackList(cached.data.feedback || [])
+        applyPageMeta(cached.data)
+        setLoading(false)
+        return
+      }
+      setLoading(true)
+      setLoadError('')
+    }
+
     try {
-      const params: Record<string, string> = { page: String(page), limit: String(pageSize), statusOrder: JSON.stringify(statusOrder) }
-      if (statusFilter !== 'all') params.status = statusFilter
-      // Filter by category based on active tab
-      if (feedbackTab === 'support') {
-        params.category = 'support'
+      const { observation, data } = await guard.read<FeedbackPageData>(key, () => loadPage(page), !silent)
+      if (requestId !== latestRequestRef.current) return
+      pageCacheRef.current.set(key, { data, fetchedAt: Date.now() })
+      const incoming = data.feedback || []
+      if (silent) {
+        setFeedbackList(current => guard.reconcile(current, incoming, observation, 'complete'))
       } else {
-        params.category = '!support'
+        setFeedbackList(incoming)
       }
-      const { data } = await apiClient.get('/api/feedback', { params })
-      setFeedbackList(data.feedback || [])
-      setTotal(data.total || 0)
-      if (data.statusCounts) setStatusCounts(data.statusCounts)
-      // Initialise statusOrder from the user's saved preference (once, using ref to avoid re-fetch)
-      if (!statusOrderInitialisedRef.current) {
-        statusOrderInitialisedRef.current = true
-        if (data.savedStatusOrder) {
-          // Flag that the next fetchFeedback (triggered by statusOrder state change) should be skipped
-          skipStatusOrderFetchRef.current = true
-          setStatusOrder(data.savedStatusOrder)
-        }
-      }
-      // The API tells us authoritatively whether we're admin
-      if (typeof data.isAdmin === 'boolean') {
-        setIsAdminFromApi(data.isAdmin)
-      }
+      applyPageMeta(data)
     } catch (err) {
+      if (requestId !== latestRequestRef.current || silent) return
       setLoadError((err as { response?: { data?: { error?: string } } }).response?.data?.error || 'Failed to load feedback')
     } finally {
-      setLoading(false)
+      if (!silent && requestId === latestRequestRef.current) setLoading(false)
     }
-  }, [page, pageSize, statusFilter, statusOrder, feedbackTab])
+  }, [page, queryKeyFor, getFreshCachedPage, guard, loadPage, applyPageMeta])
+
+  /** Drop cached pages after any write so a later Next never shows stale rows. */
+  const invalidatePageCache = useCallback(() => {
+    pageCacheRef.current.clear()
+  }, [])
 
   // Sync tab state when URL search params change (e.g. navigating from /support link)
   useEffect(() => {
@@ -148,6 +279,12 @@ export default function FeedbackPage() {
   useEffect(() => {
     fetchFeedback()
   }, [fetchFeedback])
+
+  // Once the current page is settled, warm the next page in the background
+  useEffect(() => {
+    if (loading || loadError || activeMotions > 0) return
+    prefetchNextPage(page, total)
+  }, [loading, loadError, activeMotions, page, total, prefetchNextPage])
 
   // Reset page when switching tabs
   useEffect(() => {
@@ -211,7 +348,8 @@ export default function FeedbackPage() {
       setSubmitSuccess(true)
       setTimeout(() => setSubmitSuccess(false), 5000)
       // Refresh the list so the new item appears immediately
-      if (page === 1) await fetchFeedback()
+      invalidatePageCache()
+      if (page === 1) await fetchFeedback({ silent: true })
       else setPage(1)
     } catch (err) {
       console.error('Feedback submit error:', err)
@@ -254,7 +392,8 @@ export default function FeedbackPage() {
       setSupportAttachments([])
       setSupportSuccess(true)
       setTimeout(() => setSupportSuccess(false), 5000)
-      if (page === 1) await fetchFeedback()
+      invalidatePageCache()
+      if (page === 1) await fetchFeedback({ silent: true })
       else setPage(1)
     } catch (err) {
       setSupportError((err as { response?: { data?: { error?: string } } }).response?.data?.error || (err as { message?: string }).message || 'Failed to submit support request')
@@ -264,12 +403,78 @@ export default function FeedbackPage() {
   }
 
   const handleSetStatus = async (feedbackId: string, status: string) => {
+    const before = feedbackListRef.current.find(item => item.id === feedbackId)
+    if (!before || before.status === status) return
+    const startKey = currentQueryKeyRef.current
+    const stillCurrent = () => currentQueryKeyRef.current === startKey
+    const reduced = prefersReducedMotion()
+    const nextPageItems = getFreshCachedPage(queryKeyFor(page + 1))?.data.feedback ?? []
+    const hasMoreAfter = page * pageSize < total
+
+    setStatusError('')
     setUpdatingId(feedbackId)
-    try {
-      await apiClient.patch(`/api/feedback/${feedbackId}`, { status })
-      fetchFeedback()
-    } catch { /* ignore */ } finally {
-      setUpdatingId(null)
+    activeMotionsRef.current += 1
+    setActiveMotions(activeMotionsRef.current)
+    const mutation = guard.beginMutation(feedbackId)
+
+    // Phase 1: change the status in place so the stepper animates old -> new
+    setFeedbackList(list => list.map(item => item.id === feedbackId ? { ...item, status } : item))
+    if (!reduced) markTransient(setFlashingIds, feedbackId, FEEDBACK_FLASH_MS)
+
+    let succeeded = true
+    const request = apiClient.patch(`/api/feedback/${feedbackId}`, { status }).catch(() => { succeeded = false })
+    await Promise.all([request, reduced ? Promise.resolve() : wait(FEEDBACK_STATUS_HOLD_MS)])
+
+    if (!succeeded) {
+      if (stillCurrent()) setFeedbackList(list => rollbackResourcePatch(list, before, { status }))
+      setStatusError('Could not update the status. Please try again.')
+    } else if (stillCurrent()) {
+      const plan = planFeedbackStatusMove({
+        list: feedbackListRef.current,
+        id: feedbackId,
+        status,
+        statusOrder,
+        statusFilter,
+        hasMoreAfter,
+        nextPageItems,
+      })
+      if (plan) {
+        if (!plan.exits) {
+          // Phase 2: glide to the new slot (FLIP via useListPresence)
+          setFeedbackList(plan.order)
+          if (!reduced) await wait(FEEDBACK_MOVE_MS)
+        } else if (reduced) {
+          setFeedbackList(plan.backfill ? [...plan.rest, plan.backfill] : plan.rest)
+        } else {
+          // Phase 2: travel down to the end of the list
+          const currentIndex = feedbackListRef.current.findIndex(item => item.id === feedbackId)
+          if (currentIndex !== -1 && currentIndex < feedbackListRef.current.length - 1) {
+            setFeedbackList([...plan.rest, plan.updated])
+            await wait(FEEDBACK_MOVE_MS)
+          }
+          // Phase 3: slide under the list edge and disappear
+          if (stillCurrent()) {
+            setFeedbackList(list => list.filter(item => item.id !== feedbackId))
+            await wait(FEEDBACK_EXIT_MS)
+          }
+          // Phase 4: backfill from the prefetched next page
+          const backfill = plan.backfill
+          if (backfill && stillCurrent()) {
+            setFeedbackList(list => list.some(item => item.id === backfill.id) ? list : [...list, backfill])
+            markTransient(setEnteringIds, backfill.id, FEEDBACK_ENTER_MS)
+          }
+        }
+      }
+    }
+
+    guard.endMutation(mutation)
+    setUpdatingId(current => current === feedbackId ? null : current)
+    invalidatePageCache()
+    activeMotionsRef.current -= 1
+    setActiveMotions(activeMotionsRef.current)
+    // Reconcile with the server once no other card is mid-animation
+    if (activeMotionsRef.current === 0 && stillCurrent()) {
+      await fetchFeedback({ silent: true })
     }
   }
 
@@ -317,19 +522,19 @@ export default function FeedbackPage() {
   }
 
   const STATUS_COLORS: Record<string, string> = {
-    open: 'bg-yellow-100 dark:bg-yellow-900/40 text-yellow-800 dark:text-yellow-200 border-yellow-300 dark:border-yellow-700',
-    reviewed: 'bg-blue-100 dark:bg-blue-900/40 text-blue-800 dark:text-blue-200 border-blue-300 dark:border-blue-700',
-    affirmed: 'bg-indigo-100 dark:bg-indigo-900/40 text-indigo-800 dark:text-indigo-200 border-indigo-300 dark:border-indigo-700',
-    resolved: 'bg-green-100 dark:bg-green-900/40 text-green-800 dark:text-green-200 border-green-300 dark:border-green-700',
-    dismissed: 'bg-gray-100 dark:bg-gray-800/60 text-gray-600 dark:text-gray-400 border-gray-300 dark:border-gray-600',
+    open: 'bg-warning-subtle text-warning border-warning-muted',
+    reviewed: 'bg-info-subtle text-info border-info-muted',
+    affirmed: 'bg-primary-subtle text-primary border-primary-muted',
+    resolved: 'bg-success-subtle text-success border-success-muted',
+    dismissed: 'bg-muted text-muted-foreground border-border',
   }
 
   const STATUS_TEXT_COLORS: Record<string, string> = {
-    open: 'text-yellow-800 dark:text-yellow-200',
-    reviewed: 'text-blue-800 dark:text-blue-200',
-    affirmed: 'text-indigo-800 dark:text-indigo-200',
-    resolved: 'text-green-800 dark:text-green-200',
-    dismissed: 'text-gray-600 dark:text-gray-400',
+    open: 'text-warning',
+    reviewed: 'text-info',
+    affirmed: 'text-primary',
+    resolved: 'text-success',
+    dismissed: 'text-muted-foreground',
   }
 
   const handleRespond = async (feedbackId: string) => {
@@ -341,7 +546,8 @@ export default function FeedbackPage() {
       })
       setAdminResponse('')
       setExpandedId(null)
-      fetchFeedback()
+      invalidatePageCache()
+      void fetchFeedback({ silent: true })
     } catch { /* ignore */ } finally {
       setUpdatingId(null)
     }
@@ -351,6 +557,7 @@ export default function FeedbackPage() {
     setUpdatingId(id)
     try {
       await apiClient.delete(`/api/feedback/${id}`)
+      invalidatePageCache()
       setFeedbackList(prev => prev.filter(f => f.id !== id))
       setTotal(prev => Math.max(0, prev - 1))
       setConfirmDeleteId(null)
@@ -400,7 +607,7 @@ export default function FeedbackPage() {
     if (isDismissed) {
       return (
         <div className="py-2 space-y-1.5">
-          <div className="flex items-center gap-1.5 text-gray-400 dark:text-gray-500">
+          <div className={`flex items-center gap-1.5 text-muted-foreground ${flashingIds.has(item.id) ? 'feedback-step-pop' : ''}`}>
             <XCircle className="w-4 h-4" />
             <span className="text-xs font-medium">Dismissed</span>
           </div>
@@ -408,14 +615,15 @@ export default function FeedbackPage() {
             <div className="flex items-center gap-1 flex-wrap">
               <span className="text-xs text-muted-foreground">Move to:</span>
               {STATUS_STEPS.map(step => (
-                <button
+                <Button
                   key={step.key}
+                  emphasis="outline"
+                  size="micro"
                   onClick={() => handleSetStatus(item.id, step.key)}
                   disabled={isUpdating}
-                  className="text-xs px-2 py-0.5 rounded border border-border text-muted-foreground hover:text-foreground hover:bg-accent/60 disabled:opacity-50 transition-colors"
                 >
                   {step.label}
-                </button>
+                </Button>
               ))}
             </div>
           )}
@@ -439,9 +647,9 @@ export default function FeedbackPage() {
           // Colors -- only the ACTIVE step shows its status colour.
           // Completed (but not active) steps stay neutral so users see a single
           // current status at a glance.
-          let iconColor = 'text-gray-300 dark:text-gray-600'
+          let iconColor = 'text-muted-foreground/60'
           let textColor = 'text-muted-foreground'
-          let lineColor = 'bg-gray-200 dark:bg-gray-700'
+          let lineColor = 'bg-muted'
 
           if (isCompleted) {
             // Faint indicator that the step has been reached, but no status colour.
@@ -452,18 +660,18 @@ export default function FeedbackPage() {
 
           if (isActive) {
             iconColor = step.key === 'affirmed'
-              ? 'text-blue-500 dark:text-blue-400'
+              ? 'text-primary'
               : step.key === 'resolved'
-                ? 'text-green-500 dark:text-green-400'
+                ? 'text-success'
                 : step.key === 'open'
-                  ? 'text-yellow-500 dark:text-yellow-400'
+                  ? 'text-warning'
                   : 'text-primary'
             textColor = step.key === 'affirmed'
-              ? 'text-blue-700 dark:text-blue-300 font-medium'
+              ? 'text-info font-medium'
               : step.key === 'resolved'
-                ? 'text-green-700 dark:text-green-300 font-medium'
+                ? 'text-success font-medium'
                 : step.key === 'open'
-                  ? 'text-yellow-700 dark:text-yellow-300 font-medium'
+                  ? 'text-warning font-medium'
                   : 'text-foreground font-medium'
           }
 
@@ -471,7 +679,7 @@ export default function FeedbackPage() {
             <div key={step.key} className="flex items-center">
               {/* Connector line (before item, except first) */}
               {idx > 0 && (
-                <div className={`w-4 sm:w-6 h-0.5 ${isCompleted ? lineColor : 'bg-gray-200 dark:bg-gray-700'} flex-shrink-0`} />
+                <div className={`w-4 sm:w-6 h-0.5 ${isCompleted ? lineColor : 'bg-muted'} shrink-0`} />
               )}
 
               {/* Step */}
@@ -479,17 +687,17 @@ export default function FeedbackPage() {
                 type="button"
                 disabled={!canClick}
                 onClick={handleClick}
-                className={`flex items-center gap-1 px-1.5 py-0.5 rounded-md transition-all flex-shrink-0 ${
+                className={`flex items-center gap-1 px-1.5 py-0.5 rounded-md transition-all shrink-0 ${
                   canClick
                     ? 'hover:bg-accent/60 cursor-pointer'
                     : 'cursor-default'
-                } ${isActive ? 'bg-accent/40 ring-1 ring-primary/20' : ''}`}
+                } ${isActive ? 'bg-accent/40 ring-1 ring-primary/20' : ''} ${isActive && flashingIds.has(item.id) ? 'feedback-step-pop' : ''}`}
                 title={isAdmin ? `Set status to ${step.label}` : step.label}
               >
                 {isCompleted ? (
-                  <CheckCircle2 className={`w-4 h-4 ${iconColor} flex-shrink-0`} />
+                  <CheckCircle2 className={`w-4 h-4 ${iconColor} shrink-0`} />
                 ) : (
-                  <Circle className={`w-4 h-4 ${iconColor} flex-shrink-0`} />
+                  <Circle className={`w-4 h-4 ${iconColor} shrink-0`} />
                 )}
                 <span className={`text-xs whitespace-nowrap ${textColor}`}>
                   {step.label}
@@ -501,16 +709,17 @@ export default function FeedbackPage() {
 
         {/* Dismiss option for admin (far right) */}
         {isAdmin && (
-          <div className="flex items-center ml-auto pl-2 flex-shrink-0">
-            <button
+          <div className="flex items-center ml-auto pl-2 shrink-0">
+            <Button
+              emphasis="ghost"
+              size="micro"
               onClick={() => handleSetStatus(item.id, 'dismissed')}
               disabled={isUpdating}
-              className="flex items-center gap-1 text-xs text-muted-foreground hover:text-red-500 dark:hover:text-red-400 transition-colors disabled:opacity-50"
               title="Dismiss this feedback"
+              icon={<XCircle className="w-3.5 h-3.5" />}
             >
-              <XCircle className="w-3.5 h-3.5" />
               <span className="hidden sm:inline">Dismiss</span>
-            </button>
+            </Button>
           </div>
         )}
       </div>
@@ -535,17 +744,17 @@ export default function FeedbackPage() {
           <MessageSquare className="w-6 h-6" />
           Feedback
           {isAdmin ? (
-            <span className="inline-flex items-center gap-1 text-xs bg-purple-100 dark:bg-purple-900 text-purple-700 dark:text-purple-200 px-2 py-0.5 rounded-full font-medium">
+            <span className="inline-flex items-center gap-1 text-xs bg-primary-subtle text-primary px-2 py-0.5 rounded-full font-medium">
               <Shield className="w-3 h-3" />
               Admin
             </span>
           ) : user?.accountType === 'traveler' ? (
-            <span className="inline-flex items-center gap-1 text-xs bg-amber-100 dark:bg-amber-900 text-amber-700 dark:text-amber-200 px-2 py-0.5 rounded-full font-medium">
+            <span className="inline-flex items-center gap-1 text-xs bg-warning-subtle text-warning px-2 py-0.5 rounded-full font-medium">
               <Globe className="w-3 h-3" />
               Traveler
             </span>
           ) : user ? (
-            <span className="inline-flex items-center gap-1 text-xs bg-green-100 dark:bg-green-900 text-green-700 dark:text-green-200 px-2 py-0.5 rounded-full font-medium">
+            <span className="inline-flex items-center gap-1 text-xs bg-success-subtle text-success px-2 py-0.5 rounded-full font-medium">
               <UserCheck className="w-3 h-3" />
               Verified
             </span>
@@ -554,52 +763,36 @@ export default function FeedbackPage() {
         <p className="text-muted-foreground mt-1">
           Share your thoughts, report bugs, or suggest features.
           {isAdmin && (
-            <span className="inline-flex items-center gap-1 ml-2 text-xs bg-purple-100 dark:bg-purple-900 text-purple-700 dark:text-purple-200 px-2 py-0.5 rounded-full">
+            <span className="inline-flex items-center gap-1 ml-2 text-xs bg-primary-subtle text-primary px-2 py-0.5 rounded-full">
               <Shield className="w-3 h-3" />
               Viewing all feedback
             </span>
+          )}
+          {feedbackTab === 'ai' && canViewAiFeedback && (
+            <LearnerHelpIcon
+              description={<><p className="font-semibold text-info mb-1">Sentiment Feedback Entry</p><p className="mb-1.5">Each card represents feedback that was submitted on an AI chat response. It captures how the user felt about the AI's answer.</p><p className="font-semibold text-info mb-1">What's inside</p><ul className="list-disc list-inside space-y-0.5"><li><strong>Sentiment grid</strong> -- a 2D rating of valence (positive/negative) and trust.</li><li><strong>Written comments</strong> -- optional text elaborating on the rating.</li><li><strong>Conversation context</strong> -- the original AI exchange that was rated.</li></ul></>}
+              size={4}
+              className="ml-1 align-middle"
+            />
           )}
         </p>
       </div>
 
       {/* Tab Switcher */}
-      <div className="flex border-b border-border">
-        <button
-          onClick={() => setSearchParams({}, { replace: true })}
-          className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ${
-            feedbackTab === 'general'
-              ? 'border-primary text-foreground'
-              : 'border-transparent text-muted-foreground hover:text-foreground hover:border-border'
-          }`}
-        >
-          <MessageSquare className="w-4 h-4" />
-          Feedback
-        </button>
-        <button
-          onClick={() => setSearchParams({ tab: 'support' }, { replace: true })}
-          className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ${
-            feedbackTab === 'support'
-              ? 'border-blue-500 text-foreground'
-              : 'border-transparent text-muted-foreground hover:text-foreground hover:border-border'
-          }`}
-        >
-          <LifeBuoy className="w-4 h-4" />
-          Support Request
-        </button>
-        {canViewAiFeedback && (
-          <button
-            onClick={() => setSearchParams({ tab: 'ai' }, { replace: true })}
-            className={`flex items-center gap-1.5 px-4 py-2.5 text-sm font-medium border-b-2 transition-colors ${
-              feedbackTab === 'ai'
-                ? 'border-primary text-foreground'
-                : 'border-transparent text-muted-foreground hover:text-foreground hover:border-border'
-            }`}
-          >
-            <BarChart3 className="w-4 h-4" />
-            AI Feedback
-          </button>
-        )}
-      </div>
+      <AnimatedTabBar<'general' | 'support' | 'ai'>
+        tabs={[
+          { id: 'general', label: 'Feedback', icon: MessageSquare },
+          { id: 'support', label: 'Support Request', icon: LifeBuoy },
+          ...(canViewAiFeedback ? [{ id: 'ai' as const, label: 'AI Feedback', icon: BarChart3 }] : []),
+        ]}
+        activeId={feedbackTab}
+        onSelect={tabId => setSearchParams(tabId === 'general' ? {} : { tab: tabId }, { replace: true })}
+        ariaLabel="Feedback sections"
+        testId="feedback-tabs"
+        className="flex flex-wrap gap-1.5"
+        buttonClassName="px-4 py-2 text-sm font-medium"
+        iconClassName="w-4 h-4"
+      />
 
       {/* AI Feedback Tab */}
       {feedbackTab === 'ai' && canViewAiFeedback ? (
@@ -610,7 +803,7 @@ export default function FeedbackPage() {
         <form
           onSubmit={handleSupportSubmit}
           onPaste={e => handlePasteImage(e, supportAttachments, setSupportAttachments)}
-          className="rounded-lg border-2 border-blue-200 dark:border-blue-800 bg-card p-5 space-y-4 relative"
+          className="rounded-lg border-2 border-info-muted bg-card p-5 space-y-4 relative"
         >
           <LearnerHelpIcon
             description="Submit a support request for technical issues, access problems, or integration help. Provide as much detail as possible so we can assist you quickly."
@@ -618,7 +811,7 @@ export default function FeedbackPage() {
             className="absolute top-3 right-3 z-10"
           />
           <div className="flex items-center gap-2 mb-1">
-            <LifeBuoy className="w-5 h-5 text-blue-500" />
+            <LifeBuoy className="w-5 h-5 text-info" />
             <h2 className="font-semibold">Submit a Support Request</h2>
           </div>
           <p className="text-sm text-muted-foreground">
@@ -641,8 +834,8 @@ export default function FeedbackPage() {
                   onClick={() => setSupportType(opt.value)}
                   className={`flex items-center gap-2 px-3 py-2.5 rounded-lg border text-sm text-left transition-all ${
                     supportType === opt.value
-                      ? 'border-blue-400 dark:border-blue-600 bg-blue-50 dark:bg-blue-950 ring-1 ring-blue-300 dark:ring-blue-700'
-                      : 'border-border hover:border-blue-200 dark:hover:border-blue-800 hover:bg-accent/30'
+                      ? 'border-info-muted bg-info-subtle ring-1 ring-info-muted'
+                      : 'border-border hover:border-info-muted hover:bg-accent/30'
                   }`}
                 >
                   <span>{opt.icon}</span>
@@ -661,20 +854,20 @@ export default function FeedbackPage() {
               onChange={e => setSupportSubject(e.target.value)}
               placeholder="e.g. Cannot connect Zoom account"
               maxLength={200}
-              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
             />
           </div>
 
           {/* Description */}
           <div>
-            <label className="block text-sm font-medium mb-1.5">Describe the issue <span className="text-red-500">*</span></label>
+            <label className="block text-sm font-medium mb-1.5">Describe the issue <span className="text-danger">*</span></label>
             <textarea
               value={supportDescription}
               onChange={e => setSupportDescription(e.target.value)}
               placeholder="What happened? What did you expect to happen? Please include any error messages you saw."
               rows={4}
               maxLength={2000}
-              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring resize-y"
+              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring resize-y"
             />
           </div>
 
@@ -687,7 +880,7 @@ export default function FeedbackPage() {
               placeholder={"1. Go to...\n2. Click on...\n3. See error..."}
               rows={3}
               maxLength={1000}
-              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring resize-y"
+              className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring resize-y"
             />
           </div>
 
@@ -703,16 +896,16 @@ export default function FeedbackPage() {
                     className="absolute inset-0 flex items-center justify-center bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity"
                     title="Enlarge"
                   >
-                    <ZoomIn className="w-5 h-5 text-white drop-shadow" />
+                    <ZoomIn className="w-5 h-5 text-white drop-shadow-sm" />
                   </button>
-                  <button
-                    type="button"
+                  <IconButton
+                    label="Remove image"
+                    icon={<XIcon />}
+                    emphasis="solid"
+                    size="micro"
                     onClick={() => setSupportAttachments(prev => prev.filter((_, idx) => idx !== i))}
-                    className="absolute top-0.5 right-0.5 p-0.5 rounded-full bg-black/60 text-white opacity-0 group-hover:opacity-100 transition-opacity z-10"
-                    title="Remove image"
-                  >
-                    <XIcon className="w-3 h-3" />
-                  </button>
+                    className="absolute top-0.5 right-0.5 opacity-0 group-hover:opacity-100 z-10"
+                  />
                 </div>
               ))}
             </div>
@@ -732,16 +925,16 @@ export default function FeedbackPage() {
             <div className="flex items-center gap-2">
               <span className="text-xs text-muted-foreground">{supportDescription.length} / 2000</span>
               <div className="flex flex-col gap-0.5">
-                <button
-                  type="button"
+                <Button
+                  emphasis="outline"
+                  size="micro"
                   onClick={() => supportAttachFileRef.current?.click()}
                   disabled={supportAttachments.length >= 3}
-                  className="flex items-center gap-1.5 px-2 py-1 rounded-md border border-border text-xs text-muted-foreground hover:text-foreground hover:bg-accent/50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                   title="Attach a screenshot (or paste from clipboard)"
+                  icon={<ImageIcon className="w-3.5 h-3.5" />}
                 >
-                  <ImageIcon className="w-3.5 h-3.5" />
                   {supportAttachments.length > 0 ? `${supportAttachments.length}/3 screenshots` : 'Add screenshot'}
-                </button>
+                </Button>
                 {supportAttachments.length < 3 && (
                   <span className="text-xs text-muted-foreground/60 pl-1">or paste from clipboard (Ctrl+V)</span>
                 )}
@@ -749,31 +942,32 @@ export default function FeedbackPage() {
             </div>
             <div className="flex items-center gap-3">
               {supportError && (
-                <span className="flex items-center gap-1 text-sm text-red-600 dark:text-red-400">
+                <span className="flex items-center gap-1 text-sm text-danger">
                   <AlertTriangle className="w-3.5 h-3.5" />
                   {supportError}
                 </span>
               )}
               {supportSuccess && (
-                <span className="flex items-center gap-1 text-sm text-green-600 dark:text-green-400">
+                <span className="flex items-center gap-1 text-sm text-success">
                   <CheckCircle className="w-3.5 h-3.5" />
                   Support request submitted!
                 </span>
               )}
-              <button
+              <Button
                 type="submit"
-                disabled={supportSubmitting || !supportDescription.trim()}
-                className="flex items-center gap-2 px-4 py-2 rounded-md bg-blue-600 hover:bg-blue-700 text-white text-sm font-medium disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                intent="primary"
+                disabled={!supportDescription.trim()}
+                loading={supportSubmitting}
+                icon={<Send className="w-4 h-4" />}
               >
-                <Send className="w-4 h-4" />
                 {supportSubmitting ? 'Sending...' : 'Submit Request'}
-              </button>
+              </Button>
             </div>
           </div>
 
-          <div className="flex items-start gap-2 p-3 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-md">
-            <Shield className="w-4 h-4 text-blue-600 dark:text-blue-400 flex-shrink-0 mt-0.5" />
-            <p className="text-xs text-blue-700 dark:text-blue-300">
+          <div className="flex items-start gap-2 p-3 bg-info-subtle border border-info-muted rounded-md">
+            <Shield className="w-4 h-4 text-primary shrink-0 mt-0.5" />
+            <p className="text-xs text-info">
               <span className="font-medium">Response time:</span> We aim to respond to support requests within 48 hours.
               For urgent issues you can also email us at{' '}
               <a href="mailto:support@coordinationmanager.com" className="underline">support@coordinationmanager.com</a>.
@@ -801,7 +995,7 @@ export default function FeedbackPage() {
           placeholder="What's on your mind? Report a bug, suggest a feature, or share general feedback..."
           rows={3}
           maxLength={2000}
-          className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring resize-y"
+          className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring resize-y"
         />
 
         {/* Image previews */}
@@ -816,16 +1010,16 @@ export default function FeedbackPage() {
                   className="absolute inset-0 flex items-center justify-center bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity"
                   title="Enlarge"
                 >
-                  <ZoomIn className="w-5 h-5 text-white drop-shadow" />
+                  <ZoomIn className="w-5 h-5 text-white drop-shadow-sm" />
                 </button>
-                <button
-                  type="button"
+                <IconButton
+                  label="Remove image"
+                  icon={<XIcon />}
+                  emphasis="solid"
+                  size="micro"
                   onClick={() => setAttachments(prev => prev.filter((_, idx) => idx !== i))}
-                  className="absolute top-0.5 right-0.5 p-0.5 rounded-full bg-black/60 text-white opacity-0 group-hover:opacity-100 transition-opacity z-10"
-                  title="Remove image"
-                >
-                  <XIcon className="w-3 h-3" />
-                </button>
+                  className="absolute top-0.5 right-0.5 opacity-0 group-hover:opacity-100 z-10"
+                />
               </div>
             ))}
           </div>
@@ -845,16 +1039,16 @@ export default function FeedbackPage() {
           <div className="flex items-center gap-2">
             <span className="text-xs text-muted-foreground">{message.length} / 2000</span>
             <div className="flex flex-col gap-0.5">
-              <button
-                type="button"
+              <Button
+                emphasis="outline"
+                size="micro"
                 onClick={() => attachFileRef.current?.click()}
                 disabled={attachments.length >= 3}
-                className="flex items-center gap-1.5 px-2 py-1 rounded-md border border-border text-xs text-muted-foreground hover:text-foreground hover:bg-accent/50 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
                 title="Attach image (or paste from clipboard)"
+                icon={<Paperclip className="w-3.5 h-3.5" />}
               >
-                <Paperclip className="w-3.5 h-3.5" />
                 {attachments.length > 0 ? `${attachments.length}/3 images` : 'Attach image'}
-              </button>
+              </Button>
               {attachments.length < 3 && (
                 <span className="text-xs text-muted-foreground/60 pl-1">or paste from clipboard (Ctrl+V)</span>
               )}
@@ -863,39 +1057,40 @@ export default function FeedbackPage() {
 
           <div className="flex items-center gap-3">
             {submitError && (
-              <span className="flex items-center gap-1 text-sm text-red-600 dark:text-red-400">
+              <span className="flex items-center gap-1 text-sm text-danger">
                 <AlertTriangle className="w-3.5 h-3.5" />
                 {submitError}
               </span>
             )}
             {submitSuccess && (
-              <span className="flex items-center gap-1 text-sm text-green-600 dark:text-green-400">
+              <span className="flex items-center gap-1 text-sm text-success">
                 <CheckCircle className="w-3.5 h-3.5" />
                 Submitted!
               </span>
             )}
-            <button
+            <Button
               type="submit"
-              disabled={submitting || !message.trim()}
-              className="flex items-center gap-2 px-4 py-2 rounded-md bg-primary text-primary-foreground text-sm font-medium hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+              intent="primary"
+              disabled={!message.trim()}
+              loading={submitting}
+              icon={<Send className="w-4 h-4" />}
             >
-              <Send className="w-4 h-4" />
               {submitting ? 'Sending...' : 'Submit'}
-            </button>
+            </Button>
           </div>
         </div>
 
         {/* Privacy Notice */}
-        <div className="flex items-start gap-2 p-3 bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 rounded-md">
-          <Shield className="w-4 h-4 text-blue-600 dark:text-blue-400 flex-shrink-0 mt-0.5" />
-          <p className="text-xs text-blue-700 dark:text-blue-300">
+        <div className="flex items-start gap-2 p-3 bg-info-subtle border border-info-muted rounded-md">
+          <Shield className="w-4 h-4 text-primary shrink-0 mt-0.5" />
+          <p className="text-xs text-info">
             <span className="font-medium">Privacy:</span> Your feedback is visible only to platform administrators. 
             It will not be shared publicly or with other users.
           </p>
         </div>
 
         <p className="text-xs text-muted-foreground">
-          You can also submit feedback via Discord using the <code className="bg-accent px-1 rounded">/feedback</code> command.
+          You can also submit feedback via Discord using the <code className="bg-accent/20 text-foreground border border-accent/40 font-mono px-1 rounded">/feedback</code> command.
         </p>
       </form>
       </>
@@ -903,37 +1098,41 @@ export default function FeedbackPage() {
 
       {/* ── Feedback / Support List (shared across general & support tabs) ── */}
       {feedbackTab !== 'ai' && (
-      <div className={isAdmin ? 'rounded-lg border-2 border-red-400 dark:border-red-600 p-4' : ''}>
+      <div className={isAdmin ? 'rounded-lg border-2 border-danger-muted p-4' : ''}>
         {/* Section header */}
         <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
           {isAdmin ? (
-            <button
-              type="button"
-              onClick={() => setAllFeedbackExpanded(prev => !prev)}
-              className="flex items-center gap-2 text-lg font-semibold hover:opacity-80 transition-opacity"
-            >
-              {allFeedbackExpanded ? <ChevronUp className="w-5 h-5" /> : <ChevronDown className="w-5 h-5" />}
-              {feedbackTab === 'support' ? 'All Support Requests' : 'All Feedback'}
-              <span className={`inline-flex items-center gap-1 text-sm font-bold px-2 py-0.5 rounded-full ${
-                statusCounts.open > 0
-                  ? 'bg-red-100 dark:bg-red-900/50 text-red-700 dark:text-red-300'
-                  : 'bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400'
-              }`}>
-                {statusCounts.open} open
-              </span>
-              {statusCounts.reviewed > 0 && (
-                <span className="text-sm text-muted-foreground font-normal">
-                  {statusCounts.reviewed} acknowledged
+            <Disclosure
+              size="section"
+              className="min-w-0 flex-1"
+              title={feedbackTab === 'support' ? 'All Support Requests' : 'All Feedback'}
+              trailing={
+                <span className="flex items-center gap-2">
+                  <span className={`inline-flex items-center gap-1 text-sm font-bold px-2 py-0.5 rounded-full ${
+                    statusCounts.open > 0
+                      ? 'bg-danger-subtle text-danger'
+                      : 'bg-muted text-muted-foreground'
+                  }`}>
+                    {statusCounts.open} open
+                  </span>
+                  {statusCounts.reviewed > 0 && (
+                    <span className="text-sm text-muted-foreground font-normal">
+                      {statusCounts.reviewed} acknowledged
+                    </span>
+                  )}
                 </span>
-              )}
-            </button>
+              }
+              expanded={allFeedbackExpanded}
+              onToggle={setAllFeedbackExpanded}
+              panelId={feedbackListPanelId}
+            />
           ) : (
             <h2 className="text-lg font-semibold flex items-center gap-2">
               {feedbackTab === 'support' ? 'Your Support Requests' : 'Your Submissions'}
               <span className={`inline-flex items-center text-sm font-bold px-2 py-0.5 rounded-full ${
                 statusCounts.open > 0
-                  ? 'bg-yellow-100 dark:bg-yellow-900/40 text-yellow-800 dark:text-yellow-200'
-                  : 'bg-gray-100 dark:bg-gray-800 text-gray-500 dark:text-gray-400'
+                  ? 'bg-warning-subtle text-warning'
+                  : 'bg-muted text-muted-foreground'
               }`}>
                 {statusCounts.open} open
               </span>
@@ -951,7 +1150,7 @@ export default function FeedbackPage() {
               <select
                 value={statusFilter}
                 onChange={e => { setStatusFilter(e.target.value); setPage(1) }}
-                className="px-2 py-1 border border-input rounded text-xs bg-background text-foreground focus:ring-1 focus:ring-ring outline-none"
+                className="px-2 py-1 border border-input rounded text-xs bg-background text-foreground focus:ring-1 focus:ring-ring outline-hidden"
               >
                 <option value="all">All statuses</option>
                 <option value="open">Open</option>
@@ -967,16 +1166,16 @@ export default function FeedbackPage() {
         {/* Admin collapsed summary */}
         {isAdmin && !allFeedbackExpanded && (
           <div className="text-sm text-muted-foreground flex items-center gap-2 py-2">
-            <Shield className="w-4 h-4 text-red-400 dark:text-red-500" />
+            <Shield className="w-4 h-4 text-danger" />
             {statusCounts.open > 0
-              ? <span>Contains private user {feedbackTab === 'support' ? 'support requests' : 'feedback'}. <span className="font-medium text-red-600 dark:text-red-400">{statusCounts.open} open</span> item{statusCounts.open !== 1 ? 's' : ''} to review.{statusCounts.reviewed > 0 && <span className="ml-1 text-blue-600 dark:text-blue-400">{statusCounts.reviewed} acknowledged.</span>}</span>
+              ? <span>Contains private user {feedbackTab === 'support' ? 'support requests' : 'feedback'}. <span className="font-medium text-danger">{statusCounts.open} open</span> item{statusCounts.open !== 1 ? 's' : ''} to review.{statusCounts.reviewed > 0 && <span className="ml-1 text-primary">{statusCounts.reviewed} acknowledged.</span>}</span>
               : <span>Nothing new to review -- all {feedbackTab === 'support' ? 'support requests have' : 'feedback has'} been addressed.</span>
             }
           </div>
         )}
 
         {/* Expandable content (always visible for non-admins) */}
-        {(!isAdmin || allFeedbackExpanded) && (<>
+        {(!isAdmin || allFeedbackExpanded) && (<div id={feedbackListPanelId}>
 
         {/* ── Drag-to-reorder status groups ── */}
         <div className="flex items-center gap-2 mb-3 flex-wrap">
@@ -990,7 +1189,7 @@ export default function FeedbackPage() {
               onDragEnd={handleDragEnd}
               className={`flex items-center gap-1 px-2 py-1 rounded-md border text-xs font-medium cursor-grab active:cursor-grabbing select-none transition-all ${
                 STATUS_COLORS[status] || 'bg-accent text-foreground border-border'
-              } ${draggedStatus === status ? 'opacity-50 scale-95' : 'hover:shadow-sm'}`}
+              } ${draggedStatus === status ? 'opacity-50 scale-95' : 'hover:shadow-xs'}`}
             >
               <GripVertical className="w-3 h-3 opacity-40" />
               {STATUS_LABELS[status] || status}
@@ -1003,50 +1202,53 @@ export default function FeedbackPage() {
           <div className="flex items-center justify-between mb-3 flex-wrap gap-2">
             <div className="flex items-center gap-1.5 text-xs text-muted-foreground">
               <span>Show:</span>
-              {[5, 10, 25, 50].map(size => (
-                <button
-                  key={size}
-                  onClick={() => { setPageSize(size); setPage(1) }}
-                  className={`px-2 py-1 rounded border text-xs transition-colors ${
-                    pageSize === size
-                      ? 'border-primary bg-primary/10 text-primary font-medium'
-                      : 'border-border hover:bg-accent/50'
-                  }`}
-                >
-                  {size}
-                </button>
-              ))}
+              <SegmentedControl
+                label="Items per page"
+                size="micro"
+                value={String(pageSize)}
+                onChange={size => { setPageSize(Number(size)); setPage(1) }}
+                options={[5, 10, 25, 50].map(size => ({ value: String(size), label: String(size) }))}
+              />
               <span>per page</span>
               <span className="ml-2 text-muted-foreground/60">{total} total</span>
             </div>
             {totalPages > 1 && (
               <div className="flex items-center gap-2">
-                <button
+                <Button
+                  emphasis="outline"
+                  size="compact"
                   onClick={() => setPage(p => Math.max(1, p - 1))}
                   disabled={page <= 1}
-                  className="px-3 py-1.5 rounded-md border border-border text-sm disabled:opacity-50 hover:bg-accent/50 transition-colors"
                 >
                   Previous
-                </button>
+                </Button>
                 <span className="text-sm text-muted-foreground">
                   {page} / {totalPages}
                 </span>
-                <button
+                <Button
+                  emphasis="outline"
+                  size="compact"
                   onClick={() => setPage(p => Math.min(totalPages, p + 1))}
                   disabled={page >= totalPages}
-                  className="px-3 py-1.5 rounded-md border border-border text-sm disabled:opacity-50 hover:bg-accent/50 transition-colors"
                 >
                   Next
-                </button>
+                </Button>
               </div>
             )}
+          </div>
+        )}
+
+        {statusError && (
+          <div role="alert" className="mb-3 text-xs text-danger flex items-center gap-1.5">
+            <AlertTriangle className="w-3.5 h-3.5" />
+            {statusError}
           </div>
         )}
 
         {loading ? (
           <div className="text-center py-8 text-muted-foreground text-sm">Loading feedback...</div>
         ) : loadError ? (
-          <div className="text-center py-8 text-sm text-red-600 dark:text-red-400 flex items-center justify-center gap-2">
+          <div className="text-center py-8 text-sm text-danger flex items-center justify-center gap-2">
             <AlertTriangle className="w-4 h-4" />
             {loadError}
           </div>
@@ -1055,22 +1257,33 @@ export default function FeedbackPage() {
             {feedbackTab === 'support' ? 'No support requests yet.' : 'No feedback yet. Be the first to share your thoughts!'}
           </div>
         ) : (
-          <div className="space-y-3">
-            {feedbackList.map(item => {
+          <div ref={presence.containerRef} className="space-y-3 overflow-y-clip pb-1">
+            {presence.items.map(item => {
               const isExpanded = expandedId === item.id
               const hasResponses = item.feedback_responses?.length > 0
               const responseCount = item.feedback_responses?.length || 0
+              const isExiting = presence.exitingIds.has(item.id)
+              const motionClass = isExiting
+                ? 'feedback-card-exit'
+                : enteringIds.has(item.id)
+                  ? 'feedback-card-enter'
+                  : flashingIds.has(item.id)
+                    ? 'feedback-status-flash'
+                    : ''
 
               return (
                 <div
                   key={item.id}
-                  className={`rounded-lg border transition-colors ${
+                  data-presence-key={item.id}
+                  data-testid={`feedback-card-${item.id}`}
+                  aria-hidden={isExiting || undefined}
+                  className={`rounded-lg border transition-colors duration-300 ${motionClass} ${
                     item.status === 'dismissed'
                       ? 'border-border/50 bg-card/50 opacity-70'
                       : item.status === 'affirmed'
-                        ? 'border-blue-200 dark:border-blue-800/60 bg-card'
+                        ? 'border-info-muted/60 bg-card'
                         : item.status === 'resolved'
-                          ? 'border-green-200 dark:border-green-800/60 bg-card'
+                          ? 'border-success-muted/60 bg-card'
                           : 'border-border bg-card'
                   }`}
                 >
@@ -1089,8 +1302,8 @@ export default function FeedbackPage() {
                         <span className="font-medium text-foreground">{getSubmitterLabel(item)}</span>
                         <span className={`px-1.5 py-0.5 rounded text-xs font-medium ${
                           item.source === 'bot'
-                            ? 'bg-indigo-100 dark:bg-indigo-900 text-indigo-700 dark:text-indigo-200'
-                            : 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-300'
+                            ? 'bg-accent text-accent-foreground'
+                            : 'bg-muted text-muted-foreground'
                         }`}>
                           {item.source === 'bot' ? 'Discord' : 'Web'}
                         </span>
@@ -1101,7 +1314,7 @@ export default function FeedbackPage() {
                           </span>
                         )}
                       </div>
-                      <time className="flex-shrink-0">{formatDateTimeInTimezone(item.created_at, getPrimaryTimezone())}</time>
+                      <time className="shrink-0">{formatDateTimeInTimezone(item.created_at, getPrimaryTimezone())}</time>
                     </div>
 
                     {/* Message */}
@@ -1124,7 +1337,7 @@ export default function FeedbackPage() {
                               className="absolute inset-0 flex items-center justify-center bg-black/30 opacity-0 group-hover:opacity-100 transition-opacity rounded-md"
                               title="Enlarge"
                             >
-                              <ZoomIn className="w-6 h-6 text-white drop-shadow" />
+                              <ZoomIn className="w-6 h-6 text-white drop-shadow-sm" />
                             </button>
                           </div>
                         ))}
@@ -1161,7 +1374,7 @@ export default function FeedbackPage() {
                                   <span className="font-medium text-foreground">
                                     {resp.admin_display_name || 'Admin'}
                                   </span>
-                                  <span className="px-1 py-0.5 rounded text-[10px] font-medium bg-purple-100 dark:bg-purple-900 text-purple-700 dark:text-purple-200">
+                                  <span className="px-1 py-0.5 rounded text-[10px] font-medium bg-primary-subtle text-primary">
                                     Admin
                                   </span>
                                 </div>
@@ -1178,7 +1391,11 @@ export default function FeedbackPage() {
                   {/* ── Admin reply toggle ── */}
                   {isAdmin && (
                     <div className="px-4 py-2 border-t border-border/50 flex items-center gap-2">
-                      <button
+                      <Button
+                        emphasis="ghost"
+                        intent="primary"
+                        size="compact"
+                        aria-expanded={isExpanded}
                         onClick={() => {
                           if (isExpanded) {
                             setExpandedId(null)
@@ -1187,40 +1404,40 @@ export default function FeedbackPage() {
                             setAdminResponse('')
                           }
                         }}
-                        className="flex items-center gap-1.5 px-3 py-1.5 rounded-md text-xs font-medium text-primary hover:bg-primary/10 transition-colors"
+                        icon={<Reply className="w-3.5 h-3.5" />}
                       >
-                        <Reply className="w-3.5 h-3.5" />
                         {isExpanded ? 'Cancel reply' : 'Reply'}
                         {isExpanded ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-                      </button>
+                      </Button>
 
                       {/* Delete controls */}
                       <div className="ml-auto flex items-center gap-1">
                         {confirmDeleteId === item.id ? (
                           <>
-                            <span className="text-xs text-red-500 mr-1">Delete permanently?</span>
-                            <button
+                            <span className="text-xs text-danger mr-1">Delete permanently?</span>
+                            <Button
+                              intent="danger"
+                              size="micro"
                               onClick={() => handleDeleteFeedback(item.id)}
                               disabled={updatingId === item.id}
-                              className="px-2 py-1 rounded-md text-xs font-medium bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 transition-colors"
                             >
                               {updatingId === item.id ? 'Deleting...' : 'Delete'}
-                            </button>
-                            <button
+                            </Button>
+                            <Button
+                              emphasis="outline"
+                              size="micro"
                               onClick={() => setConfirmDeleteId(null)}
-                              className="px-2 py-1 rounded-md text-xs border border-border hover:bg-accent/50 transition-colors"
                             >
                               Cancel
-                            </button>
+                            </Button>
                           </>
                         ) : (
-                          <button
+                          <IconButton
+                            label="Delete this entry"
+                            icon={<Trash2 />}
+                            intent="danger"
                             onClick={() => setConfirmDeleteId(item.id)}
-                            className="flex items-center gap-1 px-2 py-1.5 rounded-md text-xs text-muted-foreground hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors"
-                            title="Delete this entry"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                          />
                         )}
                       </div>
                     </div>
@@ -1235,24 +1452,28 @@ export default function FeedbackPage() {
                         placeholder="Write a reply..."
                         rows={2}
                         maxLength={2000}
-                        className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring resize-y"
+                        className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring resize-y"
                         autoFocus
                       />
                       <div className="flex gap-2">
-                        <button
+                        <Button
+                          emphasis="outline"
+                          intent="primary"
+                          size="compact"
                           onClick={() => handleRespond(item.id)}
-                          disabled={updatingId === item.id || !adminResponse.trim()}
-                          className="flex items-center gap-1.5 px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium hover:bg-primary/90 disabled:opacity-50 transition-colors"
+                          disabled={!adminResponse.trim()}
+                          loading={updatingId === item.id}
+                          icon={<Send className="w-3 h-3" />}
                         >
-                          <Send className="w-3 h-3" />
                           {updatingId === item.id ? 'Sending...' : 'Send Reply'}
-                        </button>
-                        <button
+                        </Button>
+                        <Button
+                          emphasis="outline"
+                          size="compact"
                           onClick={() => { setExpandedId(null); setAdminResponse('') }}
-                          className="px-3 py-1.5 rounded-md border border-border text-xs font-medium hover:bg-accent/50 transition-colors"
                         >
                           Cancel
-                        </button>
+                        </Button>
                       </div>
                     </div>
                   )}
@@ -1275,52 +1496,38 @@ export default function FeedbackPage() {
         {/* Pagination */}
         {totalPages > 1 && (
           <div className="flex items-center justify-center gap-2 mt-4">
-            <button
+            <Button
+              emphasis="outline"
+              size="compact"
               onClick={() => setPage(p => Math.max(1, p - 1))}
               disabled={page <= 1}
-              className="px-3 py-1.5 rounded-md border border-border text-sm disabled:opacity-50 hover:bg-accent/50 transition-colors"
             >
               Previous
-            </button>
+            </Button>
             <span className="text-sm text-muted-foreground">
               {page} / {totalPages}
             </span>
-            <button
+            <Button
+              emphasis="outline"
+              size="compact"
               onClick={() => setPage(p => Math.min(totalPages, p + 1))}
               disabled={page >= totalPages}
-              className="px-3 py-1.5 rounded-md border border-border text-sm disabled:opacity-50 hover:bg-accent/50 transition-colors"
             >
               Next
-            </button>
+            </Button>
           </div>
         )}
-        </>)}
+        </div>)}
       </div>
       )}
     </div>
 
-      {/* Lightbox overlay */}
-      {previewSrc && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/80 backdrop-blur-sm"
-          onClick={() => setPreviewSrc(null)}
-        >
-          <button
-            type="button"
-            onClick={() => setPreviewSrc(null)}
-            className="absolute top-4 right-4 p-2 rounded-full bg-black/50 text-white hover:bg-black/70 transition-colors"
-            title="Close"
-          >
-            <XIcon className="w-5 h-5" />
-          </button>
-          <img
-            src={previewSrc}
-            alt="Preview"
-            className="max-w-[90vw] max-h-[90vh] rounded-lg shadow-2xl object-contain"
-            onClick={e => e.stopPropagation()}
-          />
-        </div>
-      )}
+      <Lightbox
+        open={previewSrc !== null}
+        onClose={() => setPreviewSrc(null)}
+        src={previewSrc}
+        alt="Attachment preview"
+      />
     </>
   )
 }

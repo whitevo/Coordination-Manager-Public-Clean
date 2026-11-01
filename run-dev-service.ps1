@@ -64,7 +64,7 @@ if (Test-Path $LogPath) {
 
 [Console]::Title = $Title
 $Host.UI.RawUI.WindowTitle = $Title
-Set-Location $CodeDir
+Set-Location -LiteralPath $CodeDir
 
 # Keep the intended title even if child shells/tools attempt to change it.
 $__cmOriginalPrompt = $function:prompt
@@ -76,12 +76,7 @@ function global:prompt {
 
 [Console]::Title = $Title
 $Host.UI.RawUI.WindowTitle = $Title
-$transcriptStarted = $false
-
 try {
-    Start-Transcript -Path $LogPath -Force | Out-Null
-    $transcriptStarted = $true
-
     # Some spawned shells miss user-level PATH entries (where pnpm usually lives).
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')
     $machinePath = [Environment]::GetEnvironmentVariable('Path', 'Machine')
@@ -95,7 +90,7 @@ try {
     }
 
     if ($resolvedServiceCommand -match '^\s*pnpm(\s|$)') {
-        $pnpmPath = Resolve-ExecutablePath -CandidateNames @('pnpm', 'pnpm.cmd') -CandidatePaths @(
+        $pnpmPath = Resolve-ExecutablePath -CandidateNames @('pnpm.cmd', 'pnpm', 'pnpm.ps1') -CandidatePaths @(
             (Join-Path $env:APPDATA 'npm\pnpm.cmd'),
             (Join-Path $env:ProgramFiles 'nodejs\pnpm.cmd')
         )
@@ -104,7 +99,7 @@ try {
             $safePnpmPath = $pnpmPath.Replace('"', '""')
             $resolvedServiceCommand = $resolvedServiceCommand -replace '^\s*pnpm\b', "`"$safePnpmPath`""
         } else {
-            $corepackPath = Resolve-ExecutablePath -CandidateNames @('corepack', 'corepack.cmd') -CandidatePaths @(
+            $corepackPath = Resolve-ExecutablePath -CandidateNames @('corepack.cmd', 'corepack', 'corepack.ps1') -CandidatePaths @(
                 (Join-Path $env:ProgramFiles 'nodejs\corepack.cmd')
             )
 
@@ -115,21 +110,20 @@ try {
         }
     }
 
-    # Execute via cmd /c which properly handles command parsing with colons
-    # Use pnpm.cmd directly if it exists (cmd.exe can execute .cmd files but not .ps1)
     $cmdCommand = $resolvedServiceCommand
-    
-    # If resolved path ends in .ps1, replace with .cmd equivalent for cmd.exe compatibility
-    if ($cmdCommand -match '\.ps1"') {
-        $cmdCommand = $cmdCommand -replace '\.ps1"', '.cmd"'
+
+    "Executing: $cmdCommand" | Tee-Object -FilePath $LogPath
+    # Native output can bypass Start-Transcript. Pipe both streams to disk and the window.
+    cmd.exe /C "$cmdCommand 2>&1" | Tee-Object -FilePath $LogPath -Append
+    $serviceExitCode = $LASTEXITCODE
+    if ($serviceExitCode -ne 0) {
+        "ERROR: Service '$ServiceName' exited with code $serviceExitCode." | Tee-Object -FilePath $LogPath -Append
     }
-    
-    Write-Host "Executing: $cmdCommand"
-    cmd.exe /C $cmdCommand
+} catch {
+    "ERROR: Service '$ServiceName' could not run: $($_.Exception.Message)" | Tee-Object -FilePath $LogPath -Append
+    throw
 } finally {
-    if ($transcriptStarted) {
-        Stop-Transcript | Out-Null
-    }
+    [Console]::Title = $Title
 }
 
 if (Test-Path $markerPath) {

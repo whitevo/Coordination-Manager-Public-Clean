@@ -1,11 +1,14 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { apiClient } from '../lib/api-client'
-import { Bot, Send, Trash2, AlertTriangle, Loader2, Sparkles, User, ChevronDown, ChevronUp, MessageSquare, CheckCircle, Info, Eye, Paperclip, X as XIcon } from 'lucide-react'
+import { Bot, Send, Trash2, AlertTriangle, Loader2, Sparkles, User, MessageSquare, CheckCircle, Info, Eye, Paperclip, X as XIcon } from 'lucide-react'
 import type { AiModelId } from '../lib/theme-types'
 import { AI_MODEL_OPTIONS } from '../lib/theme-types'
 import SentimentGrid from '../components/SentimentGrid'
 import LearnerHelpIcon from '../components/LearnerHelpIcon'
+import { Button, Disclosure, IconButton } from '../components/ui'
+import { AiUserMessage } from '@/components/ai-user-message'
+import { AI_MESSAGE_MAX_LENGTH, getAiMessageError } from '@/lib/ai-message'
 
 interface ChatMessage {
   role: 'user' | 'assistant' | 'system'
@@ -38,6 +41,8 @@ export default function AiChatPage() {
   const [error, setError] = useState('')
   const [status, setStatus] = useState<AiStatus | null>(null)
   const [statusLoading, setStatusLoading] = useState(true)
+  const [remaining, setRemaining] = useState<number | null>(null)
+  const [limit, setLimit] = useState<number | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLTextAreaElement>(null)
   const imageInputRef = useRef<HTMLInputElement>(null)
@@ -66,8 +71,11 @@ export default function AiChatPage() {
       try {
         const { data } = await apiClient.get('/api/ai-chat/status')
         setStatus(data)
-      } catch {
-        setStatus({ available: false, provider: 'unknown', model: 'unknown' })
+        if (typeof data.remaining === 'number') setRemaining(data.remaining)
+        if (typeof data.limit === 'number') setLimit(data.limit)
+      } catch (statusError) {
+        console.error('Unable to check AI availability and allowance:', statusError)
+        setError('Unable to check AI availability or your daily allowance. Please refresh the page and try again.')
       } finally {
         setStatusLoading(false)
       }
@@ -86,13 +94,22 @@ export default function AiChatPage() {
     e?.preventDefault()
     const trimmed = input.trim()
     if (!trimmed || sending) return
+    if (remaining === 0) {
+      setError('Your daily AI prompt allowance has been used. It resets tomorrow.')
+      return
+    }
+    const messageError = getAiMessageError(input)
+    if (messageError) {
+      setError(messageError)
+      return
+    }
 
     setError('')
     // Show a user message with image indicator if one is pending
     const imageLabel = pendingImage ? ' [image attached]' : ''
     const userMessage: ChatMessage = {
       role: 'user',
-      content: trimmed + imageLabel,
+      content: input + imageLabel,
       timestamp: new Date(),
     }
     setMessages(prev => [...prev, userMessage])
@@ -114,13 +131,15 @@ export default function AiChatPage() {
       // Read user's AI model preference from themePreferences
       const preferredModel: AiModelId = user?.themePreferences?.aiSettings?.preferredModel || 'openai'
 
-      const payload: Record<string, unknown> = { message: trimmed, history, preferredModel }
+      const payload: Record<string, unknown> = { message: input, history, preferredModel }
       if (capturedImage) {
         payload.imageBase64 = capturedImage.base64
         payload.imageMimeType = capturedImage.mimeType
       }
 
       const { data } = await apiClient.post('/api/ai-chat', payload)
+      if (typeof data.remaining === 'number') setRemaining(data.remaining)
+      if (typeof data.limit === 'number') setLimit(data.limit)
 
       // Insert a system-prompt bubble before the assistant reply (Oversight only)
       const newMessages: ChatMessage[] = []
@@ -149,8 +168,20 @@ export default function AiChatPage() {
         setMessages(prev => [...prev, feedbackNote])
       }
     } catch (err) {
-      const errorMsg = (err as { response?: { data?: { message?: string } } }).response?.data?.message || 'Failed to get a response. Please try again.'
+      const responseData = (err as { response?: { data?: { message?: string; remaining?: number; limit?: number } } }).response?.data
+      const errorMsg = responseData?.message || 'Failed to get a response. Please try again.'
       setError(errorMsg)
+      if (typeof responseData?.remaining === 'number') setRemaining(responseData.remaining)
+      if (typeof responseData?.limit === 'number') setLimit(responseData.limit)
+      if (typeof responseData?.remaining !== 'number') {
+        try {
+          const { data } = await apiClient.get('/api/ai-chat/status')
+          if (typeof data.remaining === 'number') setRemaining(data.remaining)
+          if (typeof data.limit === 'number') setLimit(data.limit)
+        } catch (statusError) {
+          console.error('Unable to refresh AI allowance after a failed request:', statusError)
+        }
+      }
     } finally {
       setSending(false)
       // Re-focus input after response
@@ -303,13 +334,13 @@ export default function AiChatPage() {
       {/* Header */}
       <div className="flex items-center justify-between mb-4">
         <div className="flex items-center gap-3">
-          <div className="p-2 rounded-lg bg-gradient-to-br from-violet-500 to-purple-600 text-white">
+          <div className="p-2 rounded-lg bg-feature-ai-subtle text-feature-ai">
             <Sparkles className="h-5 w-5" />
           </div>
           <div>
             <div className="flex items-center gap-2">
               <h1 className="text-xl font-semibold">AI Assistant</h1>
-              <span className="px-2 py-0.5 rounded-full text-[10px] font-medium border bg-purple-100 dark:bg-purple-900/40 text-purple-700 dark:text-purple-300 border-purple-300 dark:border-purple-700">guider</span>
+              <span className="px-2 py-0.5 rounded-full text-[10px] font-medium border bg-feature-ai-subtle text-feature-ai border-feature-ai-muted">guider</span>
             </div>
             <p className="text-xs text-muted-foreground">
               Guidance, onboarding &amp; coordination philosophy
@@ -322,26 +353,28 @@ export default function AiChatPage() {
           </div>
         </div>
         {messages.length > 0 && (
-          <button
+          <Button
+            emphasis="ghost"
+            intent="danger"
+            size="compact"
             onClick={clearChat}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-sm text-muted-foreground hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950 rounded-lg transition-colors"
             title="Clear conversation"
+            icon={<Trash2 className="h-4 w-4" />}
           >
-            <Trash2 className="h-4 w-4" />
             Clear
-          </button>
+          </Button>
         )}
       </div>
 
       {/* Service unavailable warning */}
       {status && !status.available && (
-        <div className="mb-4 p-4 bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800 rounded-lg flex items-start gap-3">
-          <AlertTriangle className="h-5 w-5 text-amber-500 shrink-0 mt-0.5" />
+        <div className="mb-4 p-4 bg-warning-subtle border border-warning-muted rounded-lg flex items-start gap-3">
+          <AlertTriangle className="h-5 w-5 text-warning shrink-0 mt-0.5" />
           <div>
-            <p className="text-sm font-medium text-amber-800 dark:text-amber-200">AI Service Not Configured</p>
-            <p className="text-sm text-amber-700 dark:text-amber-300 mt-1">
+            <p className="text-sm font-medium text-warning">AI Service Not Configured</p>
+            <p className="text-sm text-warning mt-1">
               The AI chat service requires an API key to be configured. Contact your administrator to set up the 
-              <code className="bg-amber-100 dark:bg-amber-900 px-1 rounded text-xs">AI_API_KEY</code> environment variable.
+              <code className="bg-warning-subtle px-1 rounded text-xs">AI_API_KEY</code> environment variable.
             </p>
           </div>
         </div>
@@ -382,26 +415,21 @@ export default function AiChatPage() {
           <div key={i} className="space-y-1">
             {msg.role === 'system' ? (
               /* System prompt bubble — Oversight only */
-              <div className="max-w-[80%] rounded-2xl border border-amber-200 dark:border-amber-800 bg-amber-50/40 dark:bg-amber-950/20">
-                <button
-                  onClick={() => setExpandedSystemIdx(prev => {
+              <div className="max-w-[80%] rounded-2xl border border-warning-muted bg-warning-subtle">
+                <Disclosure
+                  size="compact"
+                  icon={<Eye />}
+                  title="System Prompt"
+                  expanded={expandedSystemIdx.has(i)}
+                  onToggle={() => setExpandedSystemIdx(prev => {
                     const next = new Set(prev)
                     if (next.has(i)) next.delete(i); else next.add(i)
                     return next
                   })}
-                  className="w-full flex items-center gap-2 px-4 py-2.5 text-left"
+                  panelClassName="px-4 pb-3 border-t border-warning-muted"
                 >
-                  <Eye className="w-4 h-4 text-amber-500 shrink-0" />
-                  <span className="text-xs font-medium text-amber-700 dark:text-amber-300 uppercase tracking-wider">System Prompt</span>
-                  <span className="ml-auto">
-                    {expandedSystemIdx.has(i) ? <ChevronUp className="w-4 h-4 text-amber-500" /> : <ChevronDown className="w-4 h-4 text-amber-500" />}
-                  </span>
-                </button>
-                {expandedSystemIdx.has(i) && (
-                  <div className="px-4 pb-3 border-t border-amber-200/50 dark:border-amber-800/50">
-                    <pre className="text-xs text-muted-foreground whitespace-pre-wrap mt-2 max-h-96 overflow-y-auto font-mono leading-relaxed">{msg.content}</pre>
-                  </div>
-                )}
+                  <pre className="text-xs text-muted-foreground whitespace-pre-wrap mt-2 max-h-96 overflow-y-auto font-mono leading-relaxed">{msg.content}</pre>
+                </Disclosure>
               </div>
             ) : (
             <>
@@ -409,21 +437,21 @@ export default function AiChatPage() {
               className={`flex gap-3 ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
             >
               {msg.role === 'assistant' && (
-                <div className="shrink-0 w-8 h-8 rounded-full bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center text-white">
+                <div className="shrink-0 w-8 h-8 rounded-full bg-feature-ai-subtle flex items-center justify-center text-feature-ai">
                   <Sparkles className="h-4 w-4" />
                 </div>
               )}
               <div
-                className={`max-w-[80%] rounded-2xl px-4 py-3 text-sm whitespace-pre-wrap ${
+                className={`min-w-0 max-w-[80%] rounded-2xl px-4 py-3 text-sm whitespace-pre-wrap ${
                   msg.role === 'user'
                     ? 'bg-primary text-primary-foreground rounded-br-md'
                     : 'bg-muted text-foreground rounded-bl-md'
                 }`}
               >
-                {msg.role === 'assistant' ? formatMessage(msg.content) : msg.content}
+                {msg.role === 'assistant' ? formatMessage(msg.content) : <AiUserMessage content={msg.content} />}
               </div>
               {msg.role === 'user' && (
-                <div className="shrink-0 w-8 h-8 rounded-full bg-gradient-to-br from-blue-500 to-purple-500 flex items-center justify-center text-white overflow-hidden">
+                <div className="shrink-0 w-8 h-8 rounded-full bg-primary flex items-center justify-center text-primary-foreground overflow-hidden">
                   {user?.avatarUrl ? (
                     <img src={user.avatarUrl} alt="" className="w-full h-full object-cover" referrerPolicy="no-referrer" onError={(e) => { (e.target as HTMLImageElement).style.display = 'none' }} />
                   ) : null}
@@ -443,7 +471,7 @@ export default function AiChatPage() {
 
                   if (state.submitted) {
                     return (
-                      <div className="flex items-center gap-1.5 text-xs text-green-600 dark:text-green-400 py-1">
+                      <div className="flex items-center gap-1.5 text-xs text-success py-1">
                         <CheckCircle className="h-3.5 w-3.5" />
                         Feedback submitted
                       </div>
@@ -452,20 +480,20 @@ export default function AiChatPage() {
 
                   return (
                     <div className="mt-1">
-                      <button
-                        onClick={() => setExpandedSentimentIdx(isExpanded ? null : i)}
-                        className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-amber-600 dark:hover:text-amber-400 transition-colors py-1"
-                      >
-                        <MessageSquare className="h-3.5 w-3.5" />
-                        Sentiment Feedback
-                        {isExpanded ? <ChevronUp className="h-3 w-3" /> : <ChevronDown className="h-3 w-3" />}
-                      </button>
+                      <Disclosure
+                        size="compact"
+                        icon={<MessageSquare />}
+                        title="Sentiment Feedback"
+                        expanded={isExpanded}
+                        onToggle={() => setExpandedSentimentIdx(isExpanded ? null : i)}
+                        panelId={`ai-chat-sentiment-${i}`}
+                      />
 
                       {isExpanded && (
-                        <div className="mt-2 p-4 rounded-lg border border-amber-200 dark:border-amber-800 bg-amber-50/50 dark:bg-amber-950/20">
+                        <div id={`ai-chat-sentiment-${i}`} className="mt-2 p-4 rounded-lg border border-warning-muted bg-warning-subtle">
                           <div className="flex flex-col sm:flex-row gap-4">
                             {/* Sentiment Grid */}
-                            <div className="flex-shrink-0">
+                            <div className="shrink-0">
                               <SentimentGrid
                                 valence={state.valence}
                                 trust={state.trust}
@@ -484,7 +512,7 @@ export default function AiChatPage() {
                                 onChange={(e) => updateSentiment(i, { feedbackText: e.target.value })}
                                 placeholder="Describe what was good, bad, or could be improved..."
                                 rows={4}
-                                className="w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                                className="w-full resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
                                 maxLength={2000}
                               />
 
@@ -497,18 +525,16 @@ export default function AiChatPage() {
                                 </span>
                               </div>
 
-                              <button
+                              <Button
+                                emphasis="outline"
+                                intent="primary"
+                                className="self-end"
                                 onClick={() => submitSentimentFeedback(i)}
-                                disabled={state.submitting}
-                                className="self-end flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-lg bg-amber-500 text-white hover:bg-amber-600 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                                loading={state.submitting}
+                                icon={<CheckCircle className="h-4 w-4" />}
                               >
-                                {state.submitting ? (
-                                  <Loader2 className="h-4 w-4 animate-spin" />
-                                ) : (
-                                  <CheckCircle className="h-4 w-4" />
-                                )}
                                 Submit Feedback
-                              </button>
+                              </Button>
                             </div>
                           </div>
                         </div>
@@ -526,7 +552,7 @@ export default function AiChatPage() {
         {/* Typing indicator */}
         {sending && (
           <div className="flex gap-3 justify-start">
-            <div className="shrink-0 w-8 h-8 rounded-full bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center text-white">
+            <div className="shrink-0 w-8 h-8 rounded-full bg-feature-ai-subtle flex items-center justify-center text-feature-ai">
               <Sparkles className="h-4 w-4" />
             </div>
             <div className="bg-muted rounded-2xl rounded-bl-md px-4 py-3">
@@ -541,7 +567,7 @@ export default function AiChatPage() {
 
         {/* Error message */}
         {error && (
-          <div className="flex items-start gap-2 p-3 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-700 dark:text-red-300">
+          <div className="flex items-start gap-2 p-3 bg-danger-subtle border border-danger-muted rounded-lg text-sm text-danger">
             <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
             {error}
           </div>
@@ -553,7 +579,7 @@ export default function AiChatPage() {
       {/* Input area */}
       <form onSubmit={handleSend} className="border-t border-border pt-4 relative">
         <LearnerHelpIcon
-          description={<><p className="font-semibold text-blue-700 dark:text-blue-300 mb-1">Chat Input</p><p className="mb-1.5">Type your message below and press <strong>Enter</strong> to send. Use <strong>Shift + Enter</strong> for line breaks.</p><p className="font-semibold text-blue-700 dark:text-blue-300 mb-1">What you can ask about</p><ul className="list-disc list-inside space-y-0.5"><li>App features and how to use them.</li><li>Coordination best practices for groups.</li><li>Help drafting announcements or feedback.</li><li>Any general question - the AI adapts to context.</li></ul><p className="font-semibold text-blue-700 dark:text-blue-300 mt-2 mb-1">AI Roles</p><p className="mb-1">This page uses the <strong>Guider</strong> role. Other pages activate different roles:</p><ul className="list-disc list-inside space-y-0.5"><li><strong>Guider</strong> - General guide for platform features and coordination philosophy.</li><li><strong>Composer</strong> - Drafts and refines messages (Distribute Messages page).</li><li><strong>Operator</strong> - Configures calendars via natural language (Calendar page).</li></ul></>}
+          description={<><p className="font-semibold text-info mb-1">Chat Input</p><p className="mb-1.5">Type your message below and press <strong>Enter</strong> to send. Use <strong>Shift + Enter</strong> for line breaks.</p><p className="font-semibold text-info mb-1">What you can ask about</p><ul className="list-disc list-inside space-y-0.5"><li>App features and how to use them.</li><li>Coordination best practices for groups.</li><li>Help drafting announcements or feedback.</li><li>Any general question - the AI adapts to context.</li></ul><p className="font-semibold text-info mt-2 mb-1">AI Roles</p><p className="mb-1">This page uses the <strong>Guider</strong> role. Other pages activate different roles:</p><ul className="list-disc list-inside space-y-0.5"><li><strong>Guider</strong> - General guide for platform features and coordination philosophy.</li><li><strong>Composer</strong> - Drafts and refines messages (Distribute Messages page).</li><li><strong>Operator</strong> - Configures calendars via natural language (Calendar page).</li></ul></>}
           size={4}
           className="absolute top-0 right-0 z-10"
         />
@@ -567,14 +593,14 @@ export default function AiChatPage() {
                 alt="Image to send"
                 className="h-16 w-16 object-cover rounded-md border border-border"
               />
-              <button
-                type="button"
+              <IconButton
+                label="Remove image"
+                icon={<XIcon />}
+                emphasis="solid"
+                size="micro"
                 onClick={() => setPendingImage(null)}
-                className="absolute -top-1 -right-1 p-0.5 rounded-full bg-black/70 text-white"
-                title="Remove image"
-              >
-                <XIcon className="w-3 h-3" />
-              </button>
+                className="absolute -top-1 -right-1"
+              />
             </div>
             <span className="text-xs text-muted-foreground">Image will be sent with your message</span>
           </div>
@@ -594,18 +620,20 @@ export default function AiChatPage() {
           />
         )}
 
+        {remaining !== null && limit !== null && (
+          <p className="text-xs text-muted-foreground mb-2">AI prompts left today: {remaining} of {limit}</p>
+        )}
         <div className="flex gap-2 items-end">
           {/* Image attach button — only shown when model supports vision */}
           {status?.supportsVision && (
-            <button
-              type="button"
+            <IconButton
+              label="Attach image (or paste from clipboard)"
+              icon={<Paperclip />}
+              emphasis="outline"
+              size="standard"
               disabled={sending || !status.available}
               onClick={() => imageInputRef.current?.click()}
-              className="shrink-0 p-3 rounded-xl border border-border hover:bg-accent/50 text-muted-foreground hover:text-foreground disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-              title="Attach image (or paste from clipboard)"
-            >
-              <Paperclip className="h-5 w-5" />
-            </button>
+            />
           )}
           <textarea
             ref={inputRef}
@@ -616,25 +644,26 @@ export default function AiChatPage() {
             placeholder={status?.available ? 'Type a message... (Enter to send, Shift+Enter for new line)' : 'AI service not configured'}
             disabled={!status?.available || sending}
             rows={1}
-            className="flex-1 resize-none rounded-xl border border-border bg-background px-4 py-3 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring disabled:opacity-50 disabled:cursor-not-allowed"
-            style={{ maxHeight: '200px' }}
+            aria-label="Message to AI"
+            aria-describedby="ai-chat-message-length"
+            aria-invalid={input.length > AI_MESSAGE_MAX_LENGTH || undefined}
+            className="min-w-0 flex-1 max-h-[200px] overflow-y-auto resize-none rounded-xl border border-border bg-background px-4 py-3 text-sm placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring disabled:opacity-50 disabled:cursor-not-allowed"
           />
-          <button
+          <IconButton
             type="submit"
-            disabled={!input.trim() || sending || !status?.available}
-            className="shrink-0 p-3 rounded-xl bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
-            title="Send message"
-          >
-            {sending ? (
-              <Loader2 className="h-5 w-5 animate-spin" />
-            ) : (
-              <Send className="h-5 w-5" />
-            )}
-          </button>
+            label="Send message"
+            icon={<Send />}
+            emphasis="solid"
+            intent="primary"
+            size="standard"
+            disabled={!input.trim() || !status?.available || remaining === 0}
+            loading={sending}
+          />
         </div>
-        <p className="text-xs text-muted-foreground mt-2 text-center">
-          AI responses may be inaccurate. Powered by ASI Alliance &amp; SingularityNET.
+        <p id="ai-chat-message-length" className={input.length > AI_MESSAGE_MAX_LENGTH ? 'text-xs text-danger mt-2' : 'text-xs text-muted-foreground mt-2'}>
+          {input.length} / {AI_MESSAGE_MAX_LENGTH} characters
         </p>
+        <p className="text-xs text-muted-foreground mt-2 text-center">AI responses may be inaccurate.</p>
       </form>
     </div>
   )

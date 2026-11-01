@@ -1,9 +1,9 @@
 # Gitleaks configuration for Coordination Manager
 # Allowlist rules for confirmed false positives identified on 2026-06-13 (23 raw findings,
 # 21 false positives, 1 real credential -- now rotated and untracked).
-# After adding new allowlist entries, regenerate the baseline:
-#   gitleaks detect --source . --redact --report-path .gitleaks-baseline.json
-# Then commit .gitleaks-baseline.json alongside this file.
+# Known findings are suppressed with the allowlists below, not a baseline file.
+# CI (.github/workflows/gitleaks.yml) scans PR/push deltas plus a weekly full history.
+# scripts/security-check.ps1 uses .gitleaks-baseline.json only if one exists (none is committed).
 
 title = "Coordination Manager gitleaks config"
 
@@ -14,6 +14,20 @@ useDefault = true
 # ---------------------------------------------------------------------------
 # Rule-level allowlists
 # ---------------------------------------------------------------------------
+
+[[rules]]
+id = "discord-client-id"
+description = "discord-client-id -- ignore two synthetic Guardian SQL fixture user IDs"
+[[rules.allowlists]]
+description = "Exact synthetic user IDs in the Guardian timestamp backfill assertions"
+condition = "AND"
+regexTarget = "secret"
+regexes = [
+  '^[23]23456789012345678$',
+]
+paths = [
+  '''^Code/packages/database/tests/guardian-ban-time-check\.sql$''',
+]
 
 [[rules]]
 # Suppress false positive on the JWT-shaped placeholder value used to keep
@@ -65,6 +79,8 @@ regexes = [
   '''Bearer [A-Za-z0-9_\-]{0,32}$''',
 ]
 paths = [
+  # Removed from the tree in #22 but still present in historical commits;
+  # required so full-history scans stay clean (placeholder curl example only).
   '''Code/figma-plugin/README\.md''',
   '''Code/apps/docs/src/pages/GettingStartedPage\.tsx''',
   '''docs/AI-Context/Google-OAuth-Localhost-Setup\.md''',

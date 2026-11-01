@@ -13,7 +13,7 @@ export function TopBar({ onMenuToggle, aiPanelOpen, onAiSearchClick }: TopBarPro
     : '/'
 
   return (
-    <header className="sticky top-0 z-50 h-16 border-b border-surface-700 bg-surface-900/95 backdrop-blur supports-[backdrop-filter]:bg-surface-900/80">
+    <header className="sticky top-0 z-50 h-16 border-b border-surface-700 bg-surface-900/95 backdrop-blur-sm supports-backdrop-filter:bg-surface-900/80">
       <div className="flex items-center justify-between h-full px-4 lg:px-6">
         {/* Left: back to app + logo + menu */}
         <div className="flex items-center gap-3">
@@ -32,7 +32,7 @@ export function TopBar({ onMenuToggle, aiPanelOpen, onAiSearchClick }: TopBarPro
             <Menu className="w-5 h-5" />
           </button>
           <Link to="/" className="flex items-center gap-2.5 text-white font-semibold text-lg">
-            <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-brand-500 to-brand-700 flex items-center justify-center text-sm font-bold">
+            <div className="w-8 h-8 rounded-lg bg-linear-to-br from-brand-500 to-brand-700 flex items-center justify-center text-sm font-bold">
               CM
             </div>
             <span className="hidden sm:inline">Coordination Manager</span>

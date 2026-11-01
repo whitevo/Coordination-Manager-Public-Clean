@@ -2,8 +2,8 @@ import { useState, useEffect, useCallback } from 'react'
 import { useAuth } from '../contexts/AuthContext'
 import { apiClient } from '../lib/api-client'
 import { getPrimaryTimezone, formatDateInTimezone } from '../lib/timezone-data'
-import LearnerHelpIcon from '../components/LearnerHelpIcon'
 import SentimentGrid from '../components/SentimentGrid'
+import { Button, SegmentedControl } from '../components/ui'
 import {
   MessageSquare,
   Shield,
@@ -42,11 +42,11 @@ interface AiFeedbackItem {
 }
 
 const STATUS_CONFIG: Record<string, { label: string; icon: typeof Circle; color: string }> = {
-  open: { label: 'Open', icon: Circle, color: 'text-blue-500' },
-  reviewed: { label: 'Reviewed', icon: Eye, color: 'text-amber-500' },
-  affirmed: { label: 'Affirmed', icon: UserCheck, color: 'text-green-500' },
-  resolved: { label: 'Resolved', icon: CheckCircle2, color: 'text-emerald-600' },
-  dismissed: { label: 'Dismissed', icon: XCircle, color: 'text-gray-400' },
+  open: { label: 'Open', icon: Circle, color: 'text-info' },
+  reviewed: { label: 'Reviewed', icon: Eye, color: 'text-warning' },
+  affirmed: { label: 'Affirmed', icon: UserCheck, color: 'text-success' },
+  resolved: { label: 'Resolved', icon: CheckCircle2, color: 'text-success' },
+  dismissed: { label: 'Dismissed', icon: XCircle, color: 'text-muted-foreground' },
 }
 
 const VALID_STATUSES = ['open', 'reviewed', 'resolved', 'dismissed', 'affirmed'] as const
@@ -208,9 +208,9 @@ export default function AiFeedbackPage({ embedded = false, statusOrder }: { embe
   // Sentiment colour class
   const getSentimentColor = (valence: number, trust: number) => {
     const avg = (valence + trust) / 2
-    if (avg > 0.3) return 'text-green-600 dark:text-green-400'
-    if (avg < -0.3) return 'text-red-600 dark:text-red-400'
-    return 'text-amber-600 dark:text-amber-400'
+    if (avg > 0.3) return 'text-success'
+    if (avg < -0.3) return 'text-danger'
+    return 'text-warning'
   }
 
   const totalPages = Math.max(1, Math.ceil(total / 20))
@@ -221,7 +221,7 @@ export default function AiFeedbackPage({ embedded = false, statusOrder }: { embe
       {!embedded && (
         <div className="flex items-center justify-between mb-6">
           <div className="flex items-center gap-3">
-            <div className="p-2 rounded-lg bg-gradient-to-br from-amber-500 to-orange-600 text-white">
+            <div className="p-2 rounded-lg bg-feature-feedback-subtle text-feature-feedback">
               <MessageSquare className="h-5 w-5" />
             </div>
             <div>
@@ -275,7 +275,7 @@ export default function AiFeedbackPage({ embedded = false, statusOrder }: { embe
 
       {/* Error */}
       {loadError && (
-        <div className="flex items-start gap-2 p-4 bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 rounded-lg text-sm text-red-700 dark:text-red-300 mb-4">
+        <div className="flex items-start gap-2 p-4 bg-danger-subtle border border-danger-muted rounded-lg text-sm text-danger mb-4">
           <AlertTriangle className="h-4 w-4 shrink-0 mt-0.5" />
           {loadError}
         </div>
@@ -307,11 +307,6 @@ export default function AiFeedbackPage({ embedded = false, statusOrder }: { embe
                 key={item.id}
                 className="rounded-xl border border-border bg-card overflow-hidden relative"
               >
-                <LearnerHelpIcon
-                  description={<><p className="font-semibold text-blue-700 dark:text-blue-300 mb-1">Sentiment Feedback Entry</p><p className="mb-1.5">Each card represents feedback that was submitted on an AI chat response. It captures how the user felt about the AI’s answer.</p><p className="font-semibold text-blue-700 dark:text-blue-300 mb-1">What’s inside</p><ul className="list-disc list-inside space-y-0.5"><li><strong>Sentiment grid</strong> — a 2D rating of valence (positive/negative) and trust.</li><li><strong>Written comments</strong> — optional text elaborating on the rating.</li><li><strong>Conversation context</strong> — the original AI exchange that was rated.</li></ul></>}
-                  size={4}
-                  className="absolute top-3 right-3 z-10"
-                />
                 {/* Header row */}
                 <button
                   onClick={(event) => handleItemHeaderClick(event, item.id, isExpanded)}
@@ -408,7 +403,7 @@ export default function AiFeedbackPage({ embedded = false, statusOrder }: { embe
                     {item.feedback_text && (
                       <div>
                         <h4 className="text-xs font-medium text-muted-foreground mb-1">Feedback</h4>
-                        <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 text-sm">
+                        <div className="p-3 rounded-lg bg-warning-subtle border border-warning-muted text-sm">
                           {item.feedback_text}
                         </div>
                       </div>
@@ -417,31 +412,25 @@ export default function AiFeedbackPage({ embedded = false, statusOrder }: { embe
                     {/* Copy Improvement Prompt */}
                     {isAdmin && (
                       <div className="flex justify-end">
-                        <button
+                        <Button
+                          emphasis="outline"
+                          size="compact"
                           onClick={() => handleCopyPrompt(item)}
-                          className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded-lg border border-border bg-background hover:bg-accent text-muted-foreground hover:text-foreground transition-colors"
+                          icon={copiedId === item.id
+                            ? <Check className="h-3.5 w-3.5 text-success" />
+                            : <ClipboardCopy className="h-3.5 w-3.5" />}
                         >
-                          {copiedId === item.id ? (
-                            <>
-                              <Check className="h-3.5 w-3.5 text-green-500" />
-                              Copied!
-                            </>
-                          ) : (
-                            <>
-                              <ClipboardCopy className="h-3.5 w-3.5" />
-                              Copy Improvement Prompt
-                            </>
-                          )}
-                        </button>
+                          {copiedId === item.id ? 'Copied!' : 'Copy Improvement Prompt'}
+                        </Button>
                       </div>
                     )}
 
                     {/* Admin response (if exists) */}
                     {item.admin_response && (
-                      <div className="p-3 rounded-lg bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800">
+                      <div className="p-3 rounded-lg bg-info-subtle border border-info-muted">
                         <div className="flex items-center gap-1.5 mb-1">
-                          <Shield className="h-3.5 w-3.5 text-blue-500" />
-                          <span className="text-xs font-medium text-blue-700 dark:text-blue-300">Admin Response</span>
+                          <Shield className="h-3.5 w-3.5 text-info" />
+                          <span className="text-xs font-medium text-info">Admin Response</span>
                         </div>
                         <p className="text-sm">{item.admin_response}</p>
                       </div>
@@ -453,27 +442,22 @@ export default function AiFeedbackPage({ embedded = false, statusOrder }: { embe
                         {/* Status selector */}
                         <div className="flex items-center gap-2">
                           <span className="text-xs font-medium text-muted-foreground">Status:</span>
-                          <div className="flex gap-1">
-                            {VALID_STATUSES.map(s => {
+                          <SegmentedControl<string>
+                            label="Status"
+                            size="micro"
+                            value={item.status}
+                            onChange={s => handleStatusChange(item.id, s)}
+                            options={VALID_STATUSES.map(s => {
                               const cfg = STATUS_CONFIG[s]
                               const Icon = cfg.icon
-                              return (
-                                <button
-                                  key={s}
-                                  onClick={() => handleStatusChange(item.id, s)}
-                                  disabled={updatingId === item.id}
-                                  className={`flex items-center gap-1 px-2 py-1 rounded text-xs transition-colors ${
-                                    item.status === s
-                                      ? 'bg-primary text-primary-foreground'
-                                      : 'bg-muted hover:bg-accent text-muted-foreground'
-                                  } disabled:opacity-50`}
-                                >
-                                  <Icon className="h-3 w-3" />
-                                  {cfg.label}
-                                </button>
-                              )
+                              return {
+                                value: s,
+                                label: cfg.label,
+                                icon: <Icon className="h-3 w-3" />,
+                                disabled: updatingId === item.id,
+                              }
                             })}
-                          </div>
+                          />
                         </div>
 
                         {/* Admin response input */}
@@ -483,50 +467,52 @@ export default function AiFeedbackPage({ embedded = false, statusOrder }: { embe
                             onChange={(e) => setAdminResponse(e.target.value)}
                             placeholder="Write an admin response..."
                             rows={2}
-                            className="flex-1 resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-ring"
+                            className="flex-1 resize-none rounded-lg border border-border bg-background px-3 py-2 text-sm placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-ring"
                           />
-                          <button
+                          <Button
+                            intent="primary"
+                            className="self-end"
                             onClick={() => handleAdminRespond(item.id)}
-                            disabled={!adminResponse.trim() || updatingId === item.id}
-                            className="self-end flex items-center gap-1 px-3 py-2 text-sm font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                            disabled={!adminResponse.trim()}
+                            loading={updatingId === item.id}
+                            icon={<Reply className="h-4 w-4" />}
                           >
-                            {updatingId === item.id ? (
-                              <Loader2 className="h-4 w-4 animate-spin" />
-                            ) : (
-                              <Reply className="h-4 w-4" />
-                            )}
                             Respond
-                          </button>
+                          </Button>
                         </div>
 
                         {/* Delete controls */}
                         <div className="flex items-center justify-end gap-2 pt-1 border-t border-border">
                           {confirmDeleteId === item.id ? (
                             <>
-                              <span className="text-xs text-red-500">Delete permanently?</span>
-                              <button
+                              <span className="text-xs text-danger">Delete permanently?</span>
+                              <Button
+                                intent="danger"
+                                size="micro"
                                 onClick={() => handleDeleteFeedback(item.id)}
                                 disabled={updatingId === item.id}
-                                className="px-2 py-1 rounded-md text-xs font-medium bg-red-600 text-white hover:bg-red-700 disabled:opacity-50 transition-colors"
                               >
                                 {updatingId === item.id ? 'Deleting...' : 'Delete'}
-                              </button>
-                              <button
+                              </Button>
+                              <Button
+                                emphasis="outline"
+                                size="micro"
                                 onClick={() => setConfirmDeleteId(null)}
-                                className="px-2 py-1 rounded-md text-xs border border-border hover:bg-accent/50 transition-colors"
                               >
                                 Cancel
-                              </button>
+                              </Button>
                             </>
                           ) : (
-                            <button
+                            <Button
+                              emphasis="ghost"
+                              intent="danger"
+                              size="micro"
                               onClick={() => setConfirmDeleteId(item.id)}
-                              className="flex items-center gap-1.5 px-2 py-1 rounded-md text-xs text-muted-foreground hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors"
                               title="Delete this entry"
+                              icon={<Trash2 className="h-3.5 w-3.5" />}
                             >
-                              <Trash2 className="h-3.5 w-3.5" />
                               Delete
-                            </button>
+                            </Button>
                           )}
                         </div>
                       </div>
@@ -542,23 +528,25 @@ export default function AiFeedbackPage({ embedded = false, statusOrder }: { embe
       {/* Pagination */}
       {totalPages > 1 && (
         <div className="flex items-center justify-center gap-2 mt-6">
-          <button
+          <Button
+            emphasis="outline"
+            size="compact"
             onClick={() => setPage(p => Math.max(1, p - 1))}
             disabled={page === 1}
-            className="px-3 py-1.5 text-sm border border-border rounded-lg disabled:opacity-50 hover:bg-accent transition-colors"
           >
             Previous
-          </button>
+          </Button>
           <span className="text-sm text-muted-foreground">
             Page {page} of {totalPages}
           </span>
-          <button
+          <Button
+            emphasis="outline"
+            size="compact"
             onClick={() => setPage(p => Math.min(totalPages, p + 1))}
             disabled={page === totalPages}
-            className="px-3 py-1.5 text-sm border border-border rounded-lg disabled:opacity-50 hover:bg-accent transition-colors"
           >
             Next
-          </button>
+          </Button>
         </div>
       )}
     </>

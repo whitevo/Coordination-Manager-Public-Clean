@@ -1,11 +1,19 @@
 import { Router, Response, NextFunction } from 'express'
 import { supabaseAdmin } from '../supabaseClient.js'
 import { authMiddleware, AuthenticatedRequest, hasRole } from '../middleware/auth.js'
+import { ApplicationError, ValidationError } from '../middleware/error-handler.js'
+import guardianBansRouter from './guardian-bans.js'
+import guardianActionsRouter from './guardian-actions.js'
+import { safeErrorMessage } from '../middleware/validation.js'
+import { redosReason } from '../services/safe-regex.js'
 
 const router: ReturnType<typeof Router> = Router()
 
 // All guardian routes require authentication
 router.use(authMiddleware)
+router.use('/ban-list', guardianBansRouter)
+// Moderator undo actions: POST /flagged/:id/unban, POST /flagged/:id/untimeout
+router.use(guardianActionsRouter)
 
 /** Guard: reject non-moderator users (admins must enable Moderator Overlay) */
 function requireModerator(req: AuthenticatedRequest, res: Response): boolean {
@@ -18,9 +26,39 @@ function requireModerator(req: AuthenticatedRequest, res: Response): boolean {
 
 // ─── Role Check ───────────────────────────────────────────────────────
 
+async function countScannedMessages(since?: string): Promise<number> {
+  let query = supabaseAdmin
+    .from('guardian_message_log')
+    .select('id', { count: 'exact', head: true })
+    .is('skip_reason', null)
+  if (since) query = query.gte('scanned_at', since)
+  const { count, error } = await query
+  if (error) throw new ApplicationError('Failed to count Guardian scans', 500, 'GUARDIAN_SCAN_COUNT_FAILED')
+  return count || 0
+}
+
 router.get('/access', async (req: AuthenticatedRequest, res: Response) => {
   const isModerator = hasRole(req, 'moderator')
   res.json({ isModerator, roles: req.userRoles })
+})
+
+// ─── Moderator Accounts ─────────────────────────────────────────────
+
+router.get('/moderators', async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+  if (!requireModerator(req, res)) return
+
+  try {
+    const { data, error } = await supabaseAdmin
+      .from('users')
+      .select('id, email, display_name, account_type, traveler_name, created_at, last_login_at')
+      .contains('roles', ['moderator'])
+      .order('display_name', { ascending: true })
+
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
+    res.json({ moderators: data || [] })
+  } catch (err) {
+    next(err)
+  }
 })
 
 // ─── Rule Groups ──────────────────────────────────────────────────────
@@ -34,7 +72,7 @@ router.get('/rule-groups', async (req: AuthenticatedRequest, res: Response, next
       .select('*, guardian_rules(count)')
       .order('created_at', { ascending: false })
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
     res.json({ groups: data || [] })
   } catch (err) {
     next(err)
@@ -56,7 +94,7 @@ router.post('/rule-groups', async (req: AuthenticatedRequest, res: Response, nex
       .select()
       .single()
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
     res.status(201).json(data)
   } catch (err) {
     next(err)
@@ -92,7 +130,7 @@ router.put('/rule-groups/:id', async (req: AuthenticatedRequest, res: Response, 
       .select()
       .single()
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
     res.json(data)
   } catch (err) {
     next(err)
@@ -109,7 +147,7 @@ router.delete('/rule-groups/:id', async (req: AuthenticatedRequest, res: Respons
       .delete()
       .eq('id', id)
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
     res.status(204).send()
   } catch (err) {
     next(err)
@@ -117,38 +155,6 @@ router.delete('/rule-groups/:id', async (req: AuthenticatedRequest, res: Respons
 })
 
 // ─── Rules ────────────────────────────────────────────────────────────
-
-/**
- * Hard cap on stored pattern length. Regex engines are roughly linear in
- * pattern size, so even a non-pathological 5KB regex against every Discord
- * message would burn CPU. 1KB is generous for any real moderation rule.
- */
-const MAX_PATTERN_LENGTH = 1024
-
-/**
- * Cheap structural heuristic for catastrophic-backtracking patterns.
- * Not a full safe-regex checker (which would require a dependency), but
- * catches the textbook ReDoS shapes:
- *   (a+)+         nested quantifier on a group
- *   (a|a)*        alternation of overlapping branches under a quantifier
- *   (.*)*         greedy wildcard under a quantifier
- * Returns null if the pattern looks safe, or a reason string if it doesn't.
- * Moderators get an explicit error so they can rewrite the pattern.
- */
-function redosReason(pattern: string): string | null {
-  if (pattern.length > MAX_PATTERN_LENGTH) {
-    return `Pattern too long (max ${MAX_PATTERN_LENGTH} chars)`
-  }
-  // Nested quantifier: ...(...[+*?]...)... followed by [+*?{]
-  if (/\([^)]*[+*?][^)]*\)\s*[+*{]/.test(pattern)) {
-    return 'Pattern has a nested quantifier (e.g. (a+)+) -- vulnerable to catastrophic backtracking'
-  }
-  // .* or .+ inside a group that is itself quantified
-  if (/\([^)]*\.[+*][^)]*\)\s*[+*{]/.test(pattern)) {
-    return 'Pattern has a greedy wildcard inside a quantified group -- vulnerable to catastrophic backtracking'
-  }
-  return null
-}
 
 router.get('/rules/:groupId', async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
   if (!requireModerator(req, res)) return
@@ -161,7 +167,7 @@ router.get('/rules/:groupId', async (req: AuthenticatedRequest, res: Response, n
       .eq('group_id', groupId)
       .order('created_at', { ascending: false })
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
     res.json({ rules: data || [] })
   } catch (err) {
     next(err)
@@ -210,7 +216,7 @@ router.post('/rules', async (req: AuthenticatedRequest, res: Response, next: Nex
       .select()
       .single()
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
     res.status(201).json(data)
   } catch (err) {
     next(err)
@@ -318,6 +324,10 @@ router.put('/rules/:id', async (req: AuthenticatedRequest, res: Response, next: 
 
     // Validate regex if changing pattern
     if (updates.pattern && (updates.pattern_type === 'regex' || !updates.pattern_type)) {
+      const redos = redosReason(updates.pattern as string)
+      if (redos) {
+        return res.status(400).json({ error: redos })
+      }
       try {
         new RegExp(updates.pattern as string)
       } catch {
@@ -332,7 +342,7 @@ router.put('/rules/:id', async (req: AuthenticatedRequest, res: Response, next: 
       .select()
       .single()
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
     res.json(data)
   } catch (err) {
     next(err)
@@ -349,7 +359,7 @@ router.delete('/rules/:id', async (req: AuthenticatedRequest, res: Response, nex
       .delete()
       .eq('id', id)
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
     res.status(204).send()
   } catch (err) {
     next(err)
@@ -381,7 +391,7 @@ router.get('/flagged', async (req: AuthenticatedRequest, res: Response, next: Ne
       if (until && typeof until === 'string') countQuery = countQuery.lte('flagged_at', until)
 
       const { count, error } = await countQuery
-      if (error) return res.status(500).json({ error: error.message })
+      if (error) return res.status(500).json({ error: safeErrorMessage(error) })
       return res.json({ total: count || 0 })
     }
 
@@ -418,7 +428,7 @@ router.get('/flagged', async (req: AuthenticatedRequest, res: Response, next: Ne
 
     const { data, error, count } = await query
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
 
     // Attach total_versions per message_id so the UI can show the edit-history
     // badge even when other versions live on a different page.
@@ -434,7 +444,39 @@ router.get('/flagged', async (req: AuthenticatedRequest, res: Response, next: Ne
         versionCounts.set(r.message_id, (versionCounts.get(r.message_id) || 0) + 1)
       }
     }
-    const enriched = rows.map(r => ({ ...r, total_versions: versionCounts.get(r.message_id) || 1 }))
+    // Attach successful moderator undo actions (unban / unmute) so the UI can
+    // show the undone state instead of the undo button. A ban or timeout is
+    // per author and server, so an undo recorded after a row was flagged covers
+    // that row even when it was triggered from another row. Best effort: a
+    // failed lookup leaves the rows without undo info.
+    const undoByRow = new Map<string, { unban_at?: string; unmute_at?: string }>()
+    const authorIds = Array.from(new Set(rows.map(r => r.author_id).filter(Boolean)))
+    if (authorIds.length > 0) {
+      const { data: undoRows, error: undoError } = await supabaseAdmin
+        .from('guardian_action_log')
+        .select('guild_id, author_id, action, created_at')
+        .in('author_id', authorIds)
+        .in('action', ['unban', 'unmute'])
+        .eq('success', true)
+      if (!undoError) {
+        for (const row of rows) {
+          const entry: { unban_at?: string; unmute_at?: string } = {}
+          for (const u of undoRows || []) {
+            if (u.author_id !== row.author_id || u.guild_id !== row.guild_id) continue
+            if (new Date(u.created_at).getTime() < new Date(row.flagged_at).getTime()) continue
+            const key = u.action === 'unban' ? 'unban_at' : 'unmute_at'
+            const previous = entry[key]
+            if (!previous || previous < u.created_at) entry[key] = u.created_at
+          }
+          if (entry.unban_at || entry.unmute_at) undoByRow.set(row.id, entry)
+        }
+      }
+    }
+    const enriched = rows.map(r => ({
+      ...r,
+      total_versions: versionCounts.get(r.message_id) || 1,
+      undo: undoByRow.get(r.id) || null,
+    }))
 
     res.json({ flagged: enriched, ...(skip_count !== '1' ? { total: count || 0 } : {}) })
   } catch (err) {
@@ -450,7 +492,7 @@ router.get('/flagged/count', async (req: AuthenticatedRequest, res: Response, ne
       .from('guardian_flagged_messages')
       .select('id', { count: 'exact', head: true })
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
     res.json({ count: data })
   } catch (err) {
     next(err)
@@ -470,28 +512,12 @@ router.get('/stats', async (req: AuthenticatedRequest, res: Response, next: Next
     const sevenDaysAgo = new Date(now.getTime() - 7 * 24 * 60 * 60 * 1000).toISOString()
     const thirtyDaysAgo = new Date(now.getTime() - 30 * 24 * 60 * 60 * 1000).toISOString()
 
-    // Total messages scanned (last 24h)
-    const { count: messagesLast24h } = await supabaseAdmin
-      .from('guardian_message_log')
-      .select('id', { count: 'exact', head: true })
-      .gte('scanned_at', oneDayAgo)
-
-    // Total messages scanned (last 7 days)
-    const { count: messagesLast7d } = await supabaseAdmin
-      .from('guardian_message_log')
-      .select('id', { count: 'exact', head: true })
-      .gte('scanned_at', sevenDaysAgo)
-
-    // Total messages scanned (last 30 days)
-    const { count: messagesLast30d } = await supabaseAdmin
-      .from('guardian_message_log')
-      .select('id', { count: 'exact', head: true })
-      .gte('scanned_at', thirtyDaysAgo)
-
-    // Total messages scanned all time
-    const { count: messagesTotal } = await supabaseAdmin
-      .from('guardian_message_log')
-      .select('id', { count: 'exact', head: true })
+    const [messagesLast24h, messagesLast7d, messagesLast30d, messagesTotal] = await Promise.all([
+      countScannedMessages(oneDayAgo),
+      countScannedMessages(sevenDaysAgo),
+      countScannedMessages(thirtyDaysAgo),
+      countScannedMessages(),
+    ])
 
     // Total flagged (last 24h)
     const { count: flaggedLast24h } = await supabaseAdmin
@@ -618,7 +644,10 @@ router.get('/recent', async (req: AuthenticatedRequest, res: Response, next: Nex
   if (!requireModerator(req, res)) return
 
   try {
-    const { limit = '50', offset = '0', author_ids, filter_mode, group_id, search, since, until, skip_count, count_only } = req.query
+    const { limit = '50', offset = '0', author_ids, filter_mode, group_id, search, since, until, skip_count, count_only, include_skipped } = req.query
+    if (include_skipped !== undefined && include_skipped !== '0' && include_skipped !== '1') {
+      throw new ValidationError('include_skipped must be 0 or 1')
+    }
 
     // Count-only mode: head request for total, no row data
     if (count_only === '1') {
@@ -626,6 +655,7 @@ router.get('/recent', async (req: AuthenticatedRequest, res: Response, next: Nex
         .from('guardian_message_log')
         .select('id', { count: 'exact', head: true })
 
+      if (include_skipped !== '1') countQuery = countQuery.is('skip_reason', null)
       if (author_ids && typeof author_ids === 'string') {
         const ids = author_ids.split(',').map(s => s.trim()).filter(Boolean)
         if (ids.length > 0) {
@@ -638,7 +668,7 @@ router.get('/recent', async (req: AuthenticatedRequest, res: Response, next: Nex
       if (until && typeof until === 'string') countQuery = countQuery.lte('scanned_at', until)
 
       const { count, error } = await countQuery
-      if (error) return res.status(500).json({ error: error.message })
+      if (error) return res.status(500).json({ error: safeErrorMessage(error) })
       return res.json({ total: count || 0 })
     }
 
@@ -649,6 +679,7 @@ router.get('/recent', async (req: AuthenticatedRequest, res: Response, next: Nex
       .select('*', selectOpts)
       .order('scanned_at', { ascending: false })
 
+    if (include_skipped !== '1') query = query.is('skip_reason', null)
     if (author_ids && typeof author_ids === 'string') {
       const ids = author_ids.split(',').map(s => s.trim()).filter(Boolean)
       if (ids.length > 0) {
@@ -678,7 +709,7 @@ router.get('/recent', async (req: AuthenticatedRequest, res: Response, next: Nex
 
     const { data, error, count } = await query
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
 
     // Attach total_versions per message_id so the UI can show the edit-history
     // badge even when other versions live on a different page.
@@ -724,8 +755,8 @@ router.get('/servers', async (req: AuthenticatedRequest, res: Response, next: Ne
         .order('guild_name', { ascending: true }),
     ])
 
-    if (rolesRes.error) return res.status(500).json({ error: rolesRes.error.message })
-    if (channelsRes.error) return res.status(500).json({ error: channelsRes.error.message })
+    if (rolesRes.error) return res.status(500).json({ error: safeErrorMessage(rolesRes.error) })
+    if (channelsRes.error) return res.status(500).json({ error: safeErrorMessage(channelsRes.error) })
 
     // Group roles by guild
     const guilds: Record<string, { guild_id: string; guild_name: string; roles: NonNullable<typeof rolesRes.data> }> = {}
@@ -772,7 +803,7 @@ router.put('/servers/roles/:id/ignore', async (req: AuthenticatedRequest, res: R
       .select()
       .single()
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
     res.json(data)
   } catch (err) {
     next(err)
@@ -799,7 +830,7 @@ router.get('/servers/:guildId/notification-channels', async (req: AuthenticatedR
       .eq('guild_id', guildId)
       .maybeSingle()
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
 
     res.json({
       guild_id: guildId,
@@ -851,7 +882,7 @@ router.put('/servers/:guildId/notification-channels', async (req: AuthenticatedR
         .eq('guild_id', guildId)
         .in('channel_id', idsToVerify)
 
-      if (verifyErr) return res.status(500).json({ error: verifyErr.message })
+      if (verifyErr) return res.status(500).json({ error: safeErrorMessage(verifyErr) })
       const known = new Set((existing || []).map(r => r.channel_id))
       for (const id of idsToVerify) {
         if (!known.has(id)) {
@@ -874,7 +905,7 @@ router.put('/servers/:guildId/notification-channels', async (req: AuthenticatedR
       .select('guild_id, actions_log_channel_id, user_feedback_channel_id')
       .single()
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
     res.json(data)
   } catch (err) {
     next(err)
@@ -937,7 +968,7 @@ router.get('/message-history/:messageId', async (req: AuthenticatedRequest, res:
       .eq('message_id', messageId)
       .order('edit_version', { ascending: true })
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
     res.json({ versions: data || [] })
   } catch (err) {
     next(err)
@@ -956,7 +987,7 @@ router.get('/flagged-history/:messageId', async (req: AuthenticatedRequest, res:
       .eq('message_id', messageId)
       .order('edit_version', { ascending: true })
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
     res.json({ versions: data || [] })
   } catch (err) {
     next(err)
@@ -976,8 +1007,10 @@ function getGuardianClientId(): string | null {
   }
 }
 
-/** Accepted text-like Discord channel types for monitoring */
-const MONITORED_CHANNEL_TYPES = new Set([0, 2, 5, 13, 15, 16]) // text, voice, announcement, stage, forum, media
+/** Accepted Discord channel types for monitoring, plus categories and threads for grouping/defaults */
+const MONITORED_CHANNEL_TYPES = new Set([0, 2, 4, 5, 10, 11, 12, 13, 15, 16]) // text, voice, category, announcement, threads, stage, forum, media
+const THREAD_CHANNEL_TYPES = new Set([10, 11, 12])
+interface DiscordChannelSummary { id: string; name: string; type: number; parent_id?: string | null }
 
 // ─── Live State Reconciliation ────────────────────────────────────────
 //
@@ -1067,7 +1100,17 @@ router.post('/reconcile-state', async (req: AuthenticatedRequest, res: Response,
 
     // Sequential to respect Discord rate limits; batch is capped above.
     for (const t of eligible) {
-      const url = `https://discord.com/api/v10/channels/${t.channel_id}/messages/${t.message_id}`
+      // Derive the IDs through BigInt so the URL provably contains only the
+      // validated numeric snowflakes (severs taint from request input).
+      let channelId: string
+      let messageId: string
+      try {
+        channelId = BigInt(t.channel_id).toString()
+        messageId = BigInt(t.message_id).toString()
+      } catch {
+        continue
+      }
+      const url = `https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`
       let resp: globalThis.Response
       try {
         resp = await fetch(url, { headers: { Authorization: `Bot ${botToken}` } })
@@ -1087,7 +1130,7 @@ router.post('/reconcile-state', async (req: AuthenticatedRequest, res: Response,
           .eq('message_id', t.message_id)
           .is('deleted_at', null)
         if (updErr) {
-          console.error(`Reconcile: failed to mark ${t.message_id} deleted in ${t.table}:`, updErr.message)
+          console.error('Reconcile: failed to mark message deleted:', messageId, t.table, updErr.message)
         }
         deletedCount++
         checked++
@@ -1099,7 +1142,7 @@ router.post('/reconcile-state', async (req: AuthenticatedRequest, res: Response,
           .from(t.table)
           .update({ state_checked_at: checkedAtIso })
           .eq('message_id', t.message_id)
-        if (updErr) console.error(`Reconcile: state_checked_at update failed for ${t.message_id}:`, updErr.message)
+        if (updErr) console.error('Reconcile: state_checked_at update failed:', messageId, updErr.message)
         checked++
         continue
       }
@@ -1108,12 +1151,12 @@ router.post('/reconcile-state', async (req: AuthenticatedRequest, res: Response,
           .from(t.table)
           .update({ state_checked_at: checkedAtIso })
           .eq('message_id', t.message_id)
-        if (updErr) console.error(`Reconcile: state_checked_at update failed for ${t.message_id}:`, updErr.message)
+        if (updErr) console.error('Reconcile: state_checked_at update failed:', messageId, updErr.message)
         checked++
         continue
       }
       // Other errors (5xx) -- log and skip without recording check time
-      console.error(`Reconcile got ${resp.status} for ${t.message_id}`)
+      console.error('Reconcile got unexpected status:', resp.status, messageId)
     }
 
     res.json({ checked, deleted: deletedCount, skipped, eligible: eligible.length, total: targets.length })
@@ -1169,7 +1212,21 @@ router.post('/servers/channels/sync', async (req: AuthenticatedRequest, res: Res
 
     let totalSynced = 0
 
-    // 3. For each guild, fetch channels and upsert
+    // 3. Load per-guild auto-monitor defaults (fallback TRUE when unset)
+    const { data: configRows } = guardianGuildIds.length > 0
+      ? await supabaseAdmin
+          .from('guardian_bot_config')
+          .select('guild_id, default_monitor_new_channels')
+          .in('guild_id', guardianGuildIds)
+      : { data: [] as Array<{ guild_id: string; default_monitor_new_channels: boolean | null }> }
+    const guildDefaults = new Map<string, boolean>()
+    for (const row of configRows || []) {
+      guildDefaults.set(row.guild_id, row.default_monitor_new_channels !== false)
+    }
+
+    // 4. For each guild, fetch channels and upsert. Categories are synced first
+    //    so their is_monitored value is known and can be used as the default
+    //    for newly-discovered child channels (per-channel overrides always win).
     for (const guild of guilds) {
       const chRes = await fetch(`https://discord.com/api/v10/guilds/${guild.id}/channels`, {
         headers: { Authorization: `Bot ${botToken}` },
@@ -1178,30 +1235,111 @@ router.post('/servers/channels/sync', async (req: AuthenticatedRequest, res: Res
         console.error(`Failed to fetch channels for guild ${guild.name}: ${chRes.status}`)
         continue
       }
-      const channels = await chRes.json() as Array<{ id: string; name: string; type: number }>
+      const channels = await chRes.json() as DiscordChannelSummary[]
+      const threadsRes = await fetch(`https://discord.com/api/v10/guilds/${guild.id}/threads/active`, {
+        headers: { Authorization: `Bot ${botToken}` },
+      })
+      const activeThreads = threadsRes.ok
+        ? await threadsRes.json() as { threads?: DiscordChannelSummary[] }
+        : { threads: [] }
+      const channelsById = new Map<string, DiscordChannelSummary>()
+      for (const channel of [...channels, ...(activeThreads.threads || [])]) {
+        channelsById.set(channel.id, channel)
+      }
 
-      const rows = channels
-        .filter(c => MONITORED_CHANNEL_TYPES.has(c.type))
-        .map(c => ({
+      const guildDefault = guildDefaults.get(guild.id) ?? true
+
+      const { data: existingRows, error: existingRowsError } = await supabaseAdmin
+        .from('guardian_server_channels')
+        .select('channel_id, guild_name, channel_name, channel_type, parent_id, is_monitored, default_monitor_new_threads')
+        .eq('guild_id', guild.id)
+      if (existingRowsError) throw existingRowsError
+
+      const orphanThreads = (existingRows || []).filter(row => {
+        if (!THREAD_CHANNEL_TYPES.has(row.channel_type)) return false
+        const liveChannel = channelsById.get(row.channel_id)
+        return !row.parent_id || !liveChannel?.parent_id
+      })
+      for (const thread of orphanThreads) {
+        const threadRes = await fetch(`https://discord.com/api/v10/channels/${thread.channel_id}`, {
+          headers: { Authorization: `Bot ${botToken}` },
+        })
+        if (!threadRes.ok) continue
+        const threadChannel = await threadRes.json() as DiscordChannelSummary
+        if (MONITORED_CHANNEL_TYPES.has(threadChannel.type)) {
+          channelsById.set(threadChannel.id, threadChannel)
+        }
+      }
+
+      const relevant = Array.from(channelsById.values()).filter(c => MONITORED_CHANNEL_TYPES.has(c.type))
+      if (relevant.length === 0) continue
+
+      const existingMonitored = new Map((existingRows || []).map(r => [r.channel_id, r.is_monitored !== false]))
+      const existingParents = new Map((existingRows || []).map(r => [r.channel_id, r.parent_id || null]))
+      const threadDefaults = new Map((existingRows || []).map(r => [r.channel_id, r.default_monitor_new_threads ?? null]))
+      for (const channel of relevant) {
+        existingParents.set(channel.id, channel.parent_id || null)
+      }
+
+      const categories = relevant.filter(c => c.type === 4)
+      const nonCategories = relevant.filter(c => c.type !== 4)
+
+      // Resolve each category's effective is_monitored (existing value if known,
+      // otherwise the guild default) so children can inherit it.
+      const categoryDefaults = new Map<string, boolean>()
+      for (const cat of categories) {
+        categoryDefaults.set(cat.id, existingMonitored.get(cat.id) ?? guildDefault)
+      }
+
+      const buildRow = (c: typeof relevant[number]) => {
+        const base = {
           guild_id: guild.id,
           guild_name: guild.name,
           channel_id: c.id,
           channel_name: c.name,
           channel_type: c.type,
+          parent_id: c.parent_id || null,
           synced_at: new Date().toISOString(),
-        }))
-
-      if (rows.length === 0) continue
-
-      const { error } = await supabaseAdmin
-        .from('guardian_server_channels')
-        .upsert(rows, { onConflict: 'guild_id,channel_id' })
-
-      if (error) {
-        console.error(`Failed to upsert channels for guild ${guild.name}:`, error.message)
-      } else {
-        totalSynced += rows.length
+        }
+        if (existingMonitored.has(c.id)) return base // preserve existing is_monitored
+        if (THREAD_CHANNEL_TYPES.has(c.type)) {
+          const channelDefault = c.parent_id ? threadDefaults.get(c.parent_id) : undefined
+          const categoryId = c.parent_id ? existingParents.get(c.parent_id) : undefined
+          const categoryDefault = categoryId ? threadDefaults.get(categoryId) : undefined
+          return { ...base, is_monitored: channelDefault ?? categoryDefault ?? guildDefault }
+        }
+        const parentDefault = c.parent_id ? categoryDefaults.get(c.parent_id) : undefined
+        return { ...base, is_monitored: parentDefault ?? guildDefault }
       }
+
+      const rows = [...categories, ...nonCategories].map(buildRow)
+      const existingById = new Map((existingRows || []).map(row => [row.channel_id, row]))
+      const changedRows = rows.filter(row => {
+        const previous = existingById.get(row.channel_id)
+        return !previous
+          || previous.guild_name !== row.guild_name
+          || previous.channel_name !== row.channel_name
+          || previous.channel_type !== row.channel_type
+          || (previous.parent_id || null) !== row.parent_id
+      })
+      if (changedRows.length === 0) {
+        totalSynced += rows.length
+        continue
+      }
+
+      const additions = changedRows.filter(row => !existingById.has(row.channel_id))
+      const updates = changedRows.filter(row => existingById.has(row.channel_id))
+      for (const batch of [additions, updates]) {
+        if (batch.length === 0) continue
+        const { error } = await supabaseAdmin
+          .from('guardian_server_channels')
+          .upsert(batch, {
+            onConflict: 'guild_id,channel_id',
+            ignoreDuplicates: batch === additions,
+          })
+        if (error) throw error
+      }
+      totalSynced += rows.length
     }
 
     res.json({ synced: totalSynced, guilds: guilds.length })
@@ -1228,13 +1366,27 @@ router.get('/servers/channels', async (req: AuthenticatedRequest, res: Response,
 
     const { data, error } = await query
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
+
+    const guildIds = Array.from(new Set((data || []).map(c => c.guild_id)))
+    const { data: configRows } = guildIds.length > 0
+      ? await supabaseAdmin
+          .from('guardian_bot_config')
+          .select('guild_id, default_monitor_new_channels')
+          .in('guild_id', guildIds)
+      : { data: [] as Array<{ guild_id: string; default_monitor_new_channels: boolean | null }> }
+    const defaultsMap = new Map((configRows || []).map(r => [r.guild_id, r.default_monitor_new_channels !== false]))
 
     // Group by guild
-    const guilds: Record<string, { guild_id: string; guild_name: string; channels: typeof data }> = {}
+    const guilds: Record<string, { guild_id: string; guild_name: string; default_monitor_new_channels: boolean; channels: typeof data }> = {}
     for (const ch of data || []) {
       if (!guilds[ch.guild_id]) {
-        guilds[ch.guild_id] = { guild_id: ch.guild_id, guild_name: ch.guild_name || ch.guild_id, channels: [] }
+        guilds[ch.guild_id] = {
+          guild_id: ch.guild_id,
+          guild_name: ch.guild_name || ch.guild_id,
+          default_monitor_new_channels: defaultsMap.get(ch.guild_id) ?? true,
+          channels: [],
+        }
       }
       guilds[ch.guild_id].channels.push(ch)
     }
@@ -1263,12 +1415,101 @@ router.put('/servers/channels/:id/monitor', async (req: AuthenticatedRequest, re
       .select()
       .single()
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
     res.json(data)
   } catch (err) {
     next(err)
   }
 })
+
+router.put('/servers/channels/:id/thread-monitor-default', async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+  if (!requireModerator(req, res)) return
+
+  try {
+    const { id } = req.params
+    const { default_monitor_new_threads } = req.body
+
+    if (default_monitor_new_threads !== null && typeof default_monitor_new_threads !== 'boolean') {
+      return res.status(400).json({ error: 'default_monitor_new_threads (boolean or null) is required' })
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('guardian_server_channels')
+      .update({ default_monitor_new_threads })
+      .eq('id', id)
+      .select()
+      .single()
+
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
+    res.json(data)
+  } catch (err) {
+    next(err)
+  }
+})
+
+router.post('/servers/channels/:id/clear-thread-monitor-defaults', async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+  if (!requireModerator(req, res)) return
+
+  try {
+    const { id } = req.params
+    const { data: category, error: categoryError } = await supabaseAdmin
+      .from('guardian_server_channels')
+      .select('channel_id, channel_type')
+      .eq('id', id)
+      .single()
+
+    if (categoryError) return res.status(500).json({ error: safeErrorMessage(categoryError) })
+    if (category?.channel_type !== 4) return res.status(400).json({ error: 'Thread defaults can only be cleared from a category' })
+
+    const { error } = await supabaseAdmin
+      .from('guardian_server_channels')
+      .update({ default_monitor_new_threads: null })
+      .eq('parent_id', category.channel_id)
+
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
+    res.json({ ok: true })
+  } catch (err) {
+    next(err)
+  }
+})
+
+/**
+ * PUT /api/guardian/servers/:guildId/default-monitoring
+ *
+ * Sets the per-guild fallback used when a brand-new channel or category is
+ * discovered (via sync or the bot's live channelCreate listener) and has no
+ * category default to inherit from.
+ */
+router.put('/servers/:guildId/default-monitoring', async (req: AuthenticatedRequest, res: Response, next: NextFunction) => {
+  if (!requireModerator(req, res)) return
+
+  try {
+    const { guildId } = req.params
+    if (!/^\d{17,20}$/.test(guildId)) {
+      return res.status(400).json({ error: 'Invalid guild_id' })
+    }
+
+    const { default_monitor_new_channels } = req.body
+    if (typeof default_monitor_new_channels !== 'boolean') {
+      return res.status(400).json({ error: 'default_monitor_new_channels (boolean) is required' })
+    }
+
+    const { data, error } = await supabaseAdmin
+      .from('guardian_bot_config')
+      .upsert(
+        { guild_id: guildId, default_monitor_new_channels, updated_at: new Date().toISOString() },
+        { onConflict: 'guild_id' }
+      )
+      .select('guild_id, default_monitor_new_channels')
+      .single()
+
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
+    res.json(data)
+  } catch (err) {
+    next(err)
+  }
+})
+
 
 // ─── Timeseries Stats ─────────────────────────────────────────────────
 
@@ -1349,10 +1590,11 @@ router.get('/timeseries', async (req: AuthenticatedRequest, res: Response, next:
     const { data: scannedRows, error: scannedErr } = await supabaseAdmin
       .from('guardian_message_log')
       .select('scanned_at')
+      .is('skip_reason', null)
       .gte('scanned_at', startISO)
       .lte('scanned_at', endISO)
 
-    if (scannedErr) return res.status(500).json({ error: scannedErr.message })
+    if (scannedErr) return res.status(500).json({ error: safeErrorMessage(scannedErr) })
 
     // Fetch flagged timestamps + author_id for unique users
     const { data: flaggedRows, error: flaggedErr } = await supabaseAdmin
@@ -1361,7 +1603,7 @@ router.get('/timeseries', async (req: AuthenticatedRequest, res: Response, next:
       .gte('flagged_at', startISO)
       .lte('flagged_at', endISO)
 
-    if (flaggedErr) return res.status(500).json({ error: flaggedErr.message })
+    if (flaggedErr) return res.status(500).json({ error: safeErrorMessage(flaggedErr) })
 
     // Build buckets
     const startTime = start.getTime()
@@ -1483,7 +1725,7 @@ router.get('/actions-timeseries', async (req: AuthenticatedRequest, res: Respons
       .lte('created_at', endISO)
       .in('action', ['delete', 'mute', 'ban'])
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
 
     const startTime = start.getTime()
     const buckets: Array<{ time: string; delete: number; mute: number; ban: number; failed: number }> = []
@@ -1544,7 +1786,7 @@ router.get('/system-log', async (req: AuthenticatedRequest, res: Response, next:
       .order('created_at', { ascending: false })
       .limit(limit)
 
-    if (error) return res.status(500).json({ error: error.message })
+    if (error) return res.status(500).json({ error: safeErrorMessage(error) })
 
     res.json({ entries: data || [], limit })
   } catch (err) {

@@ -38,5 +38,54 @@ export function safeErrorMessage(err: unknown): string {
   return 'An internal error occurred'
 }
 
+function getErrorMessage(err: unknown): string {
+  if (typeof err === 'object' && err !== null && 'message' in err) {
+    const message = (err as { message?: unknown }).message
+    return typeof message === 'string' ? message : ''
+  }
+  return ''
+}
+
+function getErrorStatus(err: unknown): number | null {
+  if (typeof err !== 'object' || err === null) return null
+  const candidate = err as { status?: unknown; statusCode?: unknown; code?: unknown }
+  const status = candidate.status ?? candidate.statusCode ?? candidate.code
+  if (typeof status === 'number') return status
+  if (typeof status === 'string') {
+    const parsed = Number(status)
+    return Number.isInteger(parsed) ? parsed : null
+  }
+  return null
+}
+
+export function safeExternalErrorMessage(
+  err: unknown,
+  fallback = 'External service unavailable. Please try again later.'
+): string {
+  return collapseExternalServiceErrorMessage(err, fallback) ?? safeErrorMessage(err)
+}
+
+export function collapseExternalServiceErrorMessage(
+  err: unknown,
+  fallback = 'External service unavailable. Please try again later.'
+): string | null {
+  const message = getErrorMessage(err)
+  const lowerMessage = message.toLowerCase()
+  const status = getErrorStatus(err)
+
+  if (
+    status === 522 ||
+    (status !== null && status >= 500) ||
+    lowerMessage.includes('<!doctype html') ||
+    lowerMessage.includes('<html') ||
+    lowerMessage.includes('cloudflare') ||
+    lowerMessage.includes('connection timed out')
+  ) {
+    return fallback
+  }
+
+  return null
+}
+
 /** Max announcement body length (allows room for attribution suffix) */
 export const ANNOUNCEMENT_BODY_MAX_LENGTH = 1800

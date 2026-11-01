@@ -37,6 +37,8 @@ import net from 'net'
 import { ValidationError, UnauthorizedError, ApplicationError } from '../middleware/error-handler.js'
 import { sanitizeString } from '../middleware/validation.js'
 import { isSupabaseConfigured } from '../supabaseClient.js'
+import { getSupabaseServerKey } from '../services/supabase-key.js'
+import { assertSafePublicCalendarHost } from '../services/public-calendar-fetch.js'
 import {
   readLocalConfig,
   writeLocalConfig,
@@ -184,10 +186,8 @@ async function probeDocsSite(): Promise<{ ok: boolean; detail: string }> {
 async function probeSupabaseConnection(): Promise<{ ok: boolean; detail: string }> {
   const url = process.env.SUPABASE_URL?.trim() || ''
   const anonKey = process.env.SUPABASE_KEY?.trim() || ''
-  const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY?.trim() || ''
-  const key = isMeaningfulEnvValue('SUPABASE_SERVICE_ROLE_KEY', serviceRoleKey)
-    ? serviceRoleKey
-    : anonKey
+  const serverKey = getSupabaseServerKey()
+  const key = serverKey.value !== undefined ? serverKey.value.trim() : anonKey
 
   if (!isMeaningfulEnvValue('SUPABASE_URL', url)) {
     return { ok: false, detail: 'missing or placeholder SUPABASE_URL' }
@@ -354,6 +354,13 @@ router.post('/production-summary', async (req: Request, res: Response, next: Nex
     }
     if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
       throw new ValidationError('apiBaseUrl must start with http:// or https://')
+    }
+    // SSRF hardening: even though this endpoint is localhost + dev only, never
+    // proxy to private or internal addresses (DNS-checked blocklist).
+    try {
+      await assertSafePublicCalendarHost(parsed.hostname)
+    } catch {
+      throw new ValidationError('apiBaseUrl must resolve to a public host')
     }
 
     const base = `${parsed.origin}${parsed.pathname}`.replace(/\/$/, '')

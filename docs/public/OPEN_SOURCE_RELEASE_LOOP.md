@@ -10,7 +10,7 @@ From repository root:
 pnpm release:loop
 ```
 
-Fast preparation variant (no CI poll, no live API wait):
+Faster variant that skips the CI status poll and the live API wait:
 
 ```powershell
 pnpm release:loop:prep
@@ -21,6 +21,8 @@ Skip only CI status poll:
 ```powershell
 pnpm release:loop:no-ci
 ```
+
+Every variant, including `release:loop:prep`, still installs dependencies, commits, pushes the private branch, pushes a public sync branch and opens the public PR. There is no dry run; for a read-only check of the exclusion policy run `scripts/test-public-sync-exclusions.ps1`.
 
 ## What the loop does
 

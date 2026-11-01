@@ -7,8 +7,45 @@ export function AuthenticationPage() {
     <div className="prose-docs">
       <h1>Authentication</h1>
       <p className="text-lg text-gray-400 mb-8">
-        The Agent API uses Bearer token authentication with scoped API keys.
-        Every request must include an <code>Authorization</code> header.
+        Coordination Manager uses Supabase Auth for human web sessions and scoped
+        Bearer tokens for the Agent API. Human sessions protect the web app and
+        admin tools; agent keys are for server-side integrations.
+      </p>
+
+      <h2>Web Sessions and Admin MFA</h2>
+      <p>
+        Human users sign in through Supabase Auth. The browser client stores auth
+        sessions in <code>sessionStorage</code>, so auth material is scoped to the
+        current browser tab/session and is cleared on logout along with legacy
+        Supabase auth tokens that may have previously lived in local storage.
+      </p>
+      <p>
+        Application admin endpoints require a Supabase MFA assurance level of
+        <code>aal2</code>. When an authenticated admin opens an admin surface without
+        a current MFA-verified session, the UI starts a TOTP challenge or enrollment
+        flow, refreshes the session after verification, and then retries the admin
+        request.
+      </p>
+
+      <Callout variant="info" title="Assessment evidence">
+        For CASA-style reviews, keep screenshots or exports showing Supabase JWT
+        lifetime settings, refresh-token handling, admin MFA enrollment/challenge,
+        and logout/browser-storage cleanup. See <Link to="/legal/security-policy">Security Policy</Link> for the full evidence checklist.
+      </Callout>
+
+      <h2>OAuth Flows</h2>
+      <p>
+        Google sign-in is handled through Supabase's OAuth flow, which uses the
+        recommended authorization-code pattern with provider-managed redirect
+        validation. Mailbox OAuth integrations for Gmail and Outlook use exact
+        redirect URIs and signed state values so callbacks are bound to the user
+        who started the flow.
+      </p>
+
+      <h2>Agent API Authentication</h2>
+      <p>
+        The Agent API uses Bearer token authentication with scoped API keys. Every
+        agent request must include an <code>Authorization</code> header.
       </p>
 
       <h2>How It Works</h2>
