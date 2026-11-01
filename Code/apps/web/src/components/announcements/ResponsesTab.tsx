@@ -19,6 +19,7 @@ import {
   ChevronsUp,
 } from 'lucide-react'
 import { apiClient } from '../../lib/api-client'
+import { Button, IconButton, SegmentedControl } from '../ui'
 import { getPrimaryTimezone, formatDateDDMMYYYYInTimezone, formatDateTimeDDMMYYYYInTimezone } from '../../lib/timezone-data'
 
 // ─── Types ─────────────────────────────────────────────────────────
@@ -101,14 +102,14 @@ const inputToISOEnd = (val: string): string | null => {
 }
 
 const RESPONSE_CONFIG: Record<string, { label: string; cls: string; icon: typeof CheckCircle2 }> = {
-  subscribed: { label: 'Subscribed', cls: 'bg-green-100 dark:bg-green-950/40 text-green-700 dark:text-green-400', icon: CheckCircle2 },
-  unsubscribed: { label: 'Unsubscribed', cls: 'bg-slate-100 dark:bg-slate-800/40 text-slate-600 dark:text-slate-400', icon: XCircle },
-  opted_out: { label: 'Opted Out', cls: 'bg-red-100 dark:bg-red-950/30 text-red-600 dark:text-red-400', icon: ShieldAlert },
-  invited: { label: 'No Response', cls: 'bg-amber-100 dark:bg-amber-950/30 text-amber-600 dark:text-amber-400', icon: Clock },
-  skipped_no_response: { label: 'Skipped', cls: 'bg-slate-100 dark:bg-slate-800/40 text-slate-600 dark:text-slate-400', icon: XCircle },
-  muted_bot: { label: 'Muted Bot', cls: 'bg-purple-100 dark:bg-purple-950/30 text-purple-600 dark:text-purple-400', icon: EyeOff },
-  received: { label: 'Received', cls: 'bg-blue-100 dark:bg-blue-950/30 text-blue-600 dark:text-blue-400', icon: Eye },
-  failed: { label: 'Failed', cls: 'bg-red-100 dark:bg-red-950/30 text-red-600 dark:text-red-400', icon: XCircle },
+  subscribed: { label: 'Subscribed', cls: 'bg-success-subtle text-success', icon: CheckCircle2 },
+  unsubscribed: { label: 'Unsubscribed', cls: 'bg-muted text-muted-foreground', icon: XCircle },
+  opted_out: { label: 'Opted Out', cls: 'bg-danger-subtle text-danger', icon: ShieldAlert },
+  invited: { label: 'No Response', cls: 'bg-warning-subtle text-warning', icon: Clock },
+  skipped_no_response: { label: 'Skipped', cls: 'bg-muted text-muted-foreground', icon: XCircle },
+  muted_bot: { label: 'Muted Bot', cls: 'bg-neutral-subtle text-neutral', icon: EyeOff },
+  received: { label: 'Received', cls: 'bg-info-subtle text-primary', icon: Eye },
+  failed: { label: 'Failed', cls: 'bg-danger-subtle text-danger', icon: XCircle },
 }
 
 function ResponseBadge({ type }: { type: string }) {
@@ -383,18 +384,15 @@ export default function ResponsesTab() {
   const ScaleUpButton = () => {
     if (!scaleUpLabel) return null
     return (
-      <button
+      <Button
+        emphasis="outline"
+        intent="primary"
         onClick={handleScaleUpClick}
-        disabled={scaleUpLoading}
-        className="flex items-center gap-2 px-4 py-2.5 text-sm rounded-lg border border-primary/30 bg-primary/5 hover:bg-primary/10 text-primary transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+        loading={scaleUpLoading}
+        icon={<ChevronsUp className="w-4 h-4" />}
       >
-        {scaleUpLoading ? (
-          <Loader2 className="w-4 h-4 animate-spin" />
-        ) : (
-          <ChevronsUp className="w-4 h-4" />
-        )}
         {scaleUpLoading ? 'Loading...' : scaleUpLabel}
-      </button>
+      </Button>
     )
   }
 
@@ -410,7 +408,7 @@ export default function ResponsesTab() {
               type="date"
               value={dateAfter}
               onChange={e => setDateAfter(e.target.value)}
-              className="px-2 py-1.5 text-xs rounded border border-border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30"
+              className="px-2 py-1.5 text-xs rounded border border-border bg-background focus:outline-hidden focus:ring-2 focus:ring-primary/30"
             />
           </div>
           <div>
@@ -419,22 +417,16 @@ export default function ResponsesTab() {
               type="date"
               value={dateBefore}
               onChange={e => setDateBefore(e.target.value)}
-              className="px-2 py-1.5 text-xs rounded border border-border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30"
+              className="px-2 py-1.5 text-xs rounded border border-border bg-background focus:outline-hidden focus:ring-2 focus:ring-primary/30"
             />
           </div>
-          <button
-            onClick={handleDateApply}
-            className="px-3 py-1.5 text-xs rounded bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
-          >
+          <Button intent="primary" size="compact" onClick={handleDateApply}>
             Apply
-          </button>
+          </Button>
           {hasDateFilter && (
-            <button
-              onClick={handleDateClear}
-              className="px-3 py-1.5 text-xs rounded border border-border hover:bg-muted transition-colors"
-            >
+            <Button emphasis="outline" size="compact" onClick={handleDateClear}>
               Clear
-            </button>
+            </Button>
           )}
         </div>
       )}
@@ -457,16 +449,17 @@ export default function ResponsesTab() {
       <div className="space-y-3">
         {/* Date filter still available on empty state */}
         <div className="flex items-center gap-3">
-          <button
+          <Button
+            emphasis="outline"
+            intent={hasDateFilter ? 'primary' : 'neutral'}
+            size="compact"
             onClick={() => setShowDateFilter(v => !v)}
-            className={`flex items-center gap-1.5 px-3 py-2 text-xs rounded-lg border transition-colors ${
-              hasDateFilter ? 'border-primary bg-primary/10 text-primary' : 'border-border hover:bg-muted'
-            }`}
+            aria-expanded={showDateFilter}
+            icon={<Calendar className="w-3.5 h-3.5" />}
           >
-            <Calendar className="w-3.5 h-3.5" />
             Date Range
             {hasDateFilter && <span className="font-medium">*</span>}
-          </button>
+          </Button>
           {hasDateFilter && (
             <button onClick={handleDateClear} className="text-xs text-muted-foreground hover:text-foreground underline">
               Clear dates
@@ -498,34 +491,39 @@ export default function ResponsesTab() {
               placeholder="Search by name, calendar, or announcement..."
               value={searchQuery}
               onChange={e => setSearchQuery(e.target.value)}
-              className="w-full pl-9 pr-8 py-2 text-sm rounded-lg border border-border bg-background focus:outline-none focus:ring-2 focus:ring-primary/30"
+              className="w-full pl-9 pr-8 py-2 text-sm rounded-lg border border-border bg-background focus:outline-hidden focus:ring-2 focus:ring-primary/30"
             />
             {searchQuery && (
-              <button
+              <IconButton
+                size="micro"
+                label="Clear search"
                 onClick={() => setSearchQuery('')}
-                className="absolute right-2 top-1/2 -translate-y-1/2 p-0.5 rounded hover:bg-muted"
-              >
-                <X className="w-3.5 h-3.5 text-muted-foreground" />
-              </button>
+                className="absolute right-2 top-1/2 -translate-y-1/2"
+                icon={<X />}
+              />
             )}
           </div>
-          <button
+          <Button
+            emphasis="outline"
+            intent={hasDateFilter ? 'primary' : 'neutral'}
+            size="compact"
             onClick={() => setShowDateFilter(v => !v)}
-            className={`flex items-center gap-1.5 px-3 py-2 text-xs rounded-lg border transition-colors shrink-0 ${
-              hasDateFilter ? 'border-primary bg-primary/10 text-primary' : 'border-border hover:bg-muted'
-            }`}
+            aria-expanded={showDateFilter}
+            className="shrink-0"
             title="Date range filter"
+            icon={<Calendar className="w-3.5 h-3.5" />}
           >
-            <Calendar className="w-3.5 h-3.5" />
             {hasDateFilter ? 'Filtered' : 'Dates'}
-          </button>
-          <button
+          </Button>
+          <Button
+            emphasis="outline"
+            size="compact"
             onClick={handleRefresh}
-            className="flex items-center gap-1.5 px-3 py-2 text-xs rounded-lg border border-border hover:bg-muted transition-colors shrink-0"
+            className="shrink-0"
+            icon={<RefreshCw className="w-3.5 h-3.5" />}
           >
-            <RefreshCw className="w-3.5 h-3.5" />
             Refresh
-          </button>
+          </Button>
         </div>
 
         {/* Date range picker */}
@@ -534,22 +532,17 @@ export default function ResponsesTab() {
         {/* Filter pills */}
         <div className="flex items-center gap-1.5 flex-wrap">
           <Filter className="w-3.5 h-3.5 text-muted-foreground" />
-          {filterOptions.map(opt => (
-            <button
-              key={opt.value}
-              onClick={() => setActiveFilter(opt.value)}
-              className={`px-2.5 py-1 text-[11px] rounded-full border transition-colors ${
-                activeFilter === opt.value
-                  ? 'bg-primary text-primary-foreground border-primary'
-                  : 'border-border text-muted-foreground hover:text-foreground hover:bg-muted'
-              }`}
-            >
-              {opt.label}
-              {opt.count !== undefined && opt.count > 0 && (
-                <span className="ml-1 opacity-70">{opt.count}</span>
-              )}
-            </button>
-          ))}
+          <SegmentedControl
+            label="Filter responses"
+            size="micro"
+            className="flex-wrap"
+            value={activeFilter}
+            onChange={setActiveFilter}
+            options={filterOptions.map(opt => ({
+              value: opt.value,
+              label: opt.count !== undefined && opt.count > 0 ? `${opt.label} ${opt.count}` : opt.label,
+            }))}
+          />
         </div>
 
         <div className="flex items-center gap-3 text-xs text-muted-foreground">
@@ -576,27 +569,27 @@ export default function ResponsesTab() {
         {(summaryCounts.subscribed > 0 || summaryCounts.invited > 0 || summaryCounts.unsubscribed > 0 || summaryCounts.opted_out > 0 || summaryCounts.muted_bot > 0) && (
           <div className="flex items-center gap-3 text-[11px] px-3 py-2 rounded-lg bg-muted/40 border border-border/50 mb-3 flex-wrap">
             {summaryCounts.subscribed > 0 && (
-              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-green-100 dark:bg-green-950/40 text-green-700 dark:text-green-400 font-medium">
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-success-subtle text-success font-medium">
                 <CheckCircle2 className="w-3 h-3" /> {summaryCounts.subscribed} Subscribed
               </span>
             )}
             {summaryCounts.invited > 0 && (
-              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-amber-100 dark:bg-amber-950/30 text-amber-600 dark:text-amber-400 font-medium">
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-warning-subtle text-warning font-medium">
                 <Clock className="w-3 h-3" /> {summaryCounts.invited} No Response
               </span>
             )}
             {summaryCounts.unsubscribed > 0 && (
-              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-slate-100 dark:bg-slate-800/40 text-slate-600 dark:text-slate-400 font-medium">
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-muted text-muted-foreground font-medium">
                 <XCircle className="w-3 h-3" /> {summaryCounts.unsubscribed} Unsubscribed
               </span>
             )}
             {summaryCounts.opted_out > 0 && (
-              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-red-100 dark:bg-red-950/30 text-red-600 dark:text-red-400 font-medium">
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-danger-subtle text-danger font-medium">
                 <ShieldAlert className="w-3 h-3" /> {summaryCounts.opted_out} Opted Out
               </span>
             )}
             {summaryCounts.muted_bot > 0 && (
-              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-purple-100 dark:bg-purple-950/30 text-purple-600 dark:text-purple-400 font-medium">
+              <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-full bg-neutral-subtle text-neutral font-medium">
                 <EyeOff className="w-3 h-3" /> {summaryCounts.muted_bot} Muted Bot
               </span>
             )}
@@ -745,16 +738,16 @@ export default function ResponsesTab() {
                       {/* Mini response breakdown */}
                       <div className="flex items-center gap-1">
                         {responseBreakdown.subscribed && (
-                          <span className="w-2 h-2 rounded-full bg-green-500" title={`${responseBreakdown.subscribed} subscribed`} />
+                          <span className="w-2 h-2 rounded-full bg-success" title={`${responseBreakdown.subscribed} subscribed`} />
                         )}
                         {responseBreakdown.invited && (
-                          <span className="w-2 h-2 rounded-full bg-amber-500" title={`${responseBreakdown.invited} no response`} />
+                          <span className="w-2 h-2 rounded-full bg-warning" title={`${responseBreakdown.invited} no response`} />
                         )}
                         {responseBreakdown.opted_out && (
-                          <span className="w-2 h-2 rounded-full bg-red-500" title={`${responseBreakdown.opted_out} opted out`} />
+                          <span className="w-2 h-2 rounded-full bg-danger" title={`${responseBreakdown.opted_out} opted out`} />
                         )}
                         {responseBreakdown.unsubscribed && (
-                          <span className="w-2 h-2 rounded-full bg-slate-400" title={`${responseBreakdown.unsubscribed} unsubscribed`} />
+                          <span className="w-2 h-2 rounded-full bg-neutral" title={`${responseBreakdown.unsubscribed} unsubscribed`} />
                         )}
                       </div>
                     </div>
@@ -782,8 +775,8 @@ export default function ResponsesTab() {
                           }
 
                           const bandClass = scheduleIdx % 2 === 0
-                            ? 'bg-primary/[0.04] dark:bg-primary/[0.06]'
-                            : 'bg-secondary/[0.35] dark:bg-secondary/[0.18]'
+                            ? 'bg-primary/4 dark:bg-primary/6'
+                            : 'bg-secondary/35 dark:bg-secondary/18'
 
                           return (
                             <div

@@ -1,6 +1,13 @@
 # Verbose Output Template
 
+## Contents
+- Template (sections: Intent Recognition, Your Goal, You Are Looking At,
+  Cross-Feature Impact, Decisions I Need, Implementation Plan, Next Steps)
+- Formatting Rules
+
 Render this structure when `prompt-enhancement-agent` runs full scaffolding.
+Omit the Decisions and Next Steps blocks when the verdict is sufficient and the
+user did not ask for a plan.
 Goal: keep it verbose but skimmable. Use formatting to separate three things:
 1. USER WORDS - quote the user's own sentences (blockquotes)
 2. AGENT INFERENCE - what we concluded (plain text under labelled headings)
@@ -86,7 +93,7 @@ Missing:
 - E2E (Playwright): <user workflow>
 - A11y: <contrast / focus concern>
 
-Suggested run: pnpm test:<scope>
+Suggested run: pnpm test:web, pnpm test:api, or pnpm test:e2e (web)
 
 </details>
 

@@ -252,10 +252,10 @@ export default function ColorGridPicker({
         style={{ backgroundColor: `hsl(${Math.round(hue)} 100% 50%)` }}
         aria-label="Color saturation and brightness picker"
       >
-        <div className="absolute inset-0 bg-gradient-to-r from-white via-white/0 to-transparent" />
-        <div className="absolute inset-0 bg-gradient-to-t from-black via-black/0 to-transparent" />
+        <div className="absolute inset-0 bg-linear-to-r from-white via-white/0 to-transparent" />
+        <div className="absolute inset-0 bg-linear-to-t from-black via-black/0 to-transparent" />
         <span
-          className="pointer-events-none absolute h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow"
+          className="pointer-events-none absolute h-3.5 w-3.5 -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-white shadow-sm"
           style={{
             left: selectorLeft,
             top: selectorTop,
@@ -297,7 +297,7 @@ export default function ColorGridPicker({
             style={{ backgroundColor: previewHex }}
             aria-hidden="true"
           />
-          {customError && <span className="text-[10px] text-red-600 dark:text-red-400">{customError}</span>}
+          {customError && <span className="text-[10px] text-danger">{customError}</span>}
         </div>
       )}
     </div>

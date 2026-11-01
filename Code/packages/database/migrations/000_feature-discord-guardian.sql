@@ -92,8 +92,32 @@ CREATE TABLE IF NOT EXISTS public.guardian_message_log (
   author_username TEXT,
   content_preview TEXT,
   was_flagged BOOLEAN DEFAULT FALSE,
+  skip_reason TEXT,
   scanned_at TIMESTAMP WITH TIME ZONE DEFAULT NOW()
 );
+
+ALTER TABLE public.guardian_message_log
+  ADD COLUMN IF NOT EXISTS skip_reason TEXT;
+
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.guardian_message_log'::regclass
+      AND conname = 'guardian_message_log_skip_reason_check'
+  ) THEN
+    ALTER TABLE public.guardian_message_log
+      ADD CONSTRAINT guardian_message_log_skip_reason_check
+      CHECK (
+        skip_reason IS NULL OR
+        (skip_reason IN ('ignored_role', 'channel_disabled', 'parent_channel_disabled')
+          AND was_flagged IS FALSE)
+      );
+  END IF;
+END $$;
+
+CREATE INDEX IF NOT EXISTS idx_guardian_log_scanned_not_skipped
+  ON public.guardian_message_log(scanned_at DESC)
+  WHERE skip_reason IS NULL;
 
 CREATE INDEX IF NOT EXISTS idx_guardian_log_scanned ON public.guardian_message_log(scanned_at DESC);
 CREATE INDEX IF NOT EXISTS idx_guardian_log_guild ON public.guardian_message_log(guild_id);
@@ -838,7 +862,7 @@ CREATE TABLE IF NOT EXISTS public.guardian_action_log (
   id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
 
   -- What action was taken
-  action TEXT NOT NULL CHECK (action IN ('flag', 'delete', 'mute', 'ban')),
+  action TEXT NOT NULL CHECK (action IN ('flag', 'delete', 'mute', 'ban', 'unban', 'unmute')),
   -- Why it was taken
   matched_rule_id UUID REFERENCES public.guardian_rules(id) ON DELETE SET NULL,
   matched_rule_group_id UUID REFERENCES public.guardian_rule_groups(id) ON DELETE SET NULL,
@@ -991,3 +1015,557 @@ ALTER TABLE public.guardian_instance_lock FORCE ROW LEVEL SECURITY;
 
 -- END SOURCE: 068_guardian_instance_lock_force_rls.sql
 
+-- ============================================================
+-- BEGIN SOURCE: 069_guardian_category_monitoring.sql
+-- ============================================================
+-- Migration 069: Guardian -- category-level monitoring defaults + auto-monitor toggle
+--
+-- 1. guardian_server_channels.parent_id -- Discord category (parent channel)
+--    id, so categories can be synced/toggled as their own rows (channel_type
+--    = 4) and text/voice channels can be grouped under them in the UI.
+--    A category's is_monitored value is used only as the DEFAULT applied to
+--    channels newly discovered under it -- it never overrides an existing
+--    per-channel toggle (per-channel setting always wins).
+--
+-- 2. guardian_bot_config.default_monitor_new_channels -- per-guild fallback
+--    default used when a brand-new channel/category is discovered and it has
+--    no category default to inherit from.
+
+ALTER TABLE public.guardian_server_channels
+  ADD COLUMN IF NOT EXISTS parent_id TEXT;
+
+COMMENT ON COLUMN public.guardian_server_channels.parent_id IS 'Discord category (parent) channel_id, if any. Categories are stored as their own rows with channel_type = 4.';
+
+CREATE INDEX IF NOT EXISTS idx_guardian_server_channels_parent ON public.guardian_server_channels(guild_id, parent_id);
+
+ALTER TABLE public.guardian_bot_config
+  ADD COLUMN IF NOT EXISTS default_monitor_new_channels BOOLEAN DEFAULT TRUE;
+
+COMMENT ON COLUMN public.guardian_bot_config.default_monitor_new_channels IS 'Fallback monitoring default applied when a newly discovered channel/category has no category default to inherit from.';
+
+
+-- END SOURCE: 069_guardian_category_monitoring.sql
+
+-- ============================================================
+-- BEGIN SOURCE: 070_guardian_thread_monitoring.sql
+-- ============================================================
+-- Migration 070: Guardian -- thread parent relationships and monitoring defaults
+--
+-- NULL means inherit the default from the related channel/category or guild.
+ALTER TABLE public.guardian_server_channels
+  ADD COLUMN IF NOT EXISTS default_monitor_new_threads BOOLEAN;
+
+COMMENT ON COLUMN public.guardian_server_channels.default_monitor_new_threads IS 'Default monitoring state for threads created under this channel or category; NULL inherits.';
+
+-- END SOURCE: 070_guardian_thread_monitoring.sql
+
+-- Guardian ban registry (025_guardian_ban_registry.sql).
+CREATE TABLE IF NOT EXISTS public.guardian_ban_entries (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  guild_id TEXT NOT NULL CHECK (guild_id ~ '^[0-9]{17,20}$'),
+  discord_user_id TEXT NOT NULL CHECK (discord_user_id ~ '^[0-9]{17,20}$'),
+  reason TEXT NOT NULL CHECK (length(reason) BETWEEN 1 AND 400),
+  is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
+  status TEXT NOT NULL DEFAULT 'registered'
+    CHECK (status IN ('registered', 'pending', 'processing', 'banned', 'failed')),
+  created_by UUID NOT NULL REFERENCES public.users(id),
+  requested_by UUID NOT NULL REFERENCES public.users(id),
+  requested_by_discord_id TEXT NOT NULL,
+  disabled_by UUID REFERENCES public.users(id),
+  attempts INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  processing_started_at TIMESTAMPTZ,
+  processing_token UUID,
+  last_error TEXT,
+  banned_at TIMESTAMPTZ,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (guild_id, discord_user_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_guardian_ban_queue
+  ON public.guardian_ban_entries(next_attempt_at, created_at)
+  WHERE is_enabled AND status IN ('pending', 'processing');
+CREATE INDEX IF NOT EXISTS idx_guardian_ban_guild_created
+  ON public.guardian_ban_entries(guild_id, created_at DESC);
+ALTER TABLE public.guardian_ban_entries ENABLE ROW LEVEL SECURITY;
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE schemaname = 'public' AND tablename = 'guardian_ban_entries'
+      AND policyname = 'Ban registry is service only'
+  ) THEN
+    CREATE POLICY "Ban registry is service only" ON public.guardian_ban_entries
+      FOR ALL USING (false) WITH CHECK (false);
+  END IF;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.register_guardian_bans(
+  p_guild_ids TEXT[], p_discord_ids TEXT[], p_reason TEXT,
+  p_actor UUID, p_actor_discord TEXT, p_preban BOOLEAN
+) RETURNS INTEGER LANGUAGE plpgsql SET search_path = public AS $$
+DECLARE affected INTEGER;
+BEGIN
+  INSERT INTO public.guardian_ban_entries (
+    guild_id, discord_user_id, reason, created_by, requested_by,
+    requested_by_discord_id, status
+  )
+  SELECT guild_id, discord_id, p_reason, p_actor, p_actor, p_actor_discord,
+    CASE WHEN p_preban THEN 'pending' ELSE 'registered' END
+  FROM unnest(p_guild_ids) AS g(guild_id)
+  CROSS JOIN unnest(p_discord_ids) AS d(discord_id)
+  ON CONFLICT (guild_id, discord_user_id) DO UPDATE SET
+    reason = EXCLUDED.reason,
+    requested_by = EXCLUDED.requested_by,
+    requested_by_discord_id = EXCLUDED.requested_by_discord_id,
+    is_enabled = TRUE,
+    disabled_by = NULL,
+    status = CASE WHEN p_preban THEN 'pending'
+      WHEN guardian_ban_entries.status = 'banned' THEN 'banned' ELSE 'registered' END,
+    attempts = 0,
+    next_attempt_at = NOW(),
+    processing_started_at = NULL,
+    processing_token = NULL,
+    last_error = NULL,
+    updated_at = NOW()
+  WHERE guardian_ban_entries.status <> 'processing';
+  GET DIAGNOSTICS affected = ROW_COUNT;
+  RETURN affected;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.claim_guardian_ban(p_instance_id TEXT)
+RETURNS SETOF public.guardian_ban_entries
+LANGUAGE plpgsql SET search_path = public AS $$
+BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM public.guardian_instance_lock
+    WHERE id = 'singleton' AND instance_id = p_instance_id
+      AND heartbeat_at > NOW() - INTERVAL '30 seconds'
+  ) THEN RETURN; END IF;
+
+  RETURN QUERY
+  UPDATE public.guardian_ban_entries SET
+    status = 'processing', processing_started_at = NOW(),
+    processing_token = gen_random_uuid(), attempts = attempts + 1, updated_at = NOW()
+  WHERE id = (
+    SELECT id FROM public.guardian_ban_entries
+    WHERE is_enabled AND (
+      (status = 'pending' AND next_attempt_at <= NOW()) OR
+      (status = 'processing' AND processing_started_at < NOW() - INTERVAL '5 minutes')
+    )
+    ORDER BY next_attempt_at, created_at
+    LIMIT 1 FOR UPDATE SKIP LOCKED
+  )
+  RETURNING *;
+END;
+$$;
+
+CREATE OR REPLACE FUNCTION public.enqueue_guardian_join_ban(p_guild_id TEXT, p_discord_id TEXT)
+RETURNS VOID LANGUAGE sql SET search_path = public AS $$
+  UPDATE public.guardian_ban_entries SET
+    status = 'pending', attempts = 0, next_attempt_at = NOW(),
+    last_error = NULL, updated_at = NOW()
+  WHERE guild_id = p_guild_id AND discord_user_id = p_discord_id
+    AND is_enabled AND status <> 'processing';
+$$;
+
+REVOKE ALL ON FUNCTION public.register_guardian_bans(TEXT[], TEXT[], TEXT, UUID, TEXT, BOOLEAN) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.claim_guardian_ban(TEXT) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.enqueue_guardian_join_ban(TEXT, TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.register_guardian_bans(TEXT[], TEXT[], TEXT, UUID, TEXT, BOOLEAN) TO service_role;
+GRANT EXECUTE ON FUNCTION public.claim_guardian_ban(TEXT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.enqueue_guardian_join_ban(TEXT, TEXT) TO service_role;
+
+-- Global Ban List (027_guardian_global_bans.sql).
+CREATE TABLE IF NOT EXISTS public.guardian_ban_accounts (
+  discord_user_id TEXT PRIMARY KEY CHECK (discord_user_id ~ '^[0-9]{17,20}$'),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  created_by UUID NOT NULL REFERENCES public.users(id),
+  requested_by_discord_id TEXT NOT NULL,
+  boot_count INTEGER NOT NULL DEFAULT 0 CHECK (boot_count >= 0)
+);
+
+INSERT INTO public.guardian_ban_accounts (discord_user_id, created_at, created_by, requested_by_discord_id)
+SELECT DISTINCT ON (discord_user_id) discord_user_id, created_at, created_by, requested_by_discord_id
+FROM public.guardian_ban_entries WHERE is_enabled
+ORDER BY discord_user_id, created_at, id
+ON CONFLICT DO NOTHING;
+
+CREATE TABLE IF NOT EXISTS public.guardian_ban_previews (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  created_by UUID NOT NULL REFERENCES public.users(id),
+  actor_discord_id TEXT NOT NULL,
+  discord_ids TEXT[] NOT NULL CHECK (cardinality(discord_ids) BETWEEN 1 AND 1000),
+  guild_ids TEXT[] NOT NULL CHECK (cardinality(guild_ids) > 0),
+  status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('pending', 'processing', 'ready', 'confirming', 'failed', 'confirmed')),
+  cursor INTEGER NOT NULL DEFAULT 0,
+  member_counts JSONB NOT NULL DEFAULT '{}',
+  last_error TEXT,
+  processing_token UUID,
+  processing_started_at TIMESTAMPTZ,
+  confirmation_requested BOOLEAN NOT NULL DEFAULT FALSE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  expires_at TIMESTAMPTZ NOT NULL DEFAULT NOW() + INTERVAL '24 hours'
+);
+CREATE INDEX IF NOT EXISTS idx_guardian_preview_pending ON public.guardian_ban_previews(created_at)
+  WHERE status IN ('pending', 'processing', 'confirming');
+CREATE INDEX IF NOT EXISTS idx_guardian_preview_actor ON public.guardian_ban_previews(created_by, created_at);
+
+CREATE TABLE IF NOT EXISTS public.guardian_ban_removals (
+  operation_id UUID PRIMARY KEY,
+  discord_user_id TEXT NOT NULL REFERENCES public.guardian_ban_accounts(discord_user_id),
+  guild_id TEXT NOT NULL,
+  removed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_guardian_removals_account ON public.guardian_ban_removals(discord_user_id);
+ALTER TABLE public.guardian_ban_entries ADD COLUMN IF NOT EXISTS operation_id UUID DEFAULT gen_random_uuid();
+ALTER TABLE public.guardian_ban_entries ADD COLUMN IF NOT EXISTS join_pending BOOLEAN NOT NULL DEFAULT FALSE;
+
+ALTER TABLE public.guardian_ban_accounts ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.guardian_ban_previews ENABLE ROW LEVEL SECURITY;
+ALTER TABLE public.guardian_ban_removals ENABLE ROW LEVEL SECURITY;
+GRANT ALL ON public.guardian_ban_accounts, public.guardian_ban_previews, public.guardian_ban_removals TO service_role;
+DO $$ DECLARE t TEXT; BEGIN
+  FOREACH t IN ARRAY ARRAY['guardian_ban_accounts', 'guardian_ban_previews', 'guardian_ban_removals'] LOOP
+    IF NOT EXISTS (SELECT 1 FROM pg_policies WHERE schemaname = 'public' AND tablename = t AND policyname = 'Guardian global bans service only') THEN
+      EXECUTE format('CREATE POLICY "Guardian global bans service only" ON public.%I FOR ALL USING (false) WITH CHECK (false)', t);
+    END IF;
+  END LOOP;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.claim_guardian_ban_preview(p_instance_id TEXT)
+RETURNS SETOF public.guardian_ban_previews LANGUAGE plpgsql SET search_path = public AS $$
+BEGIN
+  IF NOT EXISTS (SELECT 1 FROM guardian_instance_lock WHERE id = 'singleton'
+    AND instance_id = p_instance_id AND heartbeat_at > NOW() - INTERVAL '30 seconds') THEN RETURN; END IF;
+  RETURN QUERY UPDATE guardian_ban_previews SET status = 'processing',
+    processing_token = gen_random_uuid(), processing_started_at = NOW()
+  WHERE id = (
+    SELECT id FROM guardian_ban_previews WHERE expires_at > NOW() AND
+      (status IN ('pending', 'confirming') OR (status = 'processing' AND processing_started_at < NOW() - INTERVAL '5 minutes'))
+    ORDER BY created_at LIMIT 1 FOR UPDATE SKIP LOCKED
+  ) RETURNING *;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.confirm_guardian_global_bans(p_preview UUID, p_actor UUID, p_token UUID)
+RETURNS INTEGER LANGUAGE plpgsql SET search_path = public AS $$
+DECLARE preview guardian_ban_previews; affected INTEGER;
+BEGIN
+  SELECT * INTO preview FROM guardian_ban_previews WHERE id = p_preview AND created_by = p_actor FOR UPDATE;
+  IF NOT FOUND OR preview.expires_at <= NOW() OR NOT preview.confirmation_requested OR
+    preview.status NOT IN ('processing', 'confirmed') OR
+    (preview.status <> 'confirmed' AND preview.processing_token IS DISTINCT FROM p_token) THEN
+    RAISE EXCEPTION 'Preview is incomplete or expired';
+  END IF;
+  IF preview.status = 'confirmed' THEN RETURN 0; END IF;
+  WITH added AS (
+    INSERT INTO guardian_ban_accounts(discord_user_id, created_by, requested_by_discord_id)
+    SELECT unnest(preview.discord_ids), p_actor, preview.actor_discord_id ON CONFLICT DO NOTHING
+    RETURNING *
+  ), queued AS (
+    INSERT INTO guardian_ban_entries(guild_id, discord_user_id, reason, created_by, requested_by,
+      requested_by_discord_id, status)
+    SELECT g, a.discord_user_id, 'Global Guardian ban registry', a.created_by, a.created_by,
+      a.requested_by_discord_id, 'pending' FROM added a CROSS JOIN unnest(preview.guild_ids) g
+    ON CONFLICT (guild_id, discord_user_id) DO UPDATE SET
+      is_enabled = TRUE, disabled_by = NULL, status = 'pending', attempts = 0,
+      requested_by = EXCLUDED.requested_by, requested_by_discord_id = EXCLUDED.requested_by_discord_id,
+      next_attempt_at = NOW(), processing_token = NULL, processing_started_at = NULL,
+      operation_id = gen_random_uuid(), last_error = NULL, updated_at = NOW()
+    RETURNING id
+  ) SELECT count(*) INTO affected FROM added;
+  UPDATE guardian_ban_previews SET status = 'confirmed', cursor = cardinality(guild_ids), last_error = NULL,
+    processing_token = NULL, processing_started_at = NULL WHERE id = p_preview;
+  RETURN affected;
+END $$;
+
+-- Paged reconciliation fills new-server coverage and upgrades legacy scoped pairs.
+CREATE OR REPLACE FUNCTION public.sync_guardian_global_bans(p_guild_ids TEXT[], p_after TEXT DEFAULT '')
+RETURNS TABLE(last_id TEXT, account_count INTEGER) LANGUAGE plpgsql SET search_path = public AS $$
+BEGIN
+  RETURN QUERY WITH accounts AS MATERIALIZED (
+    SELECT * FROM guardian_ban_accounts WHERE discord_user_id > p_after ORDER BY discord_user_id LIMIT 100
+  ), queued AS (
+    INSERT INTO guardian_ban_entries(guild_id, discord_user_id, reason, created_by, requested_by,
+      requested_by_discord_id, status)
+    SELECT g, a.discord_user_id, 'Global Guardian ban registry', a.created_by, a.created_by,
+      a.requested_by_discord_id, 'pending' FROM accounts a CROSS JOIN unnest(p_guild_ids) g
+    ON CONFLICT (guild_id, discord_user_id) DO UPDATE SET
+      is_enabled = TRUE, disabled_by = NULL, status = 'pending', attempts = 0,
+      requested_by = EXCLUDED.requested_by, requested_by_discord_id = EXCLUDED.requested_by_discord_id,
+      next_attempt_at = NOW(), operation_id = gen_random_uuid(), last_error = NULL, updated_at = NOW()
+    WHERE NOT guardian_ban_entries.is_enabled OR guardian_ban_entries.status = 'registered'
+    RETURNING id
+  ) SELECT max(discord_user_id), count(*)::INTEGER FROM accounts;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.enqueue_guardian_join_ban(p_guild_id TEXT, p_discord_id TEXT)
+RETURNS VOID LANGUAGE plpgsql SET search_path = public AS $$
+BEGIN
+  INSERT INTO guardian_ban_entries(guild_id, discord_user_id, reason, created_by, requested_by,
+    requested_by_discord_id, status)
+  SELECT p_guild_id, discord_user_id, 'Global Guardian ban registry', created_by, created_by,
+    requested_by_discord_id, 'pending' FROM guardian_ban_accounts WHERE discord_user_id = p_discord_id
+  ON CONFLICT (guild_id, discord_user_id) DO UPDATE SET
+    is_enabled = TRUE,
+    status = CASE WHEN guardian_ban_entries.status = 'processing' THEN 'processing' ELSE 'pending' END,
+    attempts = CASE WHEN guardian_ban_entries.status = 'processing' THEN guardian_ban_entries.attempts ELSE 0 END,
+    next_attempt_at = NOW(), join_pending = guardian_ban_entries.status = 'processing',
+    operation_id = CASE WHEN guardian_ban_entries.status = 'processing' THEN guardian_ban_entries.operation_id ELSE gen_random_uuid() END,
+    last_error = NULL, updated_at = NOW();
+END $$;
+
+CREATE OR REPLACE FUNCTION public.finish_guardian_global_ban(
+  p_entry UUID, p_token UUID, p_removed BOOLEAN
+) RETURNS VOID LANGUAGE plpgsql SET search_path = public AS $$
+DECLARE entry guardian_ban_entries; inserted INTEGER;
+BEGIN
+  SELECT * INTO entry FROM guardian_ban_entries WHERE id = p_entry AND processing_token = p_token FOR UPDATE;
+  IF NOT FOUND THEN RETURN; END IF;
+  IF p_removed THEN
+    INSERT INTO guardian_ban_removals(operation_id, discord_user_id, guild_id)
+    VALUES (entry.operation_id, entry.discord_user_id, entry.guild_id) ON CONFLICT DO NOTHING;
+    GET DIAGNOSTICS inserted = ROW_COUNT;
+    IF inserted = 1 THEN
+      UPDATE guardian_ban_accounts SET boot_count = boot_count + 1 WHERE discord_user_id = entry.discord_user_id;
+    END IF;
+  END IF;
+  UPDATE guardian_ban_entries SET status = CASE WHEN entry.join_pending THEN 'pending' ELSE 'banned' END,
+    next_attempt_at = NOW(), attempts = CASE WHEN entry.join_pending THEN 0 ELSE attempts END,
+    operation_id = CASE WHEN entry.join_pending THEN gen_random_uuid() ELSE operation_id END,
+    join_pending = FALSE, banned_at = NOW(), last_error = NULL,
+    processing_token = NULL, processing_started_at = NULL, updated_at = NOW() WHERE id = p_entry;
+END $$;
+
+-- The old server-specific import API must not be usable alongside global enforcement.
+REVOKE ALL ON FUNCTION public.register_guardian_bans(TEXT[], TEXT[], TEXT, UUID, TEXT, BOOLEAN) FROM service_role;
+REVOKE ALL ON FUNCTION public.claim_guardian_ban_preview(TEXT) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.confirm_guardian_global_bans(UUID, UUID, UUID) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.sync_guardian_global_bans(TEXT[], TEXT) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.finish_guardian_global_ban(UUID, UUID, BOOLEAN) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.claim_guardian_ban_preview(TEXT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.confirm_guardian_global_bans(UUID, UUID, UUID) TO service_role;
+GRANT EXECUTE ON FUNCTION public.sync_guardian_global_bans(TEXT[], TEXT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.finish_guardian_global_ban(UUID, UUID, BOOLEAN) TO service_role;
+
+-- Guardian Ban List management (028_guardian_ban_management.sql).
+ALTER TABLE public.guardian_ban_accounts ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE;
+ALTER TABLE public.guardian_ban_accounts ADD COLUMN IF NOT EXISTS last_booted_at TIMESTAMPTZ;
+ALTER TABLE public.guardian_ban_accounts ADD COLUMN IF NOT EXISTS removed_at TIMESTAMPTZ;
+ALTER TABLE public.guardian_ban_accounts ADD COLUMN IF NOT EXISTS removed_by UUID REFERENCES public.users(id);
+ALTER TABLE public.guardian_ban_entries ADD COLUMN IF NOT EXISTS action TEXT NOT NULL DEFAULT 'ban';
+DO $$ BEGIN
+  IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conrelid = 'public.guardian_ban_entries'::regclass
+    AND conname = 'guardian_ban_entry_action_check') THEN
+    ALTER TABLE public.guardian_ban_entries ADD CONSTRAINT guardian_ban_entry_action_check CHECK (action IN ('ban', 'unban'));
+  END IF;
+END $$;
+CREATE INDEX IF NOT EXISTS idx_guardian_active_accounts ON public.guardian_ban_accounts(created_at DESC, discord_user_id) WHERE is_active;
+UPDATE public.guardian_ban_accounts a SET last_booted_at = r.last_booted
+FROM (SELECT discord_user_id, max(removed_at) AS last_booted FROM public.guardian_ban_removals GROUP BY discord_user_id) r
+WHERE a.discord_user_id = r.discord_user_id AND a.last_booted_at IS NULL;
+
+CREATE OR REPLACE FUNCTION public.remove_guardian_global_bans(
+  p_discord_ids TEXT[], p_guild_ids TEXT[], p_actor UUID, p_actor_discord TEXT
+) RETURNS INTEGER LANGUAGE plpgsql SET search_path = public AS $$
+DECLARE affected INTEGER;
+BEGIN
+  -- Account row locks serialize removal with re-registration and event reconciliation.
+  WITH removed AS (
+    UPDATE guardian_ban_accounts SET is_active = FALSE, removed_at = NOW(), removed_by = p_actor
+    WHERE discord_user_id = ANY(p_discord_ids) AND is_active RETURNING *
+  ), targets AS (
+    SELECT a.discord_user_id, g AS guild_id FROM removed a CROSS JOIN unnest(p_guild_ids) g
+    UNION SELECT e.discord_user_id, e.guild_id FROM guardian_ban_entries e JOIN removed a USING(discord_user_id)
+  ), queued AS (
+    INSERT INTO guardian_ban_entries(guild_id, discord_user_id, reason, created_by, requested_by,
+      requested_by_discord_id, status, action)
+    SELECT guild_id, discord_user_id, 'Guardian registry removal', p_actor, p_actor, p_actor_discord, 'pending', 'unban'
+    FROM targets
+    ON CONFLICT (guild_id, discord_user_id) DO UPDATE SET
+      action = 'unban', is_enabled = TRUE, status = 'pending', requested_by = p_actor,
+      requested_by_discord_id = p_actor_discord, attempts = 0, next_attempt_at = NOW(),
+      processing_token = NULL, processing_started_at = NULL, operation_id = gen_random_uuid(),
+      join_pending = FALSE, last_error = NULL, updated_at = NOW()
+    RETURNING id
+  ) SELECT count(*) INTO affected FROM removed;
+  RETURN affected;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.confirm_guardian_global_bans(p_preview UUID, p_actor UUID, p_token UUID)
+RETURNS INTEGER LANGUAGE plpgsql SET search_path = public AS $$
+DECLARE preview guardian_ban_previews; affected INTEGER;
+BEGIN
+  SELECT * INTO preview FROM guardian_ban_previews WHERE id = p_preview AND created_by = p_actor FOR UPDATE;
+  IF NOT FOUND OR preview.expires_at <= NOW() OR NOT preview.confirmation_requested OR
+    preview.status NOT IN ('processing', 'confirmed') OR
+    (preview.status <> 'confirmed' AND preview.processing_token IS DISTINCT FROM p_token) THEN
+    RAISE EXCEPTION 'Preview is incomplete or expired';
+  END IF;
+  IF preview.status = 'confirmed' THEN RETURN 0; END IF;
+  WITH added AS (
+    INSERT INTO guardian_ban_accounts(discord_user_id, created_by, requested_by_discord_id)
+    SELECT id, p_actor, preview.actor_discord_id FROM unnest(preview.discord_ids) id ORDER BY id
+    ON CONFLICT (discord_user_id) DO UPDATE SET
+      is_active = TRUE, removed_at = NULL, removed_by = NULL, created_at = NOW(),
+      created_by = EXCLUDED.created_by, requested_by_discord_id = EXCLUDED.requested_by_discord_id
+    WHERE NOT guardian_ban_accounts.is_active RETURNING *
+  ), queued AS (
+    INSERT INTO guardian_ban_entries(guild_id, discord_user_id, reason, created_by, requested_by,
+      requested_by_discord_id, status, action)
+    SELECT g, a.discord_user_id, 'Global Guardian ban registry', a.created_by, a.created_by,
+      a.requested_by_discord_id, 'pending', 'ban' FROM added a CROSS JOIN unnest(preview.guild_ids) g
+    ON CONFLICT (guild_id, discord_user_id) DO UPDATE SET
+      action = 'ban', is_enabled = TRUE, disabled_by = NULL, status = 'pending', attempts = 0,
+      requested_by = EXCLUDED.requested_by, requested_by_discord_id = EXCLUDED.requested_by_discord_id,
+      next_attempt_at = NOW(), processing_token = NULL, processing_started_at = NULL,
+      operation_id = gen_random_uuid(), join_pending = FALSE, last_error = NULL, updated_at = NOW()
+    RETURNING id
+  ) SELECT count(*) INTO affected FROM added;
+  UPDATE guardian_ban_previews SET status = 'confirmed', cursor = cardinality(guild_ids), last_error = NULL,
+    processing_token = NULL, processing_started_at = NULL WHERE id = p_preview;
+  RETURN affected;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.enqueue_guardian_join_ban(p_guild_id TEXT, p_discord_id TEXT)
+RETURNS VOID LANGUAGE plpgsql SET search_path = public AS $$
+BEGIN
+  PERFORM 1 FROM guardian_ban_accounts WHERE discord_user_id = p_discord_id AND is_active FOR UPDATE;
+  IF NOT FOUND THEN RETURN; END IF;
+  INSERT INTO guardian_ban_entries(guild_id, discord_user_id, reason, created_by, requested_by,
+    requested_by_discord_id, status, action)
+  SELECT p_guild_id, discord_user_id, 'Global Guardian ban registry', created_by, created_by,
+    requested_by_discord_id, 'pending', 'ban' FROM guardian_ban_accounts WHERE discord_user_id = p_discord_id AND is_active
+  ON CONFLICT (guild_id, discord_user_id) DO UPDATE SET
+    action = 'ban', is_enabled = TRUE,
+    status = CASE WHEN guardian_ban_entries.status = 'processing' AND guardian_ban_entries.action = 'ban' THEN 'processing' ELSE 'pending' END,
+    attempts = CASE WHEN guardian_ban_entries.status = 'processing' AND guardian_ban_entries.action = 'ban' THEN guardian_ban_entries.attempts ELSE 0 END,
+    next_attempt_at = NOW(), join_pending = guardian_ban_entries.status = 'processing' AND guardian_ban_entries.action = 'ban',
+    operation_id = CASE WHEN guardian_ban_entries.status = 'processing' AND guardian_ban_entries.action = 'ban' THEN guardian_ban_entries.operation_id ELSE gen_random_uuid() END,
+    last_error = NULL, updated_at = NOW();
+END $$;
+
+CREATE OR REPLACE FUNCTION public.recover_guardian_global_bans(p_guild_ids TEXT[], p_after TEXT DEFAULT '')
+RETURNS TABLE(last_id TEXT, account_count INTEGER) LANGUAGE plpgsql SET search_path = public AS $$
+BEGIN
+  RETURN QUERY WITH accounts AS MATERIALIZED (
+    SELECT * FROM guardian_ban_accounts WHERE is_active AND discord_user_id > p_after
+    ORDER BY discord_user_id LIMIT 100 FOR UPDATE
+  ), queued AS (
+    INSERT INTO guardian_ban_entries(guild_id, discord_user_id, reason, created_by, requested_by,
+      requested_by_discord_id, status, action)
+    SELECT g, a.discord_user_id, 'Global Guardian ban registry', a.created_by, a.created_by,
+      a.requested_by_discord_id, 'pending', 'ban' FROM accounts a CROSS JOIN unnest(p_guild_ids) g
+    ON CONFLICT (guild_id, discord_user_id) DO UPDATE SET
+      action = 'ban', is_enabled = TRUE, status = 'pending', attempts = 0,
+      requested_by = EXCLUDED.requested_by, requested_by_discord_id = EXCLUDED.requested_by_discord_id,
+      next_attempt_at = NOW(), operation_id = gen_random_uuid(), last_error = NULL, updated_at = NOW()
+    WHERE guardian_ban_entries.status NOT IN ('pending', 'processing')
+    RETURNING id
+  ) SELECT max(discord_user_id), count(*)::INTEGER FROM accounts;
+END $$;
+
+CREATE OR REPLACE FUNCTION public.finish_guardian_global_ban(p_entry UUID, p_token UUID, p_removed BOOLEAN)
+RETURNS VOID LANGUAGE plpgsql SET search_path = public AS $$
+DECLARE entry guardian_ban_entries; inserted INTEGER;
+BEGIN
+  SELECT * INTO entry FROM guardian_ban_entries WHERE id = p_entry AND processing_token = p_token;
+  IF NOT FOUND THEN RETURN; END IF;
+  PERFORM 1 FROM guardian_ban_accounts WHERE discord_user_id = entry.discord_user_id FOR UPDATE;
+  SELECT * INTO entry FROM guardian_ban_entries WHERE id = p_entry AND processing_token = p_token FOR UPDATE;
+  IF NOT FOUND THEN RETURN; END IF;
+  IF entry.action = 'ban' AND p_removed THEN
+    INSERT INTO guardian_ban_removals(operation_id, discord_user_id, guild_id)
+    VALUES (entry.operation_id, entry.discord_user_id, entry.guild_id) ON CONFLICT DO NOTHING;
+    GET DIAGNOSTICS inserted = ROW_COUNT;
+    IF inserted = 1 THEN
+      UPDATE guardian_ban_accounts SET boot_count = boot_count + 1, last_booted_at = NOW()
+      WHERE discord_user_id = entry.discord_user_id;
+    END IF;
+  END IF;
+  UPDATE guardian_ban_entries SET status = CASE
+      WHEN entry.action = 'unban' THEN 'registered' WHEN entry.join_pending THEN 'pending' ELSE 'banned' END,
+    is_enabled = entry.action <> 'unban',
+    next_attempt_at = NOW(), attempts = CASE WHEN entry.join_pending THEN 0 ELSE attempts END,
+    operation_id = CASE WHEN entry.join_pending THEN gen_random_uuid() ELSE operation_id END,
+    join_pending = FALSE, banned_at = CASE WHEN entry.action = 'ban' THEN NOW() ELSE banned_at END,
+    last_error = NULL, processing_token = NULL, processing_started_at = NULL, updated_at = NOW() WHERE id = p_entry;
+END $$;
+
+-- Old periodic reconciliation cannot reactivate a removed ID.
+CREATE OR REPLACE FUNCTION public.sync_guardian_global_bans(p_guild_ids TEXT[], p_after TEXT DEFAULT '')
+RETURNS TABLE(last_id TEXT, account_count INTEGER) LANGUAGE plpgsql SET search_path = public AS $$
+BEGIN
+  RAISE EXCEPTION 'Periodic Guardian reconciliation is retired; deploy the event-driven worker';
+END;
+$$;
+REVOKE ALL ON FUNCTION public.remove_guardian_global_bans(TEXT[], TEXT[], UUID, TEXT) FROM PUBLIC, anon, authenticated;
+REVOKE ALL ON FUNCTION public.recover_guardian_global_bans(TEXT[], TEXT) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.remove_guardian_global_bans(TEXT[], TEXT[], UUID, TEXT) TO service_role;
+GRANT EXECUTE ON FUNCTION public.recover_guardian_global_bans(TEXT[], TEXT) TO service_role;
+
+CREATE OR REPLACE FUNCTION public.report_guardian_registry_write(
+  p_entry UUID, p_token UUID, p_action TEXT, p_removed BOOLEAN, p_wrote BOOLEAN
+) RETURNS VOID LANGUAGE plpgsql SET search_path = public AS $$
+DECLARE entry guardian_ban_entries; active BOOLEAN; desired TEXT;
+BEGIN
+  SELECT * INTO entry FROM guardian_ban_entries WHERE id = p_entry;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Registry operation missing'; END IF;
+  SELECT is_active INTO active FROM guardian_ban_accounts WHERE discord_user_id = entry.discord_user_id FOR UPDATE;
+  IF NOT FOUND THEN RAISE EXCEPTION 'Registry account missing'; END IF;
+  SELECT * INTO entry FROM guardian_ban_entries WHERE id = p_entry FOR UPDATE;
+  desired := CASE WHEN active THEN 'ban' ELSE 'unban' END;
+  IF entry.processing_token = p_token AND entry.action = p_action AND desired = p_action THEN
+    PERFORM finish_guardian_global_ban(p_entry, p_token, p_removed);
+  ELSIF p_wrote AND desired <> p_action THEN
+    -- A late Discord write must be compensated even after a newer worker finished.
+    UPDATE guardian_ban_entries SET action = desired, status = 'pending', is_enabled = TRUE,
+      attempts = 0, next_attempt_at = NOW(), processing_token = NULL, processing_started_at = NULL,
+      operation_id = gen_random_uuid(), join_pending = FALSE, last_error = NULL, updated_at = NOW()
+    WHERE id = p_entry;
+  END IF;
+END $$;
+REVOKE ALL ON FUNCTION public.report_guardian_registry_write(UUID, UUID, TEXT, BOOLEAN, BOOLEAN) FROM PUBLIC, anon, authenticated;
+GRANT EXECUTE ON FUNCTION public.report_guardian_registry_write(UUID, UUID, TEXT, BOOLEAN, BOOLEAN) TO service_role;
+
+-- BEGIN SOURCE: 037_guardian_undo_actions.sql
+-- Migration 037: Guardian -- moderator undo actions in the action log
+--
+-- Moderators can undo a moderation action from the Guardian dashboard
+-- (unban a user, remove a Discord timeout). Each undo writes one
+-- guardian_action_log row with action 'unban' or 'unmute',
+-- actor_kind = 'moderator' (already allowed) and the platform user who
+-- acted in actor_user_id.
+--
+-- Idempotent: safe to run more than once.
+
+-- 1. Allow the undo actions in the action CHECK. The original inline CHECK
+--    from 066_guardian_action_log.sql is named guardian_action_log_action_check.
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_constraint
+    WHERE conrelid = 'public.guardian_action_log'::regclass
+      AND conname = 'guardian_action_log_action_check'
+      AND pg_get_constraintdef(oid) LIKE '%unmute%'
+  ) THEN
+    ALTER TABLE public.guardian_action_log
+      DROP CONSTRAINT IF EXISTS guardian_action_log_action_check;
+    ALTER TABLE public.guardian_action_log
+      ADD CONSTRAINT guardian_action_log_action_check
+      CHECK (action IN ('flag', 'delete', 'mute', 'ban', 'unban', 'unmute'));
+  END IF;
+END $$;
+
+-- 2. Record which platform moderator performed a manual action.
+--    NULL for bot actions.
+ALTER TABLE public.guardian_action_log
+  ADD COLUMN IF NOT EXISTS actor_user_id UUID REFERENCES public.users(id) ON DELETE SET NULL;
+
+CREATE INDEX IF NOT EXISTS idx_guardian_action_log_actor_user
+  ON public.guardian_action_log(actor_user_id)
+  WHERE actor_user_id IS NOT NULL;
+
+COMMENT ON COLUMN public.guardian_action_log.actor_user_id IS
+  'Platform user (moderator) who performed a manual action such as unban/unmute; NULL for bot actions.';
+-- END SOURCE: 037_guardian_undo_actions.sql

@@ -19,9 +19,30 @@ A web-based platform for scheduling group meetings through shared availability c
 - **Frontend:** Deployed on Vercel (https://coordinationmanager.com)
 - **Backend:** Deployed on Railway
 
+### Recovery after frontend updates
+
+An older open tab can request hashed JavaScript or CSS files that no longer
+exist in the current deployment. A 404 response may also produce a stylesheet
+MIME warning; changing MIME headers does not restore the missing file.
+
+The frontend loads [asset recovery](Code/apps/web/public/asset-recovery.js)
+before its application modules. Asset failures before the app mounts get at
+most one automatic same-URL reload per entry-module hash and tab session.
+Offline browsers and browsers without session storage get a manual reload
+notice instead. Failures after mounting never trigger an automatic asset
+reload: users are prompted to save or copy any available unsaved work first.
+React render failures can still replace the affected content with the error
+boundary; this mechanism does not restore drafts already lost to a crash.
+
+The recovery notice does not depend on React or successful stylesheet loading.
+It leaves original module errors visible for diagnosis, and does not reload
+tabs merely because they were idle. Deploy the recovery script and HTML with
+the frontend build; tabs using HTML from before this change still require a
+manual refresh to receive it.
+
 ## Tech Stack
 
-- **Frontend:** React 18 + TypeScript, Vite, TailwindCSS, React Router, Axios
+- **Frontend:** React 19 + TypeScript, Vite, TailwindCSS, React Router, Axios
 - **Backend:** Node.js + Express, TypeScript
 - **Database:** Supabase (PostgreSQL) with Row Level Security
 - **Auth:** Supabase Auth (Google OAuth + anonymous/traveler accounts + Cardano Wallets)
@@ -29,8 +50,8 @@ A web-based platform for scheduling group meetings through shared availability c
 
 ## Prerequisites
 
-- Node.js 20+
-- pnpm
+- Node.js 26.12.1+
+- pnpm 12 (`npm install -g pnpm@12.15.0`; Node 26 no longer bundles corepack)
 - A Supabase project
 
 ## Getting Started
@@ -62,15 +83,21 @@ VITE_SUPABASE_ANON_KEY=your_supabase_anon_key
 
 ### 3. Set Up Database
 
-Run the consolidated schema in the Supabase SQL Editor:
+Run the core and feature baselines in the Supabase SQL Editor. Start with:
 
 ```
 -- Copy and run the contents of:
 -- packages/database/migrations/000_full_schema.sql
 ```
 
-This creates all tables, indexes, RLS policies, and the traveler cleanup function in one step.
-For a fresh database, run only this file. The other `000_feature-*.sql` files are incremental feature migrations for existing databases and do not need to be run separately during initial setup.
+Then run the required `000_feature-*.sql` files in the order documented in
+[`Code/packages/database/migrations/README.md`](Code/packages/database/migrations/README.md).
+The core file does not create every feature schema; in particular, run the
+Time Management, feedback, mailbox, and wallet/auth baselines before the
+security baseline. The feature baselines are idempotent and intended for fresh
+setup. For existing databases, apply only unapplied historical upgrades from
+`Code/packages/database/migrations/archive/`; do not treat a baseline as an
+upgrade script.
 
 ### 4. Configure Google OAuth
 
@@ -86,6 +113,23 @@ From the repository root, start all local services:
 ```bash
 pnpm dev
 ```
+
+To start only the frontend, API, and docs (without the Discord bot or guardian), run:
+
+```bash
+pnpm dev:stack:localhost
+```
+
+This opens the services at `http://localhost:5173` (frontend), `http://localhost:3001` (API), and `http://localhost:5174` (docs).
+
+In VS Code Copilot Chat, invoke `/run-coordination-manager` for the same launch
+and health-check workflow. The command is provided by the
+[run-coordination-manager skill](.claude/skills/run-coordination-manager/SKILL.md).
+Agent Host sessions load skills, not the older `.github/prompts` prompt files.
+If the command is missing, open **Chat: Open Customizations** from the Command
+Palette and check the **Skills** section for the current harness. After adding
+the skill, start a new chat; if discovery is still stale, use **Developer: Reload
+Window**.
 
 Or start a specific service:
 
@@ -124,7 +168,13 @@ pnpm format
 pnpm dev:stop
 pnpm dev:stack
 pnpm dev:health
+pnpm verify:release
 ```
+
+Run `pnpm verify:release` before a production update. It verifies the frozen
+dependency install, approved package build scripts, typecheck, lint, tests,
+high/critical dependency audit, committed-history secret scan, all workspace
+builds, and the Vercel frontend-plus-docs artifact.
 
 ## Project Structure
 

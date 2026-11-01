@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { sanitizeString, sanitizeUUID, safeErrorMessage, ANNOUNCEMENT_BODY_MAX_LENGTH } from '../validation.js'
+import { sanitizeString, sanitizeUUID, safeErrorMessage, safeExternalErrorMessage, collapseExternalServiceErrorMessage, ANNOUNCEMENT_BODY_MAX_LENGTH } from '../validation.js'
 
 // ---------------------------------------------------------------------------
 // sanitizeString
@@ -115,6 +115,54 @@ describe('safeErrorMessage', () => {
   it('returns fallback for error without message', () => {
     vi.stubEnv('NODE_ENV', 'development')
     expect(safeErrorMessage({})).toBe('An internal error occurred')
+  })
+})
+
+// ---------------------------------------------------------------------------
+// safeExternalErrorMessage
+// ---------------------------------------------------------------------------
+
+describe('safeExternalErrorMessage', () => {
+  afterEach(() => {
+    vi.unstubAllEnvs()
+  })
+
+  it('collapses upstream HTML error pages to the external-service fallback', () => {
+    vi.stubEnv('NODE_ENV', 'development')
+    const htmlError = new Error('<!DOCTYPE html><html><title>supabase.co | 522: Connection timed out</title></html>')
+
+    expect(safeExternalErrorMessage(htmlError, 'Time Manager storage is temporarily unavailable.')).toBe(
+      'Time Manager storage is temporarily unavailable.'
+    )
+  })
+
+  it('collapses 5xx provider statuses to the external-service fallback', () => {
+    vi.stubEnv('NODE_ENV', 'development')
+
+    expect(safeExternalErrorMessage({ status: 522, message: 'Connection timed out' })).toBe(
+      'External service unavailable. Please try again later.'
+    )
+  })
+
+  it('keeps normal validation messages in non-production', () => {
+    vi.stubEnv('NODE_ENV', 'development')
+
+    expect(safeExternalErrorMessage(new Error('A category with this label already exists'))).toBe(
+      'A category with this label already exists'
+    )
+  })
+})
+
+// ---------------------------------------------------------------------------
+// collapseExternalServiceErrorMessage
+// ---------------------------------------------------------------------------
+
+describe('collapseExternalServiceErrorMessage', () => {
+  it('returns fallback for upstream HTML and null for normal errors', () => {
+    expect(collapseExternalServiceErrorMessage(new Error('<html>supabase.co | 522: Connection timed out</html>'))).toBe(
+      'External service unavailable. Please try again later.'
+    )
+    expect(collapseExternalServiceErrorMessage(new Error('No refresh token available -- please re-authorize this calendar.'))).toBeNull()
   })
 })
 

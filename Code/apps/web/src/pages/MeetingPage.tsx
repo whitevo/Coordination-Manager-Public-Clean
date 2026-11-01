@@ -1,16 +1,19 @@
-import { useState, useEffect, useMemo } from 'react'
+import { useState, useEffect, useMemo, useRef } from 'react'
 import { useParams, Link, useNavigate } from 'react-router-dom'
-import { Calendar, ExternalLink, Download, CalendarPlus, MapPin, ArrowLeft, Loader2, Copy, Check, Clock, Bell, BellOff } from 'lucide-react'
+import { Calendar, ExternalLink, Download, CalendarPlus, MapPin, ArrowLeft, Loader2, Copy, Check, Clock, Bell, BellOff, ChevronDown } from 'lucide-react'
 import { apiClient } from '../lib/api-client'
 import { downloadICSFile, buildOutlookCalendarUrl, isSafeUrl, resolveMeetingTitle } from '../lib/calendar-utils'
 import { getPrimaryTimezone, getTimezoneAbbr } from '../lib/timezone-data'
 import { useAuth } from '../contexts/AuthContext'
 import { useToast } from '../components/Toast'
+import { Button } from '../components/ui'
+import { OVERLAY_LAYER_CLASS } from '../lib/overlay-layers'
+import { stripHtmlTags } from '../lib/strip-html-tags'
 
 /** Render URLs as clickable links with copy buttons */
 function LinkifyText({ text }: { text: string }) {
   const [copiedUrl, setCopiedUrl] = useState<string | null>(null)
-  const stripped = text.replace(/<[^>]*>/g, '')
+  const stripped = stripHtmlTags(text)
   const markdownLinkRegex = /\[([^\]]+)\]\((https?:\/\/[^\s)]+)\)/g
   const normalized = stripped.replace(markdownLinkRegex, (_match, label: string, url: string) => {
     const trimmedLabel = label.trim()
@@ -23,13 +26,13 @@ function LinkifyText({ text }: { text: string }) {
       {parts.map((part, i) =>
         /^https?:\/\//.test(part) ? (
           <span key={i} className="inline-flex items-center gap-1">
-            <a href={part} target="_blank" rel="noopener noreferrer" className="text-blue-600 hover:underline break-all">{part}</a>
+            <a href={part} target="_blank" rel="noopener noreferrer" className="text-primary hover:underline break-all">{part}</a>
             <button
               onClick={(e) => { e.stopPropagation(); navigator.clipboard.writeText(part); setCopiedUrl(part); setTimeout(() => setCopiedUrl(null), 2000) }}
               className="inline-flex p-0.5 rounded hover:bg-muted transition-colors shrink-0 align-middle"
               title="Copy link"
             >
-              {copiedUrl === part ? <Check className="w-3 h-3 text-green-500" /> : <Copy className="w-3 h-3 text-muted-foreground" />}
+              {copiedUrl === part ? <Check className="w-3 h-3 text-success" /> : <Copy className="w-3 h-3 text-muted-foreground" />}
             </button>
           </span>
         ) : (
@@ -42,14 +45,22 @@ function LinkifyText({ text }: { text: string }) {
 
 type MeetingData = {
   id: string
+  kind: 'calendar' | 'event'
   title: string
   description: string | null
+  location: string | null
   start_time: string
   end_time: string
   duration_minutes: number
   meeting_link: string | null
-  calendar_hash: string
-  calendar_title: string
+  calendar_hash?: string
+  calendar_title?: string
+  source_label?: string
+}
+
+interface TimeManagerMode {
+  id: string
+  name: string
 }
 
 function formatInUserTz(iso: string, options: Intl.DateTimeFormatOptions) {
@@ -102,6 +113,14 @@ export default function MeetingPage() {
   const [isSubscribed, setIsSubscribed] = useState(false)
   const [subscriptionLoading, setSubscriptionLoading] = useState(false)
   const [subscriptionChecking, setSubscriptionChecking] = useState(false)
+  const [isTimeManagerMenuOpen, setIsTimeManagerMenuOpen] = useState(false)
+  const [timeManagerModes, setTimeManagerModes] = useState<TimeManagerMode[] | null>(null)
+  const [timeManagerModesLoading, setTimeManagerModesLoading] = useState(false)
+  const [timeManagerModesError, setTimeManagerModesError] = useState<string | null>(null)
+  const [addingModeKeys, setAddingModeKeys] = useState<Set<string>>(() => new Set())
+  const [addedModeKeys, setAddedModeKeys] = useState<Set<string>>(() => new Set())
+  const timeManagerMenuRef = useRef<HTMLDivElement>(null)
+  const timeManagerTriggerRef = useRef<HTMLButtonElement>(null)
 
   useEffect(() => {
     if (!meetingId) return
@@ -169,6 +188,138 @@ export default function MeetingPage() {
     }
   }
 
+  const loadTimeManagerModes = async () => {
+    if (timeManagerModesLoading) return
+    setTimeManagerModesLoading(true)
+    setTimeManagerModesError(null)
+    try {
+      const { data } = await apiClient.get<{ modes: TimeManagerMode[] }>('/api/time-management/modes')
+      if (!Array.isArray(data?.modes)) {
+        throw new Error('Time Manager returned an invalid mode list.')
+      }
+      setTimeManagerModes(data.modes)
+    } catch (err) {
+      const apiError = (err as { response?: { data?: { error?: unknown } } }).response?.data?.error
+      const message = typeof apiError === 'string'
+        ? apiError
+        : err instanceof Error
+          ? err.message
+          : 'Failed to load Time Manager modes.'
+      setTimeManagerModesError(message)
+    } finally {
+      setTimeManagerModesLoading(false)
+    }
+  }
+
+  const handleTimeManagerButtonClick = async () => {
+    if (!isAuthenticated) {
+      try {
+        await login()
+      } catch {
+        showToast('Sign in is required to add meetings to Time Manager.', 'error')
+      }
+      return
+    }
+
+    if (isTimeManagerMenuOpen) {
+      setIsTimeManagerMenuOpen(false)
+      return
+    }
+
+    setIsTimeManagerMenuOpen(true)
+    if (!timeManagerModes) {
+      void loadTimeManagerModes()
+    }
+  }
+
+  const handleAddToTimeManager = async (mode: TimeManagerMode) => {
+    if (!meeting) return
+    const modeKey = `${meeting.id}:${mode.id}`
+    if (addingModeKeys.has(modeKey) || addedModeKeys.has(modeKey)) return
+
+    setAddingModeKeys((current) => new Set(current).add(modeKey))
+    setIsTimeManagerMenuOpen(false)
+    timeManagerTriggerRef.current?.focus()
+    try {
+      await apiClient.post('/api/user-events', {
+        title: resolveMeetingTitle({ title: meeting.title, calendarTitle: meeting.calendar_title }),
+        description: meeting.description,
+        meeting_link: meeting.meeting_link,
+        location: meeting.location,
+        start_time: meeting.start_time,
+        end_time: meeting.end_time,
+        is_public: false,
+        source_id: mode.id,
+      })
+      setAddedModeKeys((current) => new Set(current).add(modeKey))
+      showToast(`Added to Time Manager: ${mode.name}.`)
+    } catch (err) {
+      const apiError = (err as { response?: { data?: { error?: unknown } } }).response?.data?.error
+      const message = typeof apiError === 'string' ? apiError : 'Failed to add meeting to Time Manager.'
+      showToast(message, 'error')
+    } finally {
+      setAddingModeKeys((current) => {
+        const next = new Set(current)
+        next.delete(modeKey)
+        return next
+      })
+    }
+  }
+
+  useEffect(() => {
+    if (!isTimeManagerMenuOpen) return
+
+    if (!timeManagerModesLoading) {
+      timeManagerMenuRef.current
+        ?.querySelector<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')
+        ?.focus()
+    }
+
+    const handlePointerDown = (event: PointerEvent) => {
+      if (event.target instanceof Node && !timeManagerMenuRef.current?.contains(event.target)) {
+        setIsTimeManagerMenuOpen(false)
+      }
+    }
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        event.preventDefault()
+        setIsTimeManagerMenuOpen(false)
+        timeManagerTriggerRef.current?.focus()
+        return
+      }
+
+      if (!timeManagerMenuRef.current?.contains(document.activeElement)) return
+      const menuItems = Array.from(
+        timeManagerMenuRef.current.querySelectorAll<HTMLButtonElement>('[role="menuitem"]:not(:disabled)')
+      )
+      if (menuItems.length === 0) return
+
+      const currentIndex = menuItems.indexOf(document.activeElement as HTMLButtonElement)
+      let nextIndex: number | null = null
+      if (event.key === 'ArrowDown') {
+        nextIndex = (currentIndex + 1) % menuItems.length
+      } else if (event.key === 'ArrowUp') {
+        nextIndex = (currentIndex - 1 + menuItems.length) % menuItems.length
+      } else if (event.key === 'Home') {
+        nextIndex = 0
+      } else if (event.key === 'End') {
+        nextIndex = menuItems.length - 1
+      }
+
+      if (nextIndex !== null) {
+        event.preventDefault()
+        menuItems[nextIndex]?.focus()
+      }
+    }
+
+    document.addEventListener('pointerdown', handlePointerDown)
+    document.addEventListener('keydown', handleKeyDown)
+    return () => {
+      document.removeEventListener('pointerdown', handlePointerDown)
+      document.removeEventListener('keydown', handleKeyDown)
+    }
+  }, [isTimeManagerMenuOpen, timeManagerModesLoading])
+
   const startMs = meeting ? new Date(meeting.start_time).getTime() : 0
   const endMs = meeting ? new Date(meeting.end_time).getTime() : 0
   // Tick every second when meeting is near (within join window) so the countdown
@@ -201,7 +352,7 @@ export default function MeetingPage() {
         <div className="text-center max-w-md">
           <h1 className="text-2xl font-bold text-foreground mb-2">Meeting Not Found</h1>
           <p className="text-muted-foreground mb-4">{error || 'This meeting does not exist.'}</p>
-          <Link to="/events-calendar" className="text-blue-600 hover:underline text-sm">
+          <Link to="/events-calendar" className="text-primary hover:underline text-sm">
             Browse Events Calendar
           </Link>
         </div>
@@ -211,25 +362,35 @@ export default function MeetingPage() {
 
   return (
     <div className="min-h-screen bg-background">
-      <div className="max-w-xl mx-auto px-4 py-8 md:py-16">
+      <div className="max-w-4xl mx-auto px-4 py-8 md:py-16">
         {/* Back link */}
-        <Link
-          to={`/calendar/${meeting.calendar_hash}`}
-          className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground transition-colors mb-6"
-        >
-          <ArrowLeft className="w-4 h-4" />
-          {meeting.calendar_title}
-        </Link>
+        {meeting.kind === 'calendar' ? (
+          <Link
+            to={`/calendar/${meeting.calendar_hash}`}
+            className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground transition-colors mb-6"
+          >
+            <ArrowLeft className="w-4 h-4" />
+            {meeting.calendar_title}
+          </Link>
+        ) : (
+          <Link
+            to="/events-calendar"
+            className="inline-flex items-center gap-1 text-sm text-muted-foreground hover:text-foreground transition-colors mb-6"
+          >
+            <ArrowLeft className="w-4 h-4" />
+            All Events
+          </Link>
+        )}
 
         {/* Meeting card */}
-        <div className="bg-card border border-border rounded-xl shadow-sm p-6 md:p-8">
+        <div className="bg-card border border-border rounded-xl shadow-xs p-6 md:p-8">
           {isPast && (
             <div className="inline-block px-2 py-0.5 mb-3 text-xs font-medium bg-muted text-muted-foreground rounded">
               Past Event
             </div>
           )}
 
-          <h1 className="text-2xl md:text-3xl font-bold text-foreground mb-4 break-words overflow-hidden">
+          <h1 className="text-2xl md:text-3xl font-bold text-foreground mb-4 wrap-break-word overflow-hidden">
             {displayTitle}
           </h1>
 
@@ -248,6 +409,14 @@ export default function MeetingPage() {
               </div>
             </div>
 
+            {/* Location */}
+            {meeting.location && (
+              <div className="flex items-start gap-3 text-sm text-foreground">
+                <MapPin className="w-5 h-5 mt-0.5 text-muted-foreground shrink-0" />
+                <span>{meeting.location}</span>
+              </div>
+            )}
+
             {/* Meeting link */}
             {meeting.meeting_link && (
               <div className="flex items-start gap-3">
@@ -259,7 +428,7 @@ export default function MeetingPage() {
             )}
 
             {meeting.description && (
-              <div className="text-muted-foreground text-sm whitespace-pre-wrap border-l-2 border-border pl-4 py-1 mt-2 break-words overflow-hidden">
+              <div className="text-muted-foreground text-sm whitespace-pre-wrap border-l-2 border-border pl-4 py-1 mt-2 wrap-break-word overflow-hidden">
                 <LinkifyText text={meeting.description} />
               </div>
             )}
@@ -269,14 +438,14 @@ export default function MeetingPage() {
           <div className="border-t border-border pt-5 space-y-3">
             <h2 className="text-sm font-semibold text-foreground">Add to your calendar</h2>
 
-            <div className="grid grid-cols-3 gap-3">
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3">
               <a
                 href={buildGoogleCalendarUrl(meeting)}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="flex items-center justify-center gap-2 px-4 py-3 rounded-lg text-sm font-medium bg-blue-600 text-white hover:bg-blue-700 transition-colors"
+                className="flex min-h-12 items-center justify-center gap-2 px-4 py-3 rounded-lg text-base font-medium bg-primary text-primary-foreground hover:opacity-90 transition-colors"
               >
-                <CalendarPlus className="w-4 h-4" />
+                <CalendarPlus className="w-5 h-5 shrink-0" />
                 Google
               </a>
 
@@ -290,9 +459,9 @@ export default function MeetingPage() {
                 })}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="flex items-center justify-center gap-2 px-4 py-3 rounded-lg text-sm font-medium bg-[#0078d4] text-white hover:bg-[#106ebe] transition-colors"
+                className="flex min-h-12 items-center justify-center gap-2 px-4 py-3 rounded-lg text-base font-medium bg-[#0078d4] text-white hover:bg-[#106ebe] transition-colors"
               >
-                <CalendarPlus className="w-4 h-4" />
+                <CalendarPlus className="w-5 h-5 shrink-0" />
                 Outlook
               </a>
 
@@ -304,54 +473,134 @@ export default function MeetingPage() {
                   end_time: meeting.end_time,
                   meeting_link: meeting.meeting_link,
                 })}
-                className="flex items-center justify-center gap-2 px-4 py-3 rounded-lg text-sm font-medium bg-muted text-foreground hover:bg-muted/80 transition-colors border border-border"
+                className="flex min-h-12 items-center justify-center gap-2 px-4 py-3 rounded-lg text-base font-medium bg-muted text-foreground hover:bg-muted/80 transition-colors border border-border"
               >
-                <Download className="w-4 h-4" />
+                <Download className="w-5 h-5 shrink-0" />
                 .ics
               </button>
+
+              <div className="relative min-w-0" ref={timeManagerMenuRef}>
+                <Button
+                  ref={timeManagerTriggerRef}
+                  fullWidth
+                  emphasis="outline"
+                  intent="neutral"
+                  icon={<CalendarPlus className="w-5 h-5 shrink-0" />}
+                  className="min-h-12 gap-2 text-base"
+                  onClick={() => { void handleTimeManagerButtonClick() }}
+                  aria-haspopup={isAuthenticated ? 'menu' : undefined}
+                  aria-expanded={isAuthenticated ? isTimeManagerMenuOpen : undefined}
+                >
+                  Time Manager
+                  <ChevronDown className="w-5 h-5 shrink-0" aria-hidden="true" />
+                </Button>
+
+                {isTimeManagerMenuOpen && (
+                  <div
+                    role="menu"
+                    aria-label="Add meeting to Time Manager"
+                    className={`absolute right-0 mt-1 w-full min-w-48 rounded-lg border border-border bg-popover text-popover-foreground p-1 shadow-lg ${OVERLAY_LAYER_CLASS.popover}`}
+                  >
+                    {timeManagerModesLoading && (
+                      <div role="status" className="flex items-center gap-2 px-3 py-2 text-sm text-muted-foreground">
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                        Loading modes...
+                      </div>
+                    )}
+                    {!timeManagerModesLoading && timeManagerModesError && (
+                      <div className="space-y-1 p-1">
+                        <p className="px-2 py-1 text-sm text-danger">{timeManagerModesError}</p>
+                        <button
+                          type="button"
+                          role="menuitem"
+                          className="w-full rounded-md px-3 py-2 text-left text-sm hover:bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring"
+                          onClick={() => { void loadTimeManagerModes() }}
+                        >
+                          Try again
+                        </button>
+                      </div>
+                    )}
+                    {!timeManagerModesLoading && !timeManagerModesError && timeManagerModes?.length === 0 && (
+                      <p className="px-3 py-2 text-sm text-muted-foreground">No Time Manager modes available.</p>
+                    )}
+                    {!timeManagerModesLoading && !timeManagerModesError && timeManagerModes?.map((mode) => {
+                      const modeKey = `${meeting.id}:${mode.id}`
+                      const isAdding = addingModeKeys.has(modeKey)
+                      const isAdded = addedModeKeys.has(modeKey)
+                      return (
+                        <button
+                          key={mode.id}
+                          type="button"
+                          role="menuitem"
+                          disabled={isAdding || isAdded}
+                          className="w-full rounded-md px-3 py-2 text-left text-sm hover:bg-muted focus-visible:outline-hidden focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-60"
+                          onClick={() => { void handleAddToTimeManager(mode) }}
+                        >
+                          <span className="flex items-center justify-between gap-3">
+                            <span className="truncate">{mode.name}</span>
+                            {isAdded && (
+                              <>
+                                <Check className="h-4 w-4 shrink-0 text-success" aria-hidden="true" />
+                                <span className="sr-only">Added</span>
+                              </>
+                            )}
+                            {isAdding && (
+                              <>
+                                <Loader2 className="h-4 w-4 shrink-0 animate-spin" aria-hidden="true" />
+                                <span className="sr-only">Adding</span>
+                              </>
+                            )}
+                          </span>
+                        </button>
+                      )
+                    })}
+                  </div>
+                )}
+              </div>
             </div>
 
             <p className="text-xs text-muted-foreground">
               Use Google or Outlook links to add directly. The .ics file works with Apple Calendar and other apps.
             </p>
 
-            <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-2">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <p className="text-sm font-medium text-foreground">Subscribe mode</p>
-                  <p className="text-xs text-muted-foreground">
-                    Subscribe to this Coordination Calendar to keep new and changed meetings synced without re-adding manually.
-                  </p>
+            {meeting.kind === 'calendar' && (
+              <div className="rounded-lg border border-border bg-muted/30 p-3 space-y-2">
+                <div className="flex items-center justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-medium text-foreground">Subscribe mode</p>
+                    <p className="text-xs text-muted-foreground">
+                      Subscribe to this Coordination Calendar to keep new and changed meetings synced without re-adding manually.
+                    </p>
+                  </div>
+                  <Button
+                    emphasis="outline"
+                    intent={isSubscribed ? 'success' : 'neutral'}
+                    size="compact"
+                    onClick={handleSubscriptionToggle}
+                    disabled={subscriptionLoading || subscriptionChecking}
+                    className="shrink-0"
+                    icon={subscriptionLoading || subscriptionChecking ? (
+                      <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    ) : isSubscribed ? (
+                      <BellOff className="w-3.5 h-3.5" />
+                    ) : (
+                      <Bell className="w-3.5 h-3.5" />
+                    )}
+                  >
+                    {subscriptionLoading || subscriptionChecking
+                      ? 'Checking...'
+                      : isSubscribed
+                        ? 'Unsubscribe'
+                        : 'Subscribe'}
+                  </Button>
                 </div>
-                <button
-                  onClick={handleSubscriptionToggle}
-                  disabled={subscriptionLoading || subscriptionChecking}
-                  className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-md text-xs font-medium border transition-colors ${
-                    isSubscribed
-                      ? 'bg-green-100 text-green-800 border-green-300 hover:bg-green-200'
-                      : 'bg-background text-foreground border-border hover:bg-muted'
-                  } disabled:opacity-60 disabled:cursor-not-allowed`}
-                >
-                  {subscriptionLoading || subscriptionChecking ? (
-                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
-                  ) : isSubscribed ? (
-                    <BellOff className="w-3.5 h-3.5" />
-                  ) : (
-                    <Bell className="w-3.5 h-3.5" />
-                  )}
-                  {subscriptionLoading || subscriptionChecking
-                    ? 'Checking...'
-                    : isSubscribed
-                      ? 'Unsubscribe'
-                      : 'Subscribe'}
-                </button>
+                {!isAuthenticated && (
+                  <p className="text-xs text-muted-foreground">
+                    Sign in to enable subscribe mode.
+                  </p>
+                )}
               </div>
-              {!isAuthenticated && (
-                <p className="text-xs text-muted-foreground">
-                  Sign in to enable subscribe mode.
-                </p>
-              )}
-            </div>
+            )}
           </div>
 
           {/* Countdown for future meetings */}
@@ -393,7 +642,7 @@ export default function MeetingPage() {
                 href={meeting.meeting_link ?? undefined}
                 target="_blank"
                 rel="noopener noreferrer"
-                className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-lg text-sm font-medium bg-green-600 text-white hover:bg-green-700 transition-colors"
+                className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-lg text-sm font-medium bg-primary text-primary-foreground hover:opacity-90 transition-colors"
               >
                 <ExternalLink className="w-4 h-4" />
                 Join Meeting
@@ -404,27 +653,39 @@ export default function MeetingPage() {
           {/* Meeting Over button */}
           {isPast && (
             <div className="mt-5 pt-5 border-t border-border">
-              <button
-                onClick={() => navigate(`/calendar/${meeting.calendar_hash}`)}
-                className="w-full flex items-center justify-center gap-2 px-4 py-3 rounded-lg text-sm font-medium bg-muted text-muted-foreground hover:bg-muted/80 transition-colors border border-border"
+              <Button
+                fullWidth
+                onClick={() => navigate(meeting.kind === 'calendar' ? `/calendar/${meeting.calendar_hash}` : '/events-calendar')}
               >
                 Meeting Over
-              </button>
+              </Button>
             </div>
           )}
         </div>
 
-        {/* Source calendar */}
+        {/* Source attribution */}
         <div className="text-center mt-6">
           <p className="text-xs text-muted-foreground">
-            From{' '}
-            <Link
-              to={`/calendar/${meeting.calendar_hash}`}
-              className="text-blue-600 hover:underline font-medium"
-            >
-              {meeting.calendar_title}
-            </Link>
-            {' '}on Coordination Manager
+            {meeting.kind === 'calendar' ? (
+              <>
+                From{' '}
+                <Link
+                  to={`/calendar/${meeting.calendar_hash}`}
+                  className="text-primary hover:underline font-medium"
+                >
+                  {meeting.calendar_title}
+                </Link>
+                {' '}on Coordination Manager
+              </>
+            ) : (
+              <>
+                {meeting.source_label}
+                {' '}&middot;{' '}
+                <Link to="/events-calendar" className="text-primary hover:underline font-medium">
+                  Browse all events
+                </Link>
+              </>
+            )}
           </p>
         </div>
       </div>

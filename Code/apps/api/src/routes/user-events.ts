@@ -3,23 +3,57 @@ import { createHash } from 'crypto'
 import { supabaseAdmin } from '../supabaseClient.js'
 import { authMiddleware, AuthenticatedRequest } from '../middleware/auth.js'
 import IcalExpander from 'ical-expander'
-import { sanitizeUUID } from '../middleware/validation.js'
+import { collapseExternalServiceErrorMessage, sanitizeUUID, safeErrorMessage } from '../middleware/validation.js'
+import { deleteGoogleCopies, getKeepInSyncLinks, syncUserEventAfterChange } from '../services/google-event-sync.js'
+import { clearEventTargetsSuspension, expireOverdueEventFlags, type EventModerationTargetType } from '../services/event-moderation.js'
+import { eventTimestampKey, eventTimestampsEqual } from '../services/event-sync-timestamps.js'
+import { fetchPublicCalendarUrl } from '../services/public-calendar-fetch.js'
+import { parseUserEventWindow } from '../services/user-event-window.js'
+import { ValidationError } from '../middleware/error-handler.js'
+import { withTimeItemRecurrences } from '../services/time-item-recurrence.js'
+import { getNetworkSourceKey } from '../services/network-source-key.js'
 
 const router: ReturnType<typeof Router> = Router()
 
 const GOOGLE_CALENDAR_API = 'https://www.googleapis.com/calendar/v3'
+const USER_EVENTS_STORAGE_UNAVAILABLE = 'User event sync storage is temporarily unavailable. Please try again later.'
+
+interface EventLocationFields {
+  description?: string | null
+  meeting_link?: string | null
+  location?: string | null
+}
+
+function resolveEventLocation<Event extends EventLocationFields>(event: Event) {
+  const meetingLink = event.meeting_link?.trim() || null
+  const sourceLocation = event.location?.trim() || null
+  let description = event.description || null
+
+  if (meetingLink && sourceLocation && meetingLink !== sourceLocation) {
+    const locationLine = `Location: ${sourceLocation}`
+    const hasLocationLine = description?.split(/\r?\n/)
+      .some(line => line.trim().toLowerCase() === locationLine.toLowerCase())
+    if (!hasLocationLine) {
+      description = description ? `${description}\n\n${locationLine}` : locationLine
+    }
+  }
+
+  return { ...event, description, location: meetingLink || sourceLocation }
+}
 
 type SyncSourceType = 'google_oauth' | 'google_public_url' | 'coordination_calendar'
 
-type RecurrenceType = 'none' | 'weekly' | 'biweekly' | 'monthly' | 'custom'
+type RecurrenceType = 'none' | 'weekly' | 'biweekly' | 'monthly' | 'monthlyWeek' | 'custom'
 type RecurrenceUnit = 'day' | 'week' | 'month'
-type RecurrenceEndType = 'never' | 'on' | 'after'
+type RecurrenceEndType = 'never' | 'on' | 'after' | 'whenCompleted'
 
 interface RecurrenceRule {
   type: RecurrenceType
   interval?: number
   unit?: RecurrenceUnit
   weekDays?: number[]
+  weekOffsetDays?: number
+  monthWeeks?: number[]
   endType?: RecurrenceEndType
   endDate?: string
   endCount?: number
@@ -36,6 +70,31 @@ type UserEventSyncPrefRow = {
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i
+
+function userEventSyncErrorMessage(error: unknown, fallback = 'Sync failed'): string {
+  const collapsed = collapseExternalServiceErrorMessage(error, USER_EVENTS_STORAGE_UNAVAILABLE)
+  const message = collapsed || (error instanceof Error && error.message ? error.message : fallback)
+  return message.replace(/[\r\n]+/g, ' ').slice(0, 500)
+}
+
+function isMissingEventModerationSchema(error: unknown): boolean {
+  if (!error || typeof error !== 'object') return false
+  const candidate = error as { code?: unknown; message?: unknown }
+  const moderationTables = [
+    'event_flags',
+    'event_flag_targets',
+    'event_flag_actions',
+    'public_event_moderation_state',
+  ]
+  const message = typeof candidate.message === 'string' ? candidate.message.toLowerCase() : ''
+  const namesModerationTable = moderationTables.some(table => message.includes(table))
+  return namesModerationTable && (
+    candidate.code === '42P01' ||
+    candidate.code === 'PGRST205' ||
+    message.includes('does not exist') ||
+    message.includes('schema cache')
+  )
+}
 
 function sanitizeCategoryIdArray(input: unknown): string[] {
   if (!Array.isArray(input)) return []
@@ -57,7 +116,7 @@ function sanitizeRecurrenceRule(input: unknown): RecurrenceRule | null {
 
   const candidate = input as Record<string, unknown>
   const type = candidate.type
-  if (type !== 'weekly' && type !== 'biweekly' && type !== 'monthly' && type !== 'custom' && type !== 'none') {
+  if (type !== 'weekly' && type !== 'biweekly' && type !== 'monthly' && type !== 'monthlyWeek' && type !== 'custom' && type !== 'none') {
     return null
   }
   if (type === 'none') return null
@@ -68,7 +127,10 @@ function sanitizeRecurrenceRule(input: unknown): RecurrenceRule | null {
   const weekDays = Array.isArray(candidate.weekDays)
     ? Array.from(new Set(candidate.weekDays.filter((day): day is number => Number.isInteger(day) && day >= 0 && day <= 6)))
     : undefined
-  const endType = candidate.endType === 'never' || candidate.endType === 'on' || candidate.endType === 'after' ? candidate.endType : 'never'
+  const monthWeeks = Array.isArray(candidate.monthWeeks)
+    ? Array.from(new Set(candidate.monthWeeks.filter((week): week is number => Number.isInteger(week) && week >= 1 && week <= 4))).sort((a, b) => a - b)
+    : undefined
+  const endType = candidate.endType === 'never' || candidate.endType === 'on' || candidate.endType === 'after' || candidate.endType === 'whenCompleted' ? candidate.endType : 'never'
   const endDate = typeof candidate.endDate === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(candidate.endDate) ? candidate.endDate : undefined
   const endCountValue = typeof candidate.endCount === 'number' ? candidate.endCount : Number(candidate.endCount)
   const endCount = Number.isFinite(endCountValue) && endCountValue > 0 ? Math.min(500, Math.floor(endCountValue)) : undefined
@@ -81,11 +143,25 @@ function sanitizeRecurrenceRule(input: unknown): RecurrenceRule | null {
     interval,
     unit,
     weekDays: weekDays && weekDays.length > 0 ? weekDays : undefined,
+    monthWeeks: monthWeeks && monthWeeks.length > 0 ? monthWeeks : undefined,
     endType,
     endDate,
     endCount,
     exceptions: exceptions && exceptions.length > 0 ? exceptions : undefined,
+    ...(type === 'custom' && unit === 'week' && typeof candidate.weekOffsetDays === 'number'
+      && Number.isInteger(candidate.weekOffsetDays) && candidate.weekOffsetDays > 0 && candidate.weekOffsetDays < interval * 7
+      ? { weekOffsetDays: candidate.weekOffsetDays } : {}),
   }
+}
+
+function buildUserEventsRevision(events: Array<Record<string, unknown>>): string {
+  let latestUpdatedAt = ''
+  for (const event of events) {
+    if (typeof event.updated_at === 'string' && event.updated_at > latestUpdatedAt) {
+      latestUpdatedAt = event.updated_at
+    }
+  }
+  return `${events.length}:${latestUpdatedAt}`
 }
 
 async function validateOwnedCategoryIds(userId: string, categoryIds: string[]): Promise<boolean> {
@@ -163,14 +239,29 @@ async function resolveManualModeSourceId(userId: string, requestedSourceId: unkn
 
 router.get('/public', async (_req: Request, res: Response) => {
   try {
+    try {
+      await expireOverdueEventFlags()
+    } catch (error) {
+      if (!isMissingEventModerationSchema(error)) throw error
+    }
+
+    const { data: suspendedRows, error: suspensionError } = await supabaseAdmin
+      .from('public_event_moderation_state')
+      .select('target_type, target_id')
+      .eq('is_suspended', true)
+    if (suspensionError && !isMissingEventModerationSchema(suspensionError)) throw suspensionError
+    const suspendedTargets = new Set(
+      (suspendedRows || []).map(row => `${row.target_type}:${row.target_id}`),
+    )
+
     // 1. User-published events from user_events table
     const { data: userEvents, error: ueError } = await supabaseAdmin
       .from('user_events')
-      .select('id, title, description, meeting_link, location, start_time, end_time, is_public, source_type, source_id, recurrence_rule, created_at, updated_at')
+      .select('id, title, description, meeting_link, location, start_time, end_time, is_public, source_type, source_id, external_event_id, recurrence_rule, created_at, updated_at')
       .eq('is_public', true)
       .order('start_time', { ascending: true })
 
-    if (ueError) return res.status(400).json({ error: ueError.message })
+    if (ueError) return res.status(400).json({ error: safeErrorMessage(ueError) })
 
     // Look up calendar_sources display names for google_oauth events
     const sourceIds = [...new Set((userEvents || []).map(e => e.source_id).filter(Boolean))]
@@ -187,14 +278,38 @@ router.get('/public', async (_req: Request, res: Response) => {
           sourceDisplayNames.set(s.id, s.display_name)
         }
       }
+
+      const { data: coordCals } = await supabaseAdmin
+        .from('calendars')
+        .select('hash, title')
+        .in('hash', sourceIds)
+
+      if (coordCals) {
+        for (const c of coordCals) {
+          sourceDisplayNames.set(c.hash, c.title)
+        }
+      }
     }
 
     // Enrich user events with calendar_title from their source
-    const enrichedUserEvents = (userEvents || []).map(ev => ({
-      ...ev,
-      calendar_title: ev.source_id ? sourceDisplayNames.get(ev.source_id) || undefined : undefined,
-      source_id: undefined, // don't expose source_id to client
-    }))
+    const enrichedUserEvents = (userEvents || [])
+      .filter(ev => {
+        if (suspendedTargets.has(`user_event:${ev.id}`)) return false
+        if (ev.external_event_id && suspendedTargets.has(`meeting:${ev.external_event_id}`)) return false
+        return true
+      })
+      .map(ev => ({
+        ...resolveEventLocation(ev),
+        calendar_title: ev.source_id ? sourceDisplayNames.get(ev.source_id) || undefined : undefined,
+        network_source_key: getNetworkSourceKey(ev.source_type, ev.source_id),
+        moderation_targets: [
+          { type: 'user_event' as const, id: ev.id },
+          ...(ev.source_type === 'coordination_calendar' && sanitizeUUID(ev.external_event_id)
+            ? [{ type: 'meeting' as const, id: ev.external_event_id as string }]
+            : []),
+        ],
+        source_id: undefined, // don't expose source_id to client
+      }))
 
     // 2. Meetings from public Coordination Calendars
     //    First fetch all public calendars, then their meetings
@@ -241,7 +356,7 @@ router.get('/public', async (_req: Request, res: Response) => {
             title: m.title || cal?.title || 'Meeting',
             description: m.description || null,
             meeting_link: m.meeting_link || null,
-            location: null,
+            location: m.meeting_link || null,
             start_time: ensureUTC(m.start_time),
             end_time: ensureUTC(m.end_time),
             is_public: true,
@@ -250,6 +365,8 @@ router.get('/public', async (_req: Request, res: Response) => {
             updated_at: m.updated_at,
             calendar_title: cal?.title,
             calendar_hash: cal?.hash,
+            network_source_key: getNetworkSourceKey('coordination_calendar', cal?.hash),
+            moderation_targets: [{ type: 'meeting' as const, id: m.id }],
           }
         })
       }
@@ -262,12 +379,16 @@ router.get('/public', async (_req: Request, res: Response) => {
 
     // Fetch external_event_ids from public user_events sourced from coordination calendars
     if (coordMeetings.length > 0) {
-      const { data: importedEvents } = await supabaseAdmin
+      const { data: importedEvents, error: importedEventsError } = await supabaseAdmin
         .from('user_events')
         .select('external_event_id')
         .eq('is_public', true)
         .eq('source_type', 'coordination_calendar')
         .not('external_event_id', 'is', null)
+
+      if (importedEventsError) {
+        throw importedEventsError
+      }
 
       if (importedEvents) {
         for (const ie of importedEvents) {
@@ -279,7 +400,7 @@ router.get('/public', async (_req: Request, res: Response) => {
     // Filter out coordination meetings that were already imported & published
     const uniqueCoordMeetings = coordMeetings.filter(m => {
       const originalId = m.id.replace(/^coord_/, '')
-      return !seenCoordMeetingIds.has(originalId)
+      return !seenCoordMeetingIds.has(originalId) && !suspendedTargets.has(`meeting:${originalId}`)
     })
 
     // Combine, sort by start_time
@@ -402,6 +523,20 @@ type ImportedExternalEvent = {
   uid?: string
 }
 
+interface ImportedEventRow {
+  id: string
+  external_event_id: string | null
+  title: string
+  description: string | null
+  meeting_link: string | null
+  location: string | null
+  start_time: string
+  end_time: string
+  is_public: boolean | null
+}
+
+const IMPORTED_EVENTS_PAGE_SIZE = 1000
+
 function buildFallbackExternalEventId(sourceType: string, sourceId: string, event: ImportedExternalEvent): string {
   const fingerprint = [
     sourceType,
@@ -424,8 +559,8 @@ function buildEventFingerprint(event: {
 }): string {
   return [
     (event.title || '').trim().toLowerCase(),
-    event.start,
-    event.end,
+    eventTimestampKey(event.start),
+    eventTimestampKey(event.end),
     (event.meeting_link || '').trim(),
     (event.location || '').trim(),
   ].join('|')
@@ -528,7 +663,7 @@ async function fetchImportedEventsFromCalendarSource(
 
   if (source.source_type === 'google_public_url') {
     if (!source.public_url) return importedEvents
-    const icsRes = await fetch(source.public_url)
+    const icsRes = await fetchPublicCalendarUrl(source.public_url, { signal: AbortSignal.timeout(15_000) })
     if (!icsRes.ok) {
       throw new Error(`Failed to fetch ICS feed (HTTP ${icsRes.status})`)
     }
@@ -576,6 +711,7 @@ async function fetchImportedMeetingsFromCoordinationCalendar(
     title: m.title || calendar.title || 'Meeting',
     description: m.description || undefined,
     meeting_link: m.meeting_link || undefined,
+    location: m.meeting_link || undefined,
     start: ensureUTC(m.start_time),
     end: ensureUTC(m.end_time),
     uid: m.id,
@@ -593,7 +729,7 @@ async function syncImportedSource(
   const autoPublishNew = !!options?.autoPublishNew
   const syncWindowStartMs = new Date(timeMin).getTime()
   const syncWindowEndMs = new Date(timeMax).getTime()
-  let incomingEvents: ImportedExternalEvent[] = []
+  let incomingEvents: ImportedExternalEvent[]
 
   if (sourceType === 'coordination_calendar') {
     incomingEvents = await fetchImportedMeetingsFromCoordinationCalendar(sourceId)
@@ -616,10 +752,17 @@ async function syncImportedSource(
     incomingEvents = await fetchImportedEventsFromCalendarSource(source, timeMin, timeMax)
   }
 
-  const normalizedIncoming = incomingEvents.map(ev => ({
-    ...ev,
-    external_event_id: ev.uid || buildFallbackExternalEventId(sourceType, sourceId, ev),
-  }))
+  const normalizedIncoming = incomingEvents.map(ev => {
+    eventTimestampKey(ev.start)
+    eventTimestampKey(ev.end)
+    const resolved = resolveEventLocation(ev)
+    return {
+      ...ev,
+      description: resolved.description || undefined,
+      location: resolved.location || undefined,
+      external_event_id: ev.uid || buildFallbackExternalEventId(sourceType, sourceId, ev),
+    }
+  })
 
   const incomingByExternalId = new Map<string, typeof normalizedIncoming[number]>()
   for (const ev of normalizedIncoming) {
@@ -628,20 +771,27 @@ async function syncImportedSource(
     }
   }
 
-  const { data: existingRows, error: existingErr } = await supabaseAdmin
-    .from('user_events')
-    .select('id, external_event_id, title, description, meeting_link, location, start_time, end_time, is_public')
-    .eq('user_id', userId)
-    .eq('source_type', sourceType)
-    .eq('source_id', sourceId)
+  const existingRows: ImportedEventRow[] = []
+  for (let offset = 0; ; ) {
+    const { data, error } = await supabaseAdmin
+      .from('user_events')
+      .select('id, external_event_id, title, description, meeting_link, location, start_time, end_time, is_public')
+      .eq('user_id', userId)
+      .eq('source_type', sourceType)
+      .eq('source_id', sourceId)
+      .order('id', { ascending: true })
+      .range(offset, offset + IMPORTED_EVENTS_PAGE_SIZE - 1)
 
-  if (existingErr) {
-    throw new Error(existingErr.message)
+    if (error) throw new Error(error.message)
+    if (!data || data.length === 0) break
+    existingRows.push(...data)
+    // Advance by the actual response size even when PostgREST has a lower row cap.
+    offset += data.length
   }
 
-  const existingByExternalId = new Map<string, NonNullable<typeof existingRows>[number]>()
-  const existingNoExternalByFingerprint = new Map<string, Array<NonNullable<typeof existingRows>[number]>>()
-  for (const row of existingRows || []) {
+  const existingByExternalId = new Map<string, ImportedEventRow>()
+  const existingNoExternalByFingerprint = new Map<string, ImportedEventRow[]>()
+  for (const row of existingRows) {
     if (row.external_event_id) {
       existingByExternalId.set(row.external_event_id, row)
       continue
@@ -737,8 +887,8 @@ async function syncImportedSource(
       (existing.description || null) !== (incoming.description || null) ||
       (existing.meeting_link || null) !== (incoming.meeting_link || null) ||
       (existing.location || null) !== (incoming.location || null) ||
-      existing.start_time !== incoming.start ||
-      existing.end_time !== incoming.end
+      !eventTimestampsEqual(existing.start_time, incoming.start) ||
+      !eventTimestampsEqual(existing.end_time, incoming.end)
     )
 
     if (!needsUpdate) continue
@@ -764,9 +914,16 @@ async function syncImportedSource(
   }
 
   if (rowsToInsert.length > 0) {
+    // Upsert instead of plain insert: a concurrent sync pass (e.g. the
+    // background auto-sync overlapping a manual "sync now") can race to
+    // insert the same external_event_id, which would otherwise violate the
+    // idx_user_events_external_upsert unique index and abort the whole sync.
     const { data: insertedRows, error: insertErr } = await supabaseAdmin
       .from('user_events')
-      .insert(rowsToInsert)
+      .upsert(rowsToInsert, {
+        onConflict: 'user_id,source_type,source_id,external_event_id',
+        ignoreDuplicates: false,
+      })
       .select('id')
 
     if (insertErr) {
@@ -830,7 +987,7 @@ export async function runPersistedUserEventAutoSync(
     .eq('auto_sync', true)
 
   if (prefErr) {
-    throw new Error(prefErr.message)
+    throw new Error(userEventSyncErrorMessage(prefErr))
   }
 
   const groupedByUser = new Map<string, UserEventSyncPrefRow[]>()
@@ -884,8 +1041,8 @@ export async function runPersistedUserEventAutoSync(
           .eq('source_id', pref.source_id)
       } catch (err: unknown) {
         failedSources++
-        const errorMsg = err instanceof Error ? err.message : 'Sync failed'
-        await supabaseAdmin
+        const errorMsg = userEventSyncErrorMessage(err)
+        const { error: updateError } = await supabaseAdmin
           .from('user_event_sync_prefs')
           .update({
             last_sync_error: errorMsg,
@@ -894,6 +1051,10 @@ export async function runPersistedUserEventAutoSync(
           .eq('user_id', userId)
           .eq('source_type', pref.source_type)
           .eq('source_id', pref.source_id)
+
+        if (updateError) {
+          console.warn(`[user-events:auto-sync] failed to record sync error: ${userEventSyncErrorMessage(updateError)}`)
+        }
       }
     }
   }
@@ -911,17 +1072,57 @@ export async function runPersistedUserEventAutoSync(
 // ─── GET /api/user-events ───────────────────────────────────
 // List all events for the authenticated user (their "Your Event Calendar")
 
-router.get('/', async (req: AuthenticatedRequest, res: Response) => {
+router.get('/revision', async (req: AuthenticatedRequest, res: Response) => {
   try {
-    const { data, error } = await supabaseAdmin
+    const { data, count, error } = await supabaseAdmin
       .from('user_events')
-      .select('*')
+      .select('updated_at', { count: 'exact' })
       .eq('user_id', req.userId)
-      .order('start_time', { ascending: true })
+      .order('updated_at', { ascending: false })
+      .limit(1)
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
+    const latestUpdatedAt = typeof data?.[0]?.updated_at === 'string' ? data[0].updated_at : ''
+    return res.json({ revision: `${count ?? 0}:${latestUpdatedAt}` })
+  } catch {
+    return res.status(500).json({ error: 'Failed to fetch event revision' })
+  }
+})
 
-    const events = data || []
+router.get('/', async (req: AuthenticatedRequest, res: Response) => {
+  if (!req.userId) return res.status(401).json({ error: 'Unauthorized' })
+  try {
+    const window = parseUserEventWindow(req.query.windowStart, req.query.windowEnd)
+    // PostgREST caps a single request at its configured max-rows (commonly
+    // 1000). Without pagination, any user with 1000+ total events would have
+    // everything sorting after that cutoff -- typically their furthest-future
+    // items -- silently dropped from the response despite the rows still
+    // existing untouched in the database. Page through until a page comes
+    // back short to guarantee every row is returned.
+    const PAGE_SIZE = 1000
+    const events: Array<EventLocationFields & { id: string; source_id: string | null; source_type: string; recurrence_id?: string | null; [key: string]: unknown }> = []
+    for (let from = 0; ; from += PAGE_SIZE) {
+      let query = supabaseAdmin
+        .from('user_events')
+        .select('*')
+        .eq('user_id', req.userId)
+      if (window) {
+        // Old recurrence masters are needed even when their base occurrence is
+        // outside the window. Consumers expand their rules in the visible week.
+        query = query.lt('start_time', window.windowEnd).or(
+          `end_time.gt.${window.windowStart},and(recurrence_rule.not.is.null,recurrence_rule->>type.neq.none)`,
+        )
+      }
+      const { data, error } = await query
+        .order('start_time', { ascending: true })
+        .order('id', { ascending: true })
+        .range(from, from + PAGE_SIZE - 1)
+
+      if (error) return res.status(400).json({ error: safeErrorMessage(error) })
+      const page = data || []
+      events.push(...page)
+      if (page.length < PAGE_SIZE) break
+    }
 
     // Self-healing cleanup: remove imported meetings whose originating source
     // (a connected Google calendar source or a coordination calendar network)
@@ -995,9 +1196,92 @@ router.get('/', async (req: AuthenticatedRequest, res: Response) => {
       }
     }
 
-    res.json({ events: visibleEvents })
-  } catch {
+    res.json({
+      events: await withTimeItemRecurrences(visibleEvents.map(resolveEventLocation), req.userId),
+      ...(window
+        ? { scope: { kind: 'window', ...window } }
+        : { revision: buildUserEventsRevision(visibleEvents) }),
+    })
+  } catch (error) {
+    if (error instanceof ValidationError) {
+      return res.status(400).json({ error: error.code, message: error.message, statusCode: error.statusCode })
+    }
+    console.error('Failed to fetch user events:', error)
     res.status(500).json({ error: 'Failed to fetch events' })
+  }
+})
+
+router.get('/conditional-recurrences', async (req: AuthenticatedRequest, res: Response) => {
+  if (!req.userId) return res.status(401).json({ error: 'UNAUTHORIZED', message: 'Sign in to read recurrences', statusCode: 401 })
+  try {
+    const { data, error } = await supabaseAdmin.from('time_item_recurrences')
+      .select('id').eq('user_id', req.userId).eq('status', 'active').limit(1)
+    if (error) throw error
+    return res.json({ active: data.length > 0 })
+  } catch (error) {
+    console.error('Failed to read active Time Item recurrences:', userEventSyncErrorMessage(error))
+    return res.status(500).json({ error: 'RECURRENCE_READ_FAILED', message: 'Could not read active recurrences', statusCode: 500 })
+  }
+})
+
+router.post('/conditional-recurrences/check', async (req: AuthenticatedRequest, res: Response) => {
+  if (!req.userId) return res.status(401).json({ error: 'UNAUTHORIZED', message: 'Sign in to check recurrences', statusCode: 401 })
+  try {
+    const { data, error } = await supabaseAdmin.rpc('advance_time_item_recurrences', { p_user_id: req.userId })
+    if (error) throw error
+    if (!Number.isInteger(data) || data < 0) throw new Error('Recurrence generation returned an invalid count')
+    return res.json({ created: data })
+  } catch (error) {
+    console.error('Failed to advance Time Item recurrences:', userEventSyncErrorMessage(error))
+    return res.status(500).json({ error: 'RECURRENCE_CHECK_FAILED', message: 'Could not check recurring Time Items. Please try again.', statusCode: 500 })
+  }
+})
+
+router.get('/:id/latest-occurrence', async (req: AuthenticatedRequest, res: Response) => {
+  if (!req.userId) return res.status(401).json({ error: 'UNAUTHORIZED', message: 'Sign in to read recurrences', statusCode: 401 })
+  const id = sanitizeUUID(req.params.id)
+  if (!id) return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'Invalid event id', statusCode: 400 })
+  try {
+    const { data: event, error } = await supabaseAdmin.from('user_events')
+      .select('recurrence_id').eq('id', id).eq('user_id', req.userId).maybeSingle()
+    if (error) throw error
+    if (!event?.recurrence_id) return res.status(404).json({ error: 'NOT_FOUND', message: 'Recurrence not found', statusCode: 404 })
+    const { data: series, error: seriesError } = await supabaseAdmin.from('time_item_recurrences')
+      .select('latest_event_id').eq('id', event.recurrence_id).eq('user_id', req.userId).single()
+    if (seriesError) throw seriesError
+    const { data: latest, error: latestError } = await supabaseAdmin.from('user_events')
+      .select('*').eq('id', series.latest_event_id).eq('user_id', req.userId).maybeSingle()
+    if (latestError) throw latestError
+    if (!latest) return res.status(404).json({ error: 'NOT_FOUND', message: 'Latest occurrence no longer exists', statusCode: 404 })
+    const [resolved] = await withTimeItemRecurrences([resolveEventLocation(latest)], req.userId)
+    return res.json({ event: resolved })
+  } catch (error) {
+    console.error('Failed to load latest Time Item occurrence:', userEventSyncErrorMessage(error))
+    return res.status(500).json({ error: 'RECURRENCE_READ_FAILED', message: 'Could not load latest occurrence', statusCode: 500 })
+  }
+})
+
+router.post('/:id/complete-recurrence', async (req: AuthenticatedRequest, res: Response) => {
+  if (!req.userId) return res.status(401).json({ error: 'UNAUTHORIZED', message: 'Sign in to complete a recurrence', statusCode: 401 })
+  const id = sanitizeUUID(req.params.id)
+  if (!id) return res.status(400).json({ error: 'VALIDATION_ERROR', message: 'Invalid event id', statusCode: 400 })
+  try {
+    const { data, error } = await supabaseAdmin.rpc('complete_time_item_recurrence', {
+      p_user_id: req.userId, p_event_id: id,
+    })
+    if (error) {
+      if (error.code === 'P0001') return res.status(409).json({ error: 'RECURRENCE_CONFLICT', message: error.message, statusCode: 409 })
+      throw error
+    }
+    if (!data || data.status !== 'completed') throw new Error('Recurrence completion was not confirmed')
+    const { data: event, error: eventError } = await supabaseAdmin.from('user_events')
+      .select('*').eq('id', id).eq('user_id', req.userId).single()
+    if (eventError) throw eventError
+    if (!event?.completed_at) throw new Error('Time Item completion was not confirmed. New databases use 000_feature-time-and-calendar.sql; older databases require migrations/archive/035_time_item_completion.sql.')
+    return res.json({ recurrence: data, event: { ...resolveEventLocation(event), recurrence: data } })
+  } catch (error) {
+    console.error('Failed to complete Time Item recurrence:', userEventSyncErrorMessage(error))
+    return res.status(500).json({ error: 'RECURRENCE_COMPLETION_FAILED', message: 'Could not complete recurrence', statusCode: 500 })
   }
 })
 
@@ -1008,9 +1292,27 @@ router.post('/', async (req: AuthenticatedRequest, res: Response) => {
   try {
     if (!req.userId) return res.status(401).json({ error: 'Unauthorized' })
     const { title, description, meeting_link, location, start_time, end_time, is_public, category_ids, source_id } = req.body
+    const requestedId = req.body?.id === undefined ? null : sanitizeUUID(req.body.id)
 
     if (!title || !start_time || !end_time) {
       return res.status(400).json({ error: 'title, start_time, and end_time are required' })
+    }
+    if (req.body?.id !== undefined && !requestedId) {
+      return res.status(400).json({ error: 'id must be a valid UUID' })
+    }
+
+    // Optional "this item only" link: the series this row replaces one occurrence of.
+    let seriesId: string | null = null
+    let originalStartTime: string | null = null
+    if (req.body?.series_id !== undefined && req.body?.series_id !== null) {
+      seriesId = sanitizeUUID(req.body.series_id)
+      const originalStart = new Date(typeof req.body?.original_start_time === 'string' ? req.body.original_start_time : '')
+      if (!seriesId || Number.isNaN(originalStart.getTime())) {
+        return res.status(400).json({ error: 'series_id requires a valid original_start_time' })
+      }
+      const { data: series } = await supabaseAdmin.from('user_events').select('id').eq('id', seriesId).eq('user_id', req.userId).maybeSingle()
+      if (!series) return res.status(400).json({ error: 'series_id is invalid or unauthorized' })
+      originalStartTime = originalStart.toISOString()
     }
 
     const sanitizedCategoryIds = sanitizeCategoryIdArray(category_ids)
@@ -1027,27 +1329,85 @@ router.post('/', async (req: AuthenticatedRequest, res: Response) => {
       return res.status(400).json({ error: message })
     }
 
+    const resolvedLocation = resolveEventLocation({ description, meeting_link, location })
+    const recurrenceRule = sanitizeRecurrenceRule(req.body?.recurrence_rule)
+    const matchesExistingEvent = (existing: Record<string, unknown> | null) =>
+      Boolean(
+        existing &&
+        existing.user_id === req.userId &&
+        existing.source_type === 'manual' &&
+        existing.title === title &&
+        (existing.description ?? null) === (resolvedLocation.description ?? null) &&
+        (existing.meeting_link ?? null) === (meeting_link || null) &&
+        (existing.location ?? null) === (resolvedLocation.location ?? null) &&
+        new Date(String(existing.start_time)).getTime() === new Date(String(start_time)).getTime() &&
+        new Date(String(existing.end_time)).getTime() === new Date(String(end_time)).getTime() &&
+        existing.is_public === Boolean(is_public) &&
+        existing.source_id === manualSourceId &&
+        JSON.stringify(existing.category_ids ?? []) === JSON.stringify(sanitizedCategoryIds) &&
+        JSON.stringify(existing.recurrence_rule ?? null) === JSON.stringify(recurrenceRule)
+      )
+
+    if (requestedId) {
+      const { data: existing, error: existingError } = await supabaseAdmin
+        .from('user_events')
+        .select('*')
+        .eq('id', requestedId)
+        .eq('user_id', req.userId)
+        .maybeSingle()
+      if (existingError) throw existingError
+      if (existing) {
+        if (!matchesExistingEvent(existing as Record<string, unknown>)) {
+          return res.status(409).json({ error: 'Event idempotency key conflicts with an existing event' })
+        }
+        const [created] = await withTimeItemRecurrences([existing], req.userId)
+        return res.status(200).json({ event: created })
+      }
+    }
+
     const { data, error } = await supabaseAdmin
       .from('user_events')
       .insert({
+        ...(requestedId ? { id: requestedId } : {}),
         user_id: req.userId,
         source_type: 'manual',
         title,
-        description: description || null,
+        description: resolvedLocation.description,
         meeting_link: meeting_link || null,
-        location: location || null,
+        location: resolvedLocation.location,
         start_time,
         end_time,
         is_public: is_public || false,
         category_ids: sanitizedCategoryIds,
         source_id: manualSourceId,
-        recurrence_rule: sanitizeRecurrenceRule(req.body?.recurrence_rule),
+        recurrence_rule: recurrenceRule,
+        series_id: seriesId,
+        original_start_time: originalStartTime,
       })
       .select()
       .single()
 
-    if (error) return res.status(400).json({ error: error.message })
-    res.status(201).json({ event: data })
+    if (error) {
+      if (requestedId && error.code === '23505') {
+        const { data: existing, error: existingError } = await supabaseAdmin
+          .from('user_events')
+          .select('*')
+          .eq('id', requestedId)
+          .eq('user_id', req.userId)
+          .maybeSingle()
+        if (existingError) throw existingError
+        if (matchesExistingEvent(existing as Record<string, unknown> | null)) {
+          const [created] = await withTimeItemRecurrences([existing], req.userId)
+          return res.status(200).json({ event: created })
+        }
+        return res.status(409).json({ error: 'Event idempotency key conflicts with an existing event' })
+      }
+      return res.status(400).json({ error: safeErrorMessage(error) })
+    }
+    const [created] = await withTimeItemRecurrences([data], req.userId)
+    res.status(201).json({ event: created })
+    // skip_google_sync: the user unticked "Update Google Calendar copy" for this edit.
+    if (seriesId && req.body?.skip_google_sync !== true) void syncUserEventAfterChange(req.userId, seriesId)
   } catch {
     res.status(500).json({ error: 'Failed to create event' })
   }
@@ -1059,6 +1419,11 @@ router.post('/', async (req: AuthenticatedRequest, res: Response) => {
 // If source_id is provided, all events from that source are updated.
 // NOTE: Must be registered BEFORE /:id to avoid route collision.
 
+// Large `.in('id', [...])` filters are sent as PostgREST query-string params --
+// thousands of UUIDs can exceed the URL length limit and fail with an opaque 400.
+// Chunk to keep each request well within safe URL bounds.
+const BULK_PUBLIC_ID_CHUNK_SIZE = 200
+
 router.put('/bulk-public', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const { event_ids, source_id, source_type, is_public } = req.body
@@ -1067,14 +1432,49 @@ router.put('/bulk-public', async (req: AuthenticatedRequest, res: Response) => {
       return res.status(400).json({ error: 'is_public (boolean) is required' })
     }
 
+    if (event_ids && Array.isArray(event_ids) && event_ids.length > 0) {
+      const sanitizedIds = event_ids
+        .map((id: unknown) => (typeof id === 'string' ? sanitizeUUID(id.split('__occ__')[0].replace(/^coord_/, '')) : null))
+        .filter((id): id is string => !!id)
+
+      if (sanitizedIds.length === 0) {
+        return res.status(400).json({ error: 'event_ids must contain valid event ids' })
+      }
+
+      let updated: unknown[] = []
+      for (let i = 0; i < sanitizedIds.length; i += BULK_PUBLIC_ID_CHUNK_SIZE) {
+        const chunk = sanitizedIds.slice(i, i + BULK_PUBLIC_ID_CHUNK_SIZE)
+        const { data, error } = await supabaseAdmin
+          .from('user_events')
+          .update({ is_public, updated_at: new Date().toISOString() })
+          .eq('user_id', req.userId)
+          .in('id', chunk)
+          .select()
+
+        if (error) return res.status(400).json({ error: safeErrorMessage(error) })
+        updated = updated.concat(data || [])
+      }
+
+      if (is_public && updated.length > 0) {
+        const targetsToClear: Array<{ target_type: EventModerationTargetType; target_id: string }> = []
+        for (const ev of updated as Array<{ id: string; external_event_id?: string | null }>) {
+          targetsToClear.push({ target_type: 'user_event', target_id: ev.id })
+          if (ev.external_event_id) {
+            targetsToClear.push({ target_type: 'meeting', target_id: ev.external_event_id })
+          }
+        }
+        await clearEventTargetsSuspension(targetsToClear)
+      }
+
+      return res.json({ updated: updated.length, events: updated })
+    }
+
     let query = supabaseAdmin
       .from('user_events')
       .update({ is_public, updated_at: new Date().toISOString() })
       .eq('user_id', req.userId)
 
-    if (event_ids && Array.isArray(event_ids) && event_ids.length > 0) {
-      query = query.in('id', event_ids)
-    } else if (source_id) {
+    if (source_id) {
       query = query.eq('source_id', source_id)
       if (source_type) query = query.eq('source_type', source_type)
     } else {
@@ -1082,7 +1482,19 @@ router.put('/bulk-public', async (req: AuthenticatedRequest, res: Response) => {
     }
 
     const { data, error } = await query.select()
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
+
+    if (is_public && data && data.length > 0) {
+      const targetsToClear: Array<{ target_type: EventModerationTargetType; target_id: string }> = []
+      for (const ev of data as Array<{ id: string; external_event_id?: string | null }>) {
+        targetsToClear.push({ target_type: 'user_event', target_id: ev.id })
+        if (ev.external_event_id) {
+          targetsToClear.push({ target_type: 'meeting', target_id: ev.external_event_id })
+        }
+      }
+      await clearEventTargetsSuspension(targetsToClear)
+    }
+
     res.json({ updated: data?.length || 0, events: data })
   } catch {
     res.status(500).json({ error: 'Failed to bulk-update events' })
@@ -1102,7 +1514,7 @@ router.get('/sync-prefs', async (req: AuthenticatedRequest, res: Response) => {
       .eq('user_id', req.userId)
       .order('source_type', { ascending: true })
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
     res.json({ prefs: data || [] })
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : 'Failed to fetch sync preferences'
@@ -1155,7 +1567,7 @@ router.put('/sync-prefs', async (req: AuthenticatedRequest, res: Response) => {
       .select('source_type, source_id')
       .eq('user_id', req.userId)
 
-    if (existingErr) return res.status(400).json({ error: existingErr.message })
+    if (existingErr) return res.status(400).json({ error: safeErrorMessage(existingErr) })
 
     const toDelete = (existingRows || []).filter(row => !activeKeys.has(`${row.source_type}:${row.source_id}`))
     for (const row of toDelete) {
@@ -1166,7 +1578,7 @@ router.put('/sync-prefs', async (req: AuthenticatedRequest, res: Response) => {
         .eq('source_type', row.source_type)
         .eq('source_id', row.source_id)
 
-      if (deleteErr) return res.status(400).json({ error: deleteErr.message })
+      if (deleteErr) return res.status(400).json({ error: safeErrorMessage(deleteErr) })
     }
 
     if (activeRows.length > 0) {
@@ -1174,7 +1586,7 @@ router.put('/sync-prefs', async (req: AuthenticatedRequest, res: Response) => {
         .from('user_event_sync_prefs')
         .upsert(activeRows, { onConflict: 'user_id,source_type,source_id' })
 
-      if (upsertErr) return res.status(400).json({ error: upsertErr.message })
+      if (upsertErr) return res.status(400).json({ error: safeErrorMessage(upsertErr) })
     }
 
     const { data, error } = await supabaseAdmin
@@ -1182,7 +1594,7 @@ router.put('/sync-prefs', async (req: AuthenticatedRequest, res: Response) => {
       .select('source_type, source_id, auto_sync, auto_publish_new, range_months, last_synced_at, last_sync_error, updated_at')
       .eq('user_id', req.userId)
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
     res.json({ prefs: data || [] })
   } catch (err: unknown) {
     const error = err instanceof Error ? err.message : 'Failed to update sync preferences'
@@ -1217,7 +1629,21 @@ router.put('/:id', async (req: AuthenticatedRequest, res: Response) => {
       updates.category_ids = sanitizedCategoryIds
     }
     if (recurrence_rule !== undefined) {
-      updates.recurrence_rule = sanitizeRecurrenceRule(recurrence_rule)
+      const nextRule = sanitizeRecurrenceRule(recurrence_rule)
+      updates.recurrence_rule = nextRule
+      if (nextRule?.endType === 'whenCompleted') {
+        const { data: existing, error: existingError } = await supabaseAdmin.from('user_events')
+          .select('recurrence_id').eq('id', id).eq('user_id', req.userId).maybeSingle()
+        if (existingError) throw existingError
+        if (existing?.recurrence_id) {
+          const { data: series, error: seriesError } = await supabaseAdmin.from('time_item_recurrences')
+            .select('recurrence_rule').eq('id', existing.recurrence_id).eq('user_id', req.userId).single()
+          if (seriesError) throw seriesError
+          if (JSON.stringify(sanitizeRecurrenceRule(series.recurrence_rule)) === JSON.stringify(updates.recurrence_rule)) {
+            delete updates.recurrence_rule
+          }
+        }
+      }
     }
 
     const { data, error } = await supabaseAdmin
@@ -1228,9 +1654,22 @@ router.put('/:id', async (req: AuthenticatedRequest, res: Response) => {
       .select()
       .single()
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
     if (!data) return res.status(404).json({ error: 'Event not found' })
-    res.json({ event: data })
+
+    if (is_public === true) {
+      const targetsToClear: Array<{ target_type: EventModerationTargetType; target_id: string }> = [
+        { target_type: 'user_event', target_id: data.id },
+      ]
+      if (data.external_event_id) {
+        targetsToClear.push({ target_type: 'meeting', target_id: data.external_event_id })
+      }
+      await clearEventTargetsSuspension(targetsToClear)
+    }
+
+    const [updated] = await withTimeItemRecurrences([data], req.userId)
+    res.json({ event: updated })
+    if (req.body?.skip_google_sync !== true) void syncUserEventAfterChange(req.userId, data.id)
   } catch {
     res.status(500).json({ error: 'Failed to update event' })
   }
@@ -1259,7 +1698,7 @@ router.delete('/bulk', async (req: AuthenticatedRequest, res: Response) => {
     }
 
     const { data, error } = await query.select()
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
     res.json({ deleted: data?.length || 0 })
   } catch {
     res.status(500).json({ error: 'Failed to bulk-delete events' })
@@ -1272,18 +1711,25 @@ router.delete('/:id', async (req: AuthenticatedRequest, res: Response) => {
   try {
     const id = sanitizeUUID(req.params.id)
     if (!id) return res.status(400).json({ error: 'Invalid event id' })
+    const userId = req.userId
+    if (!userId) return res.status(401).json({ error: 'Unauthorized' })
+
+    // Links cascade with the row, so read the Google copies to remove first.
+    const googleLinks = await getKeepInSyncLinks(userId, id)
 
     const { data, error } = await supabaseAdmin
       .from('user_events')
       .delete()
       .eq('id', id)
-      .eq('user_id', req.userId)
+      .eq('user_id', userId)
       .select()
       .single()
 
-    if (error) return res.status(400).json({ error: error.message })
+    if (error) return res.status(400).json({ error: safeErrorMessage(error) })
     if (!data) return res.status(404).json({ error: 'Event not found' })
     res.json({ message: 'Event deleted' })
+    if (googleLinks.length > 0) void deleteGoogleCopies(userId, googleLinks)
+    if (data.series_id) void syncUserEventAfterChange(userId, data.series_id)
   } catch {
     res.status(500).json({ error: 'Failed to delete event' })
   }
@@ -1383,7 +1829,7 @@ router.post('/import/calendar-source', async (req: AuthenticatedRequest, res: Re
 
     } else if (source.source_type === 'google_public_url') {
       // Fetch and parse ICS
-      const icsRes = await fetch(source.public_url)
+      const icsRes = await fetchPublicCalendarUrl(source.public_url, { signal: AbortSignal.timeout(15_000) })
       if (!icsRes.ok) {
         return res.status(502).json({ error: `Failed to fetch ICS feed (HTTP ${icsRes.status})` })
       }
@@ -1406,7 +1852,7 @@ router.post('/import/calendar-source', async (req: AuthenticatedRequest, res: Re
     }
 
     // Build rows to insert
-    const rows = importedEvents.map(ev => ({
+    const rows = importedEvents.map(resolveEventLocation).map(ev => ({
       user_id: req.userId,
       source_type: source.source_type,
       source_id: source.id,
@@ -1460,13 +1906,13 @@ router.post('/import/calendar-source', async (req: AuthenticatedRequest, res: Re
 
     if (insertError) {
       console.error('Event import insert error:', insertError)
-      return res.status(400).json({ error: insertError.message })
+      return res.status(400).json({ error: safeErrorMessage(insertError) })
     }
 
     res.json({ imported: insertedEvents?.length || 0, total_found: importedEvents.length, events: insertedEvents || [] })
   } catch (err) {
     console.error('Event import error:', err)
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to import events' })
+    res.status(500).json({ error: safeErrorMessage(err) })
   }
 })
 
@@ -1499,7 +1945,7 @@ router.post('/import/coordination-calendar', async (req: AuthenticatedRequest, r
       .select('*')
       .eq('calendar_id', calendar.id)
 
-    if (meetErr) return res.status(400).json({ error: meetErr.message })
+    if (meetErr) return res.status(400).json({ error: safeErrorMessage(meetErr) })
 
     if (!meetings || meetings.length === 0) {
       return res.json({ imported: 0, events: [] })
@@ -1516,7 +1962,7 @@ router.post('/import/coordination-calendar', async (req: AuthenticatedRequest, r
       title: m.title || calendar.title || 'Meeting',
       description: m.description || null,
       meeting_link: m.meeting_link || null,
-      location: null,
+      location: m.meeting_link || null,
       start_time: ensureUTC(m.start_time),
       end_time: ensureUTC(m.end_time),
       is_public: false,
@@ -1548,13 +1994,13 @@ router.post('/import/coordination-calendar', async (req: AuthenticatedRequest, r
 
     if (insertError) {
       console.error('Coordination calendar import insert error:', insertError)
-      return res.status(400).json({ error: insertError.message })
+      return res.status(400).json({ error: safeErrorMessage(insertError) })
     }
 
     res.json({ imported: insertedEvents?.length || 0, total_found: meetings.length, events: insertedEvents || [] })
   } catch (err) {
     console.error('Coordination calendar import error:', err)
-    res.status(500).json({ error: err instanceof Error ? err.message : 'Failed to import from coordination calendar' })
+    res.status(500).json({ error: safeErrorMessage(err) })
   }
 })
 
@@ -1636,7 +2082,7 @@ router.post('/sync-imports', async (req: AuthenticatedRequest, res: Response) =>
       .not('source_id', 'is', null)
 
     if (importedErr) {
-      return res.status(400).json({ error: importedErr.message })
+      return res.status(400).json({ error: safeErrorMessage(importedErr) })
     }
 
     const inferredSources = new Map<string, {

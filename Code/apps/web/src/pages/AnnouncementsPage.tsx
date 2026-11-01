@@ -1,8 +1,10 @@
 import { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import { buildEmailRecipientRows, buildReminderPlans, uniquePollOptions } from './announcement-send-plan'
 import { useSearchParams, Link } from 'react-router-dom'
 import { resolveMeetingTitle } from '../lib/calendar-utils'
 import LearnerHelpIcon from '../components/LearnerHelpIcon'
 import ResponsesTab from '../components/announcements/ResponsesTab'
+import DeletePostedMessagesAction from '../components/announcements/DeletePostedMessagesAction'
 import {
   Megaphone,
   Plus,
@@ -53,9 +55,13 @@ import {
 } from 'lucide-react'
 import EmojiPicker from '../components/announcements/EmojiPicker'
 import { apiClient } from '../lib/api-client'
+import { OVERLAY_LAYER_CLASS } from '../lib/overlay-layers'
 import { useAuth } from '../contexts/AuthContext'
 import { useAiAssistant } from '../contexts/AiAssistantContext'
+import { buildAiEvaluation, isMutationRequest, type AiEvaluation, type AiRetryRequest } from '../lib/ai-evaluation'
 import { useToast } from '../components/Toast'
+import { ChoiceDialog } from '../components/ui/ChoiceDialog'
+import { Button, CountBadge, Disclosure, IconButton, StatusBadge, Switch, ToggleButton } from '../components/ui'
 import { getPrimaryTimezone, formatDateDDMMYYYYInTimezone, formatDateTimeDDMMYYYYInTimezone } from '../lib/timezone-data'
 
 // ─── Types ────────────────────────────────────────────────────────────
@@ -134,6 +140,10 @@ interface DeliveryLogEntry {
   created_at: string
   subscription_status?: 'invited' | 'subscribed' | 'unsubscribed' | 'opted_out' | 'muted_bot' | null
   recipient_response?: 'invited' | 'subscribed' | 'unsubscribed' | 'opted_out' | 'muted_bot' | null
+  /** Set when the sender deleted the posted Discord message. */
+  deleted_at?: string | null
+  /** Last error from a sender-initiated delete attempt. */
+  delete_error?: string | null
 }
 
 // Poll option for reaction-based polling
@@ -342,7 +352,8 @@ export default function AnnouncementsPage() {
   const doAiComposeRef = useRef<((
     message: string,
     history?: Array<{ role: 'user' | 'assistant'; content: string }>,
-  ) => Promise<{ message: string; action?: string; systemPrompt?: string }>) | null>(null)
+    retry?: AiRetryRequest,
+  ) => Promise<{ message: string; action?: string; systemPrompt?: string; evaluation?: AiEvaluation; retryToken?: string }>) | null>(null)
   const [searchParams, setSearchParams] = useSearchParams()
 
   const initialTab = (searchParams.get('tab') as SubTab) || 'compose'
@@ -2068,6 +2079,13 @@ export default function AnnouncementsPage() {
     }
     return Array.from(ids)
   }, [selectedCalendarIds, selectedMeetingIds, meetings])
+  const emailRecipientProjection = useMemo(() => buildEmailRecipientRows({
+    contacts: emailContacts,
+    friends: friendConnections,
+    participants: calendarParticipantEmails,
+    calendarIds: effectiveCalendarIds,
+    calendars: allCalendars,
+  }), [emailContacts, friendConnections, calendarParticipantEmails, effectiveCalendarIds, allCalendars])
 
   // Refresh DM subscription statuses when the effective calendar set changes.
   // Subscriptions are per-calendar -- only query when at least one calendar is in scope.
@@ -2098,7 +2116,8 @@ export default function AnnouncementsPage() {
   const doAiCompose = useCallback(async (
     message: string,
     history?: Array<{ role: 'user' | 'assistant'; content: string }>,
-  ): Promise<{ message: string; action?: string; systemPrompt?: string }> => {
+    retry?: AiRetryRequest,
+  ): Promise<{ message: string; action?: string; systemPrompt?: string; evaluation?: AiEvaluation; retryToken?: string }> => {
     const trimmed = message.trim()
     if (!trimmed) return { message: 'Please enter a message.' }
 
@@ -2189,10 +2208,12 @@ export default function AnnouncementsPage() {
         history,
         currentState,
         preferredModel,
+        ...(retry ?? {}),
       })
 
       const changes = data.changes || {}
       const appliedFields: string[] = []
+      const evaluationIssues: string[] = []
 
       // Surface backend safety-net suppressions (e.g. body change held back because
       // it would have dropped existing links, or user asked to "suggest" only).
@@ -2236,6 +2257,7 @@ export default function AnnouncementsPage() {
           appliedFields.push('channels')
         } else {
           showToast('AI suggested channels that are not available in your current Distribution Targets list. Channel selection was not changed.', 'info')
+          evaluationIssues.push(`selectedChannels contained no channel IDs from the available channel list (${requestedIds.slice(0, 5).join(', ')}). Use only IDs listed under "Available Discord channels".`)
         }
       }
       if ('selectedDmUserIds' in changes && Array.isArray(changes.selectedDmUserIds) && changes.selectedDmUserIds.length > 0) {
@@ -2247,6 +2269,7 @@ export default function AnnouncementsPage() {
           appliedFields.push('DM recipients')
         } else {
           showToast('AI suggested DM recipients that are not available in your current member list. DM selection was not changed.', 'info')
+          evaluationIssues.push(`selectedDmUserIds contained no user IDs from the available member list (${requestedIds.slice(0, 5).join(', ')}). Use only IDs listed under "Available Discord members".`)
         }
       }
       if ('selectedMeetingIds' in changes && Array.isArray(changes.selectedMeetingIds) && changes.selectedMeetingIds.length > 0) {
@@ -2258,6 +2281,8 @@ export default function AnnouncementsPage() {
         if (validSelected.size > 0) {
           setMeetingContextExpanded(true)
           appliedFields.push('meetings')
+        } else {
+          evaluationIssues.push('selectedMeetingIds contained no IDs from the available meetings list, so no meeting was attached.')
         }
       }
       if ('selectedCalendarIds' in changes && Array.isArray(changes.selectedCalendarIds) && changes.selectedCalendarIds.length > 0) {
@@ -2269,13 +2294,26 @@ export default function AnnouncementsPage() {
         if (validSelected.size > 0) {
           setMeetingContextExpanded(true)
           appliedFields.push('calendars')
+        } else {
+          evaluationIssues.push('selectedCalendarIds contained no IDs from the available calendars list, so no calendar was attached.')
         }
+      }
+
+      const hasGuardrailHold = Boolean(guardrails?.suppressedFields && guardrails.suppressedFields.length > 0)
+      if (appliedFields.length === 0 && evaluationIssues.length === 0 && !hasGuardrailHold && isMutationRequest(trimmed)) {
+        evaluationIssues.push('The request asks to change the announcement, but no fields were returned in "changes", so nothing was applied.')
       }
 
       const summary = appliedFields.length > 0
         ? `Updated ${appliedFields.join(', ')}${data.explanation ? ' -- ' + data.explanation : ''}`
         : data.explanation || 'No changes needed.'
-      return { message: summary, action: 'compose', systemPrompt: data.systemPrompt }
+      return {
+        message: summary,
+        action: 'compose',
+        systemPrompt: data.systemPrompt,
+        evaluation: buildAiEvaluation(evaluationIssues, appliedFields.map(field => `Updated ${field}`)),
+        retryToken: data.retryToken,
+      }
     } catch (err) {
       throw err
     }
@@ -2295,7 +2333,7 @@ export default function AnnouncementsPage() {
         'Create a poll asking about meeting times',
       ],
       placeholder: 'e.g. "draft an announcement for the weekly sync meeting"',
-      onSubmit: (msg: string, history?: Array<{ role: 'user' | 'assistant'; content: string }>) => doAiComposeRef.current!(msg, history),
+      onSubmit: (msg: string, history?: Array<{ role: 'user' | 'assistant'; content: string }>, retry?: AiRetryRequest) => doAiComposeRef.current!(msg, history, retry),
     })
     return () => setPageContext(null)
   }, [setPageContext])
@@ -2434,34 +2472,9 @@ export default function AnnouncementsPage() {
     }
 
     // Collect selected email recipients (from the unified email table)
-    const emailRecipientRows: EmailRecipientRow[] = []
-    if (emailIntegrationSetup) {
-      // Rebuild allRows the same way the email table does
-      for (const c of emailContacts) {
-        const key = `manual:${c.id}`
-        if (selectedEmailRecipients.has(key) && !c.opted_out && !c.notification_disabled) {
-          emailRecipientRows.push({ key, display_name: c.display_name || c.email.split('@')[0], email: c.email, email_display: c.email, source: 'manual', source_detail: '', status_label: 'Active', status_color: '', selectable: true })
-        }
-      }
-      for (const f of friendConnections) {
-        const key = `friendlist:${f.user_id}`
-        if (selectedEmailRecipients.has(key) && f.email) {
-          emailRecipientRows.push({ key, display_name: f.display_name, email: f.email, email_display: f.email, source: 'friendlist', source_detail: '', status_label: 'Active', status_color: '', selectable: true })
-        }
-      }
-      const activeCalIds = new Set([
-        ...meetings.filter(m => selectedMeetingIds.has(m.id)).map(m => m.calendar_id),
-        ...Array.from(selectedCalendarIds),
-      ])
-      for (const p of calendarParticipantEmails) {
-        const matchedCalIds = p.calendar_ids.filter(cid => activeCalIds.has(cid))
-        if (matchedCalIds.length === 0) continue
-        const key = `calendar:${p.username}`
-        if (selectedEmailRecipients.has(key) && (p.email_status === 'visible' || p.email_status === 'hidden') && p.email) {
-          emailRecipientRows.push({ key, display_name: p.username, email: p.email, email_display: p.email, source: 'calendar', source_detail: '', status_label: 'Active', status_color: '', selectable: true })
-        }
-      }
-    }
+    const emailRecipientRows = emailIntegrationSetup
+      ? emailRecipientProjection.filter(row => row.selectable && row.deliveryEmail && selectedEmailRecipients.has(row.key))
+      : []
 
     if (selectedRows.length === 0 && selectedDmRows.length === 0 && emailRecipientRows.length === 0) {
       sendingRef.current = false
@@ -2498,18 +2511,7 @@ export default function AnnouncementsPage() {
 
     // Collect valid poll options (sent separately — bot adds as reactions)
     const finalBody = buildFullBody().trim()
-    const rawPollOptions = pollEnabled
-      ? pollOptions.filter(o => o.text.trim())
-      : []
-    // Deduplicate emojis before sending — keep first occurrence, skip duplicates
-    const validPollOptions: PollOption[] = []
-    const sentEmojis = new Set<string>()
-    for (const opt of rawPollOptions) {
-      if (!sentEmojis.has(opt.emoji)) {
-        sentEmojis.add(opt.emoji)
-        validPollOptions.push(opt)
-      }
-    }
+    const validPollOptions = uniquePollOptions(pollEnabled ? pollOptions : [])
 
     // Build targets from selected channel rows
     const targets: AnnouncementTarget[] = selectedRows.map(r => ({
@@ -2535,14 +2537,14 @@ export default function AnnouncementsPage() {
     // Add email targets (deduplicate by email address)
     const seenEmails = new Set<string>()
     for (const er of emailRecipientRows) {
-      if (!er.email) continue
-      const emailLower = er.email.toLowerCase()
+      if (!er.deliveryEmail) continue
+      const emailLower = er.deliveryEmail.toLowerCase()
       if (seenEmails.has(emailLower)) continue
       seenEmails.add(emailLower)
       targets.push({
         type: 'email' as const,
-        target_id: er.email,
-        label: `Email: ${er.display_name} <${er.email}>`,
+        target_id: er.deliveryEmail,
+        label: `Email: ${er.display_name} <${er.deliveryEmail}>`,
       })
     }
 
@@ -2646,22 +2648,13 @@ export default function AnnouncementsPage() {
         } else {
           // Fan out: create one schedule per (meeting x offset) at meeting.start - offset.
           const selectedMeetings = meetings.filter(m => selectedMeetingIds.has(m.id))
-          const nowMs = Date.now()
-          const minLeadMs = 60_000
-          type Plan = { meeting: MeetingOption; offset: ReminderOffset; scheduledAt: string }
-          const plans: Plan[] = []
-          const skipped: string[] = []
-          for (const m of selectedMeetings) {
-            const startMs = getMeetingStartMs(m)
-            for (const o of reminderOffsets) {
-              const sendMs = startMs - offsetToMs(o)
-              if (sendMs < nowMs + minLeadMs) {
-                skipped.push(`${m.calendar_title || m.title} - ${formatOffsetLabel(o)}`)
-                continue
-              }
-              plans.push({ meeting: m, offset: o, scheduledAt: new Date(sendMs).toISOString() })
-            }
-          }
+          const { plans, skipped } = buildReminderPlans({
+            meetings: selectedMeetings,
+            offsets: reminderOffsets,
+            startTime: getMeetingStartMs,
+            offsetTime: offsetToMs,
+            now: Date.now(),
+          })
 
           if (plans.length === 0) {
             setSendResult({ type: 'error', message: 'No reminder schedules to create - all (meeting, offset) combinations fall in the past. Add a future offset or unselect past meetings.' })
@@ -3124,6 +3117,18 @@ export default function AnnouncementsPage() {
     }
   }
 
+  // Background refresh of an expanded delivery log: keeps the current rows
+  // visible (no loading state) and keeps them on failure.
+  const refreshDeliveryLog = async (scheduleId: string) => {
+    try {
+      const res = await apiClient.get(`/api/announcements/schedules/${scheduleId}/log`)
+      const log: DeliveryLogEntry[] = res.data.log || []
+      setScheduleDeliveryLogs(prev => (scheduleId in prev ? { ...prev, [scheduleId]: log } : prev))
+    } catch (err) {
+      console.error('Failed to refresh delivery log:', err)
+    }
+  }
+
   // ─── Login Required ────────────────────────────────────────
 
   if (!isAuthenticated) {
@@ -3189,8 +3194,8 @@ export default function AnnouncementsPage() {
                 sticky top-0: stays visible while scrolling compose content.
                 z-10: below user-menu dropdown (z-20). */}
             {aiAvailable && (
-              <div className="sticky top-0 z-10 -mx-6 -mt-6 mb-6">
-                <div className="px-6 py-3 bg-purple-50/[0.92] dark:bg-purple-950/[0.88] border-b border-purple-300 dark:border-purple-700 backdrop-blur-sm flex items-start gap-3">
+              <div className="sticky top-0 z-10 -mx-6 -mt-6 mb-6 bg-card">
+                <div className="px-6 py-3 bg-feature-ai-subtle border-b border-feature-ai-muted backdrop-blur-xs flex items-start gap-3">
                 <button
                   type="button"
                   onClick={() => window.dispatchEvent(new CustomEvent('openAiPanel'))}
@@ -3200,27 +3205,25 @@ export default function AnnouncementsPage() {
                   <Sparkles className="w-3.5 h-3.5" />
                   AI Assistant
                 </button>
-                <div className="border border-purple-200 dark:border-purple-800 rounded-lg overflow-hidden flex-1 min-w-0">
-                  <div className="flex items-center gap-2 w-full px-3 py-2 text-xs font-medium text-purple-700 dark:text-purple-300 bg-purple-50 dark:bg-purple-950/40">
-                    <button
-                      type="button"
-                      onClick={() => setAiContextExpanded(prev => !prev)}
-                      className="flex items-center gap-2 flex-1 hover:bg-purple-100 dark:hover:bg-purple-950/60 rounded transition-colors py-0.5 -my-0.5 px-1 -mx-1"
-                    >
-                      {aiContextExpanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
-                      <Info className="w-3.5 h-3.5" />
-                      AI Context
-                      {aiContext && <span className="ml-auto text-[10px] text-purple-400">has context</span>}
-                    </button>
-                  </div>
+                <div className="border border-border rounded-lg overflow-hidden flex-1 min-w-0">
+                  <Disclosure
+                    size="compact"
+                    className="bg-feature-ai-subtle text-foreground"
+                    expanded={aiContextExpanded}
+                    onToggle={setAiContextExpanded}
+                    panelId="announcements-ai-context-panel"
+                    icon={<Info />}
+                    title="AI Context"
+                    trailing={aiContext ? <span className="text-[10px] font-normal text-muted-foreground">has context</span> : undefined}
+                  />
                   {aiContextExpanded && (
-                    <div className="px-3 py-2 bg-purple-50/50 dark:bg-purple-950/20">
+                    <div id="announcements-ai-context-panel" className="px-3 py-2 bg-card">
                       <textarea
                         value={aiContext}
                         onChange={(e) => setAiContext(e.target.value)}
                         placeholder="Provide background context for the AI (e.g. audience, tone, project details). The AI will also update this field with relevant context as you interact."
                         rows={3}
-                        className="w-full px-3 py-2 border border-purple-200 dark:border-purple-700 rounded-md text-sm bg-background text-foreground focus:ring-2 focus:ring-purple-400 outline-none resize-y placeholder:text-muted-foreground"
+                        className="w-full px-3 py-2 border border-border rounded-md text-sm bg-card text-foreground focus:ring-2 focus:ring-ring outline-hidden resize-y placeholder:text-muted-foreground"
                       />
                       <p className="text-[10px] text-muted-foreground mt-1">This context is sent with every AI prompt and can be updated by AI responses.</p>
                     </div>
@@ -3233,16 +3236,16 @@ export default function AnnouncementsPage() {
 
             {/* Check if Discord is connected */}
             {!integration?.bot_verified && (
-              <div className="flex items-start gap-3 p-4 rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800">
-                <AlertTriangle className="w-5 h-5 text-amber-500 mt-0.5 shrink-0" />
+              <div className="flex items-start gap-3 p-4 rounded-lg bg-warning-subtle border border-warning-muted">
+                <AlertTriangle className="w-5 h-5 text-warning mt-0.5 shrink-0" />
                 <div>
-                  <p className="text-sm font-medium text-amber-800 dark:text-amber-200">Discord not connected</p>
-                  <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
+                  <p className="text-sm font-medium text-warning">Discord not connected</p>
+                  <p className="text-xs text-warning mt-1">
                     Connect your Discord account in the Discord tab to enable announcement distribution.
                   </p>
                   <button
                     onClick={() => switchTab('discord')}
-                    className="mt-2 text-xs font-medium text-amber-700 dark:text-amber-300 underline hover:no-underline"
+                    className="mt-2 text-xs font-medium text-warning underline hover:no-underline"
                   >
                     Go to Discord setup →
                   </button>
@@ -3253,20 +3256,15 @@ export default function AnnouncementsPage() {
             {/* Load Template — expansion panel with single selection */}
             {templates.length > 0 && !sending && (
               <div className="border border-border rounded-lg overflow-hidden">
-                <button
-                  type="button"
-                  onClick={() => setTemplatePickerExpanded(!templatePickerExpanded)}
-                  className="w-full flex items-center justify-between px-3 py-2 text-sm font-medium hover:bg-muted/50 transition-colors"
-                >
-                  <span className="flex items-center gap-1.5">
-                    <Clipboard className="w-4 h-4" />
-                    Load Template
-                    <span className="text-xs font-normal text-muted-foreground">({templates.length})</span>
-                  </span>
-                  {templatePickerExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-                </button>
+                <Disclosure
+                  expanded={templatePickerExpanded}
+                  onToggle={setTemplatePickerExpanded}
+                  panelId="announcements-template-picker-panel"
+                  icon={<Clipboard />}
+                  title={<>Load Template <span className="text-xs font-normal text-muted-foreground">({templates.length})</span></>}
+                />
                 {templatePickerExpanded && (
-                  <div className="border-t border-border max-h-52 overflow-y-auto">
+                  <div id="announcements-template-picker-panel" className="border-t border-border max-h-52 overflow-y-auto">
                     {templates.map(t => (
                       <button
                         key={t.id}
@@ -3281,17 +3279,17 @@ export default function AnnouncementsPage() {
                         {((t.distribution_channel_ids?.length > 0) || (t.dm_recipient_ids?.length > 0) || (t.meeting_ids?.length > 0)) && (
                           <div className="flex items-center gap-1.5 mt-1">
                             {t.distribution_channel_ids?.length > 0 && (
-                              <span className="text-[10px] px-1 py-0.5 rounded bg-blue-500/10 text-blue-600 dark:text-blue-400">
+                              <span className="text-[10px] px-1 py-0.5 rounded bg-info-subtle text-primary">
                                 {t.distribution_channel_ids.length} ch
                               </span>
                             )}
                             {t.dm_recipient_ids?.length > 0 && (
-                              <span className="text-[10px] px-1 py-0.5 rounded bg-purple-500/10 text-purple-600 dark:text-purple-400">
+                              <span className="text-[10px] px-1 py-0.5 rounded bg-muted text-muted-foreground">
                                 {t.dm_recipient_ids.length} DM
                               </span>
                             )}
                             {t.meeting_ids?.length > 0 && (
-                              <span className="text-[10px] px-1 py-0.5 rounded bg-green-500/10 text-green-600 dark:text-green-400">
+                              <span className="text-[10px] px-1 py-0.5 rounded bg-success-subtle text-success">
                                 {t.meeting_ids.length} mtg
                               </span>
                             )}
@@ -3314,7 +3312,7 @@ export default function AnnouncementsPage() {
                 value={composeTitle}
                 onChange={e => setComposeTitle(e.target.value)}
                 placeholder="e.g., Weekly Raid Schedule Update"
-                className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+                className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
                 disabled={sending}
               />
             </div>
@@ -3375,7 +3373,7 @@ export default function AnnouncementsPage() {
                       <Link
                         to={`/calendar/${selectedCalendars[0].hash}`}
                         onClick={e => e.stopPropagation()}
-                        className="flex items-center gap-1 text-xs text-primary dark:text-sky-400 hover:underline dark:hover:text-sky-300 px-1.5 py-0.5 rounded hover:bg-primary/10 dark:hover:bg-sky-400/10 transition-colors"
+                        className="flex items-center gap-1 text-xs text-primary hover:underline px-1.5 py-0.5 rounded hover:bg-primary/10 transition-colors"
                         title={`Open ${selectedCalendars[0].title} in Calendar`}
                       >
                         <ExternalLink className="w-3 h-3" />
@@ -3388,7 +3386,7 @@ export default function AnnouncementsPage() {
                           <Link
                             key={cal.id}
                             to={`/calendar/${cal.hash}`}
-                            className="flex items-center gap-0.5 text-xs text-primary dark:text-sky-400 hover:underline dark:hover:text-sky-300 px-1.5 py-0.5 rounded hover:bg-primary/10 dark:hover:bg-sky-400/10 transition-colors max-w-[120px] truncate"
+                            className="flex items-center gap-0.5 text-xs text-primary hover:underline px-1.5 py-0.5 rounded hover:bg-primary/10 transition-colors max-w-[120px] truncate"
                             title={`Open ${cal.title} in Calendar`}
                           >
                             <ExternalLink className="w-3 h-3 shrink-0" />
@@ -3397,14 +3395,13 @@ export default function AnnouncementsPage() {
                         ))}
                       </span>
                     )}
-                    <button
+                    <IconButton
+                      size="micro"
                       onClick={(e) => { e.stopPropagation(); fetchMeetings() }}
                       disabled={loadingMeetings}
-                      className="p-1 rounded hover:bg-muted transition-colors disabled:opacity-50"
-                      title="Refresh"
-                    >
-                      <RefreshCw className={`w-3.5 h-3.5 ${loadingMeetings ? 'animate-spin' : ''}`} />
-                    </button>
+                      label="Refresh"
+                      icon={<RefreshCw className={loadingMeetings ? 'animate-spin' : ''} />}
+                    />
                     {meetingContextExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
                   </span>
                 </div>
@@ -3440,14 +3437,17 @@ export default function AnnouncementsPage() {
                           return bT - aT
                         })
                       })
+                      const groupHasSelectedContext = (group: typeof allGroups[0]) =>
+                        selectedCalendarIds.has(group.calendarId) ||
+                        pinnedCalendarIdsRef.current.has(group.calendarId) ||
+                        group.meetings.some(m => selectedMeetingIds.has(m.id) || pinnedMeetingIdsRef.current.has(m.id))
 
                       // Sort calendar groups: calendars with upcoming meetings first (by earliest upcoming),
                       // then calendars with only past meetings at the bottom (by most recent past meeting desc)
                       allGroups.sort((a, b) => {
-                        // Selected calendars (pinned at expand-time) float to top
-                        const aHasPinned = a.meetings.some(m => pinnedMeetingIdsRef.current.has(m.id))
-                        const bHasPinned = b.meetings.some(m => pinnedMeetingIdsRef.current.has(m.id))
-                        if (aHasPinned !== bHasPinned) return aHasPinned ? -1 : 1
+                        const aHasSelectedContext = groupHasSelectedContext(a)
+                        const bHasSelectedContext = groupHasSelectedContext(b)
+                        if (aHasSelectedContext !== bHasSelectedContext) return aHasSelectedContext ? -1 : 1
                         // Find earliest upcoming meeting per calendar
                         const aNextUpcoming = a.meetings.find(m => getMeetingTime(m) >= sortNow)
                         const bNextUpcoming = b.meetings.find(m => getMeetingTime(m) >= sortNow)
@@ -3474,7 +3474,7 @@ export default function AnnouncementsPage() {
                         for (const group of allGroups) {
                           // Find the most recent meeting time in this group
                           const latestTime = Math.max(...group.meetings.map(getMeetingTime))
-                          if (sortNow - latestTime > ARCHIVE_THRESHOLD) {
+                          if (!groupHasSelectedContext(group) && sortNow - latestTime > ARCHIVE_THRESHOLD) {
                             archivedGroups.push(group)
                           } else {
                             activeGroups.push(group)
@@ -3504,8 +3504,9 @@ export default function AnnouncementsPage() {
                               />
                               <CalendarDays className="w-3.5 h-3.5 text-muted-foreground" />
                               <span className="text-sm font-medium">{group.calendarTitle}</span>
-                              <button
-                                type="button"
+                              <Button
+                                emphasis="ghost"
+                                size="micro"
                                 onClick={e => {
                                   e.preventDefault()
                                   e.stopPropagation()
@@ -3516,13 +3517,12 @@ export default function AnnouncementsPage() {
                                     return next
                                   })
                                 }}
-                                className="flex items-center gap-0.5 text-xs text-muted-foreground hover:text-foreground rounded px-1 -mx-0.5 transition-colors"
                                 aria-label={meetingsCollapsed ? 'Expand meetings' : 'Collapse meetings'}
                                 aria-expanded={!meetingsCollapsed}
                               >
                                 <span>({group.meetings.length} meeting{group.meetings.length !== 1 ? 's' : ''})</span>
                                 {meetingsCollapsed ? <ChevronRight className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
-                              </button>
+                              </Button>
                               {calendarSelected && !someSelected && (
                                 <span className="text-[10px] px-1.5 py-0.5 rounded bg-primary/10 text-primary font-medium">Calendar only</span>
                               )}
@@ -3535,6 +3535,7 @@ export default function AnnouncementsPage() {
                                 const d = m.time_slots?.[0]
                                   ? new Date(m.time_slots[0] + ':00Z')
                                   : new Date(m.start_time)
+                                const hasValidDate = !isNaN(d.getTime())
                                 const isChecked = selectedMeetingIds.has(m.id)
                                 return (
                                   <label key={m.id} className={`flex items-start gap-2 py-1 px-1 -mx-1 rounded cursor-pointer transition-colors ${
@@ -3548,7 +3549,7 @@ export default function AnnouncementsPage() {
                                     />
                                     <div className="flex-1 min-w-0">
                                       <div className="text-xs text-muted-foreground">
-                                        {formatDateTimeDDMMYYYY(d)} · {m.duration_minutes} min
+                                        {hasValidDate ? formatDateTimeDDMMYYYY(d) : 'Unknown time'} · {m.duration_minutes} min
                                       </div>
                                     </div>
                                   </label>
@@ -3565,16 +3566,15 @@ export default function AnnouncementsPage() {
                           {activeGroups.map(renderCalendarGroup)}
                           {archivedGroups.length > 0 && (
                             <div className="border-t border-border pt-2 mt-2">
-                              <button
-                                type="button"
-                                onClick={() => setArchivedCalendarsExpanded(p => !p)}
-                                className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors w-full"
-                              >
-                                {archivedCalendarsExpanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
-                                <span>Show {archivedGroups.length} more where last meeting is more than 32 days ago</span>
-                              </button>
+                              <Disclosure
+                                size="compact"
+                                expanded={archivedCalendarsExpanded}
+                                onToggle={setArchivedCalendarsExpanded}
+                                panelId="announcements-archived-calendars-panel"
+                                title={`Show ${archivedGroups.length} more where last meeting is more than 32 days ago`}
+                              />
                               {archivedCalendarsExpanded && (
-                                <div className="mt-1.5 space-y-2">
+                                <div id="announcements-archived-calendars-panel" className="mt-1.5 space-y-2">
                                   {archivedGroups.map(renderCalendarGroup)}
                                 </div>
                               )}
@@ -3614,7 +3614,7 @@ export default function AnnouncementsPage() {
                                 <div className="flex items-center gap-1.5">
                                   <CalendarDays className="w-3.5 h-3.5 text-muted-foreground" />
                                   <span className="text-sm font-medium">{cal.title}</span>
-                                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-amber-500/10 text-amber-600 dark:text-amber-400 font-medium">Planning</span>
+                                  <span className="text-[10px] px-1.5 py-0.5 rounded bg-warning-subtle text-warning font-medium">Planning</span>
                                 </div>
                                 {participants.length > 0 && (
                                   <div className="text-xs text-muted-foreground mt-0.5">
@@ -3670,22 +3670,22 @@ export default function AnnouncementsPage() {
               const activeCount = visibleFields.filter(f => meetingContextFields[f.key]).length
               return (
               <div className="border border-border rounded-lg overflow-hidden">
-                <button
-                  type="button"
-                  onClick={() => setContextFieldsExpanded(!contextFieldsExpanded)}
-                  className="w-full flex items-center justify-between px-3 py-2 text-sm font-medium hover:bg-muted/50 transition-colors"
-                >
-                  <span className="flex items-center gap-1.5">
-                    <ListChecks className="w-4 h-4" />
-                    {hasMeetings ? 'Customize Meeting Context Fields' : 'Customize Calendar Context Fields'}
-                    <span className="ml-1 text-xs font-normal text-muted-foreground">
-                      ({activeCount}/{visibleFields.length})
-                    </span>
-                  </span>
-                  {contextFieldsExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-                </button>
+                <Disclosure
+                  expanded={contextFieldsExpanded}
+                  onToggle={setContextFieldsExpanded}
+                  panelId="announcements-context-fields-panel"
+                  icon={<ListChecks />}
+                  title={
+                    <>
+                      {hasMeetings ? 'Customize Meeting Context Fields' : 'Customize Calendar Context Fields'}
+                      <span className="ml-1 text-xs font-normal text-muted-foreground">
+                        ({activeCount}/{visibleFields.length})
+                      </span>
+                    </>
+                  }
+                />
                 {contextFieldsExpanded && (
-                  <div className="border-t border-border px-3 py-2 space-y-1">
+                  <div id="announcements-context-fields-panel" className="border-t border-border px-3 py-2 space-y-1">
                     <p className="text-xs text-muted-foreground mb-2">
                       {hasMeetings
                         ? 'Toggle which fields are included in the meeting context output.'
@@ -3720,17 +3720,17 @@ export default function AnnouncementsPage() {
               <div className="flex items-center justify-between mb-1">
                 <label className="text-sm font-medium">Message Body</label>
                 <div className="relative" ref={bodyEmojiPickerRef}>
-                  <button
-                    type="button"
+                  <IconButton
+                    emphasis={showBodyEmojiPicker ? 'outline' : 'ghost'}
+                    intent={showBodyEmojiPicker ? 'primary' : 'neutral'}
                     onClick={() => setShowBodyEmojiPicker(p => !p)}
                     disabled={sending}
-                    className={`p-1.5 rounded-lg transition-colors ${showBodyEmojiPicker ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:text-foreground hover:bg-muted'} disabled:opacity-50`}
-                    title="Insert emoji"
-                  >
-                    <Smile className="w-4 h-4" />
-                  </button>
+                    aria-expanded={showBodyEmojiPicker}
+                    label="Insert emoji"
+                    icon={<Smile />}
+                  />
                   {showBodyEmojiPicker && (
-                    <div className="absolute right-0 top-full mt-1 z-50">
+                    <div className={`absolute right-0 top-full mt-1 ${OVERLAY_LAYER_CLASS.popover}`}>
                       <EmojiPicker
                         onSelect={(emoji) => {
                           const ta = bodyRef.current
@@ -3763,7 +3763,7 @@ export default function AnnouncementsPage() {
                 onChange={e => setComposeBody(e.target.value)}
                 placeholder="Write your announcement message here..."
                 rows={bodyRows}
-                className={`w-full px-3 py-2 border rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none resize-y ${composeBody.length > 1800 ? 'border-red-500 dark:border-red-400' : 'border-input'}`}
+                className={`w-full px-3 py-2 border rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden resize-y ${composeBody.length > 1800 ? 'border-danger' : 'border-input'}`}
                 disabled={sending}
               />
               <div className="flex items-center justify-between mt-1">
@@ -3773,17 +3773,17 @@ export default function AnnouncementsPage() {
                 <div className="flex items-center gap-2">
                   <div className="w-20 h-1.5 rounded-full bg-muted overflow-hidden">
                     <div
-                      className={`h-full rounded-full transition-all ${composeBody.length > 1800 ? 'bg-red-500' : composeBody.length > 1500 ? 'bg-amber-500' : composeBody.length > 1200 ? 'bg-yellow-400' : 'bg-emerald-500'}`}
+                      className={`h-full rounded-full transition-all ${composeBody.length > 1800 ? 'bg-danger' : composeBody.length > 1500 ? 'bg-warning' : composeBody.length > 1200 ? 'bg-warning' : 'bg-success'}`}
                       style={{ width: `${Math.min(100, (composeBody.length / 1800) * 100)}%` }}
                     />
                   </div>
-                  <span className={`text-xs font-mono tabular-nums ${composeBody.length > 1800 ? 'text-red-500 dark:text-red-400 font-semibold' : composeBody.length > 1500 ? 'text-amber-500 dark:text-amber-400' : 'text-muted-foreground'}`}>
+                  <span className={`text-xs font-mono tabular-nums ${composeBody.length > 1800 ? 'text-danger font-semibold' : composeBody.length > 1500 ? 'text-warning' : 'text-muted-foreground'}`}>
                     {composeBody.length}/1800
                   </span>
                 </div>
               </div>
               {composeBody.length > 1800 && (
-                <p className="text-xs text-red-500 dark:text-red-400 mt-0.5">
+                <p className="text-xs text-danger mt-0.5">
                   {composeBody.length - 1800} character{composeBody.length - 1800 === 1 ? '' : 's'} over the limit -- message will be rejected
                 </p>
               )}
@@ -3794,23 +3794,17 @@ export default function AnnouncementsPage() {
             {/* Additional DM Body */}
             {(dmRows.length > 0 || composeDmBody) && (
               <div>
-                <button
-                  type="button"
-                  onClick={() => setDmBodyExpanded(p => !p)}
+                <Disclosure
+                  expanded={dmBodyExpanded}
+                  onToggle={setDmBodyExpanded}
                   disabled={sending}
-                  className="flex items-center gap-2 text-sm font-medium text-muted-foreground hover:text-foreground transition-colors disabled:opacity-50"
-                >
-                  {dmBodyExpanded ? <ChevronDown className="w-4 h-4" /> : <ChevronRight className="w-4 h-4" />}
-                  <Users className="w-4 h-4" />
-                  Additional Message for Direct Recipients
-                  {composeDmBody.trim() && (
-                    <span className="text-xs bg-primary/10 text-primary px-1.5 py-0.5 rounded-full font-normal">
-                      Active
-                    </span>
-                  )}
-                </button>
+                  panelId="announcements-dm-body-panel"
+                  icon={<Users />}
+                  title="Additional Message for Direct Recipients"
+                  trailing={composeDmBody.trim() ? <StatusBadge tone="active" density="compact">Active</StatusBadge> : undefined}
+                />
                 {dmBodyExpanded && (
-                  <div className="mt-2 pl-6">
+                  <div id="announcements-dm-body-panel" className="mt-2 pl-6">
                     <div className="relative">
                       <textarea
                         ref={dmBodyRef}
@@ -3818,21 +3812,22 @@ export default function AnnouncementsPage() {
                         onChange={e => setComposeDmBody(e.target.value)}
                         placeholder="Extra content appended only to direct messages -- leave empty to send the same body to everyone..."
                         rows={3}
-                        className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none resize-y"
+                        className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden resize-y"
                         disabled={sending}
                       />
                       <div className="absolute top-1.5 right-1.5">
-                        <button
-                          type="button"
+                        <IconButton
+                          size="micro"
+                          emphasis={showDmBodyEmojiPicker ? 'outline' : 'ghost'}
+                          intent={showDmBodyEmojiPicker ? 'primary' : 'neutral'}
                           onClick={() => setShowDmBodyEmojiPicker(p => !p)}
                           disabled={sending}
-                          className={`p-1 rounded transition-colors ${showDmBodyEmojiPicker ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:text-foreground hover:bg-muted/80'} disabled:opacity-50`}
-                          title="Insert emoji"
-                        >
-                          <Smile className="w-3.5 h-3.5" />
-                        </button>
+                          aria-expanded={showDmBodyEmojiPicker}
+                          label="Insert emoji"
+                          icon={<Smile />}
+                        />
                         {showDmBodyEmojiPicker && (
-                          <div className="absolute right-0 top-full mt-1 z-50">
+                          <div className={`absolute right-0 top-full mt-1 ${OVERLAY_LAYER_CLASS.popover}`}>
                             <EmojiPicker
                               onSelect={(emoji) => {
                                 const ta = dmBodyRef.current
@@ -3894,17 +3889,18 @@ export default function AnnouncementsPage() {
                     {pollOptions.map((option, idx) => (
                       <div key={idx} className="flex items-center gap-2">
                         <div className="relative" ref={emojiPickerIdx === idx ? emojiPickerRef : undefined}>
-                          <button
-                            type="button"
+                          <Button
+                            emphasis="outline"
                             onClick={() => setEmojiPickerIdx(prev => prev === idx ? null : idx)}
-                            className="w-12 h-10 text-center border border-input rounded-lg text-sm bg-background text-foreground hover:bg-muted focus:ring-2 focus:ring-ring outline-none cursor-pointer transition-colors disabled:opacity-50"
+                            className="w-12"
                             disabled={sending}
+                            aria-expanded={emojiPickerIdx === idx}
                             title="Click to pick an emoji"
                           >
                             {option.emoji || '🔵'}
-                          </button>
+                          </Button>
                           {emojiPickerIdx === idx && (
-                            <div className="absolute top-full left-0 mt-1 z-50 bg-popover border border-border rounded-lg shadow-lg p-2 w-[280px]">
+                            <div className={`absolute top-full left-0 mt-1 ${OVERLAY_LAYER_CLASS.popover} bg-popover border border-border rounded-lg shadow-lg p-2 w-[280px]`}>
                               <div className="grid grid-cols-8 gap-1">
                                 {EMOJI_PICKER_OPTIONS.map(em => (
                                   <button
@@ -3933,7 +3929,7 @@ export default function AnnouncementsPage() {
                                     setPollOptions(updated)
                                   }}
                                   placeholder="Custom emoji..."
-                                  className="w-full px-2 py-1 text-xs border border-input rounded bg-background text-foreground focus:ring-1 focus:ring-ring outline-none"
+                                  className="w-full px-2 py-1 text-xs border border-input rounded bg-background text-foreground focus:ring-1 focus:ring-ring outline-hidden"
                                 />
                               </div>
                             </div>
@@ -3948,35 +3944,36 @@ export default function AnnouncementsPage() {
                             setPollOptions(updated)
                           }}
                           placeholder={`Option ${idx + 1}`}
-                          className="flex-1 px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+                          className="flex-1 px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
                           disabled={sending}
                         />
                         {pollOptions.length > 2 && (
-                          <button
+                          <IconButton
+                            intent="danger"
                             onClick={() => setPollOptions(prev => prev.filter((_, i) => i !== idx))}
                             disabled={sending}
-                            className="p-2 text-muted-foreground hover:text-destructive transition-colors disabled:opacity-50"
-                            title="Remove option"
-                          >
-                            <Trash2 className="w-4 h-4" />
-                          </button>
+                            label="Remove option"
+                            icon={<Trash2 />}
+                          />
                         )}
                       </div>
                     ))}
                   </div>
 
                   {pollOptions.length < 10 && (
-                    <button
+                    <Button
+                      emphasis="ghost"
+                      intent="primary"
+                      size="micro"
                       onClick={() => {
                         const nextEmoji = DEFAULT_POLL_EMOJIS[pollOptions.length] || '🔵'
                         setPollOptions(prev => [...prev, { emoji: nextEmoji, text: '' }])
                       }}
                       disabled={sending}
-                      className="flex items-center gap-1.5 text-xs text-primary hover:underline disabled:opacity-50"
+                      icon={<Plus className="w-3.5 h-3.5" />}
                     >
-                      <Plus className="w-3.5 h-3.5" />
                       Add Option ({pollOptions.length}/10)
-                    </button>
+                    </Button>
                   )}
 
                   <p className="text-xs text-muted-foreground">
@@ -3991,17 +3988,15 @@ export default function AnnouncementsPage() {
               <div className="flex items-center gap-2 mb-2">
                 <label className="text-sm font-medium">Distribution Targets</label>
                 {distributionRows.length > 0 && (
-                  <button
-                    onClick={() => setDistSelectedOnly(prev => !prev)}
-                    className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold transition-all whitespace-nowrap shadow-sm ${
-                      distSelectedOnly
-                        ? 'border border-green-500 bg-green-500 text-white dark:bg-green-600 dark:border-green-600 hover:bg-green-600 dark:hover:bg-green-700'
-                        : 'border border-primary bg-primary/10 text-primary hover:bg-primary/20 dark:border-primary dark:text-primary dark:hover:bg-primary/20'
-                    }`}
+                  <ToggleButton
+                    size="micro"
+                    pressed={distSelectedOnly}
+                    onPressedChange={setDistSelectedOnly}
+                    className="whitespace-nowrap"
+                    icon={<Check className="w-3.5 h-3.5" />}
                   >
-                    <Check className={`w-3.5 h-3.5 ${distSelectedOnly ? 'text-white' : 'text-primary'}`} />
                     {distSelectedOnly ? 'Show All' : 'Hide Unselected'}
-                  </button>
+                  </ToggleButton>
                 )}
               </div>
 
@@ -4053,10 +4048,10 @@ export default function AnnouncementsPage() {
                     {distributionRows.filter(row => !distSelectedOnly || row.selected).map(row => {
                       const statusConfig = {
                         composing: { icon: Pencil, color: 'text-muted-foreground', bg: '' },
-                        scheduled: { icon: Clock, color: 'text-blue-500', bg: 'bg-blue-50/50 dark:bg-blue-950/30' },
-                        sending: { icon: Loader2, color: 'text-yellow-500', bg: 'bg-yellow-50/50 dark:bg-yellow-950/30' },
-                        sent: { icon: CheckCircle2, color: 'text-green-500', bg: 'bg-green-50/50 dark:bg-green-950/30' },
-                        failed: { icon: XCircle, color: 'text-red-500', bg: 'bg-red-50/50 dark:bg-red-950/30' },
+                        scheduled: { icon: Clock, color: 'text-info', bg: 'bg-info-subtle' },
+                        sending: { icon: Loader2, color: 'text-warning', bg: 'bg-warning-subtle' },
+                        sent: { icon: CheckCircle2, color: 'text-success', bg: 'bg-success-subtle' },
+                        failed: { icon: XCircle, color: 'text-danger', bg: 'bg-danger-subtle' },
                       }[row.status]
                       const StatusIcon = statusConfig.icon
 
@@ -4091,11 +4086,11 @@ export default function AnnouncementsPage() {
                             <span className="truncate text-xs">{row.channel_name}</span>
                             {(!row.bot_can_send || !row.user_can_send) && (
                               <span title={!row.bot_can_send && !row.user_can_send ? 'Neither you nor the bot can send here' : !row.bot_can_send ? 'Bot lacks permission' : 'You lack permission'}>
-                                <ShieldAlert className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                                <ShieldAlert className="w-3.5 h-3.5 text-warning shrink-0" />
                               </span>
                             )}
                             {row.bot_can_send && row.user_can_send && row.status === 'composing' && (
-                              <span title="Both you and the bot can send here"><ShieldCheck className="w-3 h-3 text-green-500 shrink-0" /></span>
+                              <span title="Both you and the bot can send here"><ShieldCheck className="w-3 h-3 text-success shrink-0" /></span>
                             )}
                           </div>
                           {/* Status */}
@@ -4105,7 +4100,7 @@ export default function AnnouncementsPage() {
                           </div>
                           {/* Details */}
                           <div className="min-w-0">
-                            <span className={`text-xs truncate block ${row.status === 'failed' ? 'text-red-500' : 'text-muted-foreground'}`} title={row.status_msg}>
+                            <span className={`text-xs truncate block ${row.status === 'failed' ? 'text-danger' : 'text-muted-foreground'}`} title={row.status_msg}>
                               {row.status_msg}
                             </span>
                           </div>
@@ -4117,7 +4112,7 @@ export default function AnnouncementsPage() {
                   <div className="px-3 py-2 bg-muted/30 border-t border-border flex items-center justify-between text-xs text-muted-foreground">
                     <span>
                       {distributionRows.some(r => !r.bot_can_send || !r.user_can_send) && (
-                        <span className="text-amber-500">
+                        <span className="text-warning">
                           {distributionRows.filter(r => !r.bot_can_send || !r.user_can_send).length} without full permission
                         </span>
                       )}
@@ -4153,23 +4148,17 @@ export default function AnnouncementsPage() {
 
               return (
                 <div className="border border-border rounded-lg overflow-hidden">
-                  <button
-                    type="button"
-                    onClick={() => setParticipantPanelExpanded(p => !p)}
-                    className="w-full flex items-center justify-between px-3 py-2 text-xs font-medium text-muted-foreground hover:bg-muted/50 transition-colors"
-                  >
-                    <span className="flex items-center gap-1.5">
-                      <Tags className="w-3.5 h-3.5" />
-                      Meeting Participants
-                      <span className="bg-muted text-foreground px-1.5 py-0.5 rounded-full text-[10px]">{participantNames.length}</span>
-                    </span>
-                    <span className="flex items-center gap-2">
-                      <span className="text-[10px] text-muted-foreground/70">Expand for details</span>
-                      {participantPanelExpanded ? <ChevronDown className="w-3.5 h-3.5" /> : <ChevronRight className="w-3.5 h-3.5" />}
-                    </span>
-                  </button>
+                  <Disclosure
+                    size="compact"
+                    expanded={participantPanelExpanded}
+                    onToggle={setParticipantPanelExpanded}
+                    panelId="announcements-participants-panel"
+                    icon={<Tags />}
+                    title={<>Meeting Participants <CountBadge count={participantNames.length} label="participants" className="ml-1" /></>}
+                    trailing={<span className="text-[10px] font-normal text-muted-foreground/70">Expand for details</span>}
+                  />
                   {participantPanelExpanded && (
-                    <div className="border-t border-border px-3 py-2.5 bg-muted/20 space-y-2">
+                    <div id="announcements-participants-panel" className="border-t border-border px-3 py-2.5 bg-muted/20 space-y-2">
                       <div className="flex flex-wrap gap-1.5">
                         {participantNames.map(name => (
                           <span
@@ -4183,23 +4172,27 @@ export default function AnnouncementsPage() {
                         ))}
                       </div>
                       <div className="flex items-center gap-3 pt-1">
-                        <button
+                        <Button
+                          emphasis="ghost"
+                          intent="primary"
+                          size="micro"
                           onClick={copyAll}
-                          className="flex items-center gap-1.5 text-xs text-primary hover:underline"
                           title="Copy all names as comma-separated list"
                         >
                           {participantsCopied
-                            ? <><ClipboardCheck className="w-3.5 h-3.5 text-green-500" /><span className="text-green-500">Copied!</span></>
+                            ? <><ClipboardCheck className="w-3.5 h-3.5 text-success" /><span className="text-success">Copied!</span></>
                             : <><Clipboard className="w-3.5 h-3.5" />Copy all names</>}
-                        </button>
-                        <button
+                        </Button>
+                        <Button
+                          emphasis="ghost"
+                          intent="primary"
+                          size="micro"
                           onClick={() => findAndSelectMembers(participantNames.join(', '))}
-                          className="flex items-center gap-1.5 text-xs text-primary hover:underline"
                           title="Find matching Discord members and select them for DMs"
+                          icon={<Search className="w-3.5 h-3.5" />}
                         >
-                          <Search className="w-3.5 h-3.5" />
                           Find &amp; Select in DMs
-                        </button>
+                        </Button>
                       </div>
                     </div>
                   )}
@@ -4214,29 +4207,27 @@ export default function AnnouncementsPage() {
                   <div className="flex items-center gap-2">
                     <label className="text-sm font-medium">Direct Message Recipients</label>
                     {dmRows.length > 0 && (
-                      <button
-                        onClick={() => setDmSelectedOnly(prev => {
+                      <ToggleButton
+                        size="micro"
+                        pressed={dmSelectedOnly}
+                        onPressedChange={() => setDmSelectedOnly(prev => {
                           if (!prev) setDmSearchQuery('')
                           return !prev
                         })}
-                        className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold transition-all whitespace-nowrap shadow-sm ${
-                          dmSelectedOnly
-                            ? 'border border-green-500 bg-green-500 text-white dark:bg-green-600 dark:border-green-600 hover:bg-green-600 dark:hover:bg-green-700'
-                            : 'border border-primary bg-primary/10 text-primary hover:bg-primary/20 dark:border-primary dark:text-primary dark:hover:bg-primary/20'
-                        }`}
+                        className="whitespace-nowrap"
+                        icon={<Check className="w-3.5 h-3.5" />}
                       >
-                        <Check className={`w-3.5 h-3.5 ${dmSelectedOnly ? 'text-white' : 'text-primary'}`} />
                         {dmSelectedOnly ? 'Show All' : 'Hide Unselected'}
-                      </button>
+                      </ToggleButton>
                     )}
                     <div className="relative">
-                      <button
+                      <IconButton
+                        size="micro"
                         onClick={() => setShowDmTooltip(!showDmTooltip)}
-                        className="text-muted-foreground hover:text-foreground transition-colors"
-                        title="About DM recipients"
-                      >
-                        <Info className="w-3.5 h-3.5" />
-                      </button>
+                        aria-expanded={showDmTooltip}
+                        label="About DM recipients"
+                        icon={<Info />}
+                      />
                       {showDmTooltip && (
                         <div className="absolute left-0 top-6 z-10 w-80 p-3 rounded-lg border border-border bg-popover text-popover-foreground shadow-lg text-xs space-y-1.5">
                           <p>The bot can send DMs to users who share a server where the bot is present.</p>
@@ -4254,31 +4245,33 @@ export default function AnnouncementsPage() {
                               (~{Math.max(1, estimateDmMinutes(dmRows.filter(r => r.selected && !r.opted_out).length))} min estimated)
                             </p>
                           )}
-                          <button onClick={() => setShowDmTooltip(false)} className="text-primary hover:underline mt-1">Dismiss</button>
+                          <Button emphasis="ghost" intent="primary" size="micro" onClick={() => setShowDmTooltip(false)} className="mt-1">Dismiss</Button>
                         </div>
                       )}
                     </div>
                   </div>
-                  <button
+                  <Button
+                    emphasis="ghost"
+                    intent="primary"
+                    size="micro"
                     onClick={fetchDmMembers}
-                    disabled={loadingDmMembers}
-                    className="flex items-center gap-1.5 text-xs text-primary hover:underline disabled:opacity-50"
+                    loading={loadingDmMembers}
+                    icon={<RefreshCw className="w-3 h-3" />}
                   >
-                    {loadingDmMembers ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
                     {dmMembers.length > 0 ? 'Refresh' : 'Load Members'}
-                  </button>
+                  </Button>
                 </div>
 
                 {/* Scan status indicator */}
                 {dmScanInfo.message && (
                   <div className={`flex items-center gap-2 px-3 py-2 mb-2 rounded-lg border text-xs ${
                     dmScanInfo.type === 'checking_subscriptions'
-                      ? 'border-blue-200 dark:border-blue-800 bg-blue-50 dark:bg-blue-950/40 text-blue-700 dark:text-blue-300'
+                      ? 'border-info-muted bg-info-subtle text-info'
                       : dmScanInfo.type === 'loading_members'
-                      ? 'border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300'
+                      ? 'border-warning-muted bg-warning-subtle text-warning'
                       : dmScanInfo.message.startsWith('No invite')
-                      ? 'border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950/40 text-amber-700 dark:text-amber-300'
-                      : 'border-emerald-200 dark:border-emerald-800 bg-emerald-50 dark:bg-emerald-950/40 text-emerald-700 dark:text-emerald-300'
+                      ? 'border-warning-muted bg-warning-subtle text-warning'
+                      : 'border-success-muted bg-success-subtle text-success'
                   }`}>
                     {dmScanInfo.type === 'checking_subscriptions' && <Loader2 className="w-3.5 h-3.5 animate-spin shrink-0" />}
                     {dmScanInfo.type === 'loading_members' && <Users className="w-3.5 h-3.5 shrink-0" />}
@@ -4287,7 +4280,10 @@ export default function AnnouncementsPage() {
                     {dmScanInfo.type === 'idle' && dmScanInfo.message.startsWith('Failed') && <XCircle className="w-3.5 h-3.5 shrink-0" />}
                     <span>{dmScanInfo.message}</span>
                     {dmScanInfo.debug && (
-                      <button
+                      <Button
+                        emphasis="ghost"
+                        size="micro"
+                        className="ml-auto shrink-0"
                         onClick={() => {
                           console.log('[DM Scan Debug]', dmScanInfo.debug)
                           const d = dmScanInfo.debug as Record<string, unknown>
@@ -4302,19 +4298,18 @@ export default function AnnouncementsPage() {
                           console.log('[DM Scan Debug] Unmatched rows (Ready):', dmRows.filter(r => r.status_msg === 'Ready to receive message').slice(0, 5).map(r => ({ user_id: r.user_id, display_name: r.display_name })))
                           showToast(`Schedules: ${src?.deliveryLog?.schedules ?? 0}, Delivery rows: ${src?.deliveryLog?.rows ?? 0}, Invites: ${src?.invites?.rows ?? 0}, Opt-outs: ${src?.optOuts?.count ?? 0} | Matched ${d.uniqueRecipients ?? 0} of ${dmRows.length} members. Sample IDs logged to console.`, 'info')
                         }}
-                        className="ml-auto text-[10px] underline opacity-70 hover:opacity-100 shrink-0"
                       >
                         Debug
-                      </button>
+                      </Button>
                     )}
                   </div>
                 )}
 
                 {dmCancelled ? (
-                  <div className="border border-green-200 dark:border-green-800 rounded-lg p-4 bg-green-50 dark:bg-green-950/40 text-center space-y-1">
-                    <CheckCircle2 className="w-5 h-5 mx-auto text-green-600 dark:text-green-400 mb-1" />
-                    <p className="text-sm font-medium text-green-700 dark:text-green-300">Not using Direct Messages in this compose message</p>
-                    <p className="text-xs text-green-600 dark:text-green-400">Refresh the page or click "Load Members" above to re-enable DM features.</p>
+                  <div className="border border-success-muted rounded-lg p-4 bg-success-subtle text-center space-y-1">
+                    <CheckCircle2 className="w-5 h-5 mx-auto text-success mb-1" />
+                    <p className="text-sm font-medium text-success">Not using Direct Messages in this compose message</p>
+                    <p className="text-xs text-success">Refresh the page or click "Load Members" above to re-enable DM features.</p>
                   </div>
                 ) : dmMembers.length === 0 && !loadingDmMembers ? (
                   <div className="border border-border rounded-lg p-4 text-center">
@@ -4338,13 +4333,9 @@ export default function AnnouncementsPage() {
                           <span className="text-xs text-muted-foreground">Connecting to bot...</span>
                         )}
                       </div>
-                      <button
-                        onClick={cancelDmLoading}
-                        className="flex items-center gap-1 px-2 py-1 rounded text-xs font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors"
-                      >
-                        <X className="w-3 h-3" />
+                      <Button emphasis="ghost" intent="danger" size="micro" onClick={cancelDmLoading} icon={<X className="w-3 h-3" />}>
                         Cancel
-                      </button>
+                      </Button>
                     </div>
                     {dmProgress && dmProgress.total > 0 && (
                       <>
@@ -4376,10 +4367,10 @@ export default function AnnouncementsPage() {
                       return (
                         <div className={`px-3 py-2 flex items-start gap-2 text-xs border-b ${
                           level === 'block'
-                            ? 'bg-red-100 dark:bg-red-950/40 border-red-300 dark:border-red-800 text-red-800 dark:text-red-300'
+                            ? 'bg-danger-subtle border-danger-muted text-danger'
                             : level === 'danger'
-                            ? 'bg-orange-100 dark:bg-orange-950/40 border-orange-300 dark:border-orange-800 text-orange-800 dark:text-orange-300'
-                            : 'bg-amber-50 dark:bg-amber-950/30 border-amber-200 dark:border-amber-800 text-amber-800 dark:text-amber-300'
+                            ? 'bg-warning-subtle border-warning text-warning'
+                            : 'bg-warning-subtle border-warning-muted text-warning'
                         }`}>
                           <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
                           <div className="flex-1 space-y-1">
@@ -4409,30 +4400,26 @@ export default function AnnouncementsPage() {
                     })()}
                     {/* ── Phase 2 Loading Bar (shown while full member list loads in background) ── */}
                     {dmLoadPhase === 'phase2' && !dmSelectedOnly && (
-                      <div className="px-3 py-2 border-b border-border bg-blue-50 dark:bg-blue-950/30 space-y-2">
+                      <div className="px-3 py-2 border-b border-border bg-info-subtle space-y-2">
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-2">
-                            <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-600 dark:text-blue-400 shrink-0" />
+                            <Loader2 className="w-3.5 h-3.5 animate-spin text-primary shrink-0" />
                             {dmProgress ? (
-                              <span className="text-xs text-blue-700 dark:text-blue-300">
+                              <span className="text-xs text-info">
                                 Loading all members -- {dmPhase2MemberCount.toLocaleString()} found, scanning {dmProgress.checked.toLocaleString()} of ~{dmProgress.total.toLocaleString()}
                               </span>
                             ) : (
-                              <span className="text-xs text-blue-700 dark:text-blue-300">Loading all server members...</span>
+                              <span className="text-xs text-info">Loading all server members...</span>
                             )}
                           </div>
-                          <button
-                            onClick={cancelDmLoading}
-                            className="flex items-center gap-1 px-2 py-1 rounded text-xs font-medium text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950/30 transition-colors"
-                          >
-                            <X className="w-3 h-3" />
+                          <Button emphasis="ghost" intent="danger" size="micro" onClick={cancelDmLoading} icon={<X className="w-3 h-3" />}>
                             Cancel
-                          </button>
+                          </Button>
                         </div>
                         {dmProgress && dmProgress.total > 0 && (
-                          <div className="w-full h-1.5 bg-blue-100 dark:bg-blue-900/40 rounded-full overflow-hidden">
+                          <div className="w-full h-1.5 bg-info-subtle rounded-full overflow-hidden">
                             <div
-                              className="h-full bg-blue-500 dark:bg-blue-400 rounded-full transition-all duration-300"
+                              className="h-full bg-info rounded-full transition-all duration-300"
                               style={{ width: `${Math.min(100, (dmProgress.checked / dmProgress.total) * 100)}%` }}
                             />
                           </div>
@@ -4453,15 +4440,17 @@ export default function AnnouncementsPage() {
                               onChange={e => setDmSearchQuery(e.target.value)}
                               placeholder={dmLoadPhase === 'phase2' ? 'Search available after full load...' : 'Search by name, username, server, role...'}
                               disabled={dmLoadPhase === 'phase2'}
-                              className="w-full pl-8 pr-3 py-1.5 border border-input rounded text-xs bg-background text-foreground focus:ring-1 focus:ring-ring outline-none disabled:opacity-50 disabled:cursor-not-allowed"
+                              className="w-full pl-8 pr-3 py-1.5 border border-input rounded text-xs bg-background text-foreground focus:ring-1 focus:ring-ring outline-hidden disabled:opacity-50 disabled:cursor-not-allowed"
                             />
                           </div>
                         ) : (
                           <span className="text-xs font-medium text-muted-foreground">Advanced Filters</span>
                         )}
                         {/* Advanced filters toggle */}
-                        <button
-                          onClick={() => {
+                        <ToggleButton
+                          size="compact"
+                          pressed={dmAdvancedFilters}
+                          onPressedChange={() => {
                             setDmAdvancedFilters(prev => !prev)
                             // Clear advanced-only filters when collapsing
                             if (dmAdvancedFilters) {
@@ -4475,16 +4464,12 @@ export default function AnnouncementsPage() {
                             }
                           }}
                           disabled={dmLoadPhase === 'phase2'}
-                          className={`flex items-center gap-1.5 px-2.5 py-1.5 border rounded text-xs transition-colors whitespace-nowrap disabled:opacity-50 disabled:cursor-not-allowed ${
-                            dmAdvancedFilters
-                              ? 'border-primary bg-primary/10 text-primary'
-                              : 'border-input bg-background text-foreground hover:bg-accent/50'
-                          }`}
+                          className="whitespace-nowrap"
                           title={dmLoadPhase === 'phase2' ? 'Available after full load completes' : 'Toggle advanced filters'}
+                          icon={<SlidersHorizontal className="w-3 h-3" />}
                         >
-                          <SlidersHorizontal className="w-3 h-3" />
                           {dmAdvancedFilters ? 'Simple' : 'Advanced'}
-                        </button>
+                        </ToggleButton>
                       </div>
 
                       {/* ── Advanced Filter Panels ── */}
@@ -4500,7 +4485,7 @@ export default function AnnouncementsPage() {
                                 value={dmUserFilter}
                                 onChange={e => setDmUserFilter(e.target.value)}
                                 placeholder="Filter by display name or username..."
-                                className="w-full pl-8 pr-3 py-1.5 border border-input rounded text-xs bg-background text-foreground focus:ring-1 focus:ring-ring outline-none"
+                                className="w-full pl-8 pr-3 py-1.5 border border-input rounded text-xs bg-background text-foreground focus:ring-1 focus:ring-ring outline-hidden"
                               />
                             </div>
                           </div>
@@ -4521,23 +4506,20 @@ export default function AnnouncementsPage() {
                                       const active = dmServerFilter.includes(server)
                                       const count = contextRowsForServer.filter(r => r.guild_names.includes(server)).length
                                       return (
-                                        <button
+                                        <ToggleButton
                                           key={server}
-                                          onClick={() => setDmServerFilter(prev => active ? prev.filter(s => s !== server) : [...prev, server])}
-                                          className={`inline-flex items-center gap-1 px-2 py-1 rounded-full text-[11px] font-medium border transition-colors ${
-                                            active
-                                              ? 'border-primary bg-primary/15 text-primary'
-                                              : 'border-border bg-background text-muted-foreground hover:bg-accent/50 hover:text-foreground'
-                                          }`}
+                                          size="micro"
+                                          pressed={active}
+                                          onPressedChange={() => setDmServerFilter(prev => active ? prev.filter(s => s !== server) : [...prev, server])}
+                                          icon={<Server className="w-3 h-3" />}
                                         >
-                                          <Server className="w-3 h-3" />
                                           <span className="truncate max-w-[140px]">{server}</span>
                                           <span className="text-[9px] opacity-70">({count})</span>
-                                        </button>
+                                        </ToggleButton>
                                       )
                                     })}
                                     {dmServerFilter.length > 0 && (
-                                      <button onClick={() => setDmServerFilter([])} className="text-[10px] text-primary hover:underline self-center ml-1">Clear</button>
+                                      <Button emphasis="ghost" intent="primary" size="micro" onClick={() => setDmServerFilter([])} className="self-center ml-1">Clear</Button>
                                     )}
                                   </div>
                                 )
@@ -4552,7 +4534,7 @@ export default function AnnouncementsPage() {
                                       value={dmServerSearch}
                                       onChange={e => setDmServerSearch(e.target.value)}
                                       placeholder={`Search ${uniqueServers.length} servers...`}
-                                      className="w-full pl-8 pr-3 py-1.5 border border-input rounded text-xs bg-background text-foreground focus:ring-1 focus:ring-ring outline-none"
+                                      className="w-full pl-8 pr-3 py-1.5 border border-input rounded text-xs bg-background text-foreground focus:ring-1 focus:ring-ring outline-hidden"
                                     />
                                   </div>
                                   <div className="flex flex-wrap gap-1 max-h-24 overflow-y-auto">
@@ -4562,25 +4544,22 @@ export default function AnnouncementsPage() {
                                         const active = dmServerFilter.includes(server)
                                         const count = contextRowsForServer.filter(r => r.guild_names.includes(server)).length
                                         return (
-                                          <button
+                                          <ToggleButton
                                             key={server}
-                                            onClick={() => setDmServerFilter(prev => active ? prev.filter(s => s !== server) : [...prev, server])}
-                                            className={`inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium border transition-colors ${
-                                              active
-                                                ? 'border-primary bg-primary/15 text-primary'
-                                                : 'border-border bg-background text-muted-foreground hover:bg-accent/50'
-                                            }`}
+                                            size="micro"
+                                            pressed={active}
+                                            onPressedChange={() => setDmServerFilter(prev => active ? prev.filter(s => s !== server) : [...prev, server])}
                                           >
                                             {server}
                                             <span className="opacity-60">({count})</span>
-                                          </button>
+                                          </ToggleButton>
                                         )
                                       })}
                                   </div>
                                   {dmServerFilter.length > 0 && (
                                     <div className="flex items-center gap-1">
                                       <span className="text-[10px] text-muted-foreground">{dmServerFilter.length} server(s) selected</span>
-                                      <button onClick={() => setDmServerFilter([])} className="text-[10px] text-primary hover:underline">Clear</button>
+                                      <Button emphasis="ghost" intent="primary" size="micro" onClick={() => setDmServerFilter([])}>Clear</Button>
                                     </div>
                                   )}
                                 </div>
@@ -4602,9 +4581,9 @@ export default function AnnouncementsPage() {
                                 sent: 'Sent', failed: 'Failed',
                               }
                               const statusColors: Record<string, string> = {
-                                opted_in: 'text-emerald-500', opted_out: 'text-red-500',
-                                composing: 'text-muted-foreground', scheduled: 'text-blue-500',
-                                sending: 'text-yellow-500', sent: 'text-green-500', failed: 'text-red-500',
+                                opted_in: 'text-success', opted_out: 'text-danger',
+                                composing: 'text-muted-foreground', scheduled: 'text-info',
+                                sending: 'text-warning', sent: 'text-success', failed: 'text-danger',
                               }
                               return (
                                 <div className="flex flex-wrap gap-1">
@@ -4613,26 +4592,21 @@ export default function AnnouncementsPage() {
                                     const count = contextRows.filter(r => dmEffectiveStatus(r) === status).length
                                     const isEmpty = count === 0
                                     return (
-                                      <button
+                                      <ToggleButton
                                         key={status}
-                                        onClick={() => !isEmpty && setDmStatusFilter(prev => active ? prev.filter(s => s !== status) : [...prev, status])}
+                                        size="micro"
+                                        pressed={active}
+                                        onPressedChange={() => !isEmpty && setDmStatusFilter(prev => active ? prev.filter(s => s !== status) : [...prev, status])}
                                         disabled={isEmpty}
-                                        className={`inline-flex items-center gap-1 px-2 py-1 rounded-full text-[11px] font-medium border transition-colors ${
-                                          active
-                                            ? 'border-primary bg-primary/15 text-primary'
-                                            : isEmpty
-                                            ? 'border-border bg-background text-muted-foreground/30 cursor-not-allowed'
-                                            : 'border-border bg-background text-muted-foreground hover:bg-accent/50 hover:text-foreground'
-                                        }`}
                                       >
                                         <span className={`w-1.5 h-1.5 rounded-full ${isEmpty ? 'opacity-30' : ''} ${statusColors[status] || 'text-muted-foreground'}`} style={{ backgroundColor: 'currentColor' }} />
                                         {statusLabels[status] || status}
                                         <span className="text-[9px] opacity-70">({count})</span>
-                                      </button>
+                                      </ToggleButton>
                                     )
                                   })}
                                   {dmStatusFilter.length > 0 && (
-                                    <button onClick={() => setDmStatusFilter([])} className="text-[10px] text-primary hover:underline self-center ml-1">Clear</button>
+                                    <Button emphasis="ghost" intent="primary" size="micro" onClick={() => setDmStatusFilter([])} className="self-center ml-1">Clear</Button>
                                   )}
                                 </div>
                               )
@@ -4652,11 +4626,11 @@ export default function AnnouncementsPage() {
                                 ready: 'Ready to receive message',
                               }
                               const detailsColors: Record<string, string> = {
-                                blocked_you: 'text-red-500',
-                                blocked_bot: 'text-purple-500',
-                                subscribed: 'text-emerald-500',
-                                did_not_respond: 'text-amber-500',
-                                opted_out_calendar: 'text-orange-500',
+                                blocked_you: 'text-danger',
+                                blocked_bot: 'text-neutral',
+                                subscribed: 'text-success',
+                                did_not_respond: 'text-warning',
+                                opted_out_calendar: 'text-neutral',
                                 ready: 'text-muted-foreground',
                               }
                               // Count only within rows that pass all OTHER active filters (server, role, search)
@@ -4670,26 +4644,21 @@ export default function AnnouncementsPage() {
                                     const count = contextRows.filter(r => dmEffectiveDetails(r) === detail).length
                                     const isEmpty = count === 0
                                     return (
-                                      <button
+                                      <ToggleButton
                                         key={detail}
-                                        onClick={() => !isEmpty && setDmDetailsFilter(prev => active ? prev.filter(d => d !== detail) : [...prev, detail])}
+                                        size="micro"
+                                        pressed={active}
+                                        onPressedChange={() => !isEmpty && setDmDetailsFilter(prev => active ? prev.filter(d => d !== detail) : [...prev, detail])}
                                         disabled={isEmpty}
-                                        className={`inline-flex items-center gap-1 px-2 py-1 rounded-full text-[11px] font-medium border transition-colors ${
-                                          active
-                                            ? 'border-primary bg-primary/15 text-primary'
-                                            : isEmpty
-                                            ? 'border-border bg-background text-muted-foreground/30 cursor-not-allowed'
-                                            : 'border-border bg-background text-muted-foreground hover:bg-accent/50 hover:text-foreground'
-                                        }`}
                                       >
                                         <span className={`w-1.5 h-1.5 rounded-full ${isEmpty ? 'opacity-30' : ''} ${detailsColors[detail] || 'text-muted-foreground'}`} style={{ backgroundColor: 'currentColor' }} />
                                         {detailsLabels[detail] || detail}
                                         <span className="text-[9px] opacity-70">({count})</span>
-                                      </button>
+                                      </ToggleButton>
                                     )
                                   })}
                                   {dmDetailsFilter.length > 0 && (
-                                    <button onClick={() => setDmDetailsFilter([])} className="text-[10px] text-primary hover:underline self-center ml-1">Clear</button>
+                                    <Button emphasis="ghost" intent="primary" size="micro" onClick={() => setDmDetailsFilter([])} className="self-center ml-1">Clear</Button>
                                   )}
                                 </div>
                               )
@@ -4759,39 +4728,35 @@ export default function AnnouncementsPage() {
                                       const roleColor = role.color ? `#${role.color.toString(16).padStart(6, '0')}` : '#99aab5'
                                       const memberCount = getMemberCount(role.id)
                                       return (
-                                        <button
+                                        <ToggleButton
                                           key={role.id}
-                                          onClick={() => setDmRoleFilter(prev => active ? prev.filter(id => id !== role.id) : [...prev, role.id])}
-                                          className={`inline-flex items-center gap-1 px-2 py-1 rounded-full text-[11px] font-medium border transition-colors ${
-                                            active
-                                              ? 'border-primary bg-primary/15 text-primary'
-                                              : 'border-border bg-background text-muted-foreground hover:bg-accent/50 hover:text-foreground'
-                                          }`}
+                                          size="micro"
+                                          pressed={active}
+                                          onPressedChange={() => setDmRoleFilter(prev => active ? prev.filter(id => id !== role.id) : [...prev, role.id])}
                                         >
                                           <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: roleColor }} />
                                           {role.name}
                                           <span className="text-[9px] opacity-70">({memberCount})</span>
-                                        </button>
+                                        </ToggleButton>
                                       )
                                     })}
                                     {dmRoleFilter.length > 0 && (
-                                      <button onClick={() => setDmRoleFilter([])} className="text-[10px] text-primary hover:underline self-center ml-1">Clear</button>
+                                      <Button emphasis="ghost" intent="primary" size="micro" onClick={() => setDmRoleFilter([])} className="self-center ml-1">Clear</Button>
                                     )}
                                   </div>
                                 ) : (
                                   /* Dropdown mode for many roles */
                                   <div className="relative">
-                                    <button
+                                    <Button
+                                      emphasis="outline"
+                                      intent={dmRoleFilter.length > 0 ? 'primary' : 'neutral'}
+                                      size="compact"
                                       onClick={() => setShowRoleDropdown(!showRoleDropdown)}
-                                      className={`flex items-center gap-1.5 px-2.5 py-1.5 border rounded text-xs transition-colors ${
-                                        dmRoleFilter.length > 0
-                                          ? 'border-primary bg-primary/10 text-primary'
-                                          : 'border-input bg-background text-foreground hover:bg-accent/50'
-                                      }`}
+                                      aria-expanded={showRoleDropdown}
+                                      icon={<Filter className="w-3 h-3" />}
                                     >
-                                      <Filter className="w-3 h-3" />
                                       {dmRoleFilter.length > 0 ? `${dmRoleFilter.length} role(s) selected` : `Select from ${allRoles.length} roles`}
-                                    </button>
+                                    </Button>
                                     {showRoleDropdown && (
                                       <div className="absolute left-0 top-full mt-1 z-20 w-72 max-h-80 rounded-lg border border-border bg-popover shadow-lg flex flex-col">
                                         <div className="p-2 border-b border-border flex items-center justify-between shrink-0">
@@ -4801,9 +4766,9 @@ export default function AnnouncementsPage() {
                                           </span>
                                           <div className="flex gap-2">
                                             {dmRoleFilter.length > 0 && (
-                                              <button onClick={() => setDmRoleFilter([])} className="text-xs text-primary hover:underline">Clear</button>
+                                              <Button emphasis="ghost" intent="primary" size="micro" onClick={() => setDmRoleFilter([])}>Clear</Button>
                                             )}
-                                            <button onClick={() => { setShowRoleDropdown(false); setRoleSearchQuery('') }} className="text-xs text-muted-foreground hover:text-foreground">Done</button>
+                                            <Button emphasis="ghost" size="micro" onClick={() => { setShowRoleDropdown(false); setRoleSearchQuery('') }}>Done</Button>
                                           </div>
                                         </div>
                                         <div className="px-2 pt-2 pb-1 shrink-0">
@@ -4814,7 +4779,7 @@ export default function AnnouncementsPage() {
                                               value={roleSearchQuery}
                                               onChange={e => setRoleSearchQuery(e.target.value)}
                                               placeholder="Search roles..."
-                                              className="w-full pl-7 pr-2 py-1 border border-input rounded text-xs bg-background text-foreground focus:ring-1 focus:ring-ring outline-none"
+                                              className="w-full pl-7 pr-2 py-1 border border-input rounded text-xs bg-background text-foreground focus:ring-1 focus:ring-ring outline-hidden"
                                             />
                                           </div>
                                         </div>
@@ -4844,7 +4809,11 @@ export default function AnnouncementsPage() {
                                         </div>
                                         {dmRoleFilter.length > 0 && (
                                           <div className="p-2 border-t border-border shrink-0">
-                                            <button
+                                            <Button
+                                              emphasis="ghost"
+                                              intent="primary"
+                                              size="micro"
+                                              fullWidth
                                               onClick={() => {
                                                 setDmRows(prev => prev.map(r => {
                                                   const matchesRole = r.roles.some(rr => dmRoleFilter.includes(rr.id))
@@ -4852,10 +4821,9 @@ export default function AnnouncementsPage() {
                                                 }))
                                                 setShowRoleDropdown(false)
                                               }}
-                                              className="w-full text-xs text-center text-primary hover:underline py-1"
                                             >
                                               Select all matching members
-                                            </button>
+                                            </Button>
                                           </div>
                                         )}
                                       </div>
@@ -4871,7 +4839,13 @@ export default function AnnouncementsPage() {
                                             <span key={roleId} className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-medium border border-border bg-accent/20">
                                               <span className="w-2 h-2 rounded-full shrink-0" style={{ backgroundColor: roleColor }} />
                                               {role.name}
-                                              <button onClick={() => setDmRoleFilter(prev => prev.filter(id => id !== roleId))} className="hover:text-foreground text-muted-foreground ml-0.5">&times;</button>
+                                              <IconButton
+                                                size="micro"
+                                                label={`Remove ${role.name}`}
+                                                onClick={() => setDmRoleFilter(prev => prev.filter(id => id !== roleId))}
+                                                className="-my-1 ml-0.5"
+                                                icon={<X />}
+                                              />
                                             </span>
                                           )
                                         })}
@@ -4886,7 +4860,10 @@ export default function AnnouncementsPage() {
                           {/* Advanced: clear all filters */}
                           {(dmUserFilter || dmServerFilter.length > 0 || dmStatusFilter.length > 0 || dmDetailsFilter || dmRoleFilter.length > 0) && (
                             <div className="flex justify-end">
-                              <button
+                              <Button
+                                emphasis="ghost"
+                                intent="primary"
+                                size="micro"
                                 onClick={() => {
                                   setDmUserFilter('')
                                   setDmServerFilter([])
@@ -4896,10 +4873,9 @@ export default function AnnouncementsPage() {
                                   setDmServerSearch('')
                                   setRoleSearchQuery('')
                                 }}
-                                className="text-[10px] text-primary hover:underline"
                               >
                                 Clear all filters
-                              </button>
+                              </Button>
                             </div>
                           )}
                         </div>
@@ -4943,10 +4919,13 @@ export default function AnnouncementsPage() {
                         <>
                           <div className="text-center" title="Fuzzy match confidence score">
                             Score
-                            <button
+                            <IconButton
+                              size="micro"
                               onClick={() => setDmMatchMeta(new Map())}
-                              className="ml-1 opacity-50 hover:opacity-100 text-[10px]" title="Clear match data"
-                            >✕</button>
+                              className="ml-1 align-middle"
+                              label="Clear match data"
+                              icon={<X />}
+                            />
                           </div>
                           <div title="Which input name produced the best match">Matched By</div>
                         </>
@@ -4975,7 +4954,10 @@ export default function AnnouncementsPage() {
                           </span>
                         </div>
                         <div className="flex items-center gap-2 shrink-0">
-                          <button
+                          <Button
+                            emphasis="ghost"
+                            intent="danger"
+                            size="micro"
                             onClick={() => {
                               setDmRows(prev => prev.map(r => ({ ...r, selected: false })))
                               setDmSelectedOnly(false)
@@ -4983,10 +4965,9 @@ export default function AnnouncementsPage() {
                               setDmRoleFilter([])
                             }}
                             disabled={sending}
-                            className="text-[11px] text-red-500 hover:underline disabled:opacity-50"
                           >
                             Deselect all {totalSelectedAll}
-                          </button>
+                          </Button>
                         </div>
                       </div>
                     )}
@@ -4996,21 +4977,21 @@ export default function AnnouncementsPage() {
                         const isSubscribed = row.subscription_status === 'subscribed'
                         const isInvited = row.subscription_status === 'invited'
                         const statusConfig = row.private_dm
-                          ? { icon: XCircle, color: 'text-red-500', label: 'opted out' }
+                          ? { icon: XCircle, color: 'text-danger', label: 'opted out' }
                           : row.opted_out
-                          ? { icon: XCircle, color: 'text-red-500', label: 'opted out' }
+                          ? { icon: XCircle, color: 'text-danger', label: 'opted out' }
                           : isSubBlocked
-                          ? { icon: XCircle, color: 'text-red-500', label: 'opted out' }
+                          ? { icon: XCircle, color: 'text-danger', label: 'opted out' }
                           : isSubscribed
-                          ? { icon: CheckCircle2, color: 'text-emerald-500', label: 'opted in' }
+                          ? { icon: CheckCircle2, color: 'text-success', label: 'opted in' }
                           : isInvited
-                          ? { icon: XCircle, color: 'text-red-500', label: 'opted out' }
+                          ? { icon: XCircle, color: 'text-danger', label: 'opted out' }
                           : {
                             composing: { icon: Pencil, color: 'text-muted-foreground', label: 'composing' },
-                            scheduled: { icon: Clock, color: 'text-blue-500', label: 'scheduled' },
-                            sending: { icon: Loader2, color: 'text-yellow-500', label: 'sending' },
-                            sent: { icon: CheckCircle2, color: 'text-green-500', label: 'sent' },
-                            failed: { icon: XCircle, color: 'text-red-500', label: 'failed' },
+                            scheduled: { icon: Clock, color: 'text-info', label: 'scheduled' },
+                            sending: { icon: Loader2, color: 'text-warning', label: 'sending' },
+                            sent: { icon: CheckCircle2, color: 'text-success', label: 'sent' },
+                            failed: { icon: XCircle, color: 'text-danger', label: 'failed' },
                           }[row.status]
                         const StatusIcon = statusConfig.icon
                         const matchInfo = dmMatchMeta.get(row.user_id)
@@ -5035,12 +5016,12 @@ export default function AnnouncementsPage() {
                                   <span className="truncate text-xs font-medium">{row.display_name}</span>
                                   <span className="truncate text-xs text-muted-foreground">@{row.username}</span>
                                   {row.private_dm ? (
-                                    <span className="inline-flex items-center gap-0.5 px-1.5 py-0 rounded-full bg-purple-100 dark:bg-purple-950/30 text-[9px] font-medium text-purple-600 dark:text-purple-400 shrink-0">
+                                    <span className="inline-flex items-center gap-0.5 px-1.5 py-0 rounded-full bg-neutral-subtle text-[9px] font-medium text-neutral shrink-0">
                                       <XCircle className="w-2.5 h-2.5" />
                                       Blocked Bot / Private
                                     </span>
                                   ) : row.opted_out && (
-                                    <span className="inline-flex items-center gap-0.5 px-1.5 py-0 rounded-full bg-red-100 dark:bg-red-950/30 text-[9px] font-medium text-red-600 dark:text-red-400 shrink-0">
+                                    <span className="inline-flex items-center gap-0.5 px-1.5 py-0 rounded-full bg-danger-subtle text-[9px] font-medium text-danger shrink-0">
                                       <XCircle className="w-2.5 h-2.5" />
                                       DM Opt-out
                                     </span>
@@ -5070,9 +5051,9 @@ export default function AnnouncementsPage() {
                                 <div className="text-center">
                                   {matchInfo ? (
                                     <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-semibold ${
-                                      matchInfo.score >= 0.75 ? 'bg-green-100 dark:bg-green-950/40 text-green-700 dark:text-green-400'
-                                        : matchInfo.score >= 0.5 ? 'bg-amber-100 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400'
-                                        : 'bg-red-100 dark:bg-red-950/40 text-red-600 dark:text-red-400'
+                                      matchInfo.score >= 0.75 ? 'bg-success-subtle text-success'
+                                        : matchInfo.score >= 0.5 ? 'bg-warning-subtle text-warning'
+                                        : 'bg-danger-subtle text-danger'
                                     }`}>
                                       {Math.round(matchInfo.score * 100)}%
                                     </span>
@@ -5090,7 +5071,7 @@ export default function AnnouncementsPage() {
                               <span className={`text-xs capitalize ${statusConfig.color}`}>{statusConfig.label}</span>
                             </div>
                             <div className="min-w-0">
-                              <span className={`text-xs truncate block ${row.status === 'failed' ? 'text-red-500' : 'text-muted-foreground'}`}>{row.status_msg}</span>
+                              <span className={`text-xs truncate block ${row.status === 'failed' ? 'text-danger' : 'text-muted-foreground'}`}>{row.status_msg}</span>
                             </div>
                           </div>
                         )
@@ -5112,44 +5093,49 @@ export default function AnnouncementsPage() {
                             const allFilteredSelected = selectableFiltered.length > 0 && selectableFiltered.every(r => r.selected)
                             return (
                               <>
-                                <button
+                                <Button
+                                  emphasis="ghost"
+                                  intent="primary"
+                                  size="micro"
                                   onClick={selectAllFiltered}
                                   disabled={sending || selectableFiltered.length === 0 || allFilteredSelected}
-                                  className="text-xs text-primary hover:underline disabled:opacity-50"
                                 >
                                   Select all {selectableFiltered.length}{hasFilters ? ' filtered' : ''}
-                                </button>
+                                </Button>
                                 <span className="text-xs text-muted-foreground">|</span>
-                                <button
+                                <Button
+                                  emphasis="ghost"
+                                  size="micro"
                                   onClick={deselectAllFiltered}
                                   disabled={sending || !selectableFiltered.some(r => r.selected)}
-                                  className="text-xs text-muted-foreground hover:underline disabled:opacity-50"
                                 >
                                   Deselect all{hasFilters ? ' filtered' : ''}
-                                </button>
+                                </Button>
                               </>
                             )
                           })()}
                         </div>
                         {totalDmPages > 1 && (
                           <div className="flex items-center gap-2">
-                            <button
+                            <Button
+                              emphasis="outline"
+                              size="micro"
                               onClick={() => setDmPage(p => Math.max(1, p - 1))}
                               disabled={safeDmPage <= 1}
-                              className="px-2 py-0.5 rounded border border-border text-xs disabled:opacity-50 hover:bg-accent/50 transition-colors"
                             >
                               ‹ Prev
-                            </button>
+                            </Button>
                             <span className="text-xs text-muted-foreground">
                               Page {safeDmPage} / {totalDmPages} · {filtered.length} members
                             </span>
-                            <button
+                            <Button
+                              emphasis="outline"
+                              size="micro"
                               onClick={() => setDmPage(p => Math.min(totalDmPages, p + 1))}
                               disabled={safeDmPage >= totalDmPages}
-                              className="px-2 py-0.5 rounded border border-border text-xs disabled:opacity-50 hover:bg-accent/50 transition-colors"
                             >
                               Next ›
-                            </button>
+                            </Button>
                           </div>
                         )}
                       </div>
@@ -5162,7 +5148,7 @@ export default function AnnouncementsPage() {
                         const selectedCount = dmRows.filter(r => r.selected && !r.opted_out).length
                         const overMax = selectedCount > DM_RATE_LIMIT_MAX
                         return overMax ? (
-                          <span className="text-red-500 font-semibold">
+                          <span className="text-danger font-semibold">
                             {selectedCount} selected -- exceeds {DM_RATE_LIMIT_MAX.toLocaleString()} limit!{!isAdmin && ' Contact support for higher limits.'}
                           </span>
                         ) : null
@@ -5191,88 +5177,7 @@ export default function AnnouncementsPage() {
               <div>
                 {(() => {
                   // ── Build unified rows from all 3 sources ──
-                  const allRows: EmailRecipientRow[] = []
-
-                  // 1. Manual email contacts
-                  for (const c of emailContacts) {
-                    allRows.push({
-                      key: `manual:${c.id}`,
-                      display_name: c.display_name || c.email.split('@')[0],
-                      email: c.email,
-                      email_display: c.email,
-                      source: 'manual',
-                      source_detail: '',
-                      status_label: c.opted_out ? 'Opted out' : c.notification_disabled ? 'Disabled' : 'Active',
-                      status_color: c.opted_out ? 'text-red-500' : c.notification_disabled ? 'text-amber-500' : 'text-green-500',
-                      selectable: !c.opted_out && !c.notification_disabled,
-                    })
-                  }
-
-                  // 2. Friendlist connections
-                  for (const f of friendConnections) {
-                    allRows.push({
-                      key: `friendlist:${f.user_id}`,
-                      display_name: f.display_name,
-                      email: f.email,
-                      email_display: f.email ? f.email : 'N/A',
-                      source: 'friendlist',
-                      source_detail: '',
-                      status_label: f.email ? 'Active' : 'No Email',
-                      status_color: f.email ? 'text-green-500' : 'text-muted-foreground',
-                      selectable: !!f.email,
-                    })
-                  }
-
-                  // 3. Calendar participants (from selected meetings/calendars)
-                  const activeCalIds = new Set([
-                    ...meetings.filter(m => selectedMeetingIds.has(m.id)).map(m => m.calendar_id),
-                    ...Array.from(selectedCalendarIds),
-                  ])
-                  for (const p of calendarParticipantEmails) {
-                    const matchedCalIds = p.calendar_ids.filter(cid => activeCalIds.has(cid))
-                    if (matchedCalIds.length === 0) continue
-                    const calNames = matchedCalIds
-                      .map(cid => allCalendars.find(c => c.id === cid)?.title || cid)
-                      .filter((t, i, arr) => arr.indexOf(t) === i)
-
-                    let emailDisplay = 'N/A'
-                    let statusLabel = 'No Email'
-                    let statusColor = 'text-muted-foreground'
-                    let selectable = false
-
-                    if (p.email_status === 'visible' && p.email) {
-                      emailDisplay = p.email
-                      statusLabel = 'Active'
-                      statusColor = 'text-green-500'
-                      selectable = true
-                    } else if (p.email_status === 'hidden') {
-                      emailDisplay = 'Email Exists'
-                      statusLabel = 'Active'
-                      statusColor = 'text-green-500'
-                      selectable = true
-                    } else if (p.email_status === 'disabled') {
-                      statusLabel = 'Disabled'
-                      statusColor = 'text-amber-500'
-                    }
-
-                    allRows.push({
-                      key: `calendar:${p.username}`,
-                      display_name: p.username,
-                      email: p.email_status === 'visible' ? p.email : null,
-                      email_display: emailDisplay,
-                      source: 'calendar',
-                      source_detail: calNames.join(', '),
-                      status_label: statusLabel,
-                      status_color: statusColor,
-                      selectable,
-                    })
-                  }
-
-                  // Sort: selectable first, then alphabetically
-                  allRows.sort((a, b) => {
-                    if (a.selectable !== b.selectable) return a.selectable ? -1 : 1
-                    return a.display_name.localeCompare(b.display_name)
-                  })
+                  const allRows: EmailRecipientRow[] = emailRecipientProjection
 
                   // Apply search/filter
                   let filteredRows = allRows
@@ -5302,9 +5207,9 @@ export default function AnnouncementsPage() {
                   // Source badge styling
                   const sourceBadge = (src: 'manual' | 'calendar' | 'friendlist') => {
                     const styles = {
-                      manual: 'bg-blue-100 dark:bg-blue-950/40 text-blue-700 dark:text-blue-400',
-                      calendar: 'bg-purple-100 dark:bg-purple-950/40 text-purple-700 dark:text-purple-400',
-                      friendlist: 'bg-green-100 dark:bg-green-950/40 text-green-700 dark:text-green-400',
+                      manual: 'bg-info-subtle text-info',
+                      calendar: 'bg-muted text-muted-foreground',
+                      friendlist: 'bg-success-subtle text-success',
                     }
                     const labels = { manual: 'Manual', calendar: 'Calendar', friendlist: 'Friendlist' }
                     return { style: styles[src], label: labels[src] }
@@ -5313,9 +5218,9 @@ export default function AnnouncementsPage() {
                   return (
                     <>
                       {emailServiceStatus && !emailServiceStatus.configured && (
-                        <div className="mb-2 px-3 py-2.5 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-lg flex items-center gap-2">
-                          <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" />
-                          <p className="text-xs text-amber-700 dark:text-amber-400">
+                        <div className="mb-2 px-3 py-2.5 bg-warning-subtle border border-warning-muted rounded-lg flex items-center gap-2">
+                          <AlertTriangle className="w-4 h-4 text-warning shrink-0" />
+                          <p className="text-xs text-warning">
                             Email sending is not configured. Go to the <button onClick={() => switchTab('email')} className="text-primary hover:underline font-medium">Email tab</button> to set up your email address, or ask an admin to configure the platform default sender.
                           </p>
                         </div>
@@ -5324,28 +5229,28 @@ export default function AnnouncementsPage() {
                         <div className="flex items-center gap-2">
                           <label className="text-sm font-medium">Email Recipients</label>
                           {allRows.length > 0 && (
-                            <button
-                              onClick={() => { setEmailSelectedOnly(prev => !prev); setEmailSearchQuery('') }}
-                              className={`flex items-center gap-1.5 px-2.5 py-1 rounded-md text-xs font-semibold transition-all whitespace-nowrap shadow-sm ${
-                                emailSelectedOnly
-                                  ? 'border border-green-500 bg-green-500 text-white dark:bg-green-600 dark:border-green-600 hover:bg-green-600 dark:hover:bg-green-700'
-                                  : 'border border-primary bg-primary/10 text-primary hover:bg-primary/20 dark:border-primary dark:text-primary dark:hover:bg-primary/20'
-                              }`}
+                            <ToggleButton
+                              size="micro"
+                              pressed={emailSelectedOnly}
+                              onPressedChange={() => { setEmailSelectedOnly(prev => !prev); setEmailSearchQuery('') }}
+                              className="whitespace-nowrap"
+                              icon={<Check className="w-3.5 h-3.5" />}
                             >
-                              <Check className={`w-3.5 h-3.5 ${emailSelectedOnly ? 'text-white' : 'text-primary'}`} />
                               {emailSelectedOnly ? 'Show All' : 'Hide Unselected'}
-                            </button>
+                            </ToggleButton>
                           )}
                         </div>
                         <div className="flex items-center gap-2">
-                          <button
+                          <Button
+                            emphasis="ghost"
+                            intent="primary"
+                            size="micro"
                             onClick={() => { fetchEmailContacts(); fetchFriendConnections(); fetchMeetings() }}
-                            disabled={loadingEmailContacts || loadingFriends || loadingMeetings}
-                            className="flex items-center gap-1.5 text-xs text-primary hover:underline disabled:opacity-50"
+                            loading={loadingEmailContacts || loadingFriends || loadingMeetings}
+                            icon={<RefreshCw className="w-3 h-3" />}
                           >
-                            {(loadingEmailContacts || loadingFriends || loadingMeetings) ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
                             Refresh
-                          </button>
+                          </Button>
                         </div>
                       </div>
                       {emailServiceStatus?.configured && totalSelected > 0 && (
@@ -5357,13 +5262,13 @@ export default function AnnouncementsPage() {
                               : emailServiceStatus.platformFrom || '(platform default)'}
                           </span>
                           {emailServiceStatus.userConfig?.verified && (
-                            <span className="ml-1 text-[10px] text-green-500">(your email)</span>
+                            <span className="ml-1 text-[10px] text-success">(your email)</span>
                           )}
                           {emailServiceStatus.verifiedSenderEmail && (
                             <>
                               <span className="ml-2 text-muted-foreground/50">|</span>
                               <span>Sender attribution: <span className="font-medium text-foreground">{emailServiceStatus.verifiedSenderEmail}</span></span>
-                              <span className="ml-1 text-[10px] text-green-500">(verified)</span>
+                              <span className="ml-1 text-[10px] text-success">(verified)</span>
                             </>
                           )}
                         </div>
@@ -5380,9 +5285,9 @@ export default function AnnouncementsPage() {
                         <div className="border border-border rounded-lg overflow-hidden">
                           {/* No-email notification for calendar participants (hidden when Selected Only is active) */}
                           {noCalendarEmailsAvailable && !emailSelectedOnly && (
-                            <div className="px-3 py-2.5 bg-amber-50 dark:bg-amber-950/30 border-b border-amber-200 dark:border-amber-800 flex items-center gap-2">
-                              <AlertTriangle className="w-4 h-4 text-amber-500 shrink-0" />
-                              <p className="text-xs text-amber-700 dark:text-amber-400">
+                            <div className="px-3 py-2.5 bg-warning-subtle border-b border-warning-muted flex items-center gap-2">
+                              <AlertTriangle className="w-4 h-4 text-warning shrink-0" />
+                              <p className="text-xs text-warning">
                                 None of the Coordination Calendar users have a visible email or email on their profile. No email announcements can be sent to these calendar participants.
                               </p>
                             </div>
@@ -5396,7 +5301,7 @@ export default function AnnouncementsPage() {
                                 value={emailSearchQuery}
                                 onChange={e => setEmailSearchQuery(e.target.value)}
                                 placeholder="Search by name, source, or email..."
-                                className="w-full pl-8 pr-3 py-1.5 border border-input rounded text-xs bg-background text-foreground focus:ring-1 focus:ring-ring outline-none"
+                                className="w-full pl-8 pr-3 py-1.5 border border-input rounded text-xs bg-background text-foreground focus:ring-1 focus:ring-ring outline-hidden"
                               />
                             </div>
                           </div>
@@ -5486,12 +5391,13 @@ export default function AnnouncementsPage() {
                                   <div className="truncate text-xs text-muted-foreground flex items-center gap-1">
                                     <span>{displayEmail}</span>
                                     {row.email && row.email_display !== 'Email Exists' && row.email_display !== 'N/A' && (
-                                      <button
+                                      <IconButton
+                                        size="micro"
                                         onClick={() => setShowEmails(!showEmails)}
-                                        className="ml-0.5 text-muted-foreground/50 hover:text-foreground"
-                                      >
-                                        {showEmails ? <EyeOff className="w-3 h-3 inline" /> : <Eye className="w-3 h-3 inline" />}
-                                      </button>
+                                        className="ml-0.5 -my-1"
+                                        label={showEmails ? 'Hide emails' : 'Show emails'}
+                                        icon={showEmails ? <EyeOff /> : <Eye />}
+                                      />
                                     )}
                                   </div>
                                   <div>
@@ -5541,15 +5447,15 @@ export default function AnnouncementsPage() {
             {emailIntegrationSetup && selectedEmailRecipients.size > 0 && (
               <div>
                 <label className="text-sm font-medium block mb-1">
-                  Email Subject <span className="text-red-500">*</span>
+                  Email Subject <span className="text-danger">*</span>
                 </label>
                 <input
                   type="text"
                   value={emailSubject}
                   onChange={e => setEmailSubject(e.target.value)}
                   placeholder="e.g., Weekly Meeting Update — March 2026"
-                  className={`w-full px-3 py-2 border rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none ${
-                    !emailSubject.trim() ? 'border-red-300 dark:border-red-700' : 'border-input'
+                  className={`w-full px-3 py-2 border rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden ${
+                    !emailSubject.trim() ? 'border-danger-muted' : 'border-input'
                   }`}
                   disabled={sending}
                   maxLength={500}
@@ -5566,8 +5472,9 @@ export default function AnnouncementsPage() {
                 <div className="flex items-center justify-between px-3 py-2 border-b border-border bg-muted/50">
                   <p className="text-xs font-medium text-muted-foreground">Message Preview</p>
                   <div className="flex items-center gap-2">
-                    <button
-                      type="button"
+                    <Button
+                      emphasis="ghost"
+                      size="micro"
                       onClick={(e) => {
                         e.stopPropagation()
                         let text = ''
@@ -5594,21 +5501,20 @@ export default function AnnouncementsPage() {
                         text += `\n\n— ${sendMode === 'now' ? 'Posted' : 'Scheduled'} via ${viaText} by @${integration!.discord_username}`
                         navigator.clipboard.writeText(text)
                       }}
-                      className="text-[10px] text-muted-foreground/60 hover:text-muted-foreground transition-colors cursor-pointer flex items-center gap-0.5"
                       style={{ pointerEvents: 'auto' }}
                       title="Copy message as plain text"
+                      icon={<Clipboard className="w-3 h-3" />}
                     >
-                      <Clipboard className="w-3 h-3" />
                       copy
-                    </button>
-                    <button
-                      type="button"
+                    </Button>
+                    <Button
+                      emphasis="ghost"
+                      size="micro"
                       onClick={(e) => { e.stopPropagation(); window.scrollTo({ top: 0, behavior: 'smooth' }) }}
-                      className="text-[10px] text-muted-foreground/60 hover:text-muted-foreground transition-colors cursor-pointer"
                       style={{ pointerEvents: 'auto' }}
                     >
                       edit →
-                    </button>
+                    </Button>
                   </div>
                 </div>
                 <div className="text-xs leading-relaxed whitespace-pre-wrap select-text">
@@ -5621,8 +5527,8 @@ export default function AnnouncementsPage() {
                   )}
                   {/* Calendar context section */}
                   {(selectedMeetingIds.size > 0 || selectedCalendarIds.size > 0) && (
-                    <div className="px-3 py-2 bg-sky-50/60 dark:bg-sky-950/20 border-b border-border/50">
-                      <span className="inline-block text-[10px] font-medium text-sky-600 dark:text-sky-400 uppercase tracking-wide mb-1">Calendar Context</span>
+                    <div className="px-3 py-2 bg-info-subtle/60 border-b border-border/50">
+                      <span className="inline-block text-[10px] font-medium text-info uppercase tracking-wide mb-1">Calendar Context</span>
                       <div className="text-muted-foreground">
                         {selectedMeetingIds.size > 0 && renderDiscordMarkdown(
                           buildGroupedMeetingBlocks(
@@ -5659,8 +5565,8 @@ export default function AnnouncementsPage() {
                   )}
                   {/* Poll section */}
                   {pollEnabled && pollOptions.some(o => o.text.trim()) && (
-                    <div className="px-3 py-2 bg-amber-50/60 dark:bg-amber-950/20 border-b border-border/50">
-                      <span className="inline-block text-[10px] font-medium text-amber-600 dark:text-amber-400 uppercase tracking-wide mb-1">Reaction Poll</span>
+                    <div className="px-3 py-2 bg-warning-subtle border-b border-border/50">
+                      <span className="inline-block text-[10px] font-medium text-warning uppercase tracking-wide mb-1">Reaction Poll</span>
                       <div className="text-muted-foreground">
                         {pollOptions.filter(o => o.text.trim()).map((o, i) => (
                           <span key={i}>{o.emoji} {o.text}{'\n'}</span>
@@ -5670,8 +5576,8 @@ export default function AnnouncementsPage() {
                   )}
                   {/* DM-only additional message section */}
                   {composeDmBody.trim() && (
-                    <div className="px-3 py-2 bg-violet-50/60 dark:bg-violet-950/20 border-b border-border/50">
-                      <span className="inline-block text-[10px] font-medium text-violet-600 dark:text-violet-400 uppercase tracking-wide mb-1">DM Only - Additional Message</span>
+                    <div className="px-3 py-2 bg-muted/60 border-b border-border/50">
+                      <span className="inline-block text-[10px] font-medium text-muted-foreground uppercase tracking-wide mb-1">DM Only - Additional Message</span>
                       <div className="text-muted-foreground">{renderDiscordMarkdown(composeDmBody)}</div>
                     </div>
                   )}
@@ -5799,26 +5705,23 @@ export default function AnnouncementsPage() {
                       {/* Preset chips */}
                       <div className="flex flex-wrap gap-1.5">
                         {presets.map(p => (
-                          <button
+                          <ToggleButton
                             key={p.id}
-                            type="button"
-                            onClick={() => togglePreset(p)}
-                            className={`px-2.5 py-1 text-xs rounded-full border transition-colors ${
-                              isActive(p)
-                                ? 'bg-primary text-primary-foreground border-primary'
-                                : 'bg-background text-muted-foreground border-input hover:border-primary/50'
-                            }`}
+                            size="micro"
+                            pressed={isActive(p)}
+                            onPressedChange={() => togglePreset(p)}
                           >
                             {formatOffsetLabel(p)}
-                          </button>
+                          </ToggleButton>
                         ))}
-                        <button
-                          type="button"
+                        <Button
+                          emphasis="outline"
+                          size="micro"
                           onClick={addCustom}
-                          className="px-2.5 py-1 text-xs rounded-full border border-dashed border-input text-muted-foreground hover:border-primary/50 hover:text-primary transition-colors flex items-center gap-1"
+                          icon={<Plus className="w-3 h-3" />}
                         >
-                          <Plus className="w-3 h-3" /> Custom
-                        </button>
+                          Custom
+                        </Button>
                       </div>
 
                       {/* Active offsets list (editable) */}
@@ -5850,14 +5753,14 @@ export default function AnnouncementsPage() {
                                 <option value="week">weeks</option>
                               </select>
                               <span className="text-xs text-muted-foreground">before each meeting</span>
-                              <button
-                                type="button"
+                              <IconButton
+                                size="micro"
+                                intent="danger"
                                 onClick={() => setReminderOffsets(prev => prev.filter((_, i) => i !== idx))}
-                                className="ml-auto p-1 text-muted-foreground hover:text-red-500"
-                                aria-label="Remove offset"
-                              >
-                                <X className="w-3.5 h-3.5" />
-                              </button>
+                                className="ml-auto"
+                                label="Remove offset"
+                                icon={<X />}
+                              />
                             </div>
                           ))}
                         </div>
@@ -5872,12 +5775,12 @@ export default function AnnouncementsPage() {
                             </span>{' '}
                             will be created across {selectedMeetings.length} meeting{selectedMeetings.length !== 1 ? 's' : ''} x {reminderOffsets.length} offset{reminderOffsets.length !== 1 ? 's' : ''}.
                             {skippedCount > 0 && (
-                              <span className="text-amber-600 dark:text-amber-400"> ({skippedCount} skipped - already in the past.)</span>
+                              <span className="text-warning"> ({skippedCount} skipped - already in the past.)</span>
                             )}
                           </div>
                           {(selChannels + selDms + selEmails) > 0 ? (
                             <div className="flex items-center gap-1.5">
-                              <AlertTriangle className="w-3 h-3 text-amber-500" />
+                              <AlertTriangle className="w-3 h-3 text-warning" />
                               <span>
                                 Each batch delivers to {selChannels + selDms + selEmails} target{(selChannels + selDms + selEmails) !== 1 ? 's' : ''} ({formatDurationShort(batchSec)} per batch).
                                 {plannedCount > 1 && (
@@ -5886,7 +5789,7 @@ export default function AnnouncementsPage() {
                               </span>
                             </div>
                           ) : (
-                            <div className="text-amber-600 dark:text-amber-400">Select at least one channel, DM, or email recipient to deliver these reminders.</div>
+                            <div className="text-warning">Select at least one channel, DM, or email recipient to deliver these reminders.</div>
                           )}
                         </div>
                       )}
@@ -5914,10 +5817,10 @@ export default function AnnouncementsPage() {
             {sendResult && (
               <div className={`flex items-center gap-2 p-3 rounded-lg text-sm ${
                 sendResult.type === 'success'
-                  ? 'bg-green-50 dark:bg-green-950 text-green-700 dark:text-green-300 border border-green-200 dark:border-green-800'
+                  ? 'bg-success-subtle text-success border border-success-muted'
                   : sendResult.type === 'warning'
-                  ? 'bg-orange-50 dark:bg-orange-950 text-orange-700 dark:text-orange-300 border border-orange-200 dark:border-orange-800'
-                  : 'bg-red-50 dark:bg-red-950 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-800'
+                  ? 'bg-warning-subtle text-warning border border-warning-muted'
+                  : 'bg-danger-subtle text-danger border border-danger-muted'
               }`}>
                 {sendResult.type === 'success' ? <CheckCircle2 className="w-4 h-4" /> : sendResult.type === 'warning' ? <AlertCircle className="w-4 h-4" /> : <XCircle className="w-4 h-4" />}
                 {sendResult.message}
@@ -5963,20 +5866,21 @@ export default function AnnouncementsPage() {
             {/* Action buttons */}
             <div className="flex gap-2">
               {!activeScheduleId ? (
-                <button
+                <Button
+                  intent="primary"
                   onClick={() => {
                     void handleSend()
                   }}
                   disabled={sending || !composeBody.trim() || (distributionRows.filter(r => r.selected).length === 0 && dmRows.filter(r => r.selected).length === 0 && selectedEmailRecipients.size === 0)}
-                  className="flex items-center gap-2 px-5 py-2.5 text-sm font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                  loading={sending}
+                  icon={<Send className="w-4 h-4" />}
                 >
-                  {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
                   {sendMode === 'now'
                     ? 'Send Now'
                     : (selectedMeetingIds.size > 0 && reminderOffsets.length > 0)
                       ? 'Schedule Reminders'
                       : 'Schedule'}
-                </button>
+                </Button>
               ) : (() => {
                 const selectedChannels = distributionRows.filter(r => r.selected)
                 const selectedDms = dmRows.filter(r => r.selected)
@@ -5999,7 +5903,7 @@ export default function AnnouncementsPage() {
                     </div>
                     <div className="w-full h-2 bg-muted rounded-full overflow-hidden">
                       <div
-                        className={`h-full rounded-full transition-all duration-500 ${failedCount > 0 ? 'bg-yellow-500' : 'bg-primary'}`}
+                        className={`h-full rounded-full transition-all duration-500 ${failedCount > 0 ? 'bg-warning' : 'bg-primary'}`}
                         style={{ width: `${pct}%` }}
                       />
                     </div>
@@ -6008,56 +5912,51 @@ export default function AnnouncementsPage() {
                         Estimated time: ~{Math.max(1, estimateDmMinutes(totalTargets - delivered))} min remaining
                       </p>
                     )}
-                    <p className="text-[10px] text-blue-600 dark:text-blue-400">
+                    <p className="text-[10px] text-primary">
                       The bot delivers in the background -- you can close this page or start a new announcement.
                     </p>
                   </div>
                 )
               })()}
               {(distributionRows.some(r => r.status !== 'composing') || sendResult) && (
-                <button
-                  onClick={resetCompose}
-                  className="flex items-center gap-2 px-4 py-2.5 text-sm font-medium rounded-lg border border-border text-muted-foreground hover:bg-muted transition-colors"
-                >
-                  <RefreshCw className="w-4 h-4" />
+                <Button emphasis="outline" onClick={resetCompose} icon={<RefreshCw className="w-4 h-4" />}>
                   New Announcement
-                </button>
+                </Button>
               )}
               {composeBody.trim() && !sending && !activeScheduleId && (
-                <button
+                <Button
+                  emphasis="outline"
                   onClick={() => {
                     setTemplateTitle(composeTitle)
                     setTemplateBody(composeBody)
                     setEditingTemplate(null)
                     saveTemplate()
                   }}
-                  disabled={savingTemplate}
-                  className="flex items-center gap-2 px-4 py-2.5 text-sm font-medium rounded-lg border border-border text-muted-foreground hover:bg-muted transition-colors disabled:opacity-50"
+                  loading={savingTemplate}
+                  icon={<Plus className="w-4 h-4" />}
                 >
-                  {savingTemplate ? <Loader2 className="w-4 h-4 animate-spin" /> : <Plus className="w-4 h-4" />}
                   Save as Template
-                </button>
+                </Button>
               )}
 
               {/* Template duplicate override confirmation */}
               {templateOverrideTarget && (
-                <div className="flex items-start gap-3 p-3 rounded-lg bg-amber-50 dark:bg-amber-950 border border-amber-200 dark:border-amber-800">
-                  <AlertTriangle className="w-5 h-5 text-amber-500 mt-0.5 shrink-0" />
+                <div className="flex items-start gap-3 p-3 rounded-lg bg-warning-subtle border border-warning-muted">
+                  <AlertTriangle className="w-5 h-5 text-warning mt-0.5 shrink-0" />
                   <div className="flex-1">
-                    <p className="text-sm font-medium text-amber-800 dark:text-amber-200">
+                    <p className="text-sm font-medium text-warning">
                       Template &quot;{templateOverrideTarget.title}&quot; already exists
                     </p>
-                    <p className="text-xs text-amber-600 dark:text-amber-400 mt-1">
+                    <p className="text-xs text-warning mt-1">
                       Do you want to overwrite it or save as a new template?
                     </p>
                     <div className="flex gap-2 mt-2">
-                      <button
-                        onClick={() => saveTemplate(templateOverrideTarget.id)}
-                        className="px-3 py-1.5 text-xs font-medium rounded bg-amber-600 text-white hover:bg-amber-700 transition-colors"
-                      >
+                      <Button intent="warning" size="compact" onClick={() => saveTemplate(templateOverrideTarget.id)}>
                         Overwrite
-                      </button>
-                      <button
+                      </Button>
+                      <Button
+                        emphasis="outline"
+                        size="compact"
                         onClick={() => {
                           // Save as new with a slightly different title
                           setTemplateOverrideTarget(null)
@@ -6075,16 +5974,12 @@ export default function AnnouncementsPage() {
                           }).catch(err => console.error('Failed to save template:', err))
                           .finally(() => setSavingTemplate(false))
                         }}
-                        className="px-3 py-1.5 text-xs font-medium rounded border border-border hover:bg-muted transition-colors"
                       >
                         Save as Copy
-                      </button>
-                      <button
-                        onClick={() => setTemplateOverrideTarget(null)}
-                        className="px-3 py-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
-                      >
+                      </Button>
+                      <Button emphasis="ghost" size="compact" onClick={() => setTemplateOverrideTarget(null)}>
                         Cancel
-                      </button>
+                      </Button>
                     </div>
                   </div>
                 </div>
@@ -6107,7 +6002,7 @@ export default function AnnouncementsPage() {
                 <p>Write your announcement, then click <span className="font-medium text-foreground">Save as Template</span> to save it here for reuse.</p>
               </div>
               <LearnerHelpIcon
-                description={<><p className="font-semibold text-blue-700 dark:text-blue-300 mb-1">Announcement Templates</p><p className="mb-1.5">Templates let you save pre-filled announcements so you can reuse them without rewriting everything from scratch.</p><p className="font-semibold text-blue-700 dark:text-blue-300 mb-1">How it works</p><ul className="list-disc list-inside space-y-0.5"><li>Go to the <strong>Compose</strong> tab and fill in your announcement.</li><li>Click <strong>Save as Template</strong> to store it.</li><li>Templates preserve your title, body, channel selections, DM recipients, and meeting context.</li><li>Click the send icon on any template to load it back into Compose.</li></ul></>}
+                description={<><p className="font-semibold text-info mb-1">Announcement Templates</p><p className="mb-1.5">Templates let you save pre-filled announcements so you can reuse them without rewriting everything from scratch.</p><p className="font-semibold text-info mb-1">How it works</p><ul className="list-disc list-inside space-y-0.5"><li>Go to the <strong>Compose</strong> tab and fill in your announcement.</li><li>Click <strong>Save as Template</strong> to store it.</li><li>Templates preserve your title, body, channel selections, DM recipients, and meeting context.</li><li>Click the send icon on any template to load it back into Compose.</li></ul></>}
                 size={4}
                 className="shrink-0"
               />
@@ -6142,30 +6037,29 @@ export default function AnnouncementsPage() {
                             Updated {formatDateDDMMYYYY(template.updated_at)}
                           </span>
                           {(template.distribution_channel_ids?.length > 0) && (
-                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-blue-500/10 text-blue-600 dark:text-blue-400">
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-info-subtle text-primary">
                               {template.distribution_channel_ids.length} channel{template.distribution_channel_ids.length !== 1 ? 's' : ''}
                             </span>
                           )}
                           {(template.dm_recipient_ids?.length > 0) && (
-                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-purple-500/10 text-purple-600 dark:text-purple-400">
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-muted text-muted-foreground">
                               {template.dm_recipient_ids.length} DM{template.dm_recipient_ids.length !== 1 ? 's' : ''}
                             </span>
                           )}
                           {(template.meeting_ids?.length > 0) && (
-                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-green-500/10 text-green-600 dark:text-green-400">
+                            <span className="text-[10px] px-1.5 py-0.5 rounded bg-success-subtle text-success">
                               {template.meeting_ids.length} meeting{template.meeting_ids.length !== 1 ? 's' : ''}
                             </span>
                           )}
                         </div>
                       </div>
                       <div className="flex gap-1 ml-3 shrink-0" onClick={(e) => e.stopPropagation()}>
-                        <button
+                        <IconButton
+                          intent="danger"
                           onClick={() => deleteTemplate(template.id)}
-                          className="p-1.5 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors"
-                          title="Delete"
-                        >
-                          <Trash2 className="w-3.5 h-3.5" />
-                        </button>
+                          label="Delete"
+                          icon={<Trash2 />}
+                        />
                       </div>
                     </div>
                   </div>
@@ -6184,17 +6078,13 @@ export default function AnnouncementsPage() {
               <div className="flex items-center gap-1.5">
                 <h3 className="text-sm font-medium">Announcement History</h3>
                 <LearnerHelpIcon
-                  description={<><p className="font-semibold text-blue-700 dark:text-blue-300 mb-1">Scheduled Announcement</p><p className="mb-1.5">Each card tracks the lifecycle of an announcement -- from pending delivery to sent or failed.</p><p className="font-semibold text-blue-700 dark:text-blue-300 mb-1">What you can do</p><ul className="list-disc list-inside space-y-0.5"><li><strong>Expand</strong> to see delivery details and channel status.</li><li><strong>Cancel</strong> pending announcements before they send.</li><li><strong>Retry</strong> failed deliveries to try again.</li></ul></>}
+                  description={<><p className="font-semibold text-info mb-1">Scheduled Announcement</p><p className="mb-1.5">Each card tracks the lifecycle of an announcement -- from pending delivery to sent or failed.</p><p className="font-semibold text-info mb-1">What you can do</p><ul className="list-disc list-inside space-y-0.5"><li><strong>Expand</strong> to see delivery details and channel status.</li><li><strong>Cancel</strong> pending announcements before they send.</li><li><strong>Retry</strong> failed deliveries to try again.</li></ul></>}
                   size={4}
                 />
               </div>
-              <button
-                onClick={fetchSchedules}
-                className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-border hover:bg-muted transition-colors"
-              >
-                <RefreshCw className="w-3.5 h-3.5" />
+              <Button emphasis="outline" size="compact" onClick={fetchSchedules} icon={<RefreshCw className="w-3.5 h-3.5" />}>
                 Refresh
-              </button>
+              </Button>
             </div>
 
             {loadingSchedules ? (
@@ -6209,11 +6099,11 @@ export default function AnnouncementsPage() {
               <div className="space-y-2">
                 {schedules.map(schedule => {
                   const allStatusConfigs = {
-                    pending: { icon: Clock, color: 'text-yellow-500 dark:text-blue-400', bg: 'bg-yellow-50 dark:bg-blue-950', label: 'Pending' },
-                    sending: { icon: Loader2, color: 'text-blue-500', bg: 'bg-blue-50 dark:bg-blue-950', label: 'Sending' },
-                    sent: { icon: CheckCircle2, color: 'text-green-500', bg: 'bg-green-50 dark:bg-green-950', label: 'Sent' },
-                    partially_sent: { icon: AlertCircle, color: 'text-emerald-600 dark:text-emerald-400', bg: 'bg-emerald-50 dark:bg-emerald-950', label: 'Partially Sent' },
-                    failed: { icon: XCircle, color: 'text-red-500', bg: 'bg-red-50 dark:bg-red-950', label: 'Failed' },
+                    pending: { icon: Clock, color: 'text-warning', bg: 'bg-warning-subtle', label: 'Pending' },
+                    sending: { icon: Loader2, color: 'text-info', bg: 'bg-info-subtle', label: 'Sending' },
+                    sent: { icon: CheckCircle2, color: 'text-success', bg: 'bg-success-subtle', label: 'Sent' },
+                    partially_sent: { icon: AlertCircle, color: 'text-success', bg: 'bg-success-subtle', label: 'Partially Sent' },
+                    failed: { icon: XCircle, color: 'text-danger', bg: 'bg-danger-subtle', label: 'Failed' },
                     cancelled: { icon: X, color: 'text-muted-foreground', bg: 'bg-muted', label: 'Cancelled' },
                   }
 
@@ -6278,7 +6168,7 @@ export default function AnnouncementsPage() {
                             <span>{schedule.targets.length} target(s)</span>
                           </div>
                           {schedule.error_message && (
-                            <p className="text-xs text-red-500 mt-1 ml-[52px]">
+                            <p className="text-xs text-danger mt-1 ml-[52px]">
                               {(() => {
                                 const match = schedule.error_message.match(/^(\d+) of (\d+) failed/)
                                 return match ? `${match[1]} of ${match[2]} target(s) failed` : schedule.error_message
@@ -6288,13 +6178,12 @@ export default function AnnouncementsPage() {
                         </div>
                         <div className="flex gap-1 ml-3 shrink-0" onClick={e => e.stopPropagation()}>
                           {schedule.status === 'pending' && (
-                            <button
+                            <IconButton
+                              intent="danger"
                               onClick={() => cancelSchedule(schedule.id)}
-                              className="p-1.5 rounded hover:bg-destructive/10 text-muted-foreground hover:text-destructive transition-colors"
-                              title="Cancel"
-                            >
-                              <X className="w-3.5 h-3.5" />
-                            </button>
+                              label="Cancel"
+                              icon={<X />}
+                            />
                           )}
                         </div>
                       </div>
@@ -6316,6 +6205,7 @@ export default function AnnouncementsPage() {
                             const sentEntries = deliveryLog.filter(l => l.status === 'sent')
                             const failedEntries = deliveryLog.filter(l => l.status === 'failed')
                             const pendingEntries = deliveryLog.filter(l => l.status === 'pending')
+                            const deletedCount = sentEntries.filter(l => !!l.deleted_at).length
 
                             const systemBadge = (entry: DeliveryLogEntry) => {
                               if (entry.channel_type !== 'discord_dm' || !entry.recipient_response) return null
@@ -6323,17 +6213,17 @@ export default function AnnouncementsPage() {
                               const isFirstMessage = entry.recipient_response === 'invited' && entry.status === 'sent'
                               let badge: { label: string; cls: string } | null = null
                               if (isBlockedInvite) {
-                                badge = { label: 'Skipped', cls: 'bg-amber-100 dark:bg-amber-950/40 text-amber-700 dark:text-amber-400' }
+                                badge = { label: 'Skipped', cls: 'bg-warning-subtle text-warning' }
                               } else if (isFirstMessage) {
-                                badge = { label: 'First Message', cls: 'bg-blue-100 dark:bg-blue-950/40 text-blue-700 dark:text-blue-400' }
+                                badge = { label: 'First Message', cls: 'bg-info-subtle text-info' }
                               } else if (entry.recipient_response === 'subscribed') {
-                                badge = { label: 'Subscribed', cls: 'bg-green-100 dark:bg-green-950/40 text-green-700 dark:text-green-400' }
+                                badge = { label: 'Subscribed', cls: 'bg-success-subtle text-success' }
                               } else if (entry.recipient_response === 'unsubscribed') {
-                                badge = { label: 'Skipped', cls: 'bg-slate-100 dark:bg-slate-800/40 text-slate-600 dark:text-slate-400' }
+                                badge = { label: 'Skipped', cls: 'bg-muted text-muted-foreground' }
                               } else if (entry.recipient_response === 'opted_out') {
-                                badge = { label: 'Opted Out', cls: 'bg-red-100 dark:bg-red-950/30 text-red-600 dark:text-red-400' }
+                                badge = { label: 'Opted Out', cls: 'bg-danger-subtle text-danger' }
                               } else if (entry.recipient_response === 'muted_bot') {
-                                badge = { label: 'Blocked Bot / Private', cls: 'bg-purple-100 dark:bg-purple-950/30 text-purple-600 dark:text-purple-400' }
+                                badge = { label: 'Blocked Bot / Private', cls: 'bg-neutral-subtle text-neutral' }
                               }
                               if (!badge) return null
                               return <span className={`inline-flex px-1.5 py-0 rounded-full text-[9px] font-medium shrink-0 ${badge.cls}`}>{badge.label}</span>
@@ -6348,32 +6238,45 @@ export default function AnnouncementsPage() {
                                 {/* Summary bar */}
                                 <div className="flex items-center gap-4 text-xs flex-wrap">
                                   <span className="flex items-center gap-1.5">
-                                    <CheckCircle2 className="w-3.5 h-3.5 text-green-500" />
+                                    <CheckCircle2 className="w-3.5 h-3.5 text-success" />
                                     {sentEntries.length} sent
                                   </span>
                                   {failedEntries.length > 0 && (
                                     <span className="flex items-center gap-1.5">
-                                      <XCircle className="w-3.5 h-3.5 text-red-500" />
+                                      <XCircle className="w-3.5 h-3.5 text-danger" />
                                       {failedEntries.length} failed
                                     </span>
                                   )}
                                   {pendingEntries.length > 0 && (
                                     <span className="flex items-center gap-1.5">
-                                      <Clock className="w-3.5 h-3.5 text-yellow-500" />
+                                      <Clock className="w-3.5 h-3.5 text-warning" />
                                       {pendingEntries.length} pending
                                     </span>
                                   )}
                                   <span className="text-muted-foreground">
                                     {deliveryLog.length} total
                                   </span>
+                                  {deletedCount > 0 && (
+                                    <span className="flex items-center gap-1.5 text-muted-foreground">
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                      {deletedCount} deleted
+                                    </span>
+                                  )}
+                                  <div className="ml-auto">
+                                    <DeletePostedMessagesAction
+                                      scheduleId={schedule.id}
+                                      deliveryLog={deliveryLog}
+                                      onSettled={() => refreshDeliveryLog(schedule.id)}
+                                    />
+                                  </div>
                                 </div>
                                 {/* Failed targets first */}
                                 {failedEntries.length > 0 && (
                                   <div className="space-y-1">
-                                    <p className="text-xs font-medium text-red-500">Failed deliveries:</p>
+                                    <p className="text-xs font-medium text-danger">Failed deliveries:</p>
                                     {failedEntries.map(entry => (
-                                      <div key={entry.id} className="flex items-center gap-2 px-3 py-1.5 rounded bg-red-50 dark:bg-red-950/40 text-xs flex-wrap">
-                                        <XCircle className="w-3.5 h-3.5 text-red-500 shrink-0" />
+                                      <div key={entry.id} className="flex items-center gap-2 px-3 py-1.5 rounded bg-danger-subtle text-xs flex-wrap">
+                                        <XCircle className="w-3.5 h-3.5 text-danger shrink-0" />
                                         {entry.channel_type === 'discord_dm' ? (
                                           <Users className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
                                         ) : (
@@ -6381,7 +6284,7 @@ export default function AnnouncementsPage() {
                                         )}
                                         <span className="truncate">{entry.target_label || entry.target_id}</span>
                                         {systemBadge(entry)}
-                                        <span className="text-red-500 ml-auto shrink-0">
+                                        <span className="text-danger ml-auto shrink-0">
                                           {entry.recipient_response === 'muted_bot'
                                             ? 'User has DMs closed or muted the bot'
                                             : entry.error_message || 'Unknown error'}
@@ -6393,10 +6296,10 @@ export default function AnnouncementsPage() {
                                 {/* Successful deliveries */}
                                 {sentEntries.length > 0 && (
                                   <div className="space-y-1">
-                                    <p className="text-xs font-medium text-green-600 dark:text-green-400">Successful deliveries:</p>
+                                    <p className="text-xs font-medium text-success">Successful deliveries:</p>
                                     {sentEntries.map(entry => (
-                                      <div key={entry.id} className="flex items-center gap-2 px-3 py-1.5 rounded bg-green-50 dark:bg-green-950/40 text-xs">
-                                        <CheckCircle2 className="w-3.5 h-3.5 text-green-500 shrink-0" />
+                                      <div key={entry.id} className="flex items-center gap-2 px-3 py-1.5 rounded bg-success-subtle text-xs">
+                                        <CheckCircle2 className="w-3.5 h-3.5 text-success shrink-0" />
                                         {entry.channel_type === 'discord_dm' ? (
                                           <Users className="w-3.5 h-3.5 text-muted-foreground shrink-0" />
                                         ) : (
@@ -6404,6 +6307,11 @@ export default function AnnouncementsPage() {
                                         )}
                                         <span className="truncate">{entry.target_label || entry.target_id}</span>
                                         {systemBadge(entry)}
+                                        {entry.deleted_at ? (
+                                          <StatusBadge tone="neutral" density="compact" className="shrink-0">Deleted</StatusBadge>
+                                        ) : entry.delete_error ? (
+                                          <span className="text-danger truncate" title={entry.delete_error}>Delete failed: {entry.delete_error}</span>
+                                        ) : null}
                                         {entry.delivered_at && (
                                           <span className="text-muted-foreground ml-auto shrink-0">{formatDateTimeDDMMYYYY(entry.delivered_at)}</span>
                                         )}
@@ -6475,48 +6383,47 @@ export default function AnnouncementsPage() {
                     </div>
                   </div>
 
-                  <button
+                  <Button
+                    intent="primary"
                     onClick={generateKey}
-                    disabled={generatingKey}
-                    className="flex items-center gap-2 px-5 py-2.5 text-sm font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 mx-auto transition-colors"
+                    loading={generatingKey}
+                    className="mx-auto"
+                    icon={<Key className="w-4 h-4" />}
                   >
-                    {generatingKey ? <Loader2 className="w-4 h-4 animate-spin" /> : <Key className="w-4 h-4" />}
                     Generate Link Key
-                  </button>
+                  </Button>
                 </div>
               </div>
             ) : !integration.bot_verified ? (
               /* ── Key generated but not yet verified ── */
               <div className="space-y-4">
-                <div className="border border-amber-200 dark:border-amber-800 bg-amber-50 dark:bg-amber-950 rounded-lg p-6 space-y-4">
-                  <div className="flex items-center gap-2 text-amber-700 dark:text-amber-300">
+                <div className="border border-warning-muted bg-warning-subtle rounded-lg p-6 space-y-4">
+                  <div className="flex items-center gap-2 text-warning">
                     <Key className="w-5 h-5" />
                     <h4 className="font-medium">Awaiting Bot Verification</h4>
                   </div>
 
-                  <p className="text-sm text-amber-600 dark:text-amber-400">
+                  <p className="text-sm text-warning">
                     Your link key has been generated. Follow these steps to complete the connection:
                   </p>
 
                   {/* Link key display */}
                   <div className="bg-card rounded-lg p-3 flex items-center gap-2 border border-border">
                     <code className="flex-1 text-sm font-mono break-all">{integration.link_key}</code>
-                    <button
+                    <IconButton
                       onClick={() => copyKey(integration.link_key)}
-                      className="p-2 rounded hover:bg-muted transition-colors shrink-0"
-                      title="Copy key"
-                    >
-                      {keyCopied ? <Check className="w-4 h-4 text-green-500" /> : <Copy className="w-4 h-4" />}
-                    </button>
+                      label="Copy key"
+                      icon={keyCopied ? <Check className="text-success" /> : <Copy />}
+                    />
                   </div>
 
-                  <div className="text-sm space-y-2 text-amber-600 dark:text-amber-400">
+                  <div className="text-sm space-y-2 text-warning">
                     <p>1. Invite the <strong>Swarm Coordinator</strong> bot to your server if you haven't yet</p>
                     <p>2. <strong>DM the key to the bot</strong> for privacy, or use <code className="px-1 py-0.5 bg-background rounded text-xs">/link {integration.link_key.slice(0, 12)}...</code> in a server</p>
                     <p>3. Once verified, refresh this page</p>
                   </div>
 
-                  <div className="p-3 rounded-lg bg-blue-50 dark:bg-blue-950 border border-blue-200 dark:border-blue-800 text-xs text-blue-600 dark:text-blue-400 flex items-start gap-2">
+                  <div className="p-3 rounded-lg bg-info-subtle border border-info-muted text-xs text-primary flex items-start gap-2">
                     <ShieldCheck className="w-4 h-4 shrink-0 mt-0.5" />
                     <span>For security, we recommend sending the key via <strong>direct message</strong> to the bot instead of using /link in a public channel where others could see it.</span>
                   </div>
@@ -6540,24 +6447,15 @@ export default function AnnouncementsPage() {
                       <Plus className="w-4 h-4" />
                       Invite Bot to Server
                     </a>
-                    <button
-                      onClick={fetchIntegration}
-                      className="flex items-center gap-2 px-4 py-2 text-sm rounded-lg border border-border hover:bg-muted transition-colors"
-                    >
-                      <RefreshCw className="w-4 h-4" />
+                    <Button emphasis="outline" onClick={fetchIntegration} icon={<RefreshCw className="w-4 h-4" />}>
                       Check Status
-                    </button>
-                    <button
-                      onClick={generateKey}
-                      disabled={generatingKey}
-                      className="flex items-center gap-2 px-4 py-2 text-sm rounded-lg border border-border hover:bg-muted transition-colors"
-                    >
-                      <Key className="w-4 h-4" />
+                    </Button>
+                    <Button emphasis="outline" onClick={generateKey} disabled={generatingKey} icon={<Key className="w-4 h-4" />}>
                       Regenerate Key
-                    </button>
+                    </Button>
                   </div>
 
-                  <p className="text-xs text-amber-500 dark:text-amber-600">
+                  <p className="text-xs text-warning dark:text-warning">
                     Key expires: {formatDateTimeDDMMYYYY(integration.link_key_expires_at)}
                   </p>
                 </div>
@@ -6566,14 +6464,14 @@ export default function AnnouncementsPage() {
               /* ── Connected ── */
               <div className="space-y-6">
                 {/* Connection status */}
-                <div className="border border-green-200 dark:border-green-800 bg-green-50 dark:bg-green-950 rounded-lg p-4 flex items-center justify-between">
+                <div className="border border-success-muted bg-success-subtle rounded-lg p-4 flex items-center justify-between">
                   <div className="flex items-center gap-3">
-                    <CheckCircle2 className="w-5 h-5 text-green-500" />
+                    <CheckCircle2 className="w-5 h-5 text-success" />
                     <div>
-                      <p className="text-sm font-medium text-green-700 dark:text-green-300">
+                      <p className="text-sm font-medium text-success">
                         Connected as {integration.discord_username}
                       </p>
-                      <p className="text-xs text-green-600 dark:text-green-400">
+                      <p className="text-xs text-success">
                         Linked {formatDateDDMMYYYY(integration.bot_verified_at!)}
                       </p>
                     </div>
@@ -6588,13 +6486,9 @@ export default function AnnouncementsPage() {
                       <Plus className="w-3.5 h-3.5" />
                       Invite Bot to Another Server
                     </a>
-                    <button
-                      onClick={disconnectDiscord}
-                      className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-red-200 dark:border-red-800 text-red-600 dark:text-red-400 hover:bg-red-50 dark:hover:bg-red-950 transition-colors"
-                    >
-                      <Unlink className="w-3.5 h-3.5" />
+                    <Button emphasis="outline" intent="danger" size="compact" onClick={disconnectDiscord} icon={<Unlink className="w-3.5 h-3.5" />}>
                       Disconnect
-                    </button>
+                    </Button>
                   </div>
                 </div>
 
@@ -6610,14 +6504,15 @@ export default function AnnouncementsPage() {
                         </p>
                       )}
                     </div>
-                    <button
+                    <Button
+                      emphasis="outline"
+                      size="compact"
                       onClick={() => refreshGuilds(true)}
                       disabled={syncing}
-                      className="flex items-center gap-1.5 px-3 py-1.5 text-xs rounded border border-border hover:bg-muted transition-colors disabled:opacity-50"
+                      icon={<RefreshCw className={`w-3.5 h-3.5 ${syncing ? 'animate-spin' : ''}`} />}
                     >
-                      <RefreshCw className={`w-3.5 h-3.5 ${syncing ? 'animate-spin' : ''}`} />
                       {syncing ? 'Syncing...' : 'Sync Channels'}
-                    </button>
+                    </Button>
                   </div>
 
                   {guilds.length === 0 ? (
@@ -6631,14 +6526,15 @@ export default function AnnouncementsPage() {
                           Make sure the bot is invited to your server, then click "Sync Channels" above.
                         </p>
                       </div>
-                      <button
+                      <Button
+                        intent="primary"
                         onClick={() => refreshGuilds(true)}
                         disabled={syncing}
-                        className="flex items-center gap-2 px-4 py-2 text-sm rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 mx-auto transition-colors"
+                        className="mx-auto"
+                        icon={<RefreshCw className={`w-4 h-4 ${syncing ? 'animate-spin' : ''}`} />}
                       >
-                        <RefreshCw className={`w-4 h-4 ${syncing ? 'animate-spin' : ''}`} />
                         Sync Now
-                      </button>
+                      </Button>
                     </div>
                   ) : (
                     <div className="space-y-4">
@@ -6648,69 +6544,60 @@ export default function AnnouncementsPage() {
                         return (
                           <div key={guild.guild_id} className="border border-border rounded-lg overflow-hidden">
                             <div className="flex items-center bg-muted/30">
-                              <button
-                                onClick={() => toggleGuildCollapsed(guild.guild_id)}
-                                className="flex-1 px-4 py-2.5 flex items-center justify-between hover:bg-muted/50 transition-colors"
-                              >
-                                <div className="flex items-center gap-2">
-                                  <ChevronDown className={`w-4 h-4 text-muted-foreground transition-transform ${isCollapsed ? '-rotate-90' : ''}`} />
-                                  <Users className="w-4 h-4 text-muted-foreground" />
-                                  <span className="text-sm font-medium">{guild.guild_name}</span>
-                                </div>
-                                <span className="text-xs text-muted-foreground">
-                                  {activeCount} / {guild.channels.length} active
-                                </span>
-                              </button>
-                              <button
+                              <Disclosure
+                                className="flex-1 min-w-0 p-1"
+                                expanded={!isCollapsed}
+                                onToggle={() => toggleGuildCollapsed(guild.guild_id)}
+                                panelId={`announcements-guild-${guild.guild_id}-channels`}
+                                icon={<Users />}
+                                title={guild.guild_name}
+                                trailing={
+                                  <span className="text-xs font-normal text-muted-foreground">
+                                    {activeCount} / {guild.channels.length} active
+                                  </span>
+                                }
+                              />
+                              <IconButton
+                                intent="danger"
                                 onClick={(e) => { e.stopPropagation(); removeGuild(guild.guild_id, guild.guild_name) }}
-                                className="px-3 py-2.5 text-muted-foreground hover:text-red-500 hover:bg-red-50 dark:hover:bg-red-950 transition-colors"
-                                title={`Remove ${guild.guild_name}`}
-                              >
-                                <Trash2 className="w-3.5 h-3.5" />
-                              </button>
+                                className="mx-1"
+                                label={`Remove ${guild.guild_name}`}
+                                icon={<Trash2 />}
+                              />
                             </div>
                             {!isCollapsed && (
-                            <div className="p-2 space-y-0.5">
+                            <div id={`announcements-guild-${guild.guild_id}-channels`} className="p-2 space-y-0.5">
                               {guild.channels.map(ch => (
-                                <button
+                                <Switch
                                   key={ch.channel_id}
-                                  onClick={() => toggleChannelActive(ch.channel_id)}
-                                  className={`w-full flex items-center justify-between py-2 px-3 rounded-lg transition-colors ${
-                                    ch.is_active
-                                      ? 'bg-primary/10 border border-primary/30'
-                                      : 'hover:bg-muted/50'
-                                  }`}
+                                  variant="card"
+                                  size="compact"
+                                  checked={ch.is_active}
+                                  onCheckedChange={() => toggleChannelActive(ch.channel_id)}
                                 >
-                                  <div className="flex items-center gap-2">
+                                  <span className="flex items-center gap-2">
                                     <Hash className={`w-3.5 h-3.5 ${ch.is_active ? 'text-primary' : 'text-muted-foreground'}`} />
                                     <span className={`text-sm ${ch.is_active ? 'text-foreground font-medium' : 'text-muted-foreground'}`}>
                                       {ch.channel_name}
                                     </span>
                                     {/* Permission indicators */}
                                     {ch.bot_can_send && ch.user_can_send && (
-                                      <span title="Both you and the bot can send here"><ShieldCheck className="w-3 h-3 text-green-500" /></span>
+                                      <span title="Both you and the bot can send here"><ShieldCheck className="w-3 h-3 text-success" /></span>
                                     )}
                                     {!ch.bot_can_send && (
-                                      <span className="flex items-center gap-1 text-xs text-amber-500" title="Bot cannot send messages to this channel">
+                                      <span className="flex items-center gap-1 text-xs text-warning" title="Bot cannot send messages to this channel">
                                         <ShieldAlert className="w-3 h-3" />
                                         Bot: no access
                                       </span>
                                     )}
                                     {!ch.user_can_send && (
-                                      <span className="flex items-center gap-1 text-xs text-amber-500" title="You don't have permission to send messages in this channel">
+                                      <span className="flex items-center gap-1 text-xs text-warning" title="You don't have permission to send messages in this channel">
                                         <ShieldAlert className="w-3 h-3" />
                                         You: no access
                                       </span>
                                     )}
-                                  </div>
-                                  <div className={`w-8 h-5 rounded-full transition-colors relative ${
-                                    ch.is_active ? 'bg-primary' : 'bg-muted-foreground/30'
-                                  }`}>
-                                    <div className={`absolute top-0.5 w-4 h-4 rounded-full bg-primary-foreground transition-transform ${
-                                      ch.is_active ? 'translate-x-3.5' : 'translate-x-0.5'
-                                    }`} />
-                                  </div>
-                                </button>
+                                  </span>
+                                </Switch>
                               ))}
                             </div>
                             )}
@@ -6767,7 +6654,7 @@ export default function AnnouncementsPage() {
                     </div>
                   </div>
 
-                  <div className="p-3 rounded-lg bg-red-50 dark:bg-red-950 border border-red-200 dark:border-red-800 text-xs text-red-600 dark:text-red-400 flex items-start gap-2 max-w-lg mx-auto">
+                  <div className="p-3 rounded-lg bg-danger-subtle border border-danger-muted text-xs text-danger flex items-start gap-2 max-w-lg mx-auto">
                     <Shield className="w-4 h-4 shrink-0 mt-0.5" />
                     <span>
                       Emails are used only to deliver announcements you write. We never spam, sell, or share addresses.
@@ -6775,13 +6662,9 @@ export default function AnnouncementsPage() {
                     </span>
                   </div>
 
-                  <button
-                    onClick={startEmailIntegration}
-                    className="flex items-center gap-2 px-5 py-2.5 text-sm font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 mx-auto transition-colors"
-                  >
-                    <Mail className="w-4 h-4" />
+                  <Button intent="primary" onClick={startEmailIntegration} className="mx-auto" icon={<Mail className="w-4 h-4" />}>
                     Start Email Integration
-                  </button>
+                  </Button>
                 </div>
               </div>
             ) : (
@@ -6789,47 +6672,52 @@ export default function AnnouncementsPage() {
               <div className="space-y-6">
                 {/* Disable integration option */}
                 <div className="flex items-center justify-end">
-                  <button
-                    onClick={disableEmailIntegration}
-                    className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-red-500 transition-colors"
-                  >
-                    <XCircle className="w-3.5 h-3.5" />
+                  <Button emphasis="ghost" intent="danger" size="compact" onClick={disableEmailIntegration} icon={<XCircle className="w-3.5 h-3.5" />}>
                     Disable Email Integration
-                  </button>
+                  </Button>
                 </div>
 
                 {/* ── Verified Email Addresses ── */}
-                <div className="border border-red-200 dark:border-red-800/50 rounded-lg overflow-hidden">
-                  <button
-                    onClick={() => setVerifiedEmailsCollapsed(prev => !prev)}
-                    className="w-full flex items-center gap-2 p-4 text-left hover:bg-red-50/50 dark:hover:bg-red-950/20 transition-colors"
-                  >
-                    {verifiedEmailsCollapsed ? <ChevronRight className="w-4 h-4 text-red-400" /> : <ChevronDown className="w-4 h-4 text-red-400" />}
-                    <ShieldCheck className="w-4 h-4 text-red-500" />
-                    <h4 className="text-sm font-medium text-red-700 dark:text-red-400">Verified Email Addresses</h4>
-                    <span className="text-[10px] text-red-500 dark:text-red-400 font-medium">Private</span>
-                    {verifiedEmails.length > 0 && (
-                      <span className="text-xs text-muted-foreground">({verifiedEmails.length})</span>
-                    )}
-                  </button>
+                <div className="border border-danger-muted/50 rounded-lg overflow-hidden">
+                  <Disclosure
+                    className="p-2"
+                    headingLevel={4}
+                    expanded={!verifiedEmailsCollapsed}
+                    onToggle={() => setVerifiedEmailsCollapsed(prev => !prev)}
+                    panelId="announcements-verified-emails-panel"
+                    icon={<ShieldCheck />}
+                    title="Verified Email Addresses"
+                    trailing={
+                      <span className="flex items-center gap-2">
+                        <span className="text-[10px] text-danger font-medium">Private</span>
+                        {verifiedEmails.length > 0 && (
+                          <span className="text-xs font-normal text-muted-foreground">({verifiedEmails.length})</span>
+                        )}
+                      </span>
+                    }
+                  />
 
                   {!verifiedEmailsCollapsed && (
-                  <div className="p-4 space-y-4 border-t border-border">
+                  <div id="announcements-verified-emails-panel" className="p-4 space-y-4 border-t border-border">
                     <p className="text-xs text-muted-foreground">
                       Verified emails serve as both your receiving address and your sender identity. Your primary email is used for notifications and appears in the "sent by" attribution on announcements.
                     </p>
 
                     {/* Warning when email notifications are disabled */}
                     {notifChannelEmail === false && (
-                      <div className="flex items-center justify-between p-3 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-lg">
+                      <div className="flex items-center justify-between p-3 bg-warning-subtle border border-warning-muted rounded-lg">
                         <div className="flex items-center gap-2">
-                          <AlertCircle className="w-4 h-4 flex-shrink-0 text-amber-600 dark:text-amber-400" />
-                          <p className="text-xs text-amber-700 dark:text-amber-400">
+                          <AlertCircle className="w-4 h-4 shrink-0 text-warning" />
+                          <p className="text-xs text-warning">
                             Email notifications are disabled. You won't receive any emails until you enable them in Notification settings.
                           </p>
                         </div>
-                        <button
-                          onClick={async () => {
+                        <Switch
+                          checked={false}
+                          label="Enable email notifications"
+                          title="Enable email notifications"
+                          className="ml-3"
+                          onCheckedChange={async () => {
                             try {
                               const res = await apiClient.get('/api/notification-preferences')
                               const p = res.data.preferences
@@ -6848,11 +6736,7 @@ export default function AnnouncementsPage() {
                               console.error('Failed to enable email notifications:', err)
                             }
                           }}
-                          className="ml-3 flex-shrink-0 relative w-12 h-6 rounded-full transition-colors bg-rose-300 dark:bg-rose-500/60"
-                          title="Enable email notifications"
-                        >
-                          <span className="absolute top-1 left-1 w-4 h-4 rounded-full bg-white dark:bg-gray-200 shadow-[0_1px_3px_rgba(0,0,0,0.3)] transition-all" />
-                        </button>
+                        />
                       </div>
                     )}
 
@@ -6870,31 +6754,25 @@ export default function AnnouncementsPage() {
                               <Mail className="w-4 h-4 text-muted-foreground" />
                               <span className="text-sm font-medium">{ve.email}</span>
                               {ve.is_primary ? (
-                                <span className="px-1.5 py-0.5 bg-green-100 dark:bg-green-950/40 text-green-700 dark:text-green-400 text-[10px] font-medium rounded">Primary</span>
+                                <span className="px-1.5 py-0.5 bg-success-subtle text-success text-[10px] font-medium rounded">Primary</span>
                               ) : (
-                                <button
-                                  onClick={() => handleSetPrimaryEmail(ve.id)}
-                                  className="px-2.5 py-1 bg-primary/10 hover:bg-primary/20 text-primary text-xs font-medium rounded-md border border-primary/20 transition-colors"
-                                >
+                                <Button emphasis="outline" intent="primary" size="micro" onClick={() => handleSetPrimaryEmail(ve.id)}>
                                   Set Primary
-                                </button>
+                                </Button>
                               )}
                             </div>
                             <div className="flex items-center gap-1.5">
-                              <button
-                                onClick={() => handleRemoveVerifiedEmail(ve.id)}
-                                className="text-xs text-red-500 hover:underline"
-                              >
+                              <Button emphasis="ghost" intent="danger" size="micro" onClick={() => handleRemoveVerifiedEmail(ve.id)}>
                                 Remove
-                              </button>
+                              </Button>
                             </div>
                           </div>
                         ))}
                       </div>
                     ) : (
-                      <div className="p-3 bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 rounded-lg">
-                        <p className="text-xs text-amber-700 dark:text-amber-400 flex items-center gap-2">
-                          <AlertCircle className="w-4 h-4 flex-shrink-0" />
+                      <div className="p-3 bg-warning-subtle border border-warning-muted rounded-lg">
+                        <p className="text-xs text-warning flex items-center gap-2">
+                          <AlertCircle className="w-4 h-4 shrink-0" />
                           No verified emails yet. Verify an email below to receive notifications and use it as your sender identity.
                         </p>
                       </div>
@@ -6905,15 +6783,12 @@ export default function AnnouncementsPage() {
                       <div className="p-3 border border-border rounded-lg bg-card">
                         <div className="flex items-center justify-between">
                           <div className="flex items-center gap-2">
-                            <ShieldCheck className="w-4 h-4 text-green-500" />
+                            <ShieldCheck className="w-4 h-4 text-success" />
                             <span className="text-sm">Verify your Google email: <strong>{user.email}</strong></span>
                           </div>
-                          <button
-                            onClick={handleVerifyGoogleEmail}
-                            className="px-3 py-1.5 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition-colors"
-                          >
+                          <Button intent="primary" size="compact" onClick={handleVerifyGoogleEmail}>
                             Verify with Google
-                          </button>
+                          </Button>
                         </div>
                       </div>
                     )}
@@ -6928,17 +6803,20 @@ export default function AnnouncementsPage() {
                             value={verifyEmailInput}
                             onChange={e => setVerifyEmailInput(e.target.value)}
                             placeholder="your@email.com"
-                            className="flex-1 px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+                            className="flex-1 px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
                             disabled={verifyStep === 'sending'}
                           />
-                          <button
+                          <Button
+                            emphasis="outline"
+                            intent="primary"
+                            size="compact"
                             onClick={handleSendVerificationCode}
-                            disabled={!verifyEmailInput.trim() || verifyStep === 'sending'}
-                            className="flex items-center gap-1.5 px-3 py-2 bg-blue-600 hover:bg-blue-700 text-white text-xs font-medium rounded-lg transition-colors disabled:opacity-50"
+                            disabled={!verifyEmailInput.trim()}
+                            loading={verifyStep === 'sending'}
+                            icon={<Mail className="w-3.5 h-3.5" />}
                           >
-                            {verifyStep === 'sending' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Mail className="w-3.5 h-3.5" />}
                             Send Code
-                          </button>
+                          </Button>
                         </div>
                       ) : (
                         <div className="space-y-2">
@@ -6952,30 +6830,31 @@ export default function AnnouncementsPage() {
                               onChange={e => setVerifyCodeInput(e.target.value.replace(/\D/g, '').slice(0, 6))}
                               placeholder="123456"
                               maxLength={6}
-                              className="w-32 px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground text-center tracking-widest font-mono focus:ring-2 focus:ring-ring outline-none"
+                              className="w-32 px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground text-center tracking-widest font-mono focus:ring-2 focus:ring-ring outline-hidden"
                               disabled={verifyStep === 'verifying'}
                             />
-                            <button
+                            <Button
+                              emphasis="outline"
+                              intent="primary"
+                              size="compact"
                               onClick={handleVerifyCode}
-                              disabled={verifyCodeInput.length !== 6 || verifyStep === 'verifying'}
-                              className="flex items-center gap-1.5 px-3 py-2 bg-green-600 hover:bg-green-700 text-white text-xs font-medium rounded-lg transition-colors disabled:opacity-50"
+                              disabled={verifyCodeInput.length !== 6}
+                              loading={verifyStep === 'verifying'}
+                              icon={<Check className="w-3.5 h-3.5" />}
                             >
-                              {verifyStep === 'verifying' ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
                               Verify
-                            </button>
-                            <button
+                            </Button>
+                            <Button
+                              emphasis="ghost"
+                              size="compact"
                               onClick={() => { setVerifyStep('idle'); setVerifyCodeInput(''); setVerifyPendingEmail(''); setVerifyResult(null) }}
-                              className="px-3 py-2 text-xs text-muted-foreground hover:text-foreground transition-colors"
                             >
                               Cancel
-                            </button>
+                            </Button>
                           </div>
-                          <button
-                            onClick={handleSendVerificationCode}
-                            className="text-xs text-primary hover:underline"
-                          >
+                          <Button emphasis="ghost" intent="primary" size="micro" onClick={handleSendVerificationCode}>
                             Resend code
-                          </button>
+                          </Button>
                         </div>
                       )}
                     </div>
@@ -6984,8 +6863,8 @@ export default function AnnouncementsPage() {
                     {verifyResult && (
                       <div className={`p-2.5 rounded-lg text-xs flex items-center gap-2 ${
                         verifyResult.type === 'success'
-                          ? 'bg-green-50 dark:bg-green-950/30 border border-green-200 dark:border-green-800 text-green-700 dark:text-green-400'
-                          : 'bg-red-50 dark:bg-red-950/30 border border-red-200 dark:border-red-800 text-red-700 dark:text-red-400'
+                          ? 'bg-success-subtle border border-success-muted text-success'
+                          : 'bg-danger-subtle border border-danger-muted text-danger'
                       }`}>
                         {verifyResult.type === 'success' ? <CheckCircle2 className="w-3.5 h-3.5" /> : <AlertCircle className="w-3.5 h-3.5" />}
                         {verifyResult.message}
@@ -7000,24 +6879,27 @@ export default function AnnouncementsPage() {
                 </div>
 
                 {/* ── Your Email Configuration ── */}
-                <div className="border border-red-200 dark:border-red-800/50 rounded-lg overflow-hidden">
-                  <button
-                    onClick={() => setEmailConfCollapsed(prev => !prev)}
-                    className="w-full flex items-center gap-2 p-4 text-left hover:bg-red-50/50 dark:hover:bg-red-950/20 transition-colors"
-                  >
-                    {emailConfCollapsed ? <ChevronRight className="w-4 h-4 text-red-400" /> : <ChevronDown className="w-4 h-4 text-red-400" />}
-                    <Key className="w-4 h-4 text-red-500" />
-                    <h4 className="text-sm font-medium text-red-700 dark:text-red-400">Your Email Configuration</h4>
-                    {emailServiceStatus?.userConfig?.verified && (
-                      <span className="inline-flex items-center gap-1 text-[10px] font-medium text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-950 px-2 py-0.5 rounded-full">
-                        <CheckCircle2 className="w-3 h-3" /> Verified
+                <div className="border border-danger-muted/50 rounded-lg overflow-hidden">
+                  <Disclosure
+                    className="p-2"
+                    headingLevel={4}
+                    expanded={!emailConfCollapsed}
+                    onToggle={() => setEmailConfCollapsed(prev => !prev)}
+                    panelId="announcements-email-config-panel"
+                    icon={<Key />}
+                    title="Your Email Configuration"
+                    trailing={
+                      <span className="flex items-center gap-2">
+                        {emailServiceStatus?.userConfig?.verified && (
+                          <StatusBadge tone="success" density="compact" icon={<CheckCircle2 className="w-3 h-3" />}>Verified</StatusBadge>
+                        )}
+                        <span className="text-[10px] text-danger font-medium">Private</span>
                       </span>
-                    )}
-                    <span className="text-[10px] text-red-500 dark:text-red-400 font-medium">Private</span>
-                  </button>
+                    }
+                  />
 
                   {!emailConfCollapsed && (
-                  <div className="p-4 space-y-4 border-t border-border">
+                  <div id="announcements-email-config-panel" className="p-4 space-y-4 border-t border-border">
                   <p className="text-xs text-muted-foreground">
                     Configure your own email to send announcements from your address.
                     {emailServiceStatus?.platformConfigured && (
@@ -7026,7 +6908,7 @@ export default function AnnouncementsPage() {
                   </p>
 
                   {!emailServiceStatus?.encryptionAvailable ? (
-                    <div className="p-3 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-800 text-xs text-amber-700 dark:text-amber-400 flex items-start gap-2">
+                    <div className="p-3 rounded-lg bg-warning-subtle border border-warning-muted text-xs text-warning flex items-start gap-2">
                       <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5" />
                       <span>
                         Custom email configuration is not available yet. The server needs a <code className="px-1 py-0.5 bg-muted rounded text-[10px]">SMTP_ENCRYPTION_KEY</code> to securely store credentials.
@@ -7035,7 +6917,7 @@ export default function AnnouncementsPage() {
                     </div>
                   ) : (
                     <>
-                      <div className="p-2.5 rounded-lg bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-800 text-xs text-blue-700 dark:text-blue-400 flex items-start gap-2">
+                      <div className="p-2.5 rounded-lg bg-info-subtle border border-info-muted text-xs text-info flex items-start gap-2">
                         <Info className="w-3.5 h-3.5 shrink-0 mt-0.5" />
                         <span>
                           For Gmail, use an <strong>App Password</strong> (not your regular password).
@@ -7051,7 +6933,7 @@ export default function AnnouncementsPage() {
                             value={smtpEmail}
                             onChange={e => setSmtpEmail(e.target.value)}
                             placeholder="you@gmail.com"
-                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
                           />
                         </div>
                         <div className="col-span-2 sm:col-span-1">
@@ -7061,7 +6943,7 @@ export default function AnnouncementsPage() {
                             value={smtpPassword}
                             onChange={e => setSmtpPassword(e.target.value)}
                             placeholder={emailServiceStatus?.userConfig ? '(saved - enter new to update)' : 'xxxx xxxx xxxx xxxx'}
-                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
                           />
                         </div>
                         <div>
@@ -7071,7 +6953,7 @@ export default function AnnouncementsPage() {
                             value={smtpDisplayName}
                             onChange={e => setSmtpDisplayName(e.target.value)}
                             placeholder="Your Name"
-                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
                           />
                         </div>
                         <div>
@@ -7081,7 +6963,7 @@ export default function AnnouncementsPage() {
                             value={smtpHost}
                             onChange={e => setSmtpHost(e.target.value)}
                             placeholder="smtp.gmail.com"
-                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
                           />
                         </div>
                         <div>
@@ -7091,7 +6973,7 @@ export default function AnnouncementsPage() {
                             value={smtpPort}
                             onChange={e => setSmtpPort(e.target.value)}
                             placeholder="587"
-                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
                           />
                         </div>
                       </div>
@@ -7099,8 +6981,8 @@ export default function AnnouncementsPage() {
                       {smtpResult && (
                         <div className={`flex items-center gap-2 p-2.5 rounded-lg text-xs ${
                           smtpResult.type === 'success'
-                            ? 'bg-green-50 dark:bg-green-950 text-green-700 dark:text-green-300 border border-green-200 dark:border-green-800'
-                            : 'bg-red-50 dark:bg-red-950 text-red-700 dark:text-red-300 border border-red-200 dark:border-red-800'
+                            ? 'bg-success-subtle text-success border border-success-muted'
+                            : 'bg-danger-subtle text-danger border border-danger-muted'
                         }`}>
                           {smtpResult.type === 'success' ? <CheckCircle2 className="w-3.5 h-3.5 shrink-0" /> : <XCircle className="w-3.5 h-3.5 shrink-0" />}
                           {smtpResult.message}
@@ -7108,31 +6990,36 @@ export default function AnnouncementsPage() {
                       )}
 
                       <div className="flex items-center gap-2">
-                        <button
+                        <Button
+                          intent="primary"
                           onClick={saveSmtpConfig}
-                          disabled={savingSmtp || !smtpEmail.trim() || !smtpPassword.trim()}
-                          className="flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
+                          disabled={!smtpEmail.trim() || !smtpPassword.trim()}
+                          loading={savingSmtp}
+                          icon={<Check className="w-3.5 h-3.5" />}
                         >
-                          {savingSmtp ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Check className="w-3.5 h-3.5" />}
                           Save
-                        </button>
+                        </Button>
                         {emailServiceStatus?.userConfig && (
                           <>
-                            <button
+                            <Button
+                              emphasis="outline"
+                              intent="primary"
                               onClick={testSmtpConnection}
-                              disabled={testingSmtp}
-                              className="flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-lg border border-primary text-primary hover:bg-primary/10 disabled:opacity-50 transition-colors"
+                              loading={testingSmtp}
+                              icon={<Send className="w-3.5 h-3.5" />}
                             >
-                              {testingSmtp ? <Loader2 className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
                               Test Connection
-                            </button>
-                            <button
+                            </Button>
+                            <Button
+                              emphasis="ghost"
+                              intent="danger"
+                              size="compact"
                               onClick={deleteSmtpConfig}
-                              className="flex items-center gap-1.5 px-3 py-2 text-xs text-muted-foreground hover:text-red-500 transition-colors ml-auto"
+                              className="ml-auto"
+                              icon={<Trash2 className="w-3.5 h-3.5" />}
                             >
-                              <Trash2 className="w-3.5 h-3.5" />
                               Remove
-                            </button>
+                            </Button>
                           </>
                         )}
                       </div>
@@ -7146,22 +7033,23 @@ export default function AnnouncementsPage() {
                 <div className="flex items-center gap-2 mb-1">
                   <span className="text-sm font-medium">Add Email Contacts</span>
                   <LearnerHelpIcon
-                    description={<><p className="font-semibold text-blue-700 dark:text-blue-300 mb-1">Who is this for?</p><p className="mb-1.5">Add email addresses of people you want to reach with announcements outside of Discord -- collaborators, community members, or stakeholders who prefer email.</p><p className="mb-1.5">Only add emails of people you intend to communicate with. If someone opts out, they will not receive further messages from you through Coordination Manager.</p><p>Contacts added here appear in the <strong>Compose</strong> tab as selectable email recipients alongside Discord channels and DMs.</p></>}
+                    description={<><p className="font-semibold text-info mb-1">Who is this for?</p><p className="mb-1.5">Add email addresses of people you want to reach with announcements outside of Discord -- collaborators, community members, or stakeholders who prefer email.</p><p className="mb-1.5">Only add emails of people you intend to communicate with. If someone opts out, they will not receive further messages from you through Coordination Manager.</p><p>Contacts added here appear in the <strong>Compose</strong> tab as selectable email recipients alongside Discord channels and DMs.</p></>}
                     size={4}
                     className="shrink-0"
                   />
                 </div>
                 <div className="border border-border rounded-lg overflow-hidden">
-                  <button
-                    onClick={() => setAddContactCollapsed(prev => !prev)}
-                    className="w-full flex items-center gap-2 p-4 text-left hover:bg-muted/50 transition-colors"
-                  >
-                    {addContactCollapsed ? <ChevronRight className="w-4 h-4 text-muted-foreground" /> : <ChevronDown className="w-4 h-4 text-muted-foreground" />}
-                    <h4 className="text-sm font-medium">Add / Import Email Contacts</h4>
-                  </button>
+                  <Disclosure
+                    className="p-2"
+                    headingLevel={4}
+                    expanded={!addContactCollapsed}
+                    onToggle={() => setAddContactCollapsed(prev => !prev)}
+                    panelId="announcements-add-contacts-panel"
+                    title="Add / Import Email Contacts"
+                  />
 
                   {!addContactCollapsed && (
-                  <div className="p-4 space-y-5 border-t border-border">
+                  <div id="announcements-add-contacts-panel" className="p-4 space-y-5 border-t border-border">
                     {/* ── Single contact ── */}
                     <div>
                       <h5 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">Single Contact</h5>
@@ -7173,7 +7061,7 @@ export default function AnnouncementsPage() {
                             value={addEmailName}
                             onChange={e => setAddEmailName(e.target.value)}
                             placeholder="e.g., John Doe"
-                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
                           />
                         </div>
                         <div className="flex-1 min-w-[180px]">
@@ -7184,7 +7072,7 @@ export default function AnnouncementsPage() {
                             onChange={e => setAddEmailAddress(e.target.value)}
                             onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addEmailContact() } }}
                             placeholder="email@example.com"
-                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
                           />
                         </div>
                         <div className="flex-1 min-w-[140px]">
@@ -7195,17 +7083,18 @@ export default function AnnouncementsPage() {
                             onChange={e => setAddEmailTags(e.target.value)}
                             onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); addEmailContact() } }}
                             placeholder="e.g., team, vip"
-                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
                           />
                         </div>
-                        <button
+                        <Button
+                          intent="primary"
                           onClick={addEmailContact}
-                          disabled={addingEmail || !addEmailAddress.trim()}
-                          className="flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
+                          disabled={!addEmailAddress.trim()}
+                          loading={addingEmail}
+                          icon={<UserPlus className="w-4 h-4" />}
                         >
-                          {addingEmail ? <Loader2 className="w-4 h-4 animate-spin" /> : <UserPlus className="w-4 h-4" />}
                           Add
-                        </button>
+                        </Button>
                       </div>
                     </div>
 
@@ -7223,7 +7112,7 @@ export default function AnnouncementsPage() {
                               onChange={e => { setBulkEmailInput(e.target.value); setBulkImportResult(null) }}
                               placeholder={"alice@example.com, bob@example.com;\ncarol@example.com"}
                               rows={4}
-                              className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none resize-y"
+                              className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden resize-y"
                             />
                           </div>
                           <div>
@@ -7233,7 +7122,7 @@ export default function AnnouncementsPage() {
                               onChange={e => setBulkNamesInput(e.target.value)}
                               placeholder={"Alice Smith, Bob Jones;\nCarol Lee"}
                               rows={4}
-                              className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none resize-y"
+                              className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden resize-y"
                             />
                           </div>
                         </div>
@@ -7244,18 +7133,20 @@ export default function AnnouncementsPage() {
                             value={bulkTagsInput}
                             onChange={e => setBulkTagsInput(e.target.value)}
                             placeholder="e.g., newsletter, batch-march-2026"
-                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+                            className="w-full px-3 py-2 border border-input rounded-lg text-sm bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
                           />
                         </div>
                         <div className="flex items-center gap-3">
-                          <button
+                          <Button
+                            emphasis="outline"
+                            intent="primary"
                             onClick={bulkImportEmails}
-                            disabled={bulkImporting || !bulkEmailInput.trim()}
-                            className="flex items-center gap-1.5 px-4 py-2 text-sm font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
+                            disabled={!bulkEmailInput.trim()}
+                            loading={bulkImporting}
+                            icon={<UserPlus className="w-4 h-4" />}
                           >
-                            {bulkImporting ? <Loader2 className="w-4 h-4 animate-spin" /> : <UserPlus className="w-4 h-4" />}
                             Import All
-                          </button>
+                          </Button>
                           {bulkImportResult && (
                             <span className="text-xs text-muted-foreground">
                               {bulkImportResult.imported} imported{bulkImportResult.skipped > 0 ? `, ${bulkImportResult.skipped} skipped (max 200)` : ''}
@@ -7273,39 +7164,43 @@ export default function AnnouncementsPage() {
                   <span className="text-sm font-medium">Email Contacts</span>
                   <span className="text-xs text-muted-foreground">({emailContacts.length})</span>
                   <LearnerHelpIcon
-                    description={<><p className="font-semibold text-blue-700 dark:text-blue-300 mb-1">Source types explained</p><ul className="list-disc list-inside space-y-0.5"><li><span className="font-medium text-blue-600 dark:text-blue-400">Manual</span>: you typed this email address yourself</li><li><span className="font-medium text-green-600 dark:text-green-400">Verified</span>: the platform has verified this email belongs to a user account</li><li><span className="font-medium text-purple-600 dark:text-purple-400">Both</span>: you added it manually and the platform has also verified the account</li></ul><p className="mt-2">Not all members may show emails here. If someone has turned off Notification Channels in their settings, they will appear with a "Disabled" status and will not receive emails through this system.</p></>}
+                    description={<><p className="font-semibold text-info mb-1">Source types explained</p><ul className="list-disc list-inside space-y-0.5"><li><span className="font-medium text-primary">Manual</span>: you typed this email address yourself</li><li><span className="font-medium text-success">Verified</span>: the platform has verified this email belongs to a user account</li><li><span className="font-medium text-feature-ai">Both</span>: you added it manually and the platform has also verified the account</li></ul><p className="mt-2">Not all members may show emails here. If someone has turned off Notification Channels in their settings, they will appear with a "Disabled" status and will not receive emails through this system.</p></>}
                     size={4}
                     className="shrink-0"
                   />
                 </div>
                 <div className="border border-border rounded-lg overflow-hidden">
                   <div className="flex items-center justify-between px-3 py-2 bg-muted/50 border-b border-border">
+                    <Disclosure
+                      className="flex-1 min-w-0"
+                      expanded={!contactsListCollapsed}
+                      onToggle={() => setContactsListCollapsed(prev => !prev)}
+                      panelId="announcements-email-contacts-panel"
+                      title="Email Contacts"
+                    />
                     <div className="flex items-center gap-2">
-                      <button onClick={() => setContactsListCollapsed(prev => !prev)} className="flex items-center gap-1 hover:text-primary transition-colors">
-                        {contactsListCollapsed ? <ChevronRight className="w-4 h-4 text-muted-foreground" /> : <ChevronDown className="w-4 h-4 text-muted-foreground" />}
-                        <span className="text-sm font-medium">Email Contacts</span>
-                      </button>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <button
+                      <Button
+                        emphasis="ghost"
+                        size="micro"
                         onClick={() => setShowEmails(!showEmails)}
-                        className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors"
+                        icon={showEmails ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
                       >
-                        {showEmails ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
                         {showEmails ? 'Hide Emails' : 'Show Emails'}
-                      </button>
-                      <button
+                      </Button>
+                      <Button
+                        emphasis="ghost"
+                        intent="primary"
+                        size="micro"
                         onClick={fetchEmailContacts}
-                        disabled={loadingEmailContacts}
-                        className="flex items-center gap-1.5 text-xs text-primary hover:underline disabled:opacity-50"
+                        loading={loadingEmailContacts}
+                        icon={<RefreshCw className="w-3 h-3" />}
                       >
-                        {loadingEmailContacts ? <Loader2 className="w-3 h-3 animate-spin" /> : <RefreshCw className="w-3 h-3" />}
                         Refresh
-                      </button>
+                      </Button>
                     </div>
                   </div>
 
-                  {!contactsListCollapsed && (loadingEmailContacts ? (
+                  {!contactsListCollapsed && (<div id="announcements-email-contacts-panel">{loadingEmailContacts ? (
                     <div className="text-center py-8">
                       <Loader2 className="w-5 h-5 animate-spin mx-auto text-muted-foreground" />
                     </div>
@@ -7335,9 +7230,9 @@ export default function AnnouncementsPage() {
                             both: 'Both',
                           }[contact.source]
                           const sourceBg = {
-                            manual: 'bg-blue-100 dark:bg-blue-950/40 text-blue-700 dark:text-blue-400',
-                            platform_verified: 'bg-green-100 dark:bg-green-950/40 text-green-700 dark:text-green-400',
-                            both: 'bg-purple-100 dark:bg-purple-950/40 text-purple-700 dark:text-purple-400',
+                            manual: 'bg-info-subtle text-info',
+                            platform_verified: 'bg-success-subtle text-success',
+                            both: 'bg-muted text-muted-foreground',
                           }[contact.source]
 
                           if (isEditing) {
@@ -7351,7 +7246,7 @@ export default function AnnouncementsPage() {
                                       value={editName}
                                       onChange={e => setEditName(e.target.value)}
                                       placeholder="Display name"
-                                      className="w-full px-2 py-1.5 border border-input rounded text-xs bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+                                      className="w-full px-2 py-1.5 border border-input rounded text-xs bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
                                     />
                                   </div>
                                   <div>
@@ -7361,7 +7256,7 @@ export default function AnnouncementsPage() {
                                       value={editEmail}
                                       onChange={e => setEditEmail(e.target.value)}
                                       placeholder="email@example.com"
-                                      className="w-full px-2 py-1.5 border border-input rounded text-xs bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+                                      className="w-full px-2 py-1.5 border border-input rounded text-xs bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
                                     />
                                   </div>
                                   <div>
@@ -7372,26 +7267,24 @@ export default function AnnouncementsPage() {
                                       onChange={e => setEditTags(e.target.value)}
                                       onKeyDown={e => { if (e.key === 'Enter') { e.preventDefault(); saveEditingContact() } }}
                                       placeholder="e.g., team, vip"
-                                      className="w-full px-2 py-1.5 border border-input rounded text-xs bg-background text-foreground focus:ring-2 focus:ring-ring outline-none"
+                                      className="w-full px-2 py-1.5 border border-input rounded text-xs bg-background text-foreground focus:ring-2 focus:ring-ring outline-hidden"
                                     />
                                   </div>
                                 </div>
                                 <div className="flex items-center gap-2">
-                                  <button
+                                  <Button
+                                    intent="primary"
+                                    size="compact"
                                     onClick={saveEditingContact}
-                                    disabled={savingEdit || !editEmail.trim()}
-                                    className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
+                                    disabled={!editEmail.trim()}
+                                    loading={savingEdit}
+                                    icon={<Check className="w-3 h-3" />}
                                   >
-                                    {savingEdit ? <Loader2 className="w-3 h-3 animate-spin" /> : <Check className="w-3 h-3" />}
                                     Save
-                                  </button>
-                                  <button
-                                    onClick={cancelEditingContact}
-                                    className="flex items-center gap-1 px-3 py-1.5 text-xs font-medium rounded border border-border text-muted-foreground hover:text-foreground transition-colors"
-                                  >
-                                    <X className="w-3 h-3" />
+                                  </Button>
+                                  <Button emphasis="outline" size="compact" onClick={cancelEditingContact} icon={<X className="w-3 h-3" />}>
                                     Cancel
-                                  </button>
+                                  </Button>
                                 </div>
                               </div>
                             )
@@ -7417,15 +7310,15 @@ export default function AnnouncementsPage() {
                               </div>
                               <div>
                                 {contact.opted_out ? (
-                                  <span className="inline-flex items-center gap-0.5 text-[10px] font-medium text-red-600 dark:text-red-400">
+                                  <span className="inline-flex items-center gap-0.5 text-[10px] font-medium text-danger">
                                     <XCircle className="w-3 h-3" /> Opted out
                                   </span>
                                 ) : contact.notification_disabled ? (
-                                  <span className="inline-flex items-center gap-0.5 text-[10px] font-medium text-amber-600 dark:text-amber-400" title="This user has disabled emails from Coordination Manager in their Notification Channels settings">
+                                  <span className="inline-flex items-center gap-0.5 text-[10px] font-medium text-warning" title="This user has disabled emails from Coordination Manager in their Notification Channels settings">
                                     <AlertTriangle className="w-3 h-3" /> Disabled
                                   </span>
                                 ) : (
-                                  <span className="inline-flex items-center gap-0.5 text-[10px] font-medium text-green-600 dark:text-green-400">
+                                  <span className="inline-flex items-center gap-0.5 text-[10px] font-medium text-success">
                                     <CheckCircle2 className="w-3 h-3" /> Active
                                   </span>
                                 )}
@@ -7433,20 +7326,19 @@ export default function AnnouncementsPage() {
                               <div className="flex items-center justify-end gap-1">
                                 {contact.source === 'manual' && (
                                   <>
-                                    <button
+                                    <IconButton
+                                      size="micro"
                                       onClick={() => startEditingContact(contact)}
-                                      className="text-muted-foreground hover:text-primary transition-colors p-1"
-                                      title="Edit contact"
-                                    >
-                                      <Pencil className="w-3.5 h-3.5" />
-                                    </button>
-                                    <button
+                                      label="Edit contact"
+                                      icon={<Pencil />}
+                                    />
+                                    <IconButton
+                                      size="micro"
+                                      intent="danger"
                                       onClick={() => removeEmailContact(contact.id)}
-                                      className="text-muted-foreground hover:text-red-500 transition-colors p-1"
-                                      title="Remove contact"
-                                    >
-                                      <Trash2 className="w-3.5 h-3.5" />
-                                    </button>
+                                      label="Remove contact"
+                                      icon={<Trash2 />}
+                                    />
                                   </>
                                 )}
                               </div>
@@ -7461,78 +7353,45 @@ export default function AnnouncementsPage() {
                           <span className="ml-2">· {emailContacts.filter(c => c.opted_out).length} opted out</span>
                         )}
                         {emailContacts.some(c => c.notification_disabled) && (
-                          <span className="ml-2 text-amber-500">· {emailContacts.filter(c => c.notification_disabled).length} disabled notifications</span>
+                          <span className="ml-2 text-warning">· {emailContacts.filter(c => c.notification_disabled).length} disabled notifications</span>
                         )}
                       </div>
                     </>
-                  ))}
+                  )}</div>)}
                 </div>
               </div>
             )}
           </div>
         )}
 
-        {sendWithoutCalendarModalOpen && (
-          <div
-            className="fixed inset-0 z-[110] flex items-center justify-center bg-black/45 backdrop-blur-sm px-4"
-            onClick={() => setSendWithoutCalendarModalOpen(false)}
-          >
-            <div
-              className="w-full max-w-lg rounded-xl border border-border bg-card text-card-foreground shadow-2xl"
-              onClick={e => e.stopPropagation()}
-            >
-              <div className="px-5 py-4 border-b border-border">
-                <div className="flex items-start gap-3">
-                  <div className="mt-0.5 rounded-full bg-amber-500/15 p-2 text-amber-600 dark:text-amber-400">
-                    <AlertTriangle className="w-4 h-4" />
-                  </div>
-                  <div>
-                    <h3 className="text-base font-semibold">Send Without Calendar Context?</h3>
-                    <p className="text-sm text-muted-foreground mt-1">
-                      DM recipients will not see a Subscribe button, and invite tracking will be skipped.
-                    </p>
-                  </div>
-                </div>
-              </div>
-
-              <div className="px-5 py-3">
-                <div className="rounded-lg border border-amber-500/25 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-300">
+        <ChoiceDialog<'attach' | 'send'>
+          open={sendWithoutCalendarModalOpen}
+          title="Send Without Calendar Context?"
+          description={
+            <>
+              DM recipients will not see a Subscribe button, and invite tracking will be skipped.
+              <span className="mt-3 flex items-start gap-2 rounded-lg border border-warning-muted bg-warning-subtle px-3 py-2 text-xs text-warning">
+                <AlertTriangle className="mt-0.5 h-3.5 w-3.5 shrink-0" />
+                <span>
                   Tip: Attach a coordination calendar in the "Attach Coordination Calendar Context" section for subscription management.
-                </div>
-              </div>
-
-              <div className="px-5 pb-5 flex flex-col-reverse sm:flex-row sm:justify-end gap-2">
-                <button
-                  type="button"
-                  onClick={() => setSendWithoutCalendarModalOpen(false)}
-                  className="px-3 py-2 rounded-md text-sm font-medium border border-border text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
-                >
-                  Cancel
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSendWithoutCalendarModalOpen(false)
-                    jumpToCalendarAttachment()
-                  }}
-                  className="px-3 py-2 rounded-md text-sm font-medium border border-border text-foreground hover:bg-muted transition-colors"
-                >
-                  Attach Calendar
-                </button>
-                <button
-                  type="button"
-                  onClick={() => {
-                    setSendWithoutCalendarModalOpen(false)
-                    void handleSend(true)
-                  }}
-                  className="px-3 py-2 rounded-md text-sm font-medium bg-primary text-primary-foreground hover:bg-primary/90 transition-colors"
-                >
-                  Send Anyway
-                </button>
-              </div>
-            </div>
-          </div>
-        )}
+                </span>
+              </span>
+            </>
+          }
+          choices={[
+            { value: 'send', label: 'Send Anyway', intent: 'primary' },
+            { value: 'attach', label: 'Attach Calendar' },
+          ]}
+          onChoose={(choice) => {
+            setSendWithoutCalendarModalOpen(false)
+            if (choice === 'attach') {
+              jumpToCalendarAttachment()
+              return
+            }
+            void handleSend(true)
+          }}
+          onCancel={() => setSendWithoutCalendarModalOpen(false)}
+        />
       </div>
     </div>
   )

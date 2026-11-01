@@ -1,21 +1,30 @@
 # start.ps1 - Launch dev servers in external PowerShell windows
-# Usage: .\start.ps1 [-SkipHealthCheck] [-StartupDelaySeconds 8]
+# Usage: .\start.ps1 [-SkipHealthCheck] [-StartupDelaySeconds 3] [-Mode full|localhost]
 
 [CmdletBinding()]
 param(
 	[switch]$SkipHealthCheck,
-	[int]$StartupDelaySeconds = 8,
+	[int]$StartupDelaySeconds = 3,
 	[ValidateSet("full", "localhost")]
 	[string]$Mode = "full"
 )
 
 $ErrorActionPreference = "Stop"
 
-$root = Split-Path -Parent $MyInvocation.MyCommand.Path
-$code = Join-Path $root "Code"
+function Resolve-AbsolutePath {
+	param([Parameter(Mandatory = $true)][string]$Path)
+	$resolved = Resolve-Path -LiteralPath $Path -ErrorAction SilentlyContinue
+	if (-not $resolved) {
+		throw "Path not found: $Path"
+	}
+	return $resolved.ProviderPath
+}
+
+$root = Resolve-AbsolutePath (Split-Path -Parent $MyInvocation.MyCommand.Path)
+$code = Resolve-AbsolutePath (Join-Path $root "Code")
 $stateFile = Join-Path $root ".cm-dev-state.json"
 $logDir = Join-Path $root ".cm-dev-logs"
-$serviceRunner = Join-Path $root "run-dev-service.ps1"
+$serviceRunner = Resolve-AbsolutePath (Join-Path $root "run-dev-service.ps1")
 $markerDir = Join-Path $root ".cm-stop-markers"
 $tag = "[CM]"
 $hasWindowsTerminal = $null -ne (Get-Command wt -ErrorAction SilentlyContinue)
@@ -44,7 +53,8 @@ $services = @(
 if ($Mode -eq "localhost") {
 	$services = @(
 		@{ Name = "web"; Title = "$tag Front End"; Command = "pnpm dev:web" },
-		@{ Name = "api"; Title = "$tag API Server"; Command = "pnpm dev:api" }
+		@{ Name = "api"; Title = "$tag API Server"; Command = "pnpm dev:api" },
+		@{ Name = "docs"; Title = "$tag Wiki"; Command = "pnpm dev:docs" }
 	)
 }
 

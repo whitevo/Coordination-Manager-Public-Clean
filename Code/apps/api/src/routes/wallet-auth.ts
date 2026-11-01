@@ -1,9 +1,8 @@
 import { Router, Response, NextFunction } from 'express'
 import { supabaseAdmin } from '../supabaseClient.js'
 import crypto from 'crypto'
-import { createClient } from '@supabase/supabase-js'
 import { ValidationError, UnauthorizedError, ApplicationError } from '../middleware/error-handler.js'
-import { authMiddleware, type AuthenticatedRequest } from '../middleware/auth.js'
+import { authMiddleware, createIsolatedAuthClient, getTrustedAuthMetadata, type AuthenticatedRequest } from '../middleware/auth.js'
 import { mergeAccounts } from '../services/account-merge.js'
 import { verifyCaptcha } from '../services/captcha.js'
 import { recordSignup, getSignupSource } from '../services/signup-rate-tracker.js'
@@ -213,7 +212,8 @@ router.post('/verify', async (req, res: Response, next: NextFunction) => {
     } catch (importError) {
       console.error('Failed to import @meshsdk/core for signature verification:', importError)
       throw new Error(
-        'Cardano signature verification is not available. Ensure @meshsdk/core is installed.'
+        'Cardano signature verification is not available. Ensure @meshsdk/core is installed.',
+        { cause: importError }
       )
     }
 
@@ -237,9 +237,11 @@ router.post('/verify', async (req, res: Response, next: NextFunction) => {
     const defaultDisplayName = truncateAddress(address)
 
     // Try to sign in first (existing user).
-    // Use supabaseAdmin (service role key) to bypass captcha enforcement
-    // on the server side — the frontend already verified captcha at /challenge.
-    let signInResult = await supabaseAdmin.auth.signInWithPassword({
+    // Use a per-request client with the service role key to bypass captcha
+    // enforcement on the server side (the frontend already verified captcha
+    // at /challenge) without storing session state on the shared admin client.
+    const signInClient = createIsolatedAuthClient()
+    let signInResult = await signInClient.auth.signInWithPassword({
       email: walletEmail,
       password: walletPassword,
     })
@@ -265,6 +267,8 @@ router.post('/verify', async (req, res: Response, next: NextFunction) => {
           display_name: linkedUser?.display_name || defaultDisplayName,
           wallet_address: address,
         },
+        // Trusted copy: auth middleware reads identity links only from app_metadata.
+        app_metadata: { account_type: 'cardano', wallet_address: address },
       })
 
       if (authError) {
@@ -280,6 +284,14 @@ router.post('/verify', async (req, res: Response, next: NextFunction) => {
           const staleUserId = linkData?.user?.id
 
           if (staleUserId) {
+            // Repair only the credential. Preserve existing identity-link
+            // fields in app_metadata (redirect_to_user_id and any merge/link
+            // state): a wallet login merged into a Google account keeps its
+            // redirect. Fill account_type/wallet_address only when absent.
+            const existingAppMeta = getTrustedAuthMetadata(linkData?.user)
+            const repairedAppMeta: Record<string, unknown> = { ...existingAppMeta }
+            if (repairedAppMeta.account_type === undefined) repairedAppMeta.account_type = 'cardano'
+            if (repairedAppMeta.wallet_address === undefined) repairedAppMeta.wallet_address = address
             await supabaseAdmin.auth.admin.updateUserById(staleUserId, {
               password: walletPassword,
               email_confirm: true,
@@ -288,9 +300,10 @@ router.post('/verify', async (req, res: Response, next: NextFunction) => {
                 display_name: linkedUser?.display_name || defaultDisplayName,
                 wallet_address: address,
               },
+              app_metadata: repairedAppMeta,
             })
 
-            signInResult = await supabaseAdmin.auth.signInWithPassword({
+            signInResult = await signInClient.auth.signInWithPassword({
               email: walletEmail,
               password: walletPassword,
             })
@@ -347,7 +360,7 @@ router.post('/verify', async (req, res: Response, next: NextFunction) => {
         // new auth ID to the linked user via wallet_address lookup.
 
         // Sign in with the newly created credentials
-        signInResult = await supabaseAdmin.auth.signInWithPassword({
+        signInResult = await signInClient.auth.signInWithPassword({
           email: walletEmail,
           password: walletPassword,
         })
@@ -409,12 +422,11 @@ router.post('/verify', async (req, res: Response, next: NextFunction) => {
 
             // Clean up stale redirect metadata so the auth middleware
             // stops redirecting this session to the old Google user.
-            const authUserMeta = signInResult.data.user?.user_metadata as Record<string, unknown> | undefined
-            if (authUserMeta?.redirect_to_user_id) {
+            const authUserMeta = getTrustedAuthMetadata(signInResult.data.user)
+            if (authUserMeta.redirect_to_user_id) {
               try {
                 await supabaseAdmin.auth.admin.updateUserById(authUserId, {
-                  user_metadata: {
-                    ...authUserMeta,
+                  app_metadata: {
                     redirect_to_user_id: null,
                     wallet_address: address,
                   },
@@ -688,7 +700,7 @@ router.post('/link', authMiddleware, async (req: AuthenticatedRequest, res: Resp
       isValid = await checkSignature(signedMessage, { signature, key })
     } catch (importError) {
       console.error('Failed to import @meshsdk/core for signature verification:', importError)
-      throw new Error('Cardano signature verification is not available.')
+      throw new Error('Cardano signature verification is not available.', { cause: importError })
     }
 
     // Delete the challenge (one-time use)
@@ -811,6 +823,10 @@ router.delete('/link', authMiddleware, async (req: AuthenticatedRequest, res: Re
             await supabaseAdmin.auth.admin.updateUserById(walletAuthUser.id, {
               user_metadata: {
                 ...((walletAuthUser.user_metadata || {}) as Record<string, unknown>),
+                wallet_address: null,
+              },
+              // Server-only: keeps this wallet session (and its other tabs) alive as the Google user.
+              app_metadata: {
                 wallet_address: null,
                 redirect_to_user_id: userId,
               },
@@ -997,6 +1013,7 @@ router.post('/managed/register', async (req, res: Response, next: NextFunction) 
         account_type: 'managed_cardano',
         display_name: displayName,
       },
+      app_metadata: { account_type: 'managed_cardano' },
     })
 
     if (error || !data.user) {
@@ -1032,10 +1049,7 @@ router.post('/managed/register', async (req, res: Response, next: NextFunction) 
     }
 
     // Sign in to get a real session
-    const tempClient = createClient(
-      process.env.SUPABASE_URL as string,
-      (process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_KEY) as string
-    )
+    const tempClient = createIsolatedAuthClient()
     const { data: signInData, error: signInError } = await tempClient.auth.signInWithPassword({
       email: tempEmail,
       password: tempPassword,

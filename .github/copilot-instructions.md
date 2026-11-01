@@ -20,7 +20,6 @@ pass before implementation:
   - Quick start with stated assumptions
 
 Use skill guidance from:
-- `.claude/skills/session-first-message-clarity/SKILL.md`
 - `.claude/skills/prompt-enhancement-agent/SKILL.md`
 
 Skip this protocol only for pure factual questions or trivial one-line ops.
@@ -35,3 +34,13 @@ When the user message is exactly or clearly equivalent to "Prepare Public PR":
 Optional variants only when explicitly requested:
 - pnpm release:loop:no-ci
 - pnpm release:loop:prep
+
+## Test & Verification Execution
+
+When executing tests, typechecks, or linters:
+- Prefer using the local MCP test runner tools (`run_vitest`, `run_typecheck`, `run_lint`, `run_custom_scenario`) when available, or clean single-line commands (e.g. `pnpm --dir ./Code/apps/web vitest run <file>` or `powershell -File ./scripts/test-web-copilot.ps1 -Target <file>`).
+- Do NOT chain multi-statement PowerShell scripts with variable assignments (`$x = $LASTEXITCODE`) or conditional blocks (`if ($x -ne 0) { exit 1 }`) in interactive terminals, as they trip VS Code terminal approval checks.
+- Before running any terminal validation command, do this low-cost command-shape check:
+  - Pass: one direct command such as `pnpm typecheck`, `pnpm lint`, `pnpm test`, `pnpm build`, `pnpm security:check`, `pnpm --dir ./Code/apps/web exec vitest run <file>`, or `git -C <repo> status --short --branch`.
+  - Fail: command contains `foreach`, `$LASTEXITCODE`, `$step`, `if (...) { exit ... }`, or multiple validation commands joined by `;`, `&&`, or `||`.
+  - If it fails, split the work into separate MCP runner calls or separate clean terminal commands instead of asking for approval on the chained command.

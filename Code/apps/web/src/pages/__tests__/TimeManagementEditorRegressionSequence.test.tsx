@@ -1,4 +1,4 @@
-import '@testing-library/jest-dom'
+import '@testing-library/jest-dom/vitest'
 import { afterAll, afterEach, beforeEach, describe, it, vi } from 'vitest'
 import { fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
@@ -289,7 +289,7 @@ describe('TimeManagement editor regression sequence (user walkthrough)', () => {
   // Single end-to-end walkthrough so report ordering matches the user's manual flow.
   it('runs the 19-step typing walkthrough and records pass/fail per step', async () => {
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )

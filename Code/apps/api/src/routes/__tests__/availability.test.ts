@@ -14,6 +14,12 @@ const mockDelete = vi.fn()
 const mockEq = vi.fn()
 const mockSingle = vi.fn()
 const mockOrder = vi.fn()
+const mockMaybeSingle = vi.fn()
+const mockNotify = vi.fn()
+
+vi.mock('../../services/calendar-notifications.js', () => ({
+  notifyParticipationChange: (...args: unknown[]) => mockNotify(...args),
+}))
 
 function createChain() {
   return {
@@ -25,6 +31,7 @@ function createChain() {
     eq: mockEq,
     single: mockSingle,
     order: mockOrder,
+    maybeSingle: mockMaybeSingle,
   }
 }
 
@@ -114,6 +121,12 @@ describe('Availability Routes', () => {
       expect(res.status).toBe(200)
       expect(mockFrom).toHaveBeenCalledWith('calendars')
       expect(mockFrom).toHaveBeenCalledWith('availability')
+      expect(mockNotify).toHaveBeenCalledWith(expect.objectContaining({
+        participantName: 'TestUser',
+        before: ['2026-04-17T10:00'],
+        after: ['2026-04-17T10:00', '2026-04-17T11:00'],
+        actor: { userId: MOCK_USER_ID, email: 'test@example.com' },
+      }))
     })
 
     it('returns 400 when required fields are missing', async () => {
@@ -216,6 +229,7 @@ describe('Availability Routes', () => {
     it('deletes availability and returns success', async () => {
       // Calendar lookup
       mockSingle.mockResolvedValueOnce({ data: { id: 'cal-1' }, error: null })
+      mockMaybeSingle.mockResolvedValueOnce({ data: { time_slots: ['2026-04-17_10:00'] }, error: null })
       // Delete chain: .delete().eq().eq() - terminal eq returns chain, error is undefined = success
 
       const res = await request(app)
@@ -224,6 +238,11 @@ describe('Availability Routes', () => {
 
       expect(res.status).toBe(200)
       expect(res.body.success).toBe(true)
+      expect(mockNotify).toHaveBeenCalledWith(expect.objectContaining({
+        participantName: 'TestUser',
+        before: ['2026-04-17_10:00'],
+        after: [],
+      }))
     })
 
     it('returns 400 when required fields are missing', async () => {

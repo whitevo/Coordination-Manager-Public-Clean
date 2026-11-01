@@ -3,6 +3,42 @@
 -- Keep statements idempotent when adding future changes.
 
 -- ============================================================
+-- User quick-tool order shared across devices
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS public.quick_tool_preferences (
+  user_id UUID PRIMARY KEY REFERENCES public.users(id) ON DELETE CASCADE,
+  tool_keys JSONB NOT NULL DEFAULT '["events-calendar", "calendars", "time-management"]'::jsonb,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CONSTRAINT quick_tool_preferences_tool_keys_array CHECK (jsonb_typeof(tool_keys) = 'array')
+);
+
+CREATE INDEX IF NOT EXISTS idx_quick_tool_preferences_updated_at
+  ON public.quick_tool_preferences(updated_at DESC);
+
+ALTER TABLE public.quick_tool_preferences ENABLE ROW LEVEL SECURITY;
+
+DO $$ BEGIN
+  IF NOT EXISTS (
+    SELECT 1 FROM pg_policies
+    WHERE schemaname = 'public'
+      AND tablename = 'quick_tool_preferences'
+      AND policyname = 'Deny direct client access to quick tool preferences'
+  ) THEN
+    CREATE POLICY "Deny direct client access to quick tool preferences"
+      ON public.quick_tool_preferences FOR ALL USING (false);
+  END IF;
+END $$;
+
+INSERT INTO public.quick_tool_preferences (user_id)
+SELECT id FROM public.users
+WHERE NOT EXISTS (
+  SELECT 1 FROM public.quick_tool_preferences existing
+  WHERE existing.user_id = public.users.id
+);
+
+-- ============================================================
 -- BEGIN SOURCE: 017_admin_powers.sql
 -- ============================================================
 -- ============================================================

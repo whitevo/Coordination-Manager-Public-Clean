@@ -34,6 +34,8 @@ import {
   type DisableableFeature,
 } from '../lib/setup-api'
 import { useComponentHealth, type ComponentHealth } from '../lib/setup-health'
+import { OVERLAY_LAYER_CLASS } from '../lib/overlay-layers'
+import { Button, IconButton, SegmentedControl } from '../components/ui'
 import {
   useViewOverrides,
   TEMPLATE_DEFAULTS,
@@ -200,8 +202,16 @@ const COMPONENTS: ComponentSpec[] = [
         mirrorTo: { key: 'VITE_SUPABASE_ANON_KEY', target: 'web' },
       },
       {
-        key: 'SUPABASE_SERVICE_ROLE_KEY', label: 'Service role key', target: 'api', type: 'password',
-        hint: 'Required for admin endpoints. Never exposed to the browser.',
+        key: 'SUPABASE_SECRET_KEY_LOCALHOST', label: 'Localhost secret API key', target: 'api', type: 'password',
+        hint: 'Supabase Settings -> API Keys: use localhost_api. Selected unless NODE_ENV=production. Server-only; bypasses RLS.',
+      },
+      {
+        key: 'SUPABASE_SECRET_KEY_PRODUCTION', label: 'Production secret API key', target: 'api', type: 'password',
+        hint: 'Use a separate production_api key on Railway with NODE_ENV=production. Do not copy it to localhost unnecessarily.',
+      },
+      {
+        key: 'SUPABASE_SERVICE_ROLE_KEY', label: 'Legacy key (temporary fallback)', target: 'api', type: 'password',
+        hint: 'Used only when the environment-selected secret setting is absent, never after a rejected new key. Remove after production migration.',
       },
     ],
     summary: v => {
@@ -277,8 +287,16 @@ const COMPONENTS: ComponentSpec[] = [
         hint: 'Same project as the API. Bot needs its own copy in its .env -- the wizard mirrors it for you when you save.',
       },
       {
-        key: 'SUPABASE_SERVICE_ROLE_KEY', label: 'Supabase service-role key (shared)', target: 'bot', type: 'password',
-        hint: 'Same key as the API. Bot uses the service role to read/write coordination data.',
+        key: 'SUPABASE_SECRET_KEY_LOCALHOST', label: 'Localhost secret API key', target: 'bot', type: 'password',
+        hint: 'Use the same localhost Supabase key as the API and Guardian. Selected unless this bot has NODE_ENV=production.',
+      },
+      {
+        key: 'SUPABASE_SECRET_KEY_PRODUCTION', label: 'Production secret API key', target: 'bot', type: 'password',
+        hint: 'Use the same production Supabase key as the API and Guardian, with NODE_ENV=production on its host.',
+      },
+      {
+        key: 'SUPABASE_SERVICE_ROLE_KEY', label: 'Legacy key (temporary fallback)', target: 'bot', type: 'password',
+        hint: 'Used only when the environment-selected secret setting is absent.',
       },
     ],
     summary: v => v.bot?.DISCORD_BOT_TOKEN?.set ? 'Token present in apps/discord-bot/.env' : '',
@@ -305,8 +323,16 @@ const COMPONENTS: ComponentSpec[] = [
         hint: 'Same project as the API. Guardian needs its own copy in its .env.',
       },
       {
-        key: 'SUPABASE_SERVICE_ROLE_KEY', label: 'Supabase service-role key (shared)', target: 'guardian', type: 'password',
-        hint: 'Same key as the API.',
+        key: 'SUPABASE_SECRET_KEY_LOCALHOST', label: 'Localhost secret API key', target: 'guardian', type: 'password',
+        hint: 'Use the same localhost Supabase key as the API and coordinator. Selected unless this bot has NODE_ENV=production.',
+      },
+      {
+        key: 'SUPABASE_SECRET_KEY_PRODUCTION', label: 'Production secret API key', target: 'guardian', type: 'password',
+        hint: 'Use the same production Supabase key as the API and coordinator, with NODE_ENV=production on Railway.',
+      },
+      {
+        key: 'SUPABASE_SERVICE_ROLE_KEY', label: 'Legacy key (temporary fallback)', target: 'guardian', type: 'password',
+        hint: 'Used only when the environment-selected secret setting is absent.',
       },
       {
         key: 'DISABLE_BOT', label: 'Disable bot (skip Discord login)', target: 'guardian', type: 'text',
@@ -410,7 +436,7 @@ export default function SetupPage() {
   const [prodApiKeyInput, setProdApiKeyInput] = useState<string>('')
   const [prodStoredApiKey, setProdStoredApiKey] = useState<string>(() => {
     if (typeof window === 'undefined') return ''
-    return localStorage.getItem('prod_api_key') || ''
+    return sessionStorage.getItem('prod_api_key') || ''
   })
   const [prodRequest, setProdRequest] = useState<{ apiBaseUrl: string; apiKey: string } | null>(null)
   const [prodStatus, setProdStatus] = useState<ProductionStatusSummary | null>(null)
@@ -629,8 +655,8 @@ export default function SetupPage() {
         </header>
 
         {/* Local / Production / Template view toggle */}
-        <div className="mb-6 sticky top-0 z-20 -mx-4 sm:-mx-6 lg:-mx-8 px-4 sm:px-6 lg:px-8 py-4 bg-background/95 backdrop-blur supports-[backdrop-filter]:bg-background/75 border-b border-border flex items-center gap-3 flex-wrap">
-          <span className="text-sm uppercase tracking-wide font-semibold text-cyan-700 dark:text-cyan-400">Environment view</span>
+        <div className="mb-6 sticky top-0 z-20 -mx-4 sm:-mx-6 lg:-mx-8 px-4 sm:px-6 lg:px-8 py-4 bg-background/95 backdrop-blur-sm supports-backdrop-filter:bg-background/75 border-b border-border flex items-center gap-3 flex-wrap">
+          <span className="text-sm uppercase tracking-wide font-semibold text-info">Environment view</span>
           <Segmented
             size="lg"
             accent="cyan"
@@ -650,22 +676,23 @@ export default function SetupPage() {
               : 'Clean open-source template. Secrets are intentionally blank.'}
           </span>
           {view === 'local' && (
-            <button
-              type="button"
+            <Button
+              emphasis="outline"
+              size="compact"
               onClick={() => { void refresh(); void refreshHealth() }}
-              className="ml-auto px-2 py-1 rounded-md border border-border text-xs flex items-center gap-1 hover:bg-accent/50"
+              className="ml-auto"
               title="Re-check status"
+              icon={<RefreshCw className={`h-3 w-3 ${healthLoading ? 'animate-spin' : ''}`} />}
             >
-              <RefreshCw className={`h-3 w-3 ${healthLoading ? 'animate-spin' : ''}`} />
               Refresh
-            </button>
+            </Button>
           )}
         </div>
 
         {/* Production view: API key input and public status dashboard */}
         {view === 'production' ? (
           <div className="mb-8">
-            <div className="mb-4 rounded-md border border-cyan-500/30 bg-cyan-500/5 p-3 text-xs text-muted-foreground">
+            <div className="mb-4 rounded-md border border-info-muted bg-info-subtle/50 p-3 text-xs text-muted-foreground">
               Production monitoring flow: deploy your app publicly first, create an Agent API key in Settings,
               then paste your key once. This setup remembers the key on this browser and auto-loads live deployment status.
               <a
@@ -698,7 +725,8 @@ export default function SetupPage() {
                   }
                   if (typeof window !== 'undefined') {
                     localStorage.setItem('prod_api_base', apiBase)
-                    localStorage.setItem('prod_api_key', apiKey)
+                    // Session-only: avoid persisting the API key across browser restarts.
+                    sessionStorage.setItem('prod_api_key', apiKey)
                   }
                   setProdStoredApiKey(apiKey)
                   setProdRequest({ apiBaseUrl: apiBase, apiKey })
@@ -718,17 +746,16 @@ export default function SetupPage() {
                   autoComplete="off"
                   spellCheck={false}
                 />
-                <button
+                <Button
                   type="submit"
-                  disabled={prodStatusLoading || !prodApiKeyInput.trim()}
-                  className="mt-1 px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium disabled:opacity-50"
+                  intent="primary"
+                  size="compact"
+                  disabled={!prodApiKeyInput.trim()}
+                  loading={prodStatusLoading}
+                  className="mt-1"
                 >
-                  {prodStatusLoading ? (
-                    <span><Loader2 className="h-3 w-3 inline mr-1 animate-spin" />Loading...</span>
-                  ) : (
-                    'Connect and load production status'
-                  )}
-                </button>
+                  {prodStatusLoading ? 'Loading...' : 'Connect and load production status'}
+                </Button>
               </form>
             )}
 
@@ -736,27 +763,28 @@ export default function SetupPage() {
             {prodStatusError && <div className="text-xs text-destructive">{prodStatusError}</div>}
             {prodStoredApiKey && !prodStatusLoading && (
               <div className="mb-3 flex items-center gap-2 flex-wrap">
-                <button
-                  type="button"
+                <Button
+                  emphasis="outline"
+                  size="compact"
                   onClick={() => setProdReloadNonce(n => n + 1)}
-                  className="px-3 py-1.5 rounded-md border border-border text-xs font-medium hover:bg-accent/50"
                 >
                   Reload status
-                </button>
-                <button
-                  type="button"
+                </Button>
+                <Button
+                  emphasis="outline"
+                  intent="danger"
+                  size="compact"
                   onClick={() => {
-                    if (typeof window !== 'undefined') localStorage.removeItem('prod_api_key')
+                    if (typeof window !== 'undefined') sessionStorage.removeItem('prod_api_key')
                     setProdStoredApiKey('')
                     setProdRequest(null)
                     setProdStatus(null)
                     setProdStatusError(null)
                     setProdApiKeyInput('')
                   }}
-                  className="px-3 py-1.5 rounded-md border border-rose-500/40 text-rose-600 dark:text-rose-400 text-xs font-medium hover:bg-rose-500/10"
                 >
                   Disconnect
-                </button>
+                </Button>
               </div>
             )}
             {prodStatus && (
@@ -793,8 +821,8 @@ export default function SetupPage() {
                       return (
                         <li key={c.id} className="flex items-center gap-2 text-xs">
                           {c.covered
-                            ? <CheckCircle2 className="h-3.5 w-3.5 text-emerald-600 dark:text-emerald-400 shrink-0" />
-                            : <AlertCircle className="h-3.5 w-3.5 text-amber-600 dark:text-amber-400 shrink-0" />}
+                            ? <CheckCircle2 className="h-3.5 w-3.5 text-success shrink-0" />
+                            : <AlertCircle className="h-3.5 w-3.5 text-warning shrink-0" />}
                           <span>{spec?.title || c.id}</span>
                         </li>
                       )
@@ -832,12 +860,12 @@ export default function SetupPage() {
               </div>
             )}
             {valuesError && (
-              <div className="mb-6 rounded-md border border-amber-500/40 bg-amber-500/10 p-3 text-xs">
+              <div className="mb-6 rounded-md border border-warning-muted bg-warning-subtle p-3 text-xs">
                 {valuesError}
               </div>
             )}
             {!canConfigure && !error && view === 'local' && (
-              <div className="mb-6 rounded-md border border-amber-500/40 bg-amber-500/10 p-4 text-sm">
+              <div className="mb-6 rounded-md border border-warning-muted bg-warning-subtle p-4 text-sm">
                 Server writes are disabled (not localhost, or running in production).
                 Edit <code>Code/apps/api/.env</code> and <code>Code/apps/web/.env</code> directly.
               </div>
@@ -906,7 +934,7 @@ export default function SetupPage() {
           <div
             role="status"
             aria-live="polite"
-            className="fixed bottom-6 left-1/2 -translate-x-1/2 z-50 rounded-md bg-foreground text-background px-4 py-2 text-xs shadow-lg animate-fade-in-out"
+            className={`fixed bottom-6 left-1/2 -translate-x-1/2 ${OVERLAY_LAYER_CLASS.toast} rounded-md bg-foreground text-background px-4 py-2 text-xs shadow-lg animate-fade-in-out`}
           >
             {toast}
           </div>
@@ -1037,13 +1065,13 @@ function ComponentCard({
       id={`setup-card-${component.id}`}
       className={`rounded-lg border bg-card overflow-hidden transition-shadow duration-500 scroll-mt-24 ${
         highlighted
-          ? 'border-amber-400 ring-2 ring-amber-400/60 shadow-md shadow-amber-500/20 [animation:pulse_3s_ease-in-out_infinite]'
+          ? 'border-warning-muted ring-2 ring-warning/60 shadow-md shadow-warning/20 animate-[pulse_3s_ease-in-out_infinite]'
           : isDiscordRuntimeWarnLocal
-          ? 'border-amber-500/50 bg-amber-500/10'
+          ? 'border-warning-muted bg-warning-subtle'
           : isMissingRequired
-          ? 'border-rose-500/50 bg-rose-500/5'
+          ? 'border-danger-muted bg-danger-subtle'
           : isFullyConfigured
-          ? 'border-emerald-500/40 bg-emerald-500/5'
+          ? 'border-success-muted bg-success-subtle'
           : 'border-border'
       }`}
     >
@@ -1061,24 +1089,24 @@ function ComponentCard({
         </span>
         <Icon className={`h-5 w-5 mt-0.5 shrink-0 ${
           isMissingRequired
-            ? 'text-rose-500'
+            ? 'text-danger'
             : isDiscordRuntimeWarnLocal
-            ? 'text-amber-600 dark:text-amber-400'
+            ? 'text-warning'
             : isFullyConfigured
-            ? 'text-emerald-600 dark:text-emerald-400'
+            ? 'text-success'
             : 'text-muted-foreground'
         }`} />
         <div className="flex-1 min-w-0">
           <div className="flex items-center gap-2 mb-0.5 flex-wrap">
             <h3 className="font-semibold">{component.title}</h3>
             {isMissingRequired && (
-              <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-600 dark:text-rose-400">
+              <span className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-danger-subtle text-danger">
                 needs setup
               </span>
             )}
             {isDisabledByOperator && (
               <span
-                className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-slate-500/15 text-slate-600 dark:text-slate-300 border border-slate-500/30"
+                className="text-[10px] uppercase tracking-wide px-1.5 py-0.5 rounded bg-neutral-subtle text-muted-foreground border border-border"
                 title="This feature is configured but explicitly disabled on this machine via Setup."
               >
                 disabled here
@@ -1155,31 +1183,28 @@ function ComponentCard({
               configuration surface. */}
           {!editing && view !== 'template' && (
             <div className="mt-3 pl-11 flex items-center gap-2 flex-wrap">
-              <button
-                type="button"
+              <Button
+                emphasis="outline"
+                size="compact"
                 onClick={() => onSelectMode('selfhost')}
                 disabled={!canEdit}
-                className="px-3 py-1 rounded-md border border-border text-xs font-medium hover:bg-accent/50 disabled:opacity-50"
+                icon={<Edit3 className="h-3 w-3" />}
               >
-                <Edit3 className="h-3 w-3 inline mr-1" />
                 Edit values
-              </button>
+              </Button>
               {onToggleDisabled && (
-                <button
-                  type="button"
+                <Button
+                  emphasis="outline"
+                  intent={isDisabledByOperator ? 'success' : 'neutral'}
+                  size="compact"
                   onClick={() => onToggleDisabled(!isDisabledByOperator)}
                   disabled={!canEdit}
-                  className={`px-3 py-1 rounded-md border text-xs font-medium disabled:opacity-50 ${
-                    isDisabledByOperator
-                      ? 'border-emerald-500/50 text-emerald-700 dark:text-emerald-300 hover:bg-emerald-500/10'
-                      : 'border-border hover:bg-accent/50'
-                  }`}
                   title={isDisabledByOperator
                     ? 'Currently disabled on this machine -- click to re-enable.'
                     : 'Disable this feature on this machine without clearing its keys (useful for avoiding conflicts with a production instance).'}
                 >
                   {isDisabledByOperator ? 'Enable on this machine' : 'Disable on this machine'}
-                </button>
+                </Button>
               )}
             </div>
           )}
@@ -1192,14 +1217,16 @@ function ComponentCard({
           {/* When editing: mode segmented appears together with the form */}
           {editing && (
             <div className="mt-1 pl-11 flex items-center gap-3 flex-wrap">
-              <Segmented
+              <SegmentedControl
+                label="Mode"
+                size="micro"
                 options={component.modes.map(m => ({
                   value: m,
                   label: m === 'off' ? 'Off' : 'Self-host',
                   disabled: m !== 'off' && m !== currentMode && !canEdit,
                 }))}
                 value={editing}
-                onChange={v => onSelectMode(v as ComponentMode)}
+                onChange={v => onSelectMode(v)}
               />
             </div>
           )}
@@ -1289,10 +1316,10 @@ function healthToLabel(health: ComponentHealth | undefined, mode: ComponentMode)
 }
 
 function tonePillClasses(tone: 'good' | 'warn' | 'off' | 'bad'): string {
-  if (tone === 'good') return 'bg-emerald-500/15 text-emerald-700 dark:text-emerald-300 border border-emerald-500/30'
-  if (tone === 'warn') return 'bg-amber-500/15 text-amber-700 dark:text-amber-300 border border-amber-500/35'
-  if (tone === 'bad') return 'bg-rose-500/15 text-rose-700 dark:text-rose-300 border border-rose-500/35'
-  return 'bg-slate-500/15 text-slate-700 dark:text-slate-300 border border-slate-500/30'
+  if (tone === 'good') return 'bg-success-subtle text-success border border-success-muted'
+  if (tone === 'warn') return 'bg-warning-subtle text-warning border border-warning-muted'
+  if (tone === 'bad') return 'bg-danger-subtle text-danger border border-danger-muted'
+  return 'bg-neutral-subtle text-foreground border border-border'
 }
 
 // ---------------------------------------------------------------------------
@@ -1329,13 +1356,13 @@ function CopyableKey({
         'group/key inline-flex items-center gap-1 w-56 shrink-0 text-left truncate transition-colors ' +
         (disabled
           ? 'text-muted-foreground/50 cursor-not-allowed'
-          : 'text-muted-foreground hover:text-blue-500 hover:underline cursor-pointer')
+          : 'text-muted-foreground hover:text-info hover:underline cursor-pointer')
       }
       title={disabled ? `${label} (no value to copy)` : `Copy ${label} value`}
     >
       <span className="truncate">{label}</span>
       {justCopied ? (
-        <Check className="h-3 w-3 text-emerald-500 shrink-0" />
+        <Check className="h-3 w-3 text-success shrink-0" />
       ) : (
         <Copy className="h-3 w-3 opacity-0 group-hover/key:opacity-100 transition-opacity shrink-0" />
       )}
@@ -1378,13 +1405,13 @@ function CopyableTag({
         'group/tag text-[10px] font-mono px-1.5 py-0.5 rounded border bg-background/60 inline-flex items-center gap-1 transition-colors ' +
         (disabled
           ? 'border-border text-muted-foreground/60 cursor-not-allowed'
-          : 'border-border text-muted-foreground hover:text-blue-500 hover:border-blue-400 cursor-pointer')
+          : 'border-border text-muted-foreground hover:text-info hover:border-info-muted cursor-pointer')
       }
       title={disabled ? `${label} (no value to copy)` : `Copy ${label} value`}
     >
       <span>{label}</span>
       {justCopied ? (
-        <Check className="h-2.5 w-2.5 text-emerald-500" />
+        <Check className="h-2.5 w-2.5 text-success" />
       ) : (
         <Copy className="h-2.5 w-2.5 opacity-0 group-hover/tag:opacity-100 transition-opacity" />
       )}
@@ -1427,13 +1454,13 @@ function CopyableValue({
         'group/val inline-flex items-center gap-1 min-w-0 text-left transition-colors ' +
         (disabled
           ? 'text-muted-foreground/60 cursor-not-allowed'
-          : 'hover:text-blue-500 hover:underline cursor-pointer')
+          : 'hover:text-info hover:underline cursor-pointer')
       }
       title={disabled ? 'No value to copy' : `Copy ${label} value`}
     >
       <span className="truncate">{disabled ? placeholder : value}</span>
       {!disabled && (justCopied ? (
-        <Check className="h-3 w-3 text-emerald-500 shrink-0" />
+        <Check className="h-3 w-3 text-success shrink-0" />
       ) : (
         <Copy className="h-3 w-3 opacity-0 group-hover/val:opacity-100 transition-opacity shrink-0" />
       ))}
@@ -1616,14 +1643,13 @@ function EditForm({
                 spellCheck={false}
               />
               {isSecret && (
-                <button
-                  type="button"
+                <IconButton
+                  label={reveal[f.key] ? 'Hide' : 'Show'}
+                  icon={reveal[f.key] ? <EyeOff /> : <Eye />}
+                  emphasis="outline"
+                  size="standard"
                   onClick={() => setReveal(p => ({ ...p, [f.key]: !p[f.key] }))}
-                  className="px-2 rounded-md border border-border text-xs"
-                  title={reveal[f.key] ? 'Hide' : 'Show'}
-                >
-                  {reveal[f.key] ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                </button>
+                />
               )}
             </div>
             {f.mirrorTo && (
@@ -1637,22 +1663,17 @@ function EditForm({
       {err && <p className="text-xs text-destructive">{err}</p>}
       {tokenPrompt}
       <div className="flex gap-2 flex-wrap">
-        <button
-          type="submit"
-          disabled={busy}
-          className="px-3 py-1.5 rounded-md bg-primary text-primary-foreground text-xs font-medium disabled:opacity-50"
-        >
-          {busy ? <Loader2 className="h-3 w-3 inline mr-1 animate-spin" /> : null}
+        <Button type="submit" intent="primary" size="compact" loading={busy}>
           Save
-        </button>
-        <button
-          type="button"
+        </Button>
+        <Button
+          emphasis="outline"
+          size="compact"
           onClick={onCancel}
-          className="px-3 py-1.5 rounded-md border border-border text-xs font-medium"
+          icon={<X className="h-3 w-3" />}
         >
-          <X className="h-3 w-3 inline mr-1" />
           Cancel
-        </button>
+        </Button>
       </div>
       <p className="text-[10px] text-muted-foreground">
         Restart the affected service after saving -- most modules only read env at startup.
@@ -1677,7 +1698,7 @@ function TokenSection({ token, setToken }: { token: string; setToken: (t: string
       <summary className="cursor-pointer select-none p-4 text-sm flex items-center gap-2">
         <Info className="h-4 w-4 text-muted-foreground" />
         Write-protection token (optional, for saving from this browser)
-        {token && <span className="text-[10px] text-emerald-600 dark:text-emerald-400 ml-2">stored</span>}
+        {token && <span className="text-[10px] text-success ml-2">stored</span>}
       </summary>
       <div className="px-4 pb-4 space-y-2 text-xs text-muted-foreground">
         <p>
@@ -1700,26 +1721,24 @@ function TokenSection({ token, setToken }: { token: string; setToken: (t: string
             autoComplete="off"
             spellCheck={false}
           />
-          <button
-            type="button"
+          <Button
+            emphasis="outline"
             onClick={() => {
               storeSetupToken(token.trim())
               setSavedFlash(true)
               setTimeout(() => setSavedFlash(false), 1500)
             }}
             disabled={!token.trim()}
-            className="px-3 py-2 rounded-md bg-primary text-primary-foreground text-xs font-medium disabled:opacity-50"
           >
             {savedFlash ? 'Saved' : 'Store'}
-          </button>
+          </Button>
           {token && (
-            <button
-              type="button"
+            <Button
+              emphasis="ghost"
               onClick={() => { storeSetupToken(''); setToken('') }}
-              className="px-3 py-2 rounded-md border border-border text-xs"
             >
               Clear
-            </button>
+            </Button>
           )}
         </div>
       </div>
@@ -1731,7 +1750,7 @@ function TokenPrompt({
   token, setToken, onSaved,
 }: { token: string; setToken: (t: string) => void; onSaved: () => void }) {
   return (
-    <div className="rounded-md border border-amber-500/40 bg-amber-500/10 p-3 space-y-2">
+    <div className="rounded-md border border-warning-muted bg-warning-subtle p-3 space-y-2">
       <p className="text-xs">
         <strong>Write-protection token needed.</strong> Copy it from the API server console
         (a line starting with <code>[setup] write-protection token:</code>) and paste here.
@@ -1746,14 +1765,13 @@ function TokenPrompt({
           placeholder="paste setup token..."
           autoComplete="off"
         />
-        <button
-          type="button"
+        <Button
+          emphasis="outline"
           onClick={onSaved}
           disabled={!token.trim()}
-          className="px-3 py-2 rounded-md bg-primary text-primary-foreground text-xs font-medium disabled:opacity-50"
         >
           Store token
-        </button>
+        </Button>
       </div>
     </div>
   )
@@ -1777,14 +1795,14 @@ function Segmented<T extends string>({
   const isLg = size === 'lg'
   const isCyan = accent === 'cyan'
   const wrapperClass = isLg
-    ? 'inline-flex rounded-lg border-2 border-cyan-500/40 dark:border-cyan-400/40 bg-muted/40 p-1 shadow-sm'
+    ? 'inline-flex rounded-lg border-2 border-info/40 bg-muted/40 p-1 shadow-xs'
     : 'inline-flex rounded-md border border-border bg-muted/40 p-0.5'
   const btnBase = isLg
     ? 'px-4 py-2 text-sm font-semibold rounded-md transition-all duration-200 disabled:opacity-40 '
     : 'px-3 py-1 text-xs font-medium rounded transition-colors disabled:opacity-40 '
   const activeClass = isCyan
-    ? 'bg-cyan-50 dark:bg-cyan-950/40 text-cyan-700 dark:text-cyan-300 border-2 border-cyan-500 dark:border-cyan-400 animate-cyan-trace'
-    : 'bg-background shadow-sm border border-border'
+    ? 'bg-info-subtle text-info border-2 border-info animate-cyan-trace'
+    : 'bg-background shadow-xs border border-border'
   const inactiveClass = isLg
     ? 'text-muted-foreground hover:text-foreground hover:bg-background/60 border-2 border-transparent'
     : 'text-muted-foreground hover:text-foreground'
@@ -1816,17 +1834,17 @@ function StatusTile({
   // keeps a single, scannable signal: green = healthy/configured,
   // amber = needs attention, rose = broken, neutral = not connected.
   const toneClass =
-    tone === 'good' ? 'border-emerald-500/40 bg-emerald-500/10' :
-    tone === 'warn' ? 'border-amber-500/40 bg-amber-500/10' :
-    tone === 'bad'  ? 'border-rose-500/50 bg-rose-500/10' :
+    tone === 'good' ? 'border-success-muted bg-success-subtle' :
+    tone === 'warn' ? 'border-warning-muted bg-warning-subtle' :
+    tone === 'bad'  ? 'border-danger-muted bg-danger-subtle' :
                        'border-border bg-card'
   const labelClass =
-    tone === 'good' ? 'text-emerald-700 dark:text-emerald-400' :
-    tone === 'warn' ? 'text-amber-700 dark:text-amber-400' :
-    tone === 'bad'  ? 'text-rose-700 dark:text-rose-400' :
+    tone === 'good' ? 'text-success' :
+    tone === 'warn' ? 'text-warning' :
+    tone === 'bad'  ? 'text-danger' :
                        'text-muted-foreground'
   return (
-    <div className={`rounded-lg border p-3 flex flex-col items-center text-center min-h-[6.5rem] justify-center ${toneClass}`}>
+    <div className={`rounded-lg border p-3 flex flex-col items-center text-center min-h-26 justify-center ${toneClass}`}>
       <span className={`text-xs uppercase tracking-wide mb-1 ${labelClass}`}>{label}</span>
       <p className="text-sm font-medium break-all">{value}</p>
       {sub && <p className="text-xs text-muted-foreground mt-1 break-all">{sub}</p>}
@@ -1836,9 +1854,9 @@ function StatusTile({
 
 function _StatusBadge({ tone, label }: { tone: 'good' | 'warn' | 'bad' | 'off'; label: string }) {
   const cls =
-    tone === 'good' ? 'bg-emerald-500/15 text-emerald-600 dark:text-emerald-400' :
-    tone === 'warn' ? 'bg-amber-500/15 text-amber-600 dark:text-amber-400' :
-    tone === 'bad'  ? 'bg-rose-500/15 text-rose-600 dark:text-rose-400' :
+    tone === 'good' ? 'bg-success-subtle text-success' :
+    tone === 'warn' ? 'bg-warning-subtle text-warning' :
+    tone === 'bad'  ? 'bg-danger-subtle text-danger' :
                        'bg-muted text-muted-foreground'
   const Icon =
     tone === 'good' ? CheckCircle2 :

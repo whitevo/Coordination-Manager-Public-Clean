@@ -1,20 +1,21 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
 import path from 'path'
+import { discoveryPlugin } from '../web/scripts/discovery-plugin.ts'
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [react(), discoveryPlugin('docs')],
   base: '/docs/',
   resolve: {
     alias: {
-      '@': path.resolve(__dirname, './src'),
+      '@': path.resolve(import.meta.dirname, './src'),
     },
   },
   server: {
     port: 5174,
     strictPort: true,
     fs: {
-      allow: [path.resolve(__dirname, '../../..')],
+      allow: [path.resolve(import.meta.dirname, '../../..')],
     },
     watch: {
       usePolling: true,

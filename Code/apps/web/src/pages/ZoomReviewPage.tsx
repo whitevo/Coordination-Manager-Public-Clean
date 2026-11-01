@@ -2,6 +2,7 @@ import { useState, useEffect } from 'react'
 import { useNavigate } from 'react-router-dom'
 import { Calendar, Video, ArrowRight, CheckCircle2, Loader2 } from 'lucide-react'
 import { useAuth } from '../contexts/AuthContext'
+import { Button } from '../components/ui'
 
 const SETTINGS_ZOOM_URL = '/settings?tab=calendar&section=integrations'
 
@@ -28,10 +29,10 @@ export default function ZoomReviewPage() {
   // While auth is still initialising, show a spinner
   if (authLoading) {
     return (
-      <div className="min-h-screen flex items-center justify-center bg-gradient-to-br from-slate-50 to-blue-50 dark:from-gray-950 dark:to-blue-950">
+      <div className="min-h-screen flex items-center justify-center bg-linear-to-br from-background to-muted">
         <div className="flex flex-col items-center gap-4">
-          <Loader2 className="w-8 h-8 animate-spin text-blue-600" />
-          <p className="text-sm text-gray-500">Loading...</p>
+          <Loader2 className="w-8 h-8 animate-spin text-info" />
+          <p className="text-sm text-muted-foreground">Loading...</p>
         </div>
       </div>
     )
@@ -57,12 +58,12 @@ export default function ZoomReviewPage() {
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-br from-slate-50 to-blue-50 dark:from-gray-950 dark:to-blue-950 flex flex-col">
+    <div className="min-h-screen bg-linear-to-br from-background to-muted flex flex-col">
       {/* Header */}
       <header className="p-6 flex items-center gap-2">
-        <Calendar className="h-6 w-6 text-blue-600" />
-        <span className="font-semibold text-lg text-gray-900 dark:text-white">Coordination Manager</span>
-        <span className="ml-2 px-2 py-0.5 text-[10px] font-medium bg-amber-100 text-amber-700 rounded-full uppercase tracking-wider">
+        <Calendar className="h-6 w-6 text-info" />
+        <span className="font-semibold text-lg text-foreground">Coordination Manager</span>
+        <span className="ml-2 px-2 py-0.5 text-[10px] font-medium bg-warning-subtle text-warning rounded-full uppercase tracking-wider">
           Zoom Review
         </span>
       </header>
@@ -70,54 +71,54 @@ export default function ZoomReviewPage() {
       {/* Main */}
       <main className="flex-1 flex items-center justify-center px-4 pb-16">
         <div className="w-full max-w-lg">
-          <div className="bg-white dark:bg-gray-900 rounded-2xl shadow-xl border border-gray-200 dark:border-gray-800 p-8">
+          <div className="bg-card rounded-2xl shadow-xl border border-border p-8">
             {/* Icon */}
             <div className="flex items-center justify-center mb-6">
-              <div className="w-16 h-16 bg-blue-100 dark:bg-blue-900/50 rounded-2xl flex items-center justify-center">
-                <Video className="w-8 h-8 text-blue-600 dark:text-blue-400" />
+              <div className="w-16 h-16 bg-info-subtle rounded-2xl flex items-center justify-center">
+                <Video className="w-8 h-8 text-primary" />
               </div>
             </div>
 
-            <h1 className="text-2xl font-bold text-center text-gray-900 dark:text-white mb-2">
+            <h1 className="text-2xl font-bold text-center text-foreground mb-2">
               Zoom Integration Review
             </h1>
-            <p className="text-center text-gray-600 dark:text-gray-400 mb-8">
+            <p className="text-center text-muted-foreground mb-8">
               Welcome, Zoom Marketplace reviewer. This page will help you test the Zoom OAuth integration in Coordination Manager.
             </p>
 
             {/* Steps */}
             <div className="space-y-4 mb-8">
               <div className="flex items-start gap-3">
-                <div className="w-7 h-7 rounded-full bg-blue-100 dark:bg-blue-900/50 flex items-center justify-center flex-shrink-0 mt-0.5">
-                  <span className="text-sm font-semibold text-blue-600 dark:text-blue-400">1</span>
+                <div className="w-7 h-7 rounded-full bg-info-subtle flex items-center justify-center shrink-0 mt-0.5">
+                  <span className="text-sm font-semibold text-primary">1</span>
                 </div>
                 <div>
-                  <p className="font-medium text-gray-900 dark:text-white">Click "Start Testing" below</p>
-                  <p className="text-sm text-gray-500 dark:text-gray-400">
+                  <p className="font-medium text-foreground">Click "Start Testing" below</p>
+                  <p className="text-sm text-muted-foreground">
                     A guest test account will be created automatically -- no email or password needed.
                   </p>
                 </div>
               </div>
 
               <div className="flex items-start gap-3">
-                <div className="w-7 h-7 rounded-full bg-blue-100 dark:bg-blue-900/50 flex items-center justify-center flex-shrink-0 mt-0.5">
-                  <span className="text-sm font-semibold text-blue-600 dark:text-blue-400">2</span>
+                <div className="w-7 h-7 rounded-full bg-info-subtle flex items-center justify-center shrink-0 mt-0.5">
+                  <span className="text-sm font-semibold text-primary">2</span>
                 </div>
                 <div>
-                  <p className="font-medium text-gray-900 dark:text-white">Connect your Zoom account</p>
-                  <p className="text-sm text-gray-500 dark:text-gray-400">
+                  <p className="font-medium text-foreground">Connect your Zoom account</p>
+                  <p className="text-sm text-muted-foreground">
                     You will be redirected to Settings where you can click "Connect Zoom" to start the OAuth flow.
                   </p>
                 </div>
               </div>
 
               <div className="flex items-start gap-3">
-                <div className="w-7 h-7 rounded-full bg-blue-100 dark:bg-blue-900/50 flex items-center justify-center flex-shrink-0 mt-0.5">
-                  <span className="text-sm font-semibold text-blue-600 dark:text-blue-400">3</span>
+                <div className="w-7 h-7 rounded-full bg-info-subtle flex items-center justify-center shrink-0 mt-0.5">
+                  <span className="text-sm font-semibold text-primary">3</span>
                 </div>
                 <div>
-                  <p className="font-medium text-gray-900 dark:text-white">Verify the integration</p>
-                  <p className="text-sm text-gray-500 dark:text-gray-400">
+                  <p className="font-medium text-foreground">Verify the integration</p>
+                  <p className="text-sm text-muted-foreground">
                     Once connected, the settings page will show your Zoom account details. You can also disconnect at any time.
                   </p>
                 </div>
@@ -125,10 +126,11 @@ export default function ZoomReviewPage() {
             </div>
 
             {/* CTA */}
-            <button
+            <Button
+              intent="primary"
+              fullWidth
               onClick={handleStartReview}
               disabled={isLoading}
-              className="w-full flex items-center justify-center gap-2 px-6 py-3 text-white font-medium bg-blue-600 hover:bg-blue-700 disabled:bg-blue-400 rounded-xl transition-colors"
             >
               {isLoading ? (
                 <>
@@ -147,16 +149,16 @@ export default function ZoomReviewPage() {
                   <ArrowRight className="w-5 h-5" />
                 </>
               )}
-            </button>
+            </Button>
 
             {error && (
-              <p className="mt-3 text-sm text-red-600 dark:text-red-400 text-center">{error}</p>
+              <p className="mt-3 text-sm text-danger text-center">{error}</p>
             )}
 
             {/* Info box */}
-            <div className="mt-6 p-4 bg-gray-50 dark:bg-gray-800/50 rounded-xl border border-gray-200 dark:border-gray-700">
-              <h3 className="text-sm font-semibold text-gray-900 dark:text-white mb-2">About this app</h3>
-              <p className="text-sm text-gray-600 dark:text-gray-400">
+            <div className="mt-6 p-4 bg-muted/50 rounded-xl border border-border">
+              <h3 className="text-sm font-semibold text-foreground mb-2">About this app</h3>
+              <p className="text-sm text-muted-foreground">
                 Coordination Manager is a meeting coordination platform for the Cardano blockchain community. The Zoom integration allows users to generate Zoom meeting links directly when scheduling events on their coordination calendars.
               </p>
             </div>

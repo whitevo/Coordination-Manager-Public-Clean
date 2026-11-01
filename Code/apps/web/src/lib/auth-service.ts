@@ -1,4 +1,4 @@
-import { supabase } from './supabase'
+import { setAuthPersistence, supabase } from './supabase'
 import { apiClient, clearInflightRequests } from './api-client'
 import { clearTimezoneStorage } from './use-timezones'
 import type { Session, User as SupabaseUser } from '@supabase/supabase-js'
@@ -124,12 +124,12 @@ export async function signInAsTraveler(captchaToken?: string): Promise<{ session
     const serverMsg = axiosErr.response?.data?.message
     const serverCode = axiosErr.response?.data?.error
     if (serverMsg) {
-      throw new Error(serverMsg)
+      throw new Error(serverMsg, { cause: err })
     }
     if (serverCode === 'CAPTCHA_ERROR') {
-      throw new Error('Security check failed. Please refresh the page and try again.')
+      throw new Error('Security check failed. Please refresh the page and try again.', { cause: err })
     }
-    throw new Error('Failed to create traveler account. Please try again.')
+    throw new Error('Failed to create traveler account. Please try again.', { cause: err })
   }
   const { session: sessionData, user } = response.data
 
@@ -176,8 +176,8 @@ export async function registerWithManagedWallet(wallet: {
   } catch (err: unknown) {
     const axiosErr = err as { response?: { data?: { message?: string; error?: string } } }
     const serverMsg = axiosErr.response?.data?.message
-    if (serverMsg) throw new Error(serverMsg)
-    throw new Error('Failed to create wallet account. Please try again.')
+    if (serverMsg) throw new Error(serverMsg, { cause: err })
+    throw new Error('Failed to create wallet account. Please try again.', { cause: err })
   }
 
   const { session: sessionData, user } = response.data
@@ -207,6 +207,21 @@ export async function registerWithManagedWallet(wallet: {
 /**
  * Sign out the current user
  */
+function clearSupabaseAuthStorage(): void {
+  const clearMatchingKeys = (storage: Storage) => {
+    for (let i = 0; i < storage.length; i += 1) {
+      const key = storage.key(i)
+      if (!key || !/^sb-.+-auth-token$/.test(key)) continue
+      storage.removeItem(key)
+      i -= 1
+    }
+  }
+
+  try { clearMatchingKeys(localStorage) } catch { /* ignore */ }
+  try { clearMatchingKeys(sessionStorage) } catch { /* ignore */ }
+  setAuthPersistence(false)
+}
+
 export async function signOut(): Promise<void> {
   // Try to notify backend
   try {
@@ -230,6 +245,7 @@ export async function signOut(): Promise<void> {
   } finally {
     // Clear all cached session data (AI assistant messages, form drafts, etc.)
     sessionStorage.clear()
+    clearSupabaseAuthStorage()
 
     // Clear per-account timezone preference so it does not leak to the next account
     clearTimezoneStorage()
@@ -255,14 +271,6 @@ export async function signOut(): Promise<void> {
     // Flush in-flight request deduplication cache
     clearInflightRequests()
   }
-}
-
-/**
- * Get the current Supabase session
- */
-export async function getSession(): Promise<Session | null> {
-  const { data: { session } } = await supabase.auth.getSession()
-  return session
 }
 
 /**

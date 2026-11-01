@@ -131,6 +131,13 @@ export function ApiCalendarsPage() {
           { name: 'timezone', type: 'string', required: false, description: 'IANA timezone (default: "UTC")' },
           { name: 'visibility', type: 'string', required: false, description: '"public" or "unlisted" (default: "unlisted")' },
         ]} />
+        <Callout variant="info">
+          Public calendars are auto-archived when they go quiet. A calendar with a date range is listed
+          until its end date passes. An any-week calendar is listed for 2 weeks after creation, then for
+          2 weeks after the last planned meeting; with no meeting in that window it is archived
+          (<code>archived_at</code> is set) and hidden from the home page. Planning a new meeting clears
+          <code>archived_at</code> and re-lists it.
+        </Callout>
         <h4 className="text-sm font-medium text-gray-300 mt-3 mb-2">Example Request</h4>
         <CodeBlock language="json" title="POST body">{`{
   "title": "Q1 Planning Session",

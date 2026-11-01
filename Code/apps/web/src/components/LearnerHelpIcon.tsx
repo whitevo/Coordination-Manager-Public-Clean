@@ -3,6 +3,8 @@ import { HelpCircle } from 'lucide-react'
 import { createPortal } from 'react-dom'
 import { useLearnerMode } from '../contexts/LearnerModeContext'
 import { useAuth } from '../contexts/AuthContext'
+import { OVERLAY_LAYER_CLASS } from '../lib/overlay-layers'
+import { useOverlayLayer } from '../lib/use-overlay-layer'
 
 interface LearnerHelpIconProps {
   description: ReactNode
@@ -14,7 +16,7 @@ interface LearnerHelpIconProps {
   usePortal?: boolean
 }
 
-const tooltipClasses = 'w-80 px-5 py-4 text-[13px] font-normal rounded-xl shadow-2xl border border-blue-200 dark:border-blue-800/60 bg-blue-50 dark:bg-slate-800 text-slate-800 dark:text-slate-100'
+const tooltipClasses = 'w-80 px-5 py-4 text-[13px] font-normal rounded-xl shadow-2xl border border-info-muted bg-info-subtle text-foreground'
 
 export default function LearnerHelpIcon({ description, size = 5, className = '', usePortal = false }: LearnerHelpIconProps) {
   const { learnerMode } = useLearnerMode()
@@ -25,6 +27,8 @@ export default function LearnerHelpIcon({ description, size = 5, className = '',
   const iconRef = useRef<HTMLButtonElement>(null)
 
   const visible = pinned || hovered
+  // The portaled tooltip claims the tooltip layer so it also sits above a dialog or drawer.
+  const { z: portalTooltipZ } = useOverlayLayer('tooltip', visible && (usePortal || className.includes('absolute')))
 
   const updatePosition = useCallback(() => {
     if (iconRef.current) {
@@ -73,15 +77,15 @@ export default function LearnerHelpIcon({ description, size = 5, className = '',
   const shouldPortal = isAbsolute || usePortal
 
   const iconColor = pinned
-    ? 'text-red-500 dark:text-red-400'
-    : 'text-blue-400 hover:text-blue-500 dark:text-blue-300 dark:hover:text-blue-200'
+    ? 'text-danger'
+    : 'text-info hover:opacity-80'
 
   return (
     <>
       <button
         type="button"
         ref={iconRef}
-        className={`${isAbsolute ? 'inline-flex items-center' : 'relative inline-flex items-center'} p-0.5 rounded-md hover:bg-muted/60 transition-colors focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring ${className}`}
+        className={`${isAbsolute ? 'inline-flex items-center' : 'relative inline-flex items-center'} p-0.5 rounded-md hover:bg-muted/60 transition-colors focus-visible:outline-hidden focus-visible:ring-1 focus-visible:ring-ring ${className}`}
         onMouseEnter={handleEnter}
         onMouseLeave={handleLeave}
         onClick={handleClick}
@@ -90,16 +94,16 @@ export default function LearnerHelpIcon({ description, size = 5, className = '',
       >
         <HelpCircle className={`${sizeClass} ${iconColor} cursor-pointer transition-colors`} />
         {visible && !shouldPortal && (
-          <div className={`absolute left-1/2 -translate-x-1/2 top-full mt-2 z-50 pointer-events-none ${tooltipClasses}`}>
-            <div className="absolute -top-1.5 left-1/2 -translate-x-1/2 w-3 h-3 rotate-45 bg-blue-50 dark:bg-slate-800 border-l border-t border-blue-200 dark:border-blue-800/60" />
+          <div className={`absolute left-1/2 -translate-x-1/2 top-full mt-2 ${OVERLAY_LAYER_CLASS.tooltip} pointer-events-none ${tooltipClasses}`}>
+            <div className="absolute -top-1.5 left-1/2 -translate-x-1/2 w-3 h-3 rotate-45 bg-info-subtle border-l border-t border-info-muted" />
             <div className="relative z-10 leading-relaxed learner-tooltip-content">{description}</div>
           </div>
         )}
       </button>
       {visible && shouldPortal && tooltipPos && createPortal(
         <div
-          className={`fixed z-[9999] pointer-events-none ${tooltipClasses}`}
-          style={{ top: tooltipPos.top, left: tooltipPos.left }}
+          className={`fixed pointer-events-none ${tooltipClasses}`}
+          style={{ top: tooltipPos.top, left: tooltipPos.left, zIndex: portalTooltipZ }}
         >
           <div className="leading-relaxed learner-tooltip-content">{description}</div>
         </div>,

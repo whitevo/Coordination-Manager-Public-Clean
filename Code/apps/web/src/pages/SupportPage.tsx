@@ -6,8 +6,8 @@ export default function SupportPage() {
     <div className="max-w-3xl mx-auto py-10 px-4">
       {/* Header */}
       <div className="text-center mb-10">
-        <div className="inline-flex items-center justify-center w-14 h-14 rounded-full bg-blue-100 dark:bg-blue-900 mb-4">
-          <LifeBuoy className="w-7 h-7 text-blue-600 dark:text-blue-400" />
+        <div className="inline-flex items-center justify-center w-14 h-14 rounded-full bg-info-subtle mb-4">
+          <LifeBuoy className="w-7 h-7 text-primary" />
         </div>
         <h1 className="text-3xl font-bold mb-2">Support Center</h1>
         <p className="text-muted-foreground text-lg">
@@ -19,7 +19,7 @@ export default function SupportPage() {
       <div className="grid gap-4 sm:grid-cols-2 mb-8">
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center gap-3 mb-3">
-            <Clock className="w-5 h-5 text-blue-500" />
+            <Clock className="w-5 h-5 text-info" />
             <h2 className="font-semibold text-base">Hours of Operation</h2>
           </div>
           <p className="text-sm text-muted-foreground leading-relaxed">
@@ -32,7 +32,7 @@ export default function SupportPage() {
 
         <div className="rounded-xl border border-border bg-card p-5">
           <div className="flex items-center gap-3 mb-3">
-            <AlertCircle className="w-5 h-5 text-amber-500" />
+            <AlertCircle className="w-5 h-5 text-warning" />
             <h2 className="font-semibold text-base">First Response SLA</h2>
           </div>
           <p className="text-sm text-muted-foreground leading-relaxed">
@@ -50,13 +50,13 @@ export default function SupportPage() {
         {/* Create a Support Case */}
         <Link
           to="/feedback?tab=support"
-          className="group flex items-start gap-4 rounded-xl border border-border bg-card p-5 hover:border-blue-300 dark:hover:border-blue-700 hover:shadow-md transition-all"
+          className="group flex items-start gap-4 rounded-xl border border-border bg-card p-5 hover:border-info-muted hover:shadow-md transition-all"
         >
-          <div className="shrink-0 w-10 h-10 rounded-lg bg-blue-100 dark:bg-blue-900 flex items-center justify-center">
-            <MessageSquare className="w-5 h-5 text-blue-600 dark:text-blue-400" />
+          <div className="shrink-0 w-10 h-10 rounded-lg bg-info-subtle flex items-center justify-center">
+            <MessageSquare className="w-5 h-5 text-primary" />
           </div>
           <div>
-            <h3 className="font-medium text-sm group-hover:text-blue-600 dark:group-hover:text-blue-400 transition-colors">
+            <h3 className="font-medium text-sm group-hover:text-info transition-colors">
               Create a Support Case
             </h3>
             <p className="text-xs text-muted-foreground mt-1">
@@ -68,13 +68,13 @@ export default function SupportPage() {
         {/* Email Support */}
         <a
           href="mailto:support@coordinationmanager.com"
-          className="group flex items-start gap-4 rounded-xl border border-border bg-card p-5 hover:border-green-300 dark:hover:border-green-700 hover:shadow-md transition-all"
+          className="group flex items-start gap-4 rounded-xl border border-border bg-card p-5 hover:border-success-muted hover:shadow-md transition-all"
         >
-          <div className="shrink-0 w-10 h-10 rounded-lg bg-green-100 dark:bg-green-900 flex items-center justify-center">
-            <Mail className="w-5 h-5 text-green-600 dark:text-green-400" />
+          <div className="shrink-0 w-10 h-10 rounded-lg bg-success-subtle flex items-center justify-center">
+            <Mail className="w-5 h-5 text-success" />
           </div>
           <div>
-            <h3 className="font-medium text-sm group-hover:text-green-600 dark:group-hover:text-green-400 transition-colors">
+            <h3 className="font-medium text-sm group-hover:text-success transition-colors">
               Email Support
             </h3>
             <p className="text-xs text-muted-foreground mt-1">
@@ -88,13 +88,13 @@ export default function SupportPage() {
           href="https://coordinationmanager.com/docs"
           target="_blank"
           rel="noopener noreferrer"
-          className="group flex items-start gap-4 rounded-xl border border-border bg-card p-5 hover:border-purple-300 dark:hover:border-purple-700 hover:shadow-md transition-all"
+          className="group flex items-start gap-4 rounded-xl border border-border bg-card p-5 hover:border-feature-support-muted hover:shadow-md transition-all"
         >
-          <div className="shrink-0 w-10 h-10 rounded-lg bg-purple-100 dark:bg-purple-900 flex items-center justify-center">
-            <BookOpen className="w-5 h-5 text-purple-600 dark:text-purple-400" />
+          <div className="shrink-0 w-10 h-10 rounded-lg bg-feature-support-subtle flex items-center justify-center">
+            <BookOpen className="w-5 h-5 text-feature-support" />
           </div>
           <div>
-            <h3 className="font-medium text-sm group-hover:text-purple-600 dark:group-hover:text-purple-400 transition-colors flex items-center gap-1">
+            <h3 className="font-medium text-sm group-hover:text-feature-support transition-colors flex items-center gap-1">
               Knowledge Base
               <ExternalLink className="w-3 h-3" />
             </h3>
@@ -109,13 +109,13 @@ export default function SupportPage() {
           href="https://discord.gg/8ywJuK7ruY"
           target="_blank"
           rel="noopener noreferrer"
-          className="group flex items-start gap-4 rounded-xl border border-border bg-card p-5 hover:border-indigo-300 dark:hover:border-indigo-700 hover:shadow-md transition-all"
+          className="group flex items-start gap-4 rounded-xl border border-border bg-card p-5 hover:border-feature-chat-muted hover:shadow-md transition-all"
         >
-          <div className="shrink-0 w-10 h-10 rounded-lg bg-indigo-100 dark:bg-indigo-900 flex items-center justify-center">
-            <Headphones className="w-5 h-5 text-indigo-600 dark:text-indigo-400" />
+          <div className="shrink-0 w-10 h-10 rounded-lg bg-feature-chat-subtle flex items-center justify-center">
+            <Headphones className="w-5 h-5 text-feature-chat" />
           </div>
           <div>
-            <h3 className="font-medium text-sm group-hover:text-indigo-600 dark:group-hover:text-indigo-400 transition-colors flex items-center gap-1">
+            <h3 className="font-medium text-sm group-hover:text-feature-chat transition-colors flex items-center gap-1">
               Live Community Support
               <ExternalLink className="w-3 h-3" />
             </h3>
@@ -136,16 +136,16 @@ export default function SupportPage() {
           For security vulnerabilities or privacy concerns, please contact us directly at{' '}
           <a
             href="mailto:security@coordinationmanager.com"
-            className="text-blue-600 dark:text-blue-400 hover:underline"
+            className="text-primary hover:underline"
           >
             security@coordinationmanager.com
           </a>.
         </p>
         <div className="flex flex-wrap gap-3 text-xs">
-          <Link to="/privacy" className="text-blue-600 dark:text-blue-400 hover:underline">
+          <Link to="/privacy" className="text-primary hover:underline">
             Privacy Policy
           </Link>
-          <Link to="/terms" className="text-blue-600 dark:text-blue-400 hover:underline">
+          <Link to="/terms" className="text-primary hover:underline">
             Terms of Service
           </Link>
         </div>

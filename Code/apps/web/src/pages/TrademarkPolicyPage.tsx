@@ -13,7 +13,7 @@ export default function TrademarkPolicyPage() {
       <p className="text-sm text-muted-foreground mb-4">
         Redirecting to the canonical trademark policy source.
       </p>
-      <a href={CANONICAL_TRADEMARK_URL} className="text-blue-600 hover:underline">
+      <a href={CANONICAL_TRADEMARK_URL} className="text-primary hover:underline">
         Continue to /docs/legal/trademark-policy
       </a>
     </div>

@@ -30,8 +30,8 @@ export function CodeBlock({ language = '', title, children }: CodeBlockProps) {
         </button>
       </div>
       {/* Code content */}
-      <pre className="p-4 bg-surface-850 overflow-x-auto !mb-0 !border-0 !rounded-none">
-        <code className="text-sm font-mono text-gray-200 !bg-transparent !p-0">
+      <pre className="p-4 bg-surface-850 overflow-x-auto mb-0! border-0! rounded-none!">
+        <code className="text-sm font-mono text-gray-200 bg-transparent! p-0!">
           {children}
         </code>
       </pre>

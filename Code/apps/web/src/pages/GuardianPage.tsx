@@ -1,18 +1,27 @@
 import React, { useState, useEffect, useCallback, useRef, useMemo } from 'react'
+import { endOfDay, format, parseISO } from 'date-fns'
 import { createPortal } from 'react-dom'
 import { useSearchParams } from 'react-router-dom'
 import { useAuth } from '../contexts/AuthContext'
+import { useLearnerMode } from '../contexts/LearnerModeContext'
 import { apiClient } from '../lib/api-client'
 import { getPrimaryTimezone, formatDateTimeInTimezone, formatTimeInTimezone, getTimezoneAbbr } from '../lib/timezone-data'
+import { OVERLAY_LAYER_CLASS } from '../lib/overlay-layers'
+import { useOverlayLayer } from '../lib/use-overlay-layer'
+import { clampTopBelowObstruction } from '../lib/top-obstruction'
 import GuardianTimeSeries from '../components/GuardianTimeSeries'
 import GuardianActionTimeSeries from '../components/GuardianActionTimeSeries'
 import GuardianSystemLog from '../components/GuardianSystemLog'
+import GuardianBanList from '../components/GuardianBanList'
+import GuardianUndoActions, { type GuardianUndoKind, type GuardianUndoState } from '../components/GuardianUndoActions'
+import AnimatedTabBar from '../components/AnimatedTabBar'
+import { Button, CategoryTag, Disclosure, IconButton, SegmentedControl, Switch, ToggleButton } from '../components/ui'
 import {
   Shield, ShieldAlert, Settings, BarChart3, Copy, Check, Plus, Trash2,
-  ChevronDown, ChevronRight, ChevronLeft, ToggleLeft, ToggleRight, RefreshCw,
+  ChevronDown, ChevronRight, ChevronLeft, RefreshCw,
   AlertTriangle, Eye, Clock, Users, Hash, Regex, Type, X, Upload,
   Search, Server, ChevronUp, Paperclip, Image, FileText, MessageSquare,
-  Ban, Timer, MessageSquareX, History, ExternalLink, VolumeX, Gavel
+  Ban, Timer, MessageSquareX, History, ExternalLink, VolumeX, Gavel, FolderClosed
 } from 'lucide-react'
 
 // ─── Types ────────────────────────────────────────────────────────────
@@ -65,6 +74,8 @@ interface FlaggedMessage {
   deleted_by_kind?: 'bot' | 'user' | 'moderator' | 'unknown' | null
   dm_sent_at?: string | null
   dm_failure_reason?: string | null
+  /** Latest successful moderator undo (unban / remove timeout) for this row. */
+  undo?: GuardianUndoState | null
 }
 
 interface RecentMessage {
@@ -78,6 +89,7 @@ interface RecentMessage {
   author_username: string | null
   content_preview: string | null
   was_flagged: boolean
+  skip_reason?: 'ignored_role' | 'channel_disabled' | 'parent_channel_disabled' | null
   scanned_at: string
   message_type?: string
   has_attachments?: boolean
@@ -115,6 +127,16 @@ interface KnownUser {
   display_name: string | null
 }
 
+interface ModeratorAccount {
+  id: string
+  email: string | null
+  display_name: string | null
+  account_type: string | null
+  traveler_name: string | null
+  created_at: string
+  last_login_at: string | null
+}
+
 interface ServerRole {
   id: string
   guild_id: string
@@ -139,16 +161,19 @@ interface ServerChannel {
   channel_id: string
   channel_name: string
   channel_type: number
+  parent_id: string | null
   is_monitored: boolean
+  default_monitor_new_threads: boolean | null
 }
 
 interface ServerChannelData {
   guild_id: string
   guild_name: string
+  default_monitor_new_channels: boolean
   channels: ServerChannel[]
 }
 
-type Tab = 'dashboard' | 'configuration' | 'server-settings' | 'channel-settings'
+type Tab = 'dashboard' | 'configuration' | 'server-settings' | 'channel-settings' | 'moderators' | 'ban-list'
 
 // ─── Access Gate ──────────────────────────────────────────────────────
 
@@ -156,8 +181,8 @@ function AccessDenied() {
   return (
     <div className="min-h-[60vh] flex items-center justify-center">
       <div className="max-w-md text-center space-y-4 p-8">
-        <div className="mx-auto w-16 h-16 rounded-full bg-amber-100 dark:bg-amber-900/30 flex items-center justify-center">
-          <Shield className="h-8 w-8 text-amber-600 dark:text-amber-400" />
+        <div className="mx-auto w-16 h-16 rounded-full bg-warning-subtle flex items-center justify-center">
+          <Shield className="h-8 w-8 text-warning" />
         </div>
         <h2 className="text-xl font-semibold text-foreground">Moderator Access Required</h2>
         <p className="text-muted-foreground leading-relaxed">
@@ -177,12 +202,19 @@ function AccessDenied() {
 
 // ─── Main Page ────────────────────────────────────────────────────────
 
-const TAB_SLUGS: Tab[] = ['dashboard', 'configuration', 'server-settings', 'channel-settings']
+const TAB_SLUGS: Tab[] = ['dashboard', 'configuration', 'server-settings', 'channel-settings', 'moderators', 'ban-list']
+const THREAD_CHANNEL_TYPES = new Set([10, 11, 12])
+
+function isThreadChannel(channel: ServerChannel): boolean {
+  return THREAD_CHANNEL_TYPES.has(channel.channel_type)
+}
 
 export default function GuardianPage() {
   const { isAuthenticated, isLoading: authLoading } = useAuth()
+  const { learnerMode } = useLearnerMode()
   const [hasAccess, setHasAccess] = useState<boolean | null>(null)
   const [searchParams, setSearchParams] = useSearchParams()
+  const [learnerGuideCollapsed, setLearnerGuideCollapsed] = useState(false)
   const tabParam = searchParams.get('tab') as Tab | null
   const activeTab: Tab = tabParam && TAB_SLUGS.includes(tabParam) ? tabParam : 'dashboard'
 
@@ -218,83 +250,96 @@ export default function GuardianPage() {
       {/* Header */}
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-3">
-          <div className="p-2 rounded-lg bg-red-100 dark:bg-red-900/30">
-            <ShieldAlert className="h-6 w-6 text-red-600 dark:text-red-400" />
+          <div className="p-2 rounded-lg bg-danger-subtle">
+            <ShieldAlert className="h-6 w-6 text-danger" />
           </div>
           <div>
             <h1 className="text-2xl font-bold text-foreground">Discord Guardian</h1>
             <p className="text-sm text-muted-foreground">Message scanning & moderation dashboard</p>
           </div>
         </div>
-        <button
+        <Button
+          emphasis="outline"
           onClick={async () => {
             try {
               const res = await apiClient.get('/api/guardian/bot-invite')
               if (res.data?.url && /^https:\/\//i.test(res.data.url)) {
-                window.open(res.data.url, '_blank', 'noopener')
+                window.open(res.data.url, '_blank', 'noopener,noreferrer')
               }
             } catch (err) {
               console.error('Failed to get invite URL:', err)
               alert('Could not generate bot invite link. The Guardian bot client ID may not be configured on the server.')
             }
           }}
-          className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg border border-border bg-card text-foreground hover:bg-accent transition-colors"
+          icon={<ExternalLink className="h-4 w-4" />}
         >
-          <ExternalLink className="h-4 w-4" />
           Invite Bot to Server
-        </button>
+        </Button>
       </div>
+
+      {learnerMode && (
+        <div className="rounded-xl border border-info-muted/60 bg-info-subtle text-foreground text-sm leading-relaxed">
+          <Disclosure
+            className="px-2 py-1"
+            title="Learner Guide"
+            expanded={!learnerGuideCollapsed}
+            onToggle={open => setLearnerGuideCollapsed(!open)}
+            panelId="guardian-learner-guide"
+          />
+          {!learnerGuideCollapsed && (
+            <div id="guardian-learner-guide" className="px-4 pb-3">
+              <p className="font-semibold text-info mb-1.5">What is this page?</p>
+              <p className="mb-2">
+                Discord Guardian is the moderation dashboard for reviewing scanned messages, matched rules, and automated actions across your server.
+                It helps you separate normal traffic from flagged content and decide where moderator review is needed.
+              </p>
+              <p className="font-semibold text-info mb-1.5">How to use it</p>
+              <ul className="list-disc list-inside space-y-1 mb-2">
+                <li>Start in the <strong>Dashboard</strong> to review totals, trends, and flagged messages.</li>
+                <li>Open a flagged row to inspect the matched content, rule group, and action taken.</li>
+                <li>Use <strong>System Log</strong> when an action should have happened but did not.</li>
+                <li>Change rules and server or channel settings in the other tabs only after checking the current signal.</li>
+              </ul>
+              <p>
+                If a user appeals a timeout or a false flag, review the message and the configured rule before acting. Guardian never undoes an action
+                on its own: use the Unban or Remove timeout button on the flagged row. Users on the global Ban list are unbanned from the Ban List tab.
+              </p>
+              <p className="mt-2">
+                <a
+                  href={import.meta.env.DEV ? 'http://localhost:5174/docs/guides/discord-guardian' : `${window.location.origin}/docs/guides/discord-guardian`}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="font-medium text-info underline underline-offset-2 hover:text-info"
+                >
+                  Discord Guardian Guide
+                </a>
+              </p>
+            </div>
+          )}
+        </div>
+      )}
 
       {/* Tabs */}
-      <div className="flex border-b border-border">
-        <button
-          onClick={() => setActiveTab('dashboard')}
-          className={`flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
-            activeTab === 'dashboard'
-              ? 'border-primary text-primary'
-              : 'border-transparent text-muted-foreground hover:text-foreground hover:border-border'
-          }`}
-        >
-          <BarChart3 className="h-4 w-4" />
-          Dashboard
-        </button>
-        <button
-          onClick={() => setActiveTab('configuration')}
-          className={`flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
-            activeTab === 'configuration'
-              ? 'border-primary text-primary'
-              : 'border-transparent text-muted-foreground hover:text-foreground hover:border-border'
-          }`}
-        >
-          <Settings className="h-4 w-4" />
-          Configuration
-        </button>
-        <button
-          onClick={() => setActiveTab('server-settings')}
-          className={`flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
-            activeTab === 'server-settings'
-              ? 'border-primary text-primary'
-              : 'border-transparent text-muted-foreground hover:text-foreground hover:border-border'
-          }`}
-        >
-          <Server className="h-4 w-4" />
-          Server Settings
-        </button>
-        <button
-          onClick={() => setActiveTab('channel-settings')}
-          className={`flex items-center gap-2 px-4 py-3 text-sm font-medium border-b-2 transition-colors ${
-            activeTab === 'channel-settings'
-              ? 'border-primary text-primary'
-              : 'border-transparent text-muted-foreground hover:text-foreground hover:border-border'
-          }`}
-        >
-          <Hash className="h-4 w-4" />
-          Channel Settings
-        </button>
-      </div>
+      <AnimatedTabBar<Tab>
+        tabs={[
+          { id: 'dashboard', label: 'Dashboard', icon: BarChart3 },
+          { id: 'configuration', label: 'Configuration', icon: Settings },
+          { id: 'server-settings', label: 'Server Settings', icon: Server },
+          { id: 'channel-settings', label: 'Channel Settings', icon: Hash },
+          { id: 'ban-list', label: 'Ban List', icon: Ban },
+          { id: 'moderators', label: 'Moderators', icon: Users },
+        ]}
+        activeId={activeTab}
+        onSelect={setActiveTab}
+        ariaLabel="Guardian sections"
+        testId="guardian-tabs"
+        className="flex flex-wrap gap-1.5"
+        buttonClassName="px-4 py-2 text-sm font-medium"
+        iconClassName="h-4 w-4"
+      />
 
       {/* Tab Content */}
-      {activeTab === 'dashboard' ? <DashboardTab /> : activeTab === 'configuration' ? <ConfigurationTab /> : activeTab === 'server-settings' ? <ServerSettingsTab /> : <ChannelSettingsTab />}
+      {activeTab === 'dashboard' ? <DashboardTab /> : activeTab === 'configuration' ? <ConfigurationTab /> : activeTab === 'server-settings' ? <ServerSettingsTab /> : activeTab === 'channel-settings' ? <ChannelSettingsTab /> : activeTab === 'ban-list' ? <GuardianBanList /> : <ModeratorsTab />}
     </div>
   )
 }
@@ -327,18 +372,18 @@ function ActionIcons({ actionTaken }: { actionTaken: string | null | undefined }
     <div className="inline-flex items-center gap-1">
       {wasDeleted && (
         <span title="Message was deleted by the bot">
-          <Trash2 className="h-3.5 w-3.5 text-amber-500" />
+          <Trash2 className="h-3.5 w-3.5 text-warning" />
         </span>
       )}
       {wasMuted && (
         <span title="User was temporarily muted (Discord timeout)">
-          <VolumeX className="h-3.5 w-3.5 text-yellow-500" />
+          <VolumeX className="h-3.5 w-3.5 text-warning" />
         </span>
       )}
       {wasBanned && (
         <span title="User was banned from the server" className="relative inline-flex items-center">
-          <VolumeX className="h-3.5 w-3.5 text-red-500 opacity-60" />
-          <Gavel className="h-3 w-3 text-red-600 -ml-1.5" />
+          <VolumeX className="h-3.5 w-3.5 text-danger opacity-60" />
+          <Gavel className="h-3 w-3 text-danger -ml-1.5" />
         </span>
       )}
     </div>
@@ -358,7 +403,7 @@ function HighlightedContent({ content, matchedText }: { content: string; matched
       <span>
         {parts.map((part, i) =>
           regex.test(part)
-            ? <span key={i} className="text-red-600 dark:text-red-400 font-semibold bg-red-50 dark:bg-red-950/40 px-0.5 rounded">{part}</span>
+            ? <span key={i} className="text-danger font-semibold bg-danger-subtle px-0.5 rounded">{part}</span>
             : <span key={i}>{part}</span>
         )}
       </span>
@@ -443,28 +488,33 @@ function PaginationControls({ page, totalPages, onPageChange, position = 'bottom
     <div className={`flex items-center justify-between px-4 py-2 ${borderCls}`}>
       <span className="text-xs text-muted-foreground">Page {page} of {totalPages}</span>
       <div className="flex items-center gap-1">
-        <button
+        <Button
+          emphasis="outline"
+          size="micro"
           onClick={() => onPageChange(1)}
           disabled={page <= 1}
-          className="px-1.5 py-1 rounded border border-border text-muted-foreground hover:bg-accent disabled:opacity-30 transition-colors text-[10px] font-medium"
           title="First page"
         >
           1
-        </button>
-        <button
+        </Button>
+        <IconButton
+          label="Previous page"
+          icon={<ChevronLeft />}
+          emphasis="outline"
+          size="micro"
+          showTitle={false}
           onClick={() => onPageChange(page - 1)}
           disabled={page <= 1}
-          className="p-1.5 rounded border border-border text-muted-foreground hover:bg-accent disabled:opacity-30 transition-colors"
-        >
-          <ChevronLeft className="h-3.5 w-3.5" />
-        </button>
-        <button
+        />
+        <IconButton
+          label="Next page"
+          icon={<ChevronRight />}
+          emphasis="outline"
+          size="micro"
+          showTitle={false}
           onClick={() => onPageChange(page + 1)}
           disabled={page >= totalPages}
-          className="p-1.5 rounded border border-border text-muted-foreground hover:bg-accent disabled:opacity-30 transition-colors"
-        >
-          <ChevronRight className="h-3.5 w-3.5" />
-        </button>
+        />
         {totalPages > 3 && (
           <form onSubmit={e => { e.preventDefault(); handleJump() }} className="flex items-center gap-1 ml-1">
             <input
@@ -473,15 +523,11 @@ function PaginationControls({ page, totalPages, onPageChange, position = 'bottom
               value={jumpInput}
               onChange={e => setJumpInput(e.target.value.replace(/[^0-9]/g, ''))}
               placeholder="#"
-              className="w-10 px-1.5 py-1 text-[10px] bg-background border border-border rounded text-center focus:outline-none focus:ring-1 focus:ring-primary"
+              className="w-10 px-1.5 py-1 text-[10px] bg-background border border-border rounded text-center focus:outline-hidden focus:ring-1 focus:ring-primary"
             />
-            <button
-              type="submit"
-              disabled={!jumpInput}
-              className="px-1.5 py-1 rounded border border-border text-muted-foreground hover:bg-accent disabled:opacity-30 transition-colors text-[10px] font-medium"
-            >
+            <Button type="submit" emphasis="outline" size="micro" disabled={!jumpInput}>
               Go
-            </button>
+            </Button>
           </form>
         )}
       </div>
@@ -490,6 +536,77 @@ function PaginationControls({ page, totalPages, onPageChange, position = 'bottom
 }
 
 // ─── Dashboard Tab ────────────────────────────────────────────────────
+
+function ModeratorsTab() {
+  const [moderators, setModerators] = useState<ModeratorAccount[]>([])
+  const [loading, setLoading] = useState(true)
+  const [error, setError] = useState<string | null>(null)
+
+  const loadModerators = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const res = await apiClient.get('/api/guardian/moderators')
+      setModerators(res.data.moderators || [])
+    } catch (err) {
+      setError((err as { response?: { data?: { error?: string } } })?.response?.data?.error || 'Failed to load moderator accounts')
+    } finally {
+      setLoading(false)
+    }
+  }, [])
+
+  useEffect(() => { loadModerators() }, [loadModerators])
+
+  if (loading) {
+    return (
+      <div className="flex items-center justify-center py-12">
+        <div className="w-8 h-8 border-4 border-primary border-t-transparent rounded-full animate-spin" />
+      </div>
+    )
+  }
+
+  if (error) {
+    return <div className="rounded-lg border border-danger-muted bg-danger-subtle p-4 text-sm text-danger">{error}</div>
+  }
+
+  return (
+    <div className="space-y-4">
+      <div>
+        <h2 className="text-lg font-semibold text-foreground">Moderator Accounts</h2>
+        <p className="text-sm text-muted-foreground">Accounts with access to the Discord Guardian moderation tools.</p>
+      </div>
+      {moderators.length === 0 ? (
+        <div className="rounded-lg border border-dashed border-border p-10 text-center text-sm text-muted-foreground">
+          No accounts currently have moderator access.
+        </div>
+      ) : (
+        <div className="overflow-x-auto rounded-lg border border-border bg-card">
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="border-b border-border bg-muted/50">
+                <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground">Account</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground">Type</th>
+                <th className="px-4 py-3 text-left text-xs font-medium text-muted-foreground">Last sign-in</th>
+              </tr>
+            </thead>
+            <tbody className="divide-y divide-border">
+              {moderators.map(account => (
+                <tr key={account.id} className="hover:bg-accent/30 transition-colors">
+                  <td className="px-4 py-3">
+                    <div className="font-medium text-foreground">{account.display_name || account.traveler_name || 'Unnamed account'}</div>
+                    <div className="text-xs text-muted-foreground break-all">{account.email || 'No email address'}</div>
+                  </td>
+                  <td className="px-4 py-3 text-muted-foreground">{account.account_type || 'Unknown'}</td>
+                  <td className="px-4 py-3 text-muted-foreground">{account.last_login_at ? new Date(account.last_login_at).toLocaleString() : 'Never'}</td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  )
+}
 
 function DashboardTab() {
   // Refs for charts and system log
@@ -507,17 +624,18 @@ function DashboardTab() {
   const [filterGroup, setFilterGroup] = useState<string>('')
   const [selectedUsers, setSelectedUsers] = useState<Set<string>>(new Set())
   const [filterMode, setFilterMode] = useState<'include' | 'exclude'>('include')
+  const [showSettingsSkipped, setShowSettingsSkipped] = useState(false)
   const [customPeriodNumber, setCustomPeriodNumber] = useState<number>(2)
   const [customPeriodType, setCustomPeriodType] = useState<CustomPeriodType>('week')
 
   // Compute From/To dates for a given period
-  const computeDateRange = (
+  const computeDateRange = useCallback((
     range: DateRange,
     customNumber: number = customPeriodNumber,
     customType: CustomPeriodType = customPeriodType,
+    today: Date = new Date(),
   ): { since: string; until: string } => {
-    const today = new Date()
-    const until = today.toISOString().slice(0, 10)
+    const until = format(today, 'yyyy-MM-dd')
     if (range === 'all') return { since: '', until: '' }
     const from = new Date(today)
     if (range === 'custom') {
@@ -530,13 +648,29 @@ function DashboardTab() {
       const days = range === '1d' ? 1 : range === '7d' ? 7 : 30
       from.setDate(from.getDate() - days)
     }
-    return { since: from.toISOString().slice(0, 10), until }
-  }
+    return { since: format(from, 'yyyy-MM-dd'), until }
+  }, [customPeriodNumber, customPeriodType])
 
   const initialRange = computeDateRange('custom', 2, 'week')
   const [filterSince, setFilterSince] = useState<string>(initialRange.since)
   const [filterUntil, setFilterUntil] = useState<string>(initialRange.until)
   const [dateRange, setDateRange] = useState<DateRange>('custom')
+  const [untilNow, setUntilNow] = useState(true)
+  const [rollingPeriod, setRollingPeriod] = useState(true)
+  const [dateAnchor, setDateAnchor] = useState(() => new Date())
+  const displayedSince = untilNow && rollingPeriod
+    ? computeDateRange(dateRange, customPeriodNumber, customPeriodType, dateAnchor).since
+    : filterSince
+  const resolveDateBounds = useCallback(() => {
+    const now = new Date()
+    const since = untilNow && rollingPeriod
+      ? computeDateRange(dateRange, customPeriodNumber, customPeriodType, now).since
+      : filterSince
+    return {
+      since: since ? parseISO(since).toISOString() : '',
+      until: untilNow ? now.toISOString() : filterUntil ? endOfDay(parseISO(filterUntil)).toISOString() : '',
+    }
+  }, [untilNow, rollingPeriod, computeDateRange, dateRange, customPeriodNumber, customPeriodType, filterSince, filterUntil])
   const [userSearch, setUserSearch] = useState('')
   const [showUserPicker, setShowUserPicker] = useState(false)
   const userPickerRef = useRef<HTMLDivElement>(null)
@@ -603,10 +737,11 @@ function DashboardTab() {
       params.set('author_ids', Array.from(selectedUsers).join(','))
       params.set('filter_mode', filterMode)
     }
-    if (filterSince) params.set('since', new Date(filterSince).toISOString())
-    if (filterUntil) params.set('until', new Date(filterUntil + 'T23:59:59').toISOString())
+    const bounds = resolveDateBounds()
+    if (bounds.since) params.set('since', bounds.since)
+    if (bounds.until) params.set('until', bounds.until)
     return params
-  }, [filterGroup, selectedUsers, filterMode, filterSince, filterUntil])
+  }, [filterGroup, selectedUsers, filterMode, resolveDateBounds])
 
   // Build stats filter params (for unique users filtered metric)
   const buildStatsFilterParams = useCallback(() => {
@@ -616,10 +751,11 @@ function DashboardTab() {
       params.set('author_ids', Array.from(selectedUsers).join(','))
       params.set('filter_mode', filterMode)
     }
-    if (filterSince) params.set('since', new Date(filterSince).toISOString())
-    if (filterUntil) params.set('until', new Date(filterUntil + 'T23:59:59').toISOString())
+    const bounds = resolveDateBounds()
+    if (bounds.since) params.set('since', bounds.since)
+    if (bounds.until) params.set('until', bounds.until)
     return params
-  }, [filterGroup, selectedUsers, filterMode, filterSince, filterUntil])
+  }, [filterGroup, selectedUsers, filterMode, resolveDateBounds])
 
   // Load static data (groups, users) -- only on mount and manual refresh
   const loadStaticData = useCallback(async () => {
@@ -670,25 +806,52 @@ function DashboardTab() {
     }
   }, [buildFilterParams])
 
+  // Apply a confirmed moderator undo in place: a ban or timeout is per author
+  // and server, so mark every loaded row for that pair flagged up to the undo
+  // (same rule as GET /flagged) without refetching, which keeps the page,
+  // expanded rows and scroll position.
+  const markFlaggedUndone = useCallback((flaggedId: string, kind: GuardianUndoKind, at: string) => {
+    setFlagged(prev => {
+      const source = prev.find(row => row.id === flaggedId)
+      if (!source) return prev
+      const key = kind === 'unban' ? 'unban_at' : 'unmute_at'
+      return prev.map(row => (
+        row.author_id === source.author_id && row.guild_id === source.guild_id && row.flagged_at <= at
+          ? { ...row, undo: { ...row.undo, [key]: at } }
+          : row
+      ))
+    })
+  }, [])
+
   // Load recent table -- accepts page args so callback only changes on filter change
+  const recentRequestRef = useRef(0)
   const loadRecentPage = useCallback(async (page: number, pageSize: number) => {
+    const requestId = ++recentRequestRef.current
     try {
       const recentParams = buildFilterParams(pageSize, page, 'scanned_at')
+      recentParams.set('include_skipped', showSettingsSkipped ? '1' : '0')
       recentParams.set('skip_count', '1')
-      const dataPromise = apiClient.get(`/api/guardian/recent?${recentParams}`)
       const countParams = buildFilterParams(pageSize, page, 'scanned_at')
+      countParams.set('include_skipped', showSettingsSkipped ? '1' : '0')
       countParams.set('count_only', '1')
-      const countPromise = apiClient.get(`/api/guardian/recent?${countParams}`)
-
-      const recentRes = await dataPromise
+      const [recentResult, countResult] = await Promise.allSettled([
+        apiClient.get(`/api/guardian/recent?${recentParams}`),
+        apiClient.get(`/api/guardian/recent?${countParams}`),
+      ])
+      if (requestId !== recentRequestRef.current) return
+      if (countResult.status === 'fulfilled') {
+        setRecentTotal(countResult.value.data.total)
+      } else {
+        console.error('Failed to load recent message count:', countResult.reason)
+      }
+      if (recentResult.status === 'rejected') throw recentResult.reason
+      const recentRes = recentResult.value
       setRecent(recentRes.data.messages)
       if (recentRes.data.total != null) setRecentTotal(recentRes.data.total)
-
-      countPromise.then(res => { if (res.data.total != null) setRecentTotal(res.data.total) }).catch(() => {})
     } catch (err) {
       console.error('Failed to load recent messages:', err)
     }
-  }, [buildFilterParams])
+  }, [buildFilterParams, showSettingsSkipped])
 
   // Full reload -- used on mount and manual refresh
   const loadData = useCallback(async (isManual = false) => {
@@ -711,6 +874,7 @@ function DashboardTab() {
   type RefreshSection = 'flagged' | 'recent' | 'stats' | 'timeseries' | 'actionseries' | 'systemlog'
   const refreshFrom = useCallback(async (start: RefreshSection) => {
     setRefreshing(true)
+    setDateAnchor(new Date())
     const minDelay = (p: Promise<unknown>, ms: number) =>
       Promise.all([p, new Promise(res => setTimeout(res, ms))])
     const steps: Record<RefreshSection, () => Promise<unknown>> = {
@@ -781,8 +945,16 @@ function DashboardTab() {
   }, [buildFilterParams, loadStats, loadFlaggedPage, loadRecentPage, flaggedPage, flaggedPageSize, recentPage, recentPageSize])
 
   // Reset pages when filters change
-  useEffect(() => { setFlaggedPage(1) }, [filterGroup, selectedUsers, filterMode, filterSince, filterUntil])
-  useEffect(() => { setRecentPage(1) }, [filterGroup, selectedUsers, filterMode, filterSince, filterUntil])
+  useEffect(() => { setFlaggedPage(1) }, [filterGroup, selectedUsers, filterMode, filterSince, filterUntil, untilNow])
+  useEffect(() => { setRecentPage(1) }, [filterGroup, selectedUsers, filterMode, filterSince, filterUntil, untilNow])
+
+  const previousShowSkippedRef = useRef(showSettingsSkipped)
+  useEffect(() => {
+    if (previousShowSkippedRef.current === showSettingsSkipped) return
+    previousShowSkippedRef.current = showSettingsSkipped
+    setRecentPage(1)
+    loadRecentPage(1, recentPageSize)
+  }, [showSettingsSkipped, loadRecentPage, recentPageSize])
 
   // Filtered user list for picker
   const filteredPickerUsers = useMemo(() => {
@@ -833,7 +1005,7 @@ function DashboardTab() {
   const flaggedTotalPages = Math.max(1, Math.ceil(flaggedTotal / flaggedPageSize))
   const recentTotalPages = Math.max(1, Math.ceil(recentTotal / recentPageSize))
 
-  const hasActiveFilters = !!(filterGroup || selectedUsers.size > 0 || filterSince || filterUntil)
+  const hasActiveFilters = !!(filterGroup || selectedUsers.size > 0 || filterSince || filterUntil || untilNow || showSettingsSkipped)
 
   if (loading) {
     return (
@@ -853,62 +1025,58 @@ function DashboardTab() {
               {formatSmartLastUpdated(lastRefresh)}
             </span>
           )}
-          <button
+          <Button
+            emphasis="outline"
+            size="compact"
             onClick={refreshAll}
             disabled={refreshing}
-            className="flex items-center gap-2 px-3 py-1.5 text-sm bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 disabled:opacity-50 transition-colors"
+            icon={<RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />}
           >
-            <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
             {refreshing ? 'Refreshing...' : 'Refresh Now'}
-          </button>
+          </Button>
         </div>
       </div>
 
       {/* Shared Filters */}
       <div className="bg-card border border-border rounded-lg p-4 space-y-3">
-        <h3 className="text-sm font-medium text-foreground">Filters <span className="text-muted-foreground font-normal">(apply to stats &amp; both tables)</span></h3>
+        <h3 className="text-sm font-medium text-foreground">Filters <span className="text-muted-foreground font-normal">(shared unless labelled otherwise)</span></h3>
+        <label className="flex items-center gap-2 text-sm text-foreground cursor-pointer">
+          <input
+            type="checkbox"
+            role="switch"
+            checked={showSettingsSkipped}
+            onChange={event => setShowSettingsSkipped(event.target.checked)}
+            className="h-4 w-4 accent-primary"
+          />
+          Show settings-skipped messages
+          <span className="text-xs text-muted-foreground">(recent messages only; excluded from scan counts)</span>
+        </label>
 
         {/* Date range quick filters */}
         <div className="flex items-center gap-2 flex-wrap">
           <span className="text-xs text-muted-foreground">Period:</span>
-          {([
-            { key: '1d' as DateRange, label: '1 Day' },
-            { key: '7d' as DateRange, label: '1 Week' },
-            { key: '30d' as DateRange, label: '1 Month' },
-            { key: 'all' as DateRange, label: 'All' },
-          ]).map(f => (
-            <button
-              key={f.key}
-              onClick={() => {
-                setDateRange(f.key)
-                const { since, until } = computeDateRange(f.key)
-                setFilterSince(since)
-                setFilterUntil(until)
-              }}
-              className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-colors ${
-                dateRange === f.key
-                  ? 'bg-primary text-primary-foreground border-primary'
-                  : 'border-border text-muted-foreground hover:bg-accent/50'
-              }`}
-            >
-              {f.label}
-            </button>
-          ))}
-          <button
-            onClick={() => {
-              setDateRange('custom')
-              const { since, until } = computeDateRange('custom', customPeriodNumber, customPeriodType)
+          <SegmentedControl<DateRange>
+            label="Period"
+            size="compact"
+            value={dateRange}
+            onChange={key => {
+              setDateRange(key)
+              setRollingPeriod(true)
+              setDateAnchor(new Date())
+              const { since, until } = key === 'custom'
+                ? computeDateRange('custom', customPeriodNumber, customPeriodType)
+                : computeDateRange(key)
               setFilterSince(since)
               setFilterUntil(until)
             }}
-            className={`px-3 py-1.5 text-xs font-medium rounded-md border transition-colors ${
-              dateRange === 'custom'
-                ? 'bg-primary text-primary-foreground border-primary'
-                : 'border-border text-muted-foreground hover:bg-accent/50'
-            }`}
-          >
-            Custom
-          </button>
+            options={[
+              { value: '1d', label: '1 Day' },
+              { value: '7d', label: '1 Week' },
+              { value: '30d', label: '1 Month' },
+              { value: 'all', label: 'All' },
+              { value: 'custom', label: 'Custom' },
+            ]}
+          />
           <input
             type="number"
             min={1}
@@ -919,6 +1087,8 @@ function DashboardTab() {
               const next = Number.isFinite(raw) ? Math.max(1, Math.min(99, raw)) : 1
               setCustomPeriodNumber(next)
               setDateRange('custom')
+              setRollingPeriod(true)
+              setDateAnchor(new Date())
               const { since, until } = computeDateRange('custom', next, customPeriodType)
               setFilterSince(since)
               setFilterUntil(until)
@@ -933,6 +1103,8 @@ function DashboardTab() {
               const next = e.target.value as CustomPeriodType
               setCustomPeriodType(next)
               setDateRange('custom')
+              setRollingPeriod(true)
+              setDateAnchor(new Date())
               const { since, until } = computeDateRange('custom', customPeriodNumber, next)
               setFilterSince(since)
               setFilterUntil(until)
@@ -947,19 +1119,37 @@ function DashboardTab() {
             <option value="year">year</option>
           </select>
           <span className="mx-1 h-5 w-px bg-border" aria-hidden="true" />
-          <label className="text-xs text-muted-foreground">From:</label>
+          <label htmlFor="guardian-filter-since" className="text-xs text-muted-foreground">From:</label>
           <input
+            id="guardian-filter-since"
             type="date"
-            value={filterSince}
-            onChange={e => setFilterSince(e.target.value)}
-            className="px-2 py-1.5 text-xs bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary"
+            value={displayedSince}
+            onChange={e => {
+              setRollingPeriod(false)
+              setFilterSince(e.target.value)
+            }}
+            className="px-2 py-1.5 text-xs bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary"
           />
-          <label className="text-xs text-muted-foreground">To:</label>
+          <label htmlFor="guardian-filter-until" className="text-xs text-muted-foreground">To:</label>
           <input
-            type="date"
-            value={filterUntil}
+            id="guardian-filter-until"
+            type={untilNow ? 'text' : 'date'}
+            value={untilNow ? 'NOW' : filterUntil}
+            readOnly={untilNow}
             onChange={e => setFilterUntil(e.target.value)}
-            className="px-2 py-1.5 text-xs bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary"
+            className="px-2 py-1.5 text-xs bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary"
+          />
+          <Switch
+            size="compact"
+            label="Use NOW as To date"
+            checked={untilNow}
+            onCheckedChange={enabled => {
+              const now = new Date()
+              setFilterSince(displayedSince)
+              setFilterUntil(format(now, 'yyyy-MM-dd'))
+              setDateAnchor(now)
+              setUntilNow(enabled)
+            }}
           />
         </div>
 
@@ -970,7 +1160,7 @@ function DashboardTab() {
             <select
               value={filterGroup}
               onChange={e => setFilterGroup(e.target.value)}
-              className="px-2 py-1.5 text-xs bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary min-w-[160px]"
+              className="px-2 py-1.5 text-xs bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary min-w-[160px]"
             >
               <option value="">All categories</option>
               {groups.map(g => (
@@ -990,29 +1180,27 @@ function DashboardTab() {
                 onChange={e => { setUserSearch(e.target.value); setShowUserPicker(true) }}
                 onFocus={() => setShowUserPicker(true)}
                 placeholder={selectedUsers.size > 0 ? `${selectedUsers.size} selected` : 'Search users...'}
-                className="pl-7 pr-2 py-1.5 text-xs bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary min-w-[200px]"
+                className="pl-7 pr-2 py-1.5 text-xs bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary min-w-[200px]"
               />
               {showUserPicker && (
-                <div className="absolute top-full left-0 mt-1 w-72 bg-card border border-border rounded-lg shadow-lg z-50 max-h-64 overflow-hidden">
+                <div className={`absolute top-full left-0 mt-1 w-72 bg-card border border-border rounded-lg shadow-lg ${OVERLAY_LAYER_CLASS.popover} max-h-64 overflow-hidden`}>
                   {/* Include/Exclude toggle */}
                   <div className="flex items-center gap-2 px-3 py-2 border-b border-border bg-accent/30">
                     <span className="text-xs text-muted-foreground">Mode:</span>
-                    <button
-                      onClick={() => setFilterMode('include')}
-                      className={`px-2 py-0.5 text-xs rounded ${filterMode === 'include' ? 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300 font-medium' : 'text-muted-foreground hover:text-foreground'}`}
-                    >
-                      Show only
-                    </button>
-                    <button
-                      onClick={() => setFilterMode('exclude')}
-                      className={`px-2 py-0.5 text-xs rounded ${filterMode === 'exclude' ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300 font-medium' : 'text-muted-foreground hover:text-foreground'}`}
-                    >
-                      Hide selected
-                    </button>
+                    <SegmentedControl<'include' | 'exclude'>
+                      label="User filter mode"
+                      size="micro"
+                      value={filterMode}
+                      onChange={setFilterMode}
+                      options={[
+                        { value: 'include', label: 'Show only' },
+                        { value: 'exclude', label: 'Hide selected' },
+                      ]}
+                    />
                     {selectedUsers.size > 0 && (
-                      <button onClick={() => setSelectedUsers(new Set())} className="ml-auto text-xs text-muted-foreground hover:text-foreground">
+                      <Button emphasis="ghost" size="micro" className="ml-auto" onClick={() => setSelectedUsers(new Set())}>
                         Clear
-                      </button>
+                      </Button>
                     )}
                   </div>
                   <div className="overflow-y-auto max-h-48">
@@ -1028,7 +1216,7 @@ function DashboardTab() {
                           <div className={`w-3.5 h-3.5 rounded border flex items-center justify-center shrink-0 ${
                             selectedUsers.has(u.id)
                               ? filterMode === 'exclude'
-                                ? 'bg-red-500 border-red-500 text-white'
+                                ? 'bg-danger border-danger text-danger-foreground'
                                 : 'bg-primary border-primary text-white'
                               : 'border-border'
                           }`}>
@@ -1046,7 +1234,7 @@ function DashboardTab() {
             {/* Selected user chips */}
             {selectedUsers.size > 0 && (
               <div className="flex items-center gap-1 flex-wrap">
-                <span className={`text-[10px] px-1.5 py-0.5 rounded ${filterMode === 'exclude' ? 'bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300' : 'bg-green-100 dark:bg-green-900/30 text-green-700 dark:text-green-300'}`}>
+                <span className={`text-[10px] px-1.5 py-0.5 rounded ${filterMode === 'exclude' ? 'bg-danger-subtle text-danger' : 'bg-success-subtle text-success'}`}>
                   {filterMode === 'exclude' ? 'Hiding' : 'Showing'} {selectedUsers.size}
                 </span>
               </div>
@@ -1055,13 +1243,14 @@ function DashboardTab() {
 
           {/* Clear all filters */}
           {hasActiveFilters && (
-            <button
-              onClick={() => { setFilterGroup(''); setSelectedUsers(new Set()); setFilterSince(''); setFilterUntil(''); setUserSearch('') }}
-              className="flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground px-2 py-1.5 rounded border border-border hover:bg-accent transition-colors"
+            <Button
+              emphasis="outline"
+              size="compact"
+              onClick={() => { setFilterGroup(''); setSelectedUsers(new Set()); setFilterSince(''); setFilterUntil(''); setUntilNow(false); setRollingPeriod(false); setUserSearch(''); setShowSettingsSkipped(false) }}
+              icon={<X className="h-3 w-3" />}
             >
-              <X className="h-3 w-3" />
               Clear all
-            </button>
+            </Button>
           )}
         </div>
 
@@ -1069,17 +1258,14 @@ function DashboardTab() {
         {stats && stats.flaggedByGroup.length > 0 && (
           <div className="flex flex-wrap gap-2 pt-1">
             {stats.flaggedByGroup.map(g => (
-              <button
+              <ToggleButton
                 key={g.groupId}
-                onClick={() => setFilterGroup(prev => prev === g.groupId ? '' : g.groupId)}
-                className={`text-xs px-3 py-1.5 rounded-full border transition-colors ${
-                  filterGroup === g.groupId
-                    ? 'bg-primary text-primary-foreground border-primary'
-                    : 'bg-card border-border text-muted-foreground hover:bg-accent'
-                }`}
+                size="compact"
+                pressed={filterGroup === g.groupId}
+                onPressedChange={() => setFilterGroup(prev => prev === g.groupId ? '' : g.groupId)}
               >
                 {g.groupName}: {g.count}
-              </button>
+              </ToggleButton>
             ))}
           </div>
         )}
@@ -1094,13 +1280,13 @@ function DashboardTab() {
             dateRange === '30d' ? stats.messagesLast30d :
             stats.messagesTotal
           } />
-          <StatCard icon={<AlertTriangle className="h-5 w-5 text-red-500" />} label="Flagged" value={
+          <StatCard icon={<AlertTriangle className="h-5 w-5 text-danger" />} label="Flagged" value={
             dateRange === '1d' ? stats.flaggedLast24h :
             dateRange === '7d' ? stats.flaggedLast7d :
             dateRange === '30d' ? stats.flaggedLast30d :
             stats.flaggedTotal
           } accent />
-          <StatCard icon={<Users className="h-5 w-5 text-orange-500" />} label="Users Flagged" value={
+          <StatCard icon={<Users className="h-5 w-5 text-danger" />} label="Users Flagged" value={
             stats.uniqueUsersFiltered != null ? stats.uniqueUsersFiltered :
             dateRange === '1d' ? (stats.uniqueUsers24h ?? stats.uniqueUsersTotal) :
             dateRange === '7d' ? (stats.uniqueUsers7d ?? stats.uniqueUsersTotal) :
@@ -1111,10 +1297,10 @@ function DashboardTab() {
       )}
 
       {/* Timeseries Chart */}
-      <GuardianTimeSeries ref={timeSeriesRef} dateRange={dateRange} filterSince={filterSince} filterUntil={filterUntil} />
+      <GuardianTimeSeries ref={timeSeriesRef} dateRange={dateRange} resolveDateBounds={resolveDateBounds} />
 
       {/* Moderation Actions Chart -- per-action breakdown from guardian_action_log */}
-      <GuardianActionTimeSeries ref={actionSeriesRef} dateRange={dateRange} filterSince={filterSince} filterUntil={filterUntil} />
+      <GuardianActionTimeSeries ref={actionSeriesRef} dateRange={dateRange} resolveDateBounds={resolveDateBounds} />
 
       {/* System Log -- collapsible panel of failed bot actions (default collapsed) */}
       <GuardianSystemLog
@@ -1126,35 +1312,37 @@ function DashboardTab() {
       {/* Flagged Messages — Expandable Table */}
       <div className="bg-card border border-border rounded-lg">
         <div className="flex items-center justify-between p-4 border-b border-border">
-          <button
-            onClick={() => setFlaggedExpanded(!flaggedExpanded)}
-            className="flex items-center gap-2 text-sm font-medium text-foreground hover:text-primary transition-colors"
-          >
-            {flaggedExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-            <ShieldAlert className="h-4 w-4 text-red-500" />
-            Flagged Messages
-            <span className="text-muted-foreground font-normal">({flaggedTotal})</span>
-          </button>
+          <Disclosure
+            className="mr-2 min-w-0 flex-1"
+            icon={<ShieldAlert className="text-danger" />}
+            title={<>Flagged Messages <span className="text-muted-foreground font-normal">({flaggedTotal})</span></>}
+            expanded={flaggedExpanded}
+            onToggle={setFlaggedExpanded}
+            panelId="guardian-flagged-panel"
+          />
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-1.5">
               <label className="text-xs text-muted-foreground">Show:</label>
               <select
                 value={flaggedPageSize}
                 onChange={e => { setFlaggedPageSize(Number(e.target.value)); setFlaggedPage(1) }}
-                className="px-1.5 py-1 text-xs bg-background border border-border rounded focus:outline-none focus:ring-2 focus:ring-primary"
+                className="px-1.5 py-1 text-xs bg-background border border-border rounded focus:outline-hidden focus:ring-2 focus:ring-primary"
               >
                 {[5, 10, 20, 30, 50].map(n => (
                   <option key={n} value={n}>{n}</option>
                 ))}
               </select>
             </div>
-            <button onClick={refreshAll} className="text-muted-foreground hover:text-foreground">
-              <RefreshCw className={`h-4 w-4 ${refreshing ? 'animate-spin' : ''}`} />
-            </button>
+            <IconButton
+              label="Refresh"
+              icon={<RefreshCw className={refreshing ? 'animate-spin' : undefined} />}
+              showTitle={false}
+              onClick={refreshAll}
+            />
           </div>
         </div>
         {flaggedExpanded && (
-          <>
+          <div id="guardian-flagged-panel">
             <PaginationControls page={flaggedPage} totalPages={flaggedTotalPages} onPageChange={setFlaggedPage} position="top" />
             {flagged.length === 0 ? (
               <div className="p-8 text-center text-muted-foreground text-sm">
@@ -1173,7 +1361,7 @@ function DashboardTab() {
                       <th className="px-3 py-2 text-left font-medium text-muted-foreground">Content</th>
                       <th className="px-3 py-2 text-left font-medium text-muted-foreground whitespace-nowrap w-[70px]">Source</th>
                       <th className="px-3 py-2 text-left font-medium text-muted-foreground whitespace-nowrap w-[130px]">Rule Group</th>
-                      <th className="px-3 py-2 text-right font-medium text-muted-foreground whitespace-nowrap w-[110px]">Actions</th>
+                      <th className="px-3 py-2 text-right font-medium text-muted-foreground whitespace-nowrap w-[150px]">Actions</th>
                     </tr>
                   </thead>
                   <tbody className="divide-y divide-border">
@@ -1193,7 +1381,7 @@ function DashboardTab() {
                                 {formatTime(msg.flagged_at)}
                                 {msg.deleted_at && (
                                   <span
-                                    className="px-1 py-0.5 rounded bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300 text-[9px] font-medium shrink-0"
+                                    className="px-1 py-0.5 rounded bg-danger-subtle text-danger text-[9px] font-medium shrink-0"
                                     title={`Deleted ${formatTime(msg.deleted_at)} by ${msg.deleted_by_kind || 'unknown'}`}
                                   >
                                     deleted{msg.deleted_by_kind ? ` (${msg.deleted_by_kind})` : ''}
@@ -1217,14 +1405,15 @@ function DashboardTab() {
                             </td>
                             <td className="px-3 py-2 font-medium text-foreground truncate">{msg.author_display_name || msg.author_username || 'Unknown'}</td>
                             <td className="px-3 py-2 text-center whitespace-nowrap" onClick={e => e.stopPropagation()}>
-                              <button
+                              <Button
+                                emphasis="outline"
+                                size="micro"
                                 onClick={() => copyToClipboard(msg.author_id)}
-                                className="inline-flex items-center gap-0.5 text-muted-foreground hover:text-foreground px-1.5 py-0.5 rounded border border-border hover:bg-accent transition-colors"
                                 title={`Copy author Discord ID (${msg.author_id})`}
+                                icon={copiedId === msg.author_id ? <Check className="h-3 w-3 text-success" /> : <Copy className="h-3 w-3" />}
                               >
-                                {copiedId === msg.author_id ? <Check className="h-3 w-3 text-green-500" /> : <Copy className="h-3 w-3" />}
-                                <span className="text-[10px]">ID</span>
-                              </button>
+                                ID
+                              </Button>
                             </td>
                             <td className="px-3 py-2 text-foreground">
                               {msg.content ? (
@@ -1239,18 +1428,11 @@ function DashboardTab() {
                               )}
                             </td>
                             <td className="px-3 py-2 whitespace-nowrap">
-                              <span className={`px-1.5 py-0.5 rounded text-[10px] font-medium ${
-                                msg.source_type === 'direct' ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300' :
-                                msg.source_type === 'reply' ? 'bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300' :
-                                msg.source_type === 'forward' ? 'bg-orange-100 dark:bg-orange-900/30 text-orange-700 dark:text-orange-300' :
-                                'bg-gray-100 dark:bg-gray-800 text-gray-700 dark:text-gray-300'
-                              }`}>
-                                {msg.source_type}
-                              </span>
+                              <CategoryTag>{msg.source_type}</CategoryTag>
                             </td>
                             <td className="px-3 py-2 whitespace-nowrap overflow-hidden">
                               {msg.matched_rule_group_name && (
-                                <span className="px-1.5 py-0.5 rounded bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300 text-[10px] font-medium">
+                                <span className="px-1.5 py-0.5 rounded bg-danger-subtle text-danger text-[10px] font-medium">
                                   {msg.matched_rule_group_name}
                                 </span>
                               )}
@@ -1258,18 +1440,26 @@ function DashboardTab() {
                             <td className="px-3 py-2 text-right whitespace-nowrap">
                               <div className="flex items-center gap-1 justify-end" onClick={e => e.stopPropagation()}>
                                 {hasEdits && (
-                                  <button
-                                    onClick={() => toggleEditHistory(msg.message_id, 'flagged')}
-                                    className={`flex items-center gap-0.5 px-1.5 py-0.5 rounded border transition-colors ${historyActive
-                                      ? 'border-primary bg-primary/10 text-primary'
-                                      : 'border-border text-muted-foreground hover:text-foreground hover:bg-accent'}`}
+                                  <ToggleButton
+                                    size="micro"
+                                    pressed={historyActive}
+                                    onPressedChange={() => toggleEditHistory(msg.message_id, 'flagged')}
                                     title={historyActive ? 'Hide edit history highlight' : 'Highlight all versions of this message'}
+                                    icon={<History className="h-3 w-3" />}
                                   >
-                                    <History className="h-3 w-3" />
-                                    <span className="text-[10px] font-medium">v{msg.edit_version || 1}</span>
-                                  </button>
+                                    v{msg.edit_version || 1}
+                                  </ToggleButton>
                                 )}
                                 <ActionIcons actionTaken={msg.action_taken} />
+                                <GuardianUndoActions
+                                  flaggedId={msg.id}
+                                  actionTaken={msg.action_taken}
+                                  undo={msg.undo}
+                                  userLabel={msg.author_display_name || msg.author_username || msg.author_id}
+                                  serverLabel={msg.guild_name || 'this server'}
+                                  onUndone={markFlaggedUndone}
+                                  onFailed={() => { void systemLogRef.current?.refresh() }}
+                                />
                               </div>
                             </td>
                           </tr>
@@ -1281,7 +1471,7 @@ function DashboardTab() {
               </div>
             )}
             <PaginationControls page={flaggedPage} totalPages={flaggedTotalPages} onPageChange={setFlaggedPage} position="bottom" />
-          </>
+          </div>
         )}
         {!flaggedExpanded && flagged.length > 0 && (
           <div className="px-4 py-3 text-xs text-muted-foreground">
@@ -1293,22 +1483,21 @@ function DashboardTab() {
       {/* Recent Messages — Expandable Table */}
       <div className="bg-card border border-border rounded-lg">
         <div className="flex items-center justify-between p-4 border-b border-border">
-          <button
-            onClick={() => setRecentExpanded(!recentExpanded)}
-            className="flex items-center gap-2 text-sm font-medium text-foreground hover:text-primary transition-colors"
-          >
-            {recentExpanded ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-            <Clock className="h-4 w-4" />
-            Recent Scanned Messages
-            <span className="text-muted-foreground font-normal">({recentTotal})</span>
-          </button>
+          <Disclosure
+            className="mr-2 min-w-0 flex-1"
+            icon={<Clock />}
+            title={<>Recent Scanned Messages <span className="text-muted-foreground font-normal">({recentTotal})</span></>}
+            expanded={recentExpanded}
+            onToggle={setRecentExpanded}
+            panelId="guardian-recent-panel"
+          />
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-1.5">
               <label className="text-xs text-muted-foreground">Show:</label>
               <select
                 value={recentPageSize}
                 onChange={e => { setRecentPageSize(Number(e.target.value)); setRecentPage(1) }}
-                className="px-1.5 py-1 text-xs bg-background border border-border rounded focus:outline-none focus:ring-2 focus:ring-primary"
+                className="px-1.5 py-1 text-xs bg-background border border-border rounded focus:outline-hidden focus:ring-2 focus:ring-primary"
               >
                 {[10, 20, 30, 50, 100].map(n => (
                   <option key={n} value={n}>{n}</option>
@@ -1318,7 +1507,7 @@ function DashboardTab() {
           </div>
         </div>
         {recentExpanded && (
-          <>
+          <div id="guardian-recent-panel">
             <PaginationControls page={recentPage} totalPages={recentTotalPages} onPageChange={setRecentPage} position="top" />
             {recent.length === 0 ? (
               <div className="p-8 text-center text-muted-foreground text-sm">No messages scanned yet</div>
@@ -1327,7 +1516,7 @@ function DashboardTab() {
                 <table className="w-full text-xs table-fixed">
                   <thead>
                     <tr className="border-b border-border bg-muted/50">
-                      <th className="px-3 py-2 text-left font-medium text-muted-foreground whitespace-nowrap w-[70px]">Status</th>
+                      <th className="px-3 py-2 text-left font-medium text-muted-foreground whitespace-nowrap w-[100px]">Status</th>
                       <th className="px-3 py-2 text-left font-medium text-muted-foreground whitespace-nowrap w-[170px]">Time (UTC)</th>
                       <th className="px-3 py-2 text-left font-medium text-muted-foreground whitespace-nowrap w-[100px]">Server</th>
                       <th className="px-3 py-2 text-left font-medium text-muted-foreground whitespace-nowrap w-[110px]">Channel</th>
@@ -1341,26 +1530,43 @@ function DashboardTab() {
                       const historyKey = `recent:${msg.message_id}`
                       const historyActive = !!expandedEditHistory[historyKey]
                       const hasEdits = msg.is_edit || (msg.edit_version && msg.edit_version > 1)
+                      const skipLabel = msg.skip_reason === 'ignored_role'
+                        ? 'Ignored role'
+                        : msg.skip_reason === 'parent_channel_disabled'
+                          ? 'Parent channel not monitored'
+                          : msg.skip_reason === 'channel_disabled'
+                            ? 'Channel not monitored'
+                            : null
                       return (
                         <React.Fragment key={msg.id}>
                           <tr
                             onClick={() => toggleRecentRow(msg.id)}
-                            className={`hover:bg-accent/30 transition-colors cursor-pointer ${msg.was_flagged ? 'bg-red-50/50 dark:bg-red-950/10' : ''} ${historyActive ? 'bg-primary/5' : ''}`}
+                            className={`hover:bg-accent/30 transition-colors cursor-pointer ${msg.was_flagged ? 'bg-danger-subtle' : ''} ${historyActive ? 'bg-primary/5' : ''}`}
                           >
                             <td className="px-3 py-2">
-                              <div className="flex items-center gap-1.5">
-                                <div className={`w-2 h-2 rounded-full shrink-0 ${msg.was_flagged ? 'bg-red-500' : 'bg-green-500'}`} />
+                              <div className="flex flex-wrap items-center gap-1.5">
+                                {skipLabel ? (
+                                  <span className="min-w-0 max-w-full text-xs text-muted-foreground" title={`Skipped: ${skipLabel}`}>
+                                    <span className="block">Skipped</span>
+                                    <span className="block truncate">{skipLabel}</span>
+                                  </span>
+                                ) : (
+                                  <span className={`text-xs ${msg.was_flagged ? 'text-danger' : 'text-success'}`}>
+                                    {msg.was_flagged ? 'Flagged' : 'Scanned'}
+                                  </span>
+                                )}
                                 {hasEdits && (
-                                  <button
-                                    onClick={e => { e.stopPropagation(); toggleEditHistory(msg.message_id, 'recent') }}
-                                    className={`flex items-center gap-0.5 px-1 py-0.5 rounded border transition-colors ${historyActive
-                                      ? 'border-primary bg-primary/10 text-primary'
-                                      : 'border-border text-muted-foreground hover:text-foreground hover:bg-accent'}`}
-                                    title={historyActive ? 'Hide edit history highlight' : 'Highlight all versions of this message'}
-                                  >
-                                    <History className="h-3 w-3" />
-                                    <span className="text-[10px] font-medium">v{msg.edit_version || 1}</span>
-                                  </button>
+                                  <span className="inline-flex" onClick={e => e.stopPropagation()}>
+                                    <ToggleButton
+                                      size="micro"
+                                      pressed={historyActive}
+                                      onPressedChange={() => toggleEditHistory(msg.message_id, 'recent')}
+                                      title={historyActive ? 'Hide edit history highlight' : 'Highlight all versions of this message'}
+                                      icon={<History className="h-3 w-3" />}
+                                    >
+                                      v{msg.edit_version || 1}
+                                    </ToggleButton>
+                                  </span>
                                 )}
                               </div>
                             </td>
@@ -1389,6 +1595,9 @@ function DashboardTab() {
                             </td>
                             <td className="px-3 py-2 text-foreground">
                               <div className={expandedRecentRows.has(msg.id) ? 'whitespace-pre-wrap break-all' : 'truncate'}>
+                                {skipLabel && expandedRecentRows.has(msg.id) && (
+                                  <p className="mb-1 text-muted-foreground">Skipped: {skipLabel}</p>
+                                )}
                                 <MessageContentDisplay content={msg.content_preview} messageType={msg.message_type} hasAttachments={msg.has_attachments} hasEmbeds={msg.has_embeds} attachmentTypes={msg.attachment_types} />
                               </div>
                             </td>
@@ -1401,11 +1610,11 @@ function DashboardTab() {
               </div>
             )}
             <PaginationControls page={recentPage} totalPages={recentTotalPages} onPageChange={setRecentPage} position="bottom" />
-          </>
+          </div>
         )}
         {!recentExpanded && recent.length > 0 && (
           <div className="px-4 py-3 text-xs text-muted-foreground">
-            {recentTotal} scanned message{recentTotal !== 1 ? 's' : ''} -- click header to expand
+            {recentTotal} {showSettingsSkipped ? 'audit' : 'scanned'} message{recentTotal !== 1 ? 's' : ''} -- click header to expand
           </div>
         )}
       </div>
@@ -1417,12 +1626,12 @@ function DashboardTab() {
 function MessageTypeBadge({ messageType, hasAttachments, hasEmbeds }: { messageType?: string; hasAttachments?: boolean; hasEmbeds?: boolean }) {
   const type = messageType || (hasAttachments ? 'attachment' : hasEmbeds ? 'embed' : 'text')
   const config: Record<string, { icon: React.ReactNode; label: string; cls: string }> = {
-    text: { icon: null, label: 'Text', cls: 'bg-gray-100 dark:bg-gray-800 text-gray-600 dark:text-gray-400' },
-    system: { icon: <MessageSquare className="h-2.5 w-2.5" />, label: 'System', cls: 'bg-blue-100 dark:bg-blue-900/30 text-blue-600 dark:text-blue-400' },
-    attachment: { icon: <Paperclip className="h-2.5 w-2.5" />, label: 'File', cls: 'bg-amber-100 dark:bg-amber-900/30 text-amber-600 dark:text-amber-400' },
-    embed: { icon: <FileText className="h-2.5 w-2.5" />, label: 'Embed', cls: 'bg-purple-100 dark:bg-purple-900/30 text-purple-600 dark:text-purple-400' },
-    sticker: { icon: <Image className="h-2.5 w-2.5" />, label: 'Sticker', cls: 'bg-pink-100 dark:bg-pink-900/30 text-pink-600 dark:text-pink-400' },
-    mixed: { icon: <Paperclip className="h-2.5 w-2.5" />, label: 'Mixed', cls: 'bg-teal-100 dark:bg-teal-900/30 text-teal-600 dark:text-teal-400' },
+    text: { icon: null, label: 'Text', cls: 'bg-muted text-muted-foreground' },
+    system: { icon: <MessageSquare className="h-2.5 w-2.5" />, label: 'System', cls: 'bg-info-subtle text-primary' },
+    attachment: { icon: <Paperclip className="h-2.5 w-2.5" />, label: 'File', cls: 'bg-warning-subtle text-warning' },
+    embed: { icon: <FileText className="h-2.5 w-2.5" />, label: 'Embed', cls: 'bg-muted text-muted-foreground' },
+    sticker: { icon: <Image className="h-2.5 w-2.5" />, label: 'Sticker', cls: 'bg-muted text-muted-foreground' },
+    mixed: { icon: <Paperclip className="h-2.5 w-2.5" />, label: 'Mixed', cls: 'bg-muted text-muted-foreground' },
   }
   const c = config[type] || config.text
   return (
@@ -1479,11 +1688,11 @@ function MessageContentDisplay({ content: rawContent, messageType, hasAttachment
 
     return (
       <span className="text-xs inline-flex items-center gap-1.5 min-w-0">
-        {isSystem && <MessageSquare className="h-3 w-3 text-blue-500 shrink-0" />}
-        {isAttachment && <Paperclip className="h-3 w-3 text-amber-500 shrink-0" />}
-        {isEmbed && <FileText className="h-3 w-3 text-purple-500 shrink-0" />}
-        {isSticker && <Image className="h-3 w-3 text-pink-500 shrink-0" />}
-        <span className={`min-w-0 ${isSystem ? 'text-blue-600 dark:text-blue-400' : isAttachment ? 'text-amber-600 dark:text-amber-400' : isEmbed ? 'text-purple-600 dark:text-purple-400' : 'text-muted-foreground'}`}>
+        {isSystem && <MessageSquare className="h-3 w-3 text-info shrink-0" />}
+        {isAttachment && <Paperclip className="h-3 w-3 text-warning shrink-0" />}
+        {isEmbed && <FileText className="h-3 w-3 text-muted-foreground shrink-0" />}
+        {isSticker && <Image className="h-3 w-3 text-muted-foreground shrink-0" />}
+        <span className={`min-w-0 ${isSystem ? 'text-primary' : isAttachment ? 'text-warning' : 'text-muted-foreground'}`}>
           {content}
         </span>
       </span>
@@ -1494,7 +1703,7 @@ function MessageContentDisplay({ content: rawContent, messageType, hasAttachment
   if (!content || content === '(no content)') {
     if (hasAttachments) {
       return (
-        <span className="text-xs flex-1 flex items-center gap-1.5 text-amber-600 dark:text-amber-400">
+        <span className="text-xs flex-1 flex items-center gap-1.5 text-warning">
           <Paperclip className="h-3 w-3 shrink-0" />
           Attachment{attachmentTypes ? ` (${attachmentTypes})` : ''}
         </span>
@@ -1502,7 +1711,7 @@ function MessageContentDisplay({ content: rawContent, messageType, hasAttachment
     }
     if (hasEmbeds) {
       return (
-        <span className="text-xs flex-1 flex items-center gap-1.5 text-purple-600 dark:text-purple-400">
+        <span className="text-xs flex-1 flex items-center gap-1.5 text-feature-ai">
           <FileText className="h-3 w-3 shrink-0" />
           Embedded content
         </span>
@@ -1510,7 +1719,7 @@ function MessageContentDisplay({ content: rawContent, messageType, hasAttachment
     }
     if (messageType === 'system') {
       return (
-        <span className="text-xs flex-1 flex items-center gap-1.5 text-blue-600 dark:text-blue-400">
+        <span className="text-xs flex-1 flex items-center gap-1.5 text-primary">
           <MessageSquare className="h-3 w-3 shrink-0" />
           System message
         </span>
@@ -1525,11 +1734,11 @@ function MessageContentDisplay({ content: rawContent, messageType, hasAttachment
 function StatCard({ icon, label, value, accent }: { icon: React.ReactNode; label: string; value: number; accent?: boolean }) {
   return (
     <div className="bg-card border border-border rounded-lg p-4 flex items-center gap-3">
-      <div className={`p-2 rounded-lg ${accent ? 'bg-red-100 dark:bg-red-900/30' : 'bg-accent/50'}`}>
+      <div className={`p-2 rounded-lg ${accent ? 'bg-danger-subtle' : 'bg-accent/50'}`}>
         {icon}
       </div>
       <div>
-        <div className={`text-2xl font-bold ${accent ? 'text-red-600 dark:text-red-400' : 'text-foreground'}`}>{value.toLocaleString()}</div>
+        <div className={`text-2xl font-bold ${accent ? 'text-danger' : 'text-foreground'}`}>{value.toLocaleString()}</div>
         <div className="text-xs text-muted-foreground">{label}</div>
       </div>
     </div>
@@ -1626,7 +1835,7 @@ function RuleListPreview({ groupId, rules }: RuleListPreviewProps) {
           {visibleRules.map(rule => (
             <span
               key={rule.id}
-              className="inline-flex max-w-full shrink-0 items-center gap-1 rounded-md border border-emerald-500/35 bg-emerald-500/10 px-2 py-1 text-[11px] text-emerald-800 dark:text-emerald-100"
+              className="inline-flex max-w-full shrink-0 items-center gap-1 rounded-md border border-success-muted bg-success-subtle px-2 py-1 text-[11px] text-foreground"
               title={rule.pattern}
             >
               {rule.pattern_type === 'regex' ? <Regex className="h-3 w-3 shrink-0" /> : <Type className="h-3 w-3 shrink-0" />}
@@ -1646,7 +1855,7 @@ function RuleListPreview({ groupId, rules }: RuleListPreviewProps) {
           <span
             key={rule.id}
             data-preview-chip="rule"
-            className="inline-flex max-w-full shrink-0 items-center gap-1 rounded-md border border-emerald-500/35 bg-emerald-500/10 px-2 py-1 text-[11px] text-emerald-800 dark:text-emerald-100"
+            className="inline-flex max-w-full shrink-0 items-center gap-1 rounded-md border border-success-muted bg-success-subtle px-2 py-1 text-[11px] text-foreground"
           >
             {rule.pattern_type === 'regex' ? <Regex className="h-3 w-3 shrink-0" /> : <Type className="h-3 w-3 shrink-0" />}
             <span className="font-mono">{rule.pattern}</span>
@@ -1884,52 +2093,41 @@ function ConfigurationTab() {
   return (
     <div className="space-y-4">
       {/* Info Banner */}
-      <div className="bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-800 rounded-lg p-4 text-sm text-blue-800 dark:text-blue-200">
+      <div className="bg-info-subtle border border-info-muted rounded-lg p-4 text-sm text-info">
         <p className="font-medium mb-1">How Rule Groups Work</p>
-        <p className="text-blue-700 dark:text-blue-300">
+        <p className="text-info">
           Create named groups of rules (e.g. "URL-Encoded Phishing Links", "Scam Phrases").
-          Each group contains regex patterns or wildcard filters. Use <code className="bg-blue-100 dark:bg-blue-900 px-1 rounded">*</code> for partial matching in wildcard mode.
+          Each group contains regex patterns or wildcard filters. Use <code className="bg-info-subtle px-1 rounded">*</code> for partial matching in wildcard mode.
           The bot checks every message (including quoted replies, forwards, and embeds) against all enabled rules.
         </p>
       </div>
 
       {/* Add Group Button */}
       {!showNewGroup ? (
-        <button
-          onClick={() => setShowNewGroup(true)}
-          className="flex items-center gap-2 px-4 py-2 text-sm bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 transition-colors"
-        >
-          <Plus className="h-4 w-4" />
+        <Button intent="primary" onClick={() => setShowNewGroup(true)} icon={<Plus className="h-4 w-4" />}>
           New Rule Group
-        </button>
+        </Button>
       ) : (
         <div className="bg-card border border-border rounded-lg p-4 space-y-3">
           <input
             value={newGroupName}
             onChange={e => setNewGroupName(e.target.value)}
             placeholder="Group name (e.g. URL-Encoded Phishing Links)"
-            className="w-full px-3 py-2 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary"
+            className="w-full px-3 py-2 text-sm bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary"
           />
           <input
             value={newGroupDesc}
             onChange={e => setNewGroupDesc(e.target.value)}
             placeholder="Description (optional)"
-            className="w-full px-3 py-2 text-sm bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary"
+            className="w-full px-3 py-2 text-sm bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary"
           />
           <div className="flex gap-2">
-            <button
-              onClick={createGroup}
-              disabled={saving || !newGroupName.trim()}
-              className="px-4 py-2 text-sm bg-primary text-primary-foreground rounded-lg hover:bg-primary/90 disabled:opacity-50 transition-colors"
-            >
+            <Button intent="primary" onClick={createGroup} disabled={saving || !newGroupName.trim()}>
               Create Group
-            </button>
-            <button
-              onClick={() => { setShowNewGroup(false); setNewGroupName(''); setNewGroupDesc('') }}
-              className="px-4 py-2 text-sm text-muted-foreground hover:text-foreground transition-colors"
-            >
+            </Button>
+            <Button emphasis="ghost" onClick={() => { setShowNewGroup(false); setNewGroupName(''); setNewGroupDesc('') }}>
               Cancel
-            </button>
+            </Button>
           </div>
         </div>
       )}
@@ -1959,31 +2157,26 @@ function ConfigurationTab() {
                   <div className="flex-1 min-w-0">
                     <div className="flex items-center gap-2">
                       <span className="font-medium text-foreground">{group.name}</span>
-                      <span className="rounded-full border border-emerald-500/35 bg-emerald-500/18 px-2 py-0.5 text-xs font-medium text-emerald-800 dark:text-emerald-100">{ruleCount} rule{ruleCount !== 1 ? 's' : ''}</span>
+                      <span className="rounded-full border border-success-muted bg-success-subtle px-2 py-0.5 text-xs font-medium text-foreground">{ruleCount} rule{ruleCount !== 1 ? 's' : ''}</span>
                     </div>
                     {group.description && (
                       <p className="text-xs text-muted-foreground mt-0.5">{group.description}</p>
                     )}
                   </div>
                   <div className="flex items-center gap-2" onClick={e => e.stopPropagation()}>
-                    <button
-                      onClick={() => toggleGroupEnabled(group)}
-                      className="text-muted-foreground hover:text-foreground"
+                    <Switch
+                      size="compact"
+                      checked={group.is_enabled}
+                      onCheckedChange={() => toggleGroupEnabled(group)}
+                      label={`${group.name} enabled`}
                       title={group.is_enabled ? 'Disable group' : 'Enable group'}
-                    >
-                      {group.is_enabled ? (
-                        <ToggleRight className="h-5 w-5 text-green-500" />
-                      ) : (
-                        <ToggleLeft className="h-5 w-5 text-muted-foreground" />
-                      )}
-                    </button>
-                    <button
+                    />
+                    <IconButton
+                      label="Delete group"
+                      icon={<Trash2 />}
+                      intent="danger"
                       onClick={() => deleteGroup(group.id)}
-                      className="text-muted-foreground hover:text-red-500 transition-colors"
-                      title="Delete group"
-                    >
-                      <Trash2 className="h-4 w-4" />
-                    </button>
+                    />
                   </div>
                 </div>
 
@@ -2003,14 +2196,16 @@ function ConfigurationTab() {
                           </p>
                         </div>
                         {rules.length > 0 && (
-                          <button
-                            type="button"
+                          <Button
+                            emphasis="outline"
+                            size="micro"
+                            className="shrink-0"
+                            aria-expanded={Boolean(expandedRuleLists[group.id])}
                             onClick={() => setExpandedRuleLists(prev => ({ ...prev, [group.id]: !prev[group.id] }))}
-                            className="shrink-0 inline-flex items-center gap-1.5 rounded-md border border-border bg-background px-2.5 py-1 text-xs text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+                            icon={expandedRuleLists[group.id] ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
                           >
-                            {expandedRuleLists[group.id] ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
                             {expandedRuleLists[group.id] ? 'Collapse rules' : `Expand rules (${rules.length})`}
-                          </button>
+                          </Button>
                         )}
                       </div>
 
@@ -2031,14 +2226,12 @@ function ConfigurationTab() {
 
                               return (
                             <div className="flex items-center gap-3 min-w-0">
-                              <div className={`shrink-0 px-1.5 py-0.5 rounded text-[10px] font-mono ${
-                              rule.pattern_type === 'regex'
-                                ? 'bg-purple-100 dark:bg-purple-900/30 text-purple-700 dark:text-purple-300'
-                                : 'bg-teal-100 dark:bg-teal-900/30 text-teal-700 dark:text-teal-300'
-                              }`}>
-                                {rule.pattern_type === 'regex' ? <Regex className="h-3 w-3 inline" /> : <Type className="h-3 w-3 inline" />}
-                                {' '}{rule.pattern_type}
-                              </div>
+                              <CategoryTag
+                                className="shrink-0 font-mono"
+                                icon={rule.pattern_type === 'regex' ? <Regex className="h-3 w-3" /> : <Type className="h-3 w-3" />}
+                              >
+                                {rule.pattern_type}
+                              </CategoryTag>
                               <code className="min-w-0 flex-[0_1_38%] text-xs font-mono text-foreground bg-accent/50 px-2 py-1 rounded truncate" title={rule.pattern}>
                                 {rule.pattern}
                               </code>
@@ -2052,39 +2245,38 @@ function ConfigurationTab() {
                                     {rule.description}
                                   </span>
                                   {showDescriptionToggle && (
-                                    <button
-                                      type="button"
+                                    <Button
+                                      emphasis="ghost"
+                                      size="micro"
+                                      className="shrink-0"
+                                      aria-expanded={isDescriptionExpanded}
                                       onClick={() => toggleRuleDescription(rule.id)}
-                                      className="shrink-0 text-[11px] text-muted-foreground hover:text-foreground transition-colors"
                                     >
                                       {isDescriptionExpanded ? 'Collapse' : 'Expand'}
-                                    </button>
+                                    </Button>
                                   )}
                                 </div>
                               )}
-                              <button
-                                onClick={() => toggleRuleEnabled(rule, group.id)}
-                                className="shrink-0"
+                              <Switch
+                                size="compact"
+                                checked={rule.is_enabled}
+                                onCheckedChange={() => toggleRuleEnabled(rule, group.id)}
+                                label="Rule enabled"
                                 title={rule.is_enabled ? 'Disable' : 'Enable'}
-                              >
-                                {rule.is_enabled ? (
-                                  <ToggleRight className="h-4 w-4 text-green-500" />
-                                ) : (
-                                  <ToggleLeft className="h-4 w-4 text-muted-foreground" />
-                                )}
-                              </button>
-                              <button
+                              />
+                              <IconButton
+                                label="Delete rule"
+                                icon={<Trash2 />}
+                                intent="danger"
+                                size="micro"
                                 onClick={() => deleteRule(rule.id, group.id)}
-                                className="text-muted-foreground hover:text-red-500 shrink-0 transition-colors"
-                              >
-                                <Trash2 className="h-3.5 w-3.5" />
-                              </button>
+                              />
                             </div>
                               )
                             })()}
 
                             {rule.description && expandedRuleDescriptions[rule.id] && (
-                              <p className="mt-2 text-xs text-muted-foreground whitespace-pre-wrap break-words">
+                              <p className="mt-2 text-xs text-muted-foreground whitespace-pre-wrap wrap-break-word">
                                 {rule.description}
                               </p>
                             )}
@@ -2096,27 +2288,22 @@ function ConfigurationTab() {
                     {/* Bot Actions */}
                     <div className="p-4 border-t border-border space-y-3">
                       <p className="text-xs font-medium text-foreground flex items-center gap-1.5">
-                        <AlertTriangle className="h-3.5 w-3.5 text-amber-500" />
+                        <AlertTriangle className="h-3.5 w-3.5 text-warning" />
                         Bot Actions
                         <span className="text-muted-foreground font-normal">-- when a message matches this group</span>
                       </p>
                       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
                         {/* Delete Message */}
                         <label className="flex items-center gap-3 p-3 rounded-lg border border-border bg-background hover:bg-accent/30 transition-colors cursor-pointer">
-                          <button
-                            type="button"
-                            onClick={() => updateGroupActions(group.id, { action_delete_message: !group.action_delete_message })}
-                            className="shrink-0"
-                          >
-                            {group.action_delete_message ? (
-                              <ToggleRight className="h-5 w-5 text-red-500" />
-                            ) : (
-                              <ToggleLeft className="h-5 w-5 text-muted-foreground" />
-                            )}
-                          </button>
+                          <Switch
+                            size="compact"
+                            checked={group.action_delete_message}
+                            onCheckedChange={() => updateGroupActions(group.id, { action_delete_message: !group.action_delete_message })}
+                            label="Delete Message"
+                          />
                           <div className="min-w-0">
                             <div className="flex items-center gap-1.5 text-xs font-medium text-foreground">
-                              <MessageSquareX className="h-3.5 w-3.5 text-red-500" />
+                              <MessageSquareX className="h-3.5 w-3.5 text-danger" />
                               Delete Message
                             </div>
                             <p className="text-[11px] text-muted-foreground mt-0.5">Automatically delete the flagged message</p>
@@ -2126,20 +2313,15 @@ function ConfigurationTab() {
                         {/* Timeout Member */}
                         <div className="p-3 rounded-lg border border-border bg-background space-y-2">
                           <label className="flex items-center gap-3 hover:bg-accent/30 transition-colors cursor-pointer rounded -m-1 p-1">
-                            <button
-                              type="button"
-                              onClick={() => updateGroupActions(group.id, { action_timeout_member: !group.action_timeout_member })}
-                              className="shrink-0"
-                            >
-                              {group.action_timeout_member ? (
-                                <ToggleRight className="h-5 w-5 text-amber-500" />
-                              ) : (
-                                <ToggleLeft className="h-5 w-5 text-muted-foreground" />
-                              )}
-                            </button>
+                            <Switch
+                              size="compact"
+                              checked={group.action_timeout_member}
+                              onCheckedChange={() => updateGroupActions(group.id, { action_timeout_member: !group.action_timeout_member })}
+                              label="Timeout Member"
+                            />
                             <div className="min-w-0">
                               <div className="flex items-center gap-1.5 text-xs font-medium text-foreground">
-                                <Timer className="h-3.5 w-3.5 text-amber-500" />
+                                <Timer className="h-3.5 w-3.5 text-warning" />
                                 Timeout Member
                               </div>
                               <p className="text-[11px] text-muted-foreground mt-0.5">Put the member in timeout</p>
@@ -2150,7 +2332,7 @@ function ConfigurationTab() {
                               <select
                                 value={group.action_timeout_duration}
                                 onChange={e => updateGroupActions(group.id, { action_timeout_duration: Number(e.target.value) })}
-                                className="px-2 py-1 text-xs bg-background border border-border rounded focus:outline-none focus:ring-2 focus:ring-primary"
+                                className="px-2 py-1 text-xs bg-background border border-border rounded focus:outline-hidden focus:ring-2 focus:ring-primary"
                               >
                                 <option value={60}>1 minute</option>
                                 <option value={300}>5 minutes</option>
@@ -2168,10 +2350,12 @@ function ConfigurationTab() {
                         </div>
 
                         {/* Ban Member */}
-                        <label className="flex items-center gap-3 p-3 rounded-lg border border-red-200 dark:border-red-900 bg-background hover:bg-red-50 dark:hover:bg-red-950/20 transition-colors cursor-pointer">
-                          <button
-                            type="button"
-                            onClick={() => {
+                        <label className="flex items-center gap-3 p-3 rounded-lg border border-danger-muted bg-background hover:bg-danger-subtle transition-colors cursor-pointer">
+                          <Switch
+                            size="compact"
+                            checked={group.action_ban_member}
+                            label="Ban Member"
+                            onCheckedChange={() => {
                               if (!group.action_ban_member || confirm(
                                 'Enable auto-ban?\n\n' +
                                 'WARNING -- this is irreversible from the member\'s side:\n' +
@@ -2185,17 +2369,10 @@ function ConfigurationTab() {
                                 updateGroupActions(group.id, { action_ban_member: !group.action_ban_member })
                               }
                             }}
-                            className="shrink-0"
-                          >
-                            {group.action_ban_member ? (
-                              <ToggleRight className="h-5 w-5 text-red-600" />
-                            ) : (
-                              <ToggleLeft className="h-5 w-5 text-muted-foreground" />
-                            )}
-                          </button>
+                          />
                           <div className="min-w-0">
                             <div className="flex items-center gap-1.5 text-xs font-medium text-foreground">
-                              <Ban className="h-3.5 w-3.5 text-red-600" />
+                              <Ban className="h-3.5 w-3.5 text-danger" />
                               Ban Member
                             </div>
                             <p className="text-[11px] text-muted-foreground mt-0.5">
@@ -2205,7 +2382,7 @@ function ConfigurationTab() {
                         </label>
                       </div>
                       {group.action_ban_member && (
-                        <div className="flex items-start gap-2 px-2 py-1.5 text-[11px] text-red-600 dark:text-red-400 bg-red-50 dark:bg-red-950/20 rounded border border-red-200 dark:border-red-900">
+                        <div className="flex items-start gap-2 px-2 py-1.5 text-[11px] text-danger bg-danger-subtle rounded border border-danger-muted">
                           <AlertTriangle className="h-3.5 w-3.5 shrink-0 mt-0.5" />
                           <span>
                             Auto-ban is enabled. Members matching these rules will be permanently banned with <strong>no appeal process</strong> -- only a moderator can manually unban them. In practice we recommend using <strong>Delete Message + a long Timeout</strong> (1 day to 28 days) instead, so appeals stay possible and moderators can decide whether to escalate to a manual ban.
@@ -2223,7 +2400,7 @@ function ConfigurationTab() {
                             ...prev,
                             [group.id]: { ...ruleForm, type: e.target.value as 'regex' | 'wildcard' }
                           }))}
-                          className="px-2 py-1.5 text-xs bg-background border border-border rounded focus:outline-none focus:ring-2 focus:ring-primary"
+                          className="px-2 py-1.5 text-xs bg-background border border-border rounded focus:outline-hidden focus:ring-2 focus:ring-primary"
                         >
                           <option value="regex">Regex</option>
                           <option value="wildcard">Wildcard (*)</option>
@@ -2235,28 +2412,27 @@ function ConfigurationTab() {
                             [group.id]: { ...ruleForm, pattern: e.target.value }
                           }))}
                           placeholder={ruleForm.type === 'regex' ? 'RegEx pattern (e.g. (%[0-9a-f]{2,2}){2,})' : 'Wildcard pattern (e.g. *discord.gg*)'}
-                          className="flex-1 px-3 py-1.5 text-xs font-mono bg-background border border-border rounded focus:outline-none focus:ring-2 focus:ring-primary"
+                          className="flex-1 px-3 py-1.5 text-xs font-mono bg-background border border-border rounded focus:outline-hidden focus:ring-2 focus:ring-primary"
                         />
-                        <button
+                        <Button
+                          emphasis="outline"
+                          intent="primary"
+                          size="compact"
                           onClick={() => createRule(group.id)}
                           disabled={saving || !ruleForm.pattern.trim()}
-                          className="px-3 py-1.5 text-xs bg-primary text-primary-foreground rounded hover:bg-primary/90 disabled:opacity-50 transition-colors flex items-center gap-1"
+                          icon={<Plus className="h-3 w-3" />}
                         >
-                          <Plus className="h-3 w-3" />
                           Add
-                        </button>
-                        <button
-                          onClick={() => setBulkImport(prev => ({ ...prev, [group.id]: { open: !prev[group.id]?.open, patterns: prev[group.id]?.patterns || '', type: prev[group.id]?.type || 'regex' } }))}
-                          className={`px-3 py-1.5 text-xs rounded transition-colors flex items-center gap-1 ${
-                            bulkImport[group.id]?.open
-                              ? 'bg-amber-100 dark:bg-amber-900/30 text-amber-700 dark:text-amber-300 border border-amber-300 dark:border-amber-700'
-                              : 'bg-accent text-muted-foreground hover:text-foreground border border-border'
-                          }`}
+                        </Button>
+                        <ToggleButton
+                          size="compact"
+                          pressed={Boolean(bulkImport[group.id]?.open)}
+                          onPressedChange={() => setBulkImport(prev => ({ ...prev, [group.id]: { open: !prev[group.id]?.open, patterns: prev[group.id]?.patterns || '', type: prev[group.id]?.type || 'regex' } }))}
                           title="Bulk import comma-separated patterns"
+                          icon={<Upload className="h-3 w-3" />}
                         >
-                          <Upload className="h-3 w-3" />
                           Import
-                        </button>
+                        </ToggleButton>
                       </div>
                       <input
                         value={ruleForm.description}
@@ -2265,7 +2441,7 @@ function ConfigurationTab() {
                           [group.id]: { ...ruleForm, description: e.target.value }
                         }))}
                         placeholder="Description (optional)"
-                        className="w-full px-3 py-1.5 text-xs bg-background border border-border rounded focus:outline-none focus:ring-2 focus:ring-primary"
+                        className="w-full px-3 py-1.5 text-xs bg-background border border-border rounded focus:outline-hidden focus:ring-2 focus:ring-primary"
                       />
 
                       {/* Bulk Import Panel */}
@@ -2273,12 +2449,12 @@ function ConfigurationTab() {
                         <div className="mt-2 p-3 bg-background border border-border rounded-lg space-y-2">
                           <div className="flex items-center justify-between">
                             <span className="text-xs font-medium text-foreground">Bulk Import Patterns</span>
-                            <button
+                            <IconButton
+                              label="Close bulk import"
+                              icon={<X />}
+                              size="micro"
                               onClick={() => { setBulkImport(prev => ({ ...prev, [group.id]: { open: false, patterns: '', type: 'regex' } })); setBulkResult(null) }}
-                              className="text-muted-foreground hover:text-foreground"
-                            >
-                              <X className="h-3.5 w-3.5" />
-                            </button>
+                            />
                           </div>
                           <p className="text-[11px] text-muted-foreground">
                             Enter multiple patterns separated by commas. Each pattern will be added as a separate rule.
@@ -2286,7 +2462,7 @@ function ConfigurationTab() {
                           <select
                             value={bulkImport[group.id]?.type || 'regex'}
                             onChange={e => setBulkImport(prev => ({ ...prev, [group.id]: { ...prev[group.id], type: e.target.value as 'regex' | 'wildcard' } }))}
-                            className="px-2 py-1.5 text-xs bg-background border border-border rounded focus:outline-none focus:ring-2 focus:ring-primary"
+                            className="px-2 py-1.5 text-xs bg-background border border-border rounded focus:outline-hidden focus:ring-2 focus:ring-primary"
                           >
                             <option value="regex">Regex</option>
                             <option value="wildcard">Wildcard (*)</option>
@@ -2296,7 +2472,7 @@ function ConfigurationTab() {
                             onChange={e => setBulkImport(prev => ({ ...prev, [group.id]: { ...prev[group.id], patterns: e.target.value } }))}
                             placeholder="pattern1, pattern2, pattern3"
                             rows={3}
-                            className="w-full px-3 py-2 text-xs font-mono bg-background border border-border rounded-lg focus:outline-none focus:ring-2 focus:ring-primary resize-y"
+                            className="w-full px-3 py-2 text-xs font-mono bg-background border border-border rounded-lg focus:outline-hidden focus:ring-2 focus:ring-primary resize-y"
                           />
                           {bulkImport[group.id]?.patterns?.trim() && (
                             <p className="text-[11px] text-muted-foreground">
@@ -2306,8 +2482,8 @@ function ConfigurationTab() {
                           {bulkResult && (
                             <div className={`text-xs p-2 rounded ${
                               bulkResult.failed > 0
-                                ? 'bg-amber-50 dark:bg-amber-950/20 text-amber-800 dark:text-amber-200 border border-amber-200 dark:border-amber-800'
-                                : 'bg-green-50 dark:bg-green-950/20 text-green-800 dark:text-green-200 border border-green-200 dark:border-green-800'
+                                ? 'bg-warning-subtle text-warning border border-warning-muted'
+                                : 'bg-success-subtle text-success border border-success-muted'
                             }`}>
                               <p>{bulkResult.succeeded} imported, {bulkResult.failed} failed</p>
                               {bulkResult.errors.length > 0 && (
@@ -2317,14 +2493,16 @@ function ConfigurationTab() {
                               )}
                             </div>
                           )}
-                          <button
+                          <Button
+                            emphasis="outline"
+                            intent="primary"
+                            size="compact"
                             onClick={() => bulkImportRules(group.id)}
                             disabled={saving || !bulkImport[group.id]?.patterns?.trim()}
-                            className="px-4 py-1.5 text-xs bg-primary text-primary-foreground rounded hover:bg-primary/90 disabled:opacity-50 transition-colors flex items-center gap-1"
+                            icon={<Upload className="h-3 w-3" />}
                           >
-                            <Upload className="h-3 w-3" />
                             {saving ? 'Importing...' : 'Import All'}
-                          </button>
+                          </Button>
                         </div>
                       )}
                     </div>
@@ -2366,6 +2544,8 @@ function SearchableChannelSelect({
   const menuRef = useRef<HTMLDivElement>(null)
   const inputRef = useRef<HTMLInputElement>(null)
   const [menuStyle, setMenuStyle] = useState<React.CSSProperties>({})
+  // Portaled to body; claims the popover layer so it also sits above a dialog it opens in.
+  const { z: menuZ } = useOverlayLayer('popover', isOpen)
 
   const selectedChannel = useMemo(
     () => channels.find(channel => channel.channel_id === value) ?? null,
@@ -2391,7 +2571,9 @@ function SearchableChannelSelect({
       const rect = trigger.getBoundingClientRect()
       const viewportHeight = window.innerHeight
       const spaceBelow = viewportHeight - rect.bottom
-      const spaceAbove = rect.top
+      // Space above is measured from the nav's bottom edge: the menu sits under the nav's layer.
+      const menuTopLimit = clampTopBelowObstruction(0)
+      const spaceAbove = rect.top - menuTopLimit
       const preferUpward = spaceBelow < 360 && spaceAbove > spaceBelow
 
       setMenuStyle({
@@ -2399,6 +2581,8 @@ function SearchableChannelSelect({
         width: rect.width,
         top: preferUpward ? undefined : rect.bottom + 4,
         bottom: preferUpward ? viewportHeight - rect.top + 4 : undefined,
+        // An upward menu shrinks (its list scrolls) instead of growing under the nav.
+        maxHeight: preferUpward ? Math.max(0, spaceAbove - 4) : undefined,
       })
     }
 
@@ -2444,7 +2628,7 @@ function SearchableChannelSelect({
         ref={triggerRef}
         type="button"
         onClick={() => setIsOpen(prev => !prev)}
-        className="w-full px-2 py-1.5 text-sm rounded border border-border bg-background text-left text-foreground focus:outline-none focus:ring-2 focus:ring-primary/30 flex items-center gap-2"
+        className="w-full px-2 py-1.5 text-sm rounded border border-border bg-background text-left text-foreground focus:outline-hidden focus:ring-2 focus:ring-primary/30 flex items-center gap-2"
         aria-expanded={isOpen}
       >
         <span className={`flex-1 truncate ${selectedChannel ? '' : 'text-muted-foreground'}`}>
@@ -2457,10 +2641,10 @@ function SearchableChannelSelect({
         createPortal(
           <div
             ref={menuRef}
-            style={menuStyle}
-            className="fixed z-[1200] rounded-lg border border-border bg-popover text-popover-foreground shadow-xl overflow-hidden"
+            style={{ ...menuStyle, zIndex: menuZ }}
+            className="fixed flex flex-col rounded-lg border border-border bg-popover text-popover-foreground shadow-xl overflow-hidden"
           >
-            <div className="relative border-b border-border p-2">
+            <div className="relative shrink-0 border-b border-border p-2">
               <Search className="absolute left-4 top-1/2 -translate-y-1/2 h-4 w-4 text-muted-foreground" />
               <input
                 ref={inputRef}
@@ -2468,7 +2652,7 @@ function SearchableChannelSelect({
                 value={searchQuery}
                 onChange={(event) => setSearchQuery(event.target.value)}
                 placeholder="Search channels..."
-                className="w-full pl-8 pr-2 py-1.5 text-sm rounded border border-border bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/30"
+                className="w-full pl-8 pr-2 py-1.5 text-sm rounded border border-border bg-background text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-primary/30"
               />
             </div>
 
@@ -2633,9 +2817,9 @@ function ServerSettingsTab() {
   return (
     <div className="space-y-6">
       {/* Info Banner */}
-      <div className="bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-800 rounded-lg p-4 text-sm text-blue-800 dark:text-blue-200">
+      <div className="bg-info-subtle border border-info-muted rounded-lg p-4 text-sm text-info">
         <p className="font-medium mb-1">Role-Based Whitelisting</p>
-        <p className="text-blue-700 dark:text-blue-300">
+        <p className="text-info">
           Toggle "Ignore" on a role to stop the Guardian bot from scanning messages by users with that role.
           This is useful for whitelisting trusted roles (e.g. Ambassadors, Moderators) to reduce noise.
           Changes take effect within 60 seconds.
@@ -2650,8 +2834,23 @@ function ServerSettingsTab() {
         return (
           <div key={server.guild_id} className="bg-card border border-border rounded-lg overflow-hidden">
             {/* Server Header — clickable to expand */}
-            <button
-              onClick={() => setExpandedServers(prev => {
+            <Disclosure
+              className="p-2"
+              headingLevel={3}
+              icon={<Server />}
+              title={server.guild_name}
+              description={
+                <>
+                  {server.roles.length} role{server.roles.length !== 1 ? 's' : ''}
+                  {ignoredCount > 0 && (
+                    <span className="ml-2 text-warning">
+                      ({ignoredCount} ignored)
+                    </span>
+                  )}
+                </>
+              }
+              expanded={isExpanded}
+              onToggle={() => setExpandedServers(prev => {
                 const next = new Set(prev)
                 if (next.has(server.guild_id)) {
                   next.delete(server.guild_id)
@@ -2661,26 +2860,12 @@ function ServerSettingsTab() {
                 }
                 return next
               })}
-              className="w-full flex items-center gap-3 p-4 bg-accent/20 hover:bg-accent/40 transition-colors text-left"
-            >
-              {isExpanded ? <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0" /> : <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0" />}
-              <Server className="h-5 w-5 text-muted-foreground shrink-0" />
-              <div className="flex-1 min-w-0">
-                <h3 className="font-medium text-foreground">{server.guild_name}</h3>
-                <p className="text-xs text-muted-foreground">
-                  {server.roles.length} role{server.roles.length !== 1 ? 's' : ''}
-                  {ignoredCount > 0 && (
-                    <span className="ml-2 text-amber-600 dark:text-amber-400">
-                      ({ignoredCount} ignored)
-                    </span>
-                  )}
-                </p>
-              </div>
-            </button>
+              panelId={`guardian-server-roles-${server.guild_id}`}
+            />
 
             {/* Expanded: Notification Channels + Roles Table */}
             {isExpanded && (
-              <>
+              <div id={`guardian-server-roles-${server.guild_id}`}>
                 {/* Notification Channels */}
                 <div className="border-t border-border p-4 space-y-3 bg-muted/20">
                   <div>
@@ -2708,15 +2893,16 @@ function ServerSettingsTab() {
                       <label className="block text-xs">
                         <span className="block mb-1 font-medium text-muted-foreground flex items-center gap-2">
                           User feedback channel
-                          <button
-                            type="button"
+                          <Button
+                            emphasis="outline"
+                            size="micro"
+                            className="ml-auto"
                             onClick={() => updateNotificationField(server.guild_id, 'user_feedback_channel_id', notif?.actions_log_channel_id || null)}
                             disabled={!notif?.actions_log_channel_id}
-                            className="ml-auto text-[11px] px-1.5 py-0.5 rounded border border-border bg-background hover:bg-accent disabled:opacity-40 disabled:cursor-not-allowed"
                             title="Reuse the actions log channel above"
                           >
                             Use previous channel
-                          </button>
+                          </Button>
                         </span>
                         <SearchableChannelSelect
                           value={notif?.user_feedback_channel_id || null}
@@ -2729,19 +2915,16 @@ function ServerSettingsTab() {
                   </div>
 
                   <div className="flex justify-end">
-                    <button
-                      type="button"
+                    <Button
+                      intent="primary"
+                      size="compact"
                       onClick={() => saveNotificationConfig(server.guild_id)}
-                      disabled={savingNotif === server.guild_id || !notif}
-                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium rounded bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50"
+                      disabled={!notif}
+                      loading={savingNotif === server.guild_id}
+                      icon={<Check className="h-3.5 w-3.5" />}
                     >
-                      {savingNotif === server.guild_id ? (
-                        <RefreshCw className="h-3.5 w-3.5 animate-spin" />
-                      ) : (
-                        <Check className="h-3.5 w-3.5" />
-                      )}
                       Save channels
-                    </button>
+                    </Button>
                   </div>
                 </div>
 
@@ -2762,7 +2945,7 @@ function ServerSettingsTab() {
                 </thead>
                 <tbody className="divide-y divide-border">
                   {server.roles.map(role => (
-                    <tr key={role.id} className={`hover:bg-accent/30 transition-colors ${role.is_ignored ? 'bg-amber-50/50 dark:bg-amber-950/10' : ''}`}>
+                    <tr key={role.id} className={`hover:bg-accent/30 transition-colors ${role.is_ignored ? 'bg-warning-subtle' : ''}`}>
                       <td className="px-4 py-2.5">
                         <span className="font-medium" style={roleColorStyle(role.role_color)}>
                           {role.role_name}
@@ -2772,21 +2955,19 @@ function ServerSettingsTab() {
                         {role.role_position}
                       </td>
                       <td className="px-4 py-2.5 text-right">
-                        <button
-                          onClick={() => toggleRoleIgnored(role)}
-                          disabled={togglingId === role.id}
-                          className="inline-flex items-center gap-1 text-sm disabled:opacity-50"
-                          title={role.is_ignored ? 'Currently ignored (whitelisted) - click to start scanning' : 'Currently scanned - click to ignore (whitelist)'}
-                        >
-                          {role.is_ignored ? (
-                            <ToggleRight className="h-5 w-5 text-amber-500" />
-                          ) : (
-                            <ToggleLeft className="h-5 w-5 text-muted-foreground" />
-                          )}
-                          <span className={`text-xs ${role.is_ignored ? 'text-amber-600 dark:text-amber-400' : 'text-muted-foreground'}`}>
+                        <label className="inline-flex items-center gap-1 cursor-pointer">
+                          <Switch
+                            size="compact"
+                            checked={role.is_ignored}
+                            onCheckedChange={() => toggleRoleIgnored(role)}
+                            disabled={togglingId === role.id}
+                            label={`Ignore ${role.role_name}`}
+                            title={role.is_ignored ? 'Currently ignored (whitelisted) - click to start scanning' : 'Currently scanned - click to ignore (whitelist)'}
+                          />
+                          <span className={`text-xs ${role.is_ignored ? 'text-warning' : 'text-muted-foreground'}`}>
                             {role.is_ignored ? 'Ignored' : 'Scanning'}
                           </span>
-                        </button>
+                        </label>
                       </td>
                     </tr>
                   ))}
@@ -2794,7 +2975,7 @@ function ServerSettingsTab() {
               </table>
                   </div>
                 )}
-              </>
+              </div>
             )}
           </div>
         )
@@ -2810,6 +2991,7 @@ function ChannelSettingsTab() {
   const [loading, setLoading] = useState(true)
   const [syncing, setSyncing] = useState(false)
   const [togglingId, setTogglingId] = useState<string | null>(null)
+  const [savingDefaultGuildId, setSavingDefaultGuildId] = useState<string | null>(null)
   const [expandedServers, setExpandedServers] = useState<Set<string>>(new Set())
   const [searchQuery, setSearchQuery] = useState('')
 
@@ -2856,6 +3038,56 @@ function ChannelSettingsTab() {
     }
   }
 
+  const toggleDefaultMonitorNewChannels = async (server: ServerChannelData) => {
+    setSavingDefaultGuildId(server.guild_id)
+    try {
+      const next = !server.default_monitor_new_channels
+      await apiClient.put(`/api/guardian/servers/${server.guild_id}/default-monitoring`, {
+        default_monitor_new_channels: next,
+      })
+      setServers(prev => prev.map(s => s.guild_id === server.guild_id ? { ...s, default_monitor_new_channels: next } : s))
+    } catch (err) {
+      console.error('Failed to update auto-monitor default:', err)
+    } finally {
+      setSavingDefaultGuildId(null)
+    }
+  }
+
+  const updateThreadMonitorDefault = async (channel: ServerChannel, value: boolean | null) => {
+    setTogglingId(channel.id)
+    try {
+      await apiClient.put(`/api/guardian/servers/channels/${channel.id}/thread-monitor-default`, {
+        default_monitor_new_threads: value,
+      })
+      setServers(prev => prev.map(s => ({
+        ...s,
+        channels: s.channels.map(c => c.id === channel.id ? { ...c, default_monitor_new_threads: value } : c),
+      })))
+    } catch (err) {
+      console.error('Failed to update thread monitor default:', err)
+    } finally {
+      setTogglingId(null)
+    }
+  }
+
+  const clearCategoryThreadDefaults = async (category: ServerChannel, children: ServerChannel[]) => {
+    setTogglingId(category.id)
+    try {
+      await apiClient.post(`/api/guardian/servers/channels/${category.id}/clear-thread-monitor-defaults`)
+      const childIds = new Set(children.map(child => child.id))
+      setServers(prev => prev.map(s => ({
+        ...s,
+        channels: s.channels.map(c => childIds.has(c.id) ? { ...c, default_monitor_new_threads: null } : c),
+      })))
+    } catch (err) {
+      console.error('Failed to clear channel thread defaults:', err)
+    } finally {
+      setTogglingId(null)
+    }
+  }
+
+  const threadDefaultLabel = (value: boolean | null) => value === null ? 'Inherit' : value ? 'On' : 'Off'
+
   /** Discord channel type label */
   const channelTypeLabel = (type: number) => {
     switch (type) {
@@ -2885,14 +3117,14 @@ function ChannelSettingsTab() {
         <Hash className="h-12 w-12 mx-auto opacity-30" />
         <p className="text-sm">No channels synced yet. Click "Sync Channels" to fetch channels from Discord, or invite the bot to a new server.</p>
         <div className="flex items-center justify-center gap-3">
-          <button
+          <Button
+            intent="primary"
             onClick={syncChannels}
             disabled={syncing}
-            className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
+            icon={<RefreshCw className={`h-4 w-4 ${syncing ? 'animate-spin' : ''}`} />}
           >
-            <RefreshCw className={`h-4 w-4 ${syncing ? 'animate-spin' : ''}`} />
             {syncing ? 'Syncing...' : 'Sync Channels'}
-          </button>
+          </Button>
         </div>
       </div>
     )
@@ -2901,24 +3133,25 @@ function ChannelSettingsTab() {
   return (
     <div className="space-y-6">
       {/* Info Banner */}
-      <div className="bg-blue-50 dark:bg-blue-950/20 border border-blue-200 dark:border-blue-800 rounded-lg p-4 text-sm text-blue-800 dark:text-blue-200">
+      <div className="bg-info-subtle border border-info-muted rounded-lg p-4 text-sm text-info">
         <p className="font-medium mb-1">Channel Monitoring</p>
-        <p className="text-blue-700 dark:text-blue-300">
+        <p className="text-info">
           Disable monitoring on channels that don't need scanning (e.g. read-only announcement channels, bot command channels, or internal admin channels).
-          All channels are monitored by default. Changes take effect within 60 seconds.
+          Toggling a category sets the default applied to new channels created under it later -- it does not change channels already in that category.
+          A per-channel toggle always overrides the category and server defaults. Changes take effect within 60 seconds.
         </p>
       </div>
 
       {/* Actions */}
       <div className="flex items-center gap-3">
-        <button
+        <Button
+          intent="primary"
           onClick={syncChannels}
           disabled={syncing}
-          className="inline-flex items-center gap-2 px-4 py-2 text-sm font-medium rounded-lg bg-primary text-primary-foreground hover:bg-primary/90 disabled:opacity-50 transition-colors"
+          icon={<RefreshCw className={`h-4 w-4 ${syncing ? 'animate-spin' : ''}`} />}
         >
-          <RefreshCw className={`h-4 w-4 ${syncing ? 'animate-spin' : ''}`} />
           {syncing ? 'Syncing...' : 'Sync Channels'}
-        </button>
+        </Button>
       </div>
 
       {/* Search */}
@@ -2929,100 +3162,283 @@ function ChannelSettingsTab() {
           placeholder="Search channels..."
           value={searchQuery}
           onChange={(e) => setSearchQuery(e.target.value)}
-          className="w-full pl-10 pr-4 py-2 text-sm rounded-lg border border-border bg-background text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/30"
+          className="w-full pl-10 pr-4 py-2 text-sm rounded-lg border border-border bg-background text-foreground placeholder:text-muted-foreground focus:outline-hidden focus:ring-2 focus:ring-primary/30"
         />
       </div>
 
       {servers.map(server => {
-        const filteredChannels = searchQuery
-          ? server.channels.filter(c => c.channel_name.toLowerCase().includes(searchQuery.toLowerCase()))
-          : server.channels
-        if (searchQuery && filteredChannels.length === 0) return null
+        const categories = server.channels.filter(c => c.channel_type === 4)
+        const nonCategoryChannels = server.channels.filter(c => c.channel_type !== 4 && !isThreadChannel(c))
+        const threads = server.channels.filter(isThreadChannel)
 
-        const disabledCount = server.channels.filter(c => !c.is_monitored).length
+        const filteredChannels = searchQuery
+          ? nonCategoryChannels.filter(c => {
+            const query = searchQuery.toLowerCase()
+            return c.channel_name.toLowerCase().includes(query) || threads.some(t => t.parent_id === c.channel_id && t.channel_name.toLowerCase().includes(query))
+          })
+          : nonCategoryChannels
+
+        const channelsByCategory = new Map<string, ServerChannel[]>()
+        const threadsByParent = new Map<string, ServerChannel[]>()
+        const uncategorized: ServerChannel[] = []
+        for (const thread of threads) {
+          if (!thread.parent_id) continue
+          if (searchQuery && !thread.channel_name.toLowerCase().includes(searchQuery.toLowerCase()) && !nonCategoryChannels.some(c => c.channel_id === thread.parent_id && c.channel_name.toLowerCase().includes(searchQuery.toLowerCase()))) continue
+          if (!threadsByParent.has(thread.parent_id)) threadsByParent.set(thread.parent_id, [])
+          threadsByParent.get(thread.parent_id)!.push(thread)
+        }
+        for (const ch of filteredChannels) {
+          if (ch.parent_id) {
+            if (!channelsByCategory.has(ch.parent_id)) channelsByCategory.set(ch.parent_id, [])
+            channelsByCategory.get(ch.parent_id)!.push(ch)
+          } else {
+            uncategorized.push(ch)
+          }
+        }
+
+        const categoryMatchesSearch = (cat: ServerChannel) =>
+          !searchQuery || cat.channel_name.toLowerCase().includes(searchQuery.toLowerCase()) || (channelsByCategory.get(cat.channel_id) || []).some(channel => threadsByParent.has(channel.channel_id))
+        const visibleCategories = categories.filter(cat => channelsByCategory.has(cat.channel_id) || categoryMatchesSearch(cat))
+
+        if (searchQuery && filteredChannels.length === 0 && visibleCategories.length === 0) return null
+
+        const disabledCount = nonCategoryChannels.filter(c => !c.is_monitored).length
         const isExpanded = expandedServers.has(server.guild_id)
+        const renderChannelWithThreads = (channel: ServerChannel) => (
+          <React.Fragment key={channel.id}>
+            <ChannelRow
+              channel={channel}
+              toggling={togglingId === channel.id}
+              onToggle={() => toggleChannelMonitored(channel)}
+              onThreadToggle={() => updateThreadMonitorDefault(channel, channel.default_monitor_new_threads === true ? false : true)}
+              typeLabel={channelTypeLabel(channel.channel_type)}
+              threadDefaultLabel={threadDefaultLabel(channel.default_monitor_new_threads)}
+            />
+            {(threadsByParent.get(channel.channel_id) || []).map(thread => (
+              <ChannelRow
+                key={thread.id}
+                channel={thread}
+                toggling={togglingId === thread.id}
+                onToggle={() => toggleChannelMonitored(thread)}
+                typeLabel={channelTypeLabel(thread.channel_type)}
+                isThread
+              />
+            ))}
+          </React.Fragment>
+        )
+        const categoryThreadState = new Map(categories.map(category => {
+          const children = nonCategoryChannels.filter(channel => channel.parent_id === category.channel_id)
+          return [category.id, { children, hasPartialDefaults: children.some(channel => channel.default_monitor_new_threads !== null) }] as const
+        }))
         return (
           <div key={server.guild_id} className="bg-card border border-border rounded-lg overflow-hidden">
             {/* Server Header */}
-            <button
-              onClick={() => setExpandedServers(prev => {
+            <Disclosure
+              className="p-2"
+              headingLevel={3}
+              icon={<Server />}
+              title={server.guild_name}
+              description={
+                <>
+                  {nonCategoryChannels.length} channel{nonCategoryChannels.length !== 1 ? 's' : ''}
+                  {categories.length > 0 && `, ${categories.length} categor${categories.length !== 1 ? 'ies' : 'y'}`}
+                  {disabledCount > 0 && (
+                    <span className="ml-2 text-danger">
+                      ({disabledCount} not monitored)
+                    </span>
+                  )}
+                </>
+              }
+              expanded={isExpanded}
+              onToggle={() => setExpandedServers(prev => {
                 const next = new Set(prev)
                 if (next.has(server.guild_id)) next.delete(server.guild_id)
                 else next.add(server.guild_id)
                 return next
               })}
-              className="w-full flex items-center gap-3 p-4 bg-accent/20 hover:bg-accent/40 transition-colors text-left"
-            >
-              {isExpanded ? <ChevronDown className="h-4 w-4 text-muted-foreground shrink-0" /> : <ChevronRight className="h-4 w-4 text-muted-foreground shrink-0" />}
-              <Server className="h-5 w-5 text-muted-foreground shrink-0" />
-              <div className="flex-1 min-w-0">
-                <h3 className="font-medium text-foreground">{server.guild_name}</h3>
-                <p className="text-xs text-muted-foreground">
-                  {server.channels.length} channel{server.channels.length !== 1 ? 's' : ''}
-                  {disabledCount > 0 && (
-                    <span className="ml-2 text-red-600 dark:text-red-400">
-                      ({disabledCount} not monitored)
-                    </span>
-                  )}
-                </p>
-              </div>
-            </button>
+              panelId={`guardian-server-channels-${server.guild_id}`}
+            />
 
-            {/* Expanded: Channels Table */}
+            {/* Expanded: Auto-monitor default + Categories + Channels */}
             {isExpanded && (
-              filteredChannels.length === 0 ? (
-                <div className="px-4 py-6 text-center text-sm text-muted-foreground border-t border-border">
-                  {searchQuery ? 'No channels match your search.' : 'No channels found. Channels will appear after the bot syncs them from Discord.'}
+              <div id={`guardian-server-channels-${server.guild_id}`}>
+                {/* General auto-monitor toggle */}
+                <div className="flex items-center justify-between gap-3 px-4 py-3 border-t border-border bg-muted/20">
+                  <div className="min-w-0">
+                    <p className="text-sm font-medium text-foreground">Auto-monitor new channels</p>
+                    <p className="text-xs text-muted-foreground">
+                      Default applied when the bot discovers a new channel or category with no category-level default to inherit.
+                    </p>
+                  </div>
+                  <label className="inline-flex items-center gap-1 cursor-pointer shrink-0">
+                    <Switch
+                      size="compact"
+                      checked={server.default_monitor_new_channels}
+                      onCheckedChange={() => toggleDefaultMonitorNewChannels(server)}
+                      disabled={savingDefaultGuildId === server.guild_id}
+                      label="Auto-monitor new channels"
+                      title={server.default_monitor_new_channels ? 'New channels are monitored by default - click to disable' : 'New channels are not monitored by default - click to enable'}
+                    />
+                    <span className={`text-xs ${server.default_monitor_new_channels ? 'text-success' : 'text-danger'}`}>
+                      {server.default_monitor_new_channels ? 'Enabled' : 'Disabled'}
+                    </span>
+                  </label>
                 </div>
-              ) : (
-                <div className="overflow-x-auto border-t border-border">
-                  <table className="w-full text-sm">
-                    <thead>
-                      <tr className="border-b border-border bg-muted/50">
-                        <th className="px-4 py-2.5 text-left text-xs font-medium text-muted-foreground">Channel</th>
-                        <th className="px-4 py-2.5 text-left text-xs font-medium text-muted-foreground">Type</th>
-                        <th className="px-4 py-2.5 text-right text-xs font-medium text-muted-foreground">Monitoring</th>
-                      </tr>
-                    </thead>
-                    <tbody className="divide-y divide-border">
-                      {filteredChannels.map(channel => (
-                        <tr key={channel.id} className={`hover:bg-accent/30 transition-colors ${!channel.is_monitored ? 'bg-red-50/50 dark:bg-red-950/10' : ''}`}>
-                          <td className="px-4 py-2.5">
-                            <div className="flex items-center gap-1.5">
-                              <Hash className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
-                              <span className="font-medium text-foreground">{channel.channel_name}</span>
-                            </div>
-                          </td>
-                          <td className="px-4 py-2.5 text-xs text-muted-foreground">
-                            {channelTypeLabel(channel.channel_type)}
-                          </td>
-                          <td className="px-4 py-2.5 text-right">
-                            <button
-                              onClick={() => toggleChannelMonitored(channel)}
-                              disabled={togglingId === channel.id}
-                              className="inline-flex items-center gap-1 text-sm disabled:opacity-50"
-                              title={channel.is_monitored ? 'Currently monitored - click to disable' : 'Not monitored - click to enable'}
+
+                {filteredChannels.length === 0 && visibleCategories.length === 0 ? (
+                  <div className="px-4 py-6 text-center text-sm text-muted-foreground border-t border-border">
+                    {searchQuery ? 'No channels match your search.' : 'No channels found. Channels will appear after the bot syncs them from Discord.'}
+                  </div>
+                ) : (
+                  <div className="border-t border-border divide-y divide-border">
+                    {visibleCategories.map(category => (
+                      <div key={category.id}>
+                        {/* Category header row with "default for new channels" toggle */}
+                        <div className="flex items-center justify-between gap-3 px-4 py-2 bg-muted/30">
+                          <div className="flex items-center gap-1.5 min-w-0">
+                            <FolderClosed className="h-3.5 w-3.5 text-muted-foreground shrink-0" />
+                            <span className="font-medium text-foreground text-sm truncate">{category.channel_name}</span>
+                          </div>
+                          <label className="inline-flex items-center gap-1 cursor-pointer shrink-0">
+                            <Switch
+                              size="compact"
+                              checked={category.is_monitored}
+                              onCheckedChange={() => toggleChannelMonitored(category)}
+                              disabled={togglingId === category.id}
+                              label={`Default for new channels in ${category.channel_name}`}
+                              title={category.is_monitored ? 'New channels in this category are monitored by default - click to disable' : 'New channels in this category are not monitored by default - click to enable'}
+                            />
+                            <span className={`text-xs ${category.is_monitored ? 'text-success' : 'text-danger'}`}>
+                              Default for new channels: {category.is_monitored ? 'On' : 'Off'}
+                            </span>
+                          </label>
+                          {categoryThreadState.get(category.id)!.hasPartialDefaults ? (
+                            <Button
+                              emphasis="ghost"
+                              intent="warning"
+                              size="micro"
+                              className="shrink-0"
+                              onClick={() => clearCategoryThreadDefaults(category, categoryThreadState.get(category.id)!.children)}
+                              disabled={togglingId === category.id}
+                              title="Clear channel-level thread defaults and use this category setting"
+                              icon={<X className="h-3.5 w-3.5" />}
                             >
-                              {channel.is_monitored ? (
-                                <ToggleRight className="h-5 w-5 text-green-500" />
-                              ) : (
-                                <ToggleLeft className="h-5 w-5 text-muted-foreground" />
-                              )}
-                              <span className={`text-xs ${channel.is_monitored ? 'text-green-600 dark:text-green-400' : 'text-red-600 dark:text-red-400'}`}>
-                                {channel.is_monitored ? 'Monitored' : 'Disabled'}
+                              Remove partial defaults from channels
+                            </Button>
+                          ) : (
+                            <label className="inline-flex items-center gap-1 cursor-pointer shrink-0">
+                              <Switch
+                                size="compact"
+                                checked={category.default_monitor_new_threads === true}
+                                onCheckedChange={() => updateThreadMonitorDefault(category, category.default_monitor_new_threads === true ? false : true)}
+                                disabled={togglingId === category.id}
+                                label={`Default for new threads in ${category.channel_name}`}
+                                title="Set the default for new threads in this category"
+                              />
+                              <span className={`text-xs ${category.default_monitor_new_threads ? 'text-success' : 'text-muted-foreground'}`}>
+                                {`New threads: ${threadDefaultLabel(category.default_monitor_new_threads)}`}
                               </span>
-                            </button>
-                          </td>
-                        </tr>
-                      ))}
-                    </tbody>
-                  </table>
-                </div>
-              )
+                            </label>
+                          )}
+                        </div>
+
+                        {(channelsByCategory.get(category.channel_id) || []).length > 0 && (
+                          <table className="w-full text-sm">
+                            <tbody className="divide-y divide-border">
+                              {(channelsByCategory.get(category.channel_id) || []).map(channel => (
+                                renderChannelWithThreads(channel)
+                              ))}
+                            </tbody>
+                          </table>
+                        )}
+                      </div>
+                    ))}
+
+                    {(uncategorized.length > 0 || threads.some(thread => !thread.parent_id || !nonCategoryChannels.some(channel => channel.channel_id === thread.parent_id))) && (
+                      <div>
+                        {visibleCategories.length > 0 && (
+                          <div className="px-4 py-2 bg-muted/30 text-xs font-medium text-muted-foreground">No Category</div>
+                        )}
+                        <table className="w-full text-sm">
+                          <tbody className="divide-y divide-border">
+                            {uncategorized.map(channel => (
+                              renderChannelWithThreads(channel)
+                            ))}
+                            {threads.filter(thread => !thread.parent_id || !nonCategoryChannels.some(channel => channel.channel_id === thread.parent_id)).map(thread => (
+                              <ChannelRow
+                                key={thread.id}
+                                channel={thread}
+                                toggling={togglingId === thread.id}
+                                onToggle={() => toggleChannelMonitored(thread)}
+                                typeLabel={channelTypeLabel(thread.channel_type)}
+                                isThread
+                              />
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
             )}
           </div>
         )
       })}
     </div>
+  )
+}
+
+function ChannelRow({ channel, toggling, onToggle, onThreadToggle, typeLabel, threadDefaultLabel, isThread = false }: {
+  channel: ServerChannel
+  toggling: boolean
+  onToggle: () => void
+  onThreadToggle?: () => void
+  typeLabel: string
+  threadDefaultLabel?: string
+  isThread?: boolean
+}) {
+  return (
+    <tr className={`hover:bg-accent/30 transition-colors ${!channel.is_monitored ? 'bg-danger-subtle' : ''}`}>
+      <td className="px-4 py-2.5 w-full">
+        <div className={`flex items-center gap-1.5 ${isThread ? 'pl-6' : ''}`}>
+          {isThread ? <MessageSquare className="h-3.5 w-3.5 text-muted-foreground shrink-0" /> : <Hash className="h-3.5 w-3.5 text-muted-foreground shrink-0" />}
+          <span className="font-medium text-foreground">{channel.channel_name}</span>
+        </div>
+      </td>
+      <td className="px-4 py-2.5 text-xs text-muted-foreground whitespace-nowrap">
+        {typeLabel}
+      </td>
+      <td className="px-4 py-2.5 text-right whitespace-nowrap">
+        <div className="flex items-center justify-end gap-3">
+          {onThreadToggle && (
+            <label className="inline-flex items-center gap-1 cursor-pointer">
+              <Switch
+                size="compact"
+                checked={channel.default_monitor_new_threads === true}
+                onCheckedChange={onThreadToggle}
+                disabled={toggling}
+                label={`Default for new threads in ${channel.channel_name}`}
+                title="Set the default monitoring state for new threads under this channel"
+              />
+              <span className="text-xs text-muted-foreground">Threads: {threadDefaultLabel}</span>
+            </label>
+          )}
+          <label className="inline-flex items-center gap-1 cursor-pointer">
+            <Switch
+              size="compact"
+              checked={channel.is_monitored}
+              onCheckedChange={onToggle}
+              disabled={toggling}
+              label={`Monitor ${channel.channel_name}`}
+              title={channel.is_monitored ? 'Currently monitored - click to disable' : 'Not monitored - click to enable'}
+            />
+            <span className={`text-xs ${channel.is_monitored ? 'text-success' : 'text-danger'}`}>
+              {channel.is_monitored ? 'Monitored' : 'Disabled'}
+            </span>
+          </label>
+        </div>
+      </td>
+    </tr>
   )
 }

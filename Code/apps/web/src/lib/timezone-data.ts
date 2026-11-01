@@ -354,6 +354,7 @@ export function getTimezoneAbbr(iana: string): string {
  */
 export function formatTimeInTimezone(date: Date | string, iana: string): string {
   const d = typeof date === 'string' ? new Date(date) : date
+  if (isNaN(d.getTime())) return '--'
   const formatter = new Intl.DateTimeFormat('en-US', {
     timeZone: iana,
     hour: 'numeric',
@@ -368,6 +369,7 @@ export function formatTimeInTimezone(date: Date | string, iana: string): string 
  */
 export function formatDateInTimezone(date: Date | string, iana: string): string {
   const d = typeof date === 'string' ? new Date(date) : date
+  if (isNaN(d.getTime())) return '--'
   const formatter = new Intl.DateTimeFormat('en-US', {
     timeZone: iana,
     month: 'short',
@@ -382,6 +384,7 @@ export function formatDateInTimezone(date: Date | string, iana: string): string 
  */
 export function formatDateTimeInTimezone(date: Date | string, iana: string): string {
   const d = typeof date === 'string' ? new Date(date) : date
+  if (isNaN(d.getTime())) return '--'
   const abbr = getTimezoneAbbr(iana)
   const formatter = new Intl.DateTimeFormat('en-US', {
     timeZone: iana,
@@ -400,6 +403,7 @@ export function formatDateTimeInTimezone(date: Date | string, iana: string): str
  */
 export function formatDateDDMMYYYYInTimezone(date: Date | string, iana: string): string {
   const d = typeof date === 'string' ? new Date(date) : date
+  if (isNaN(d.getTime())) return '--'
   const formatter = new Intl.DateTimeFormat('en-GB', {
     timeZone: iana,
     day: '2-digit',
@@ -415,6 +419,7 @@ export function formatDateDDMMYYYYInTimezone(date: Date | string, iana: string):
  */
 export function formatDateTimeDDMMYYYYInTimezone(date: Date | string, iana: string): string {
   const d = typeof date === 'string' ? new Date(date) : date
+  if (isNaN(d.getTime())) return '--'
   const abbr = getTimezoneAbbr(iana)
   const datePart = formatDateDDMMYYYYInTimezone(d, iana)
   const timeFmt = new Intl.DateTimeFormat('en-GB', {
@@ -442,6 +447,23 @@ export function formatUtcTimeWithPeriodInTimezone(utcTime: string, iana: string)
     hour: 'numeric',
     minute: '2-digit',
     hour12: true,
+  })
+  return `${formatter.format(utcDate)} ${abbr}`
+}
+
+/** Same as formatUtcTimeWithPeriodInTimezone but uses 24-hour clock ("HH:MM TZ"). */
+export function formatUtcTime24InTimezone(utcTime: string, iana: string): string {
+  const [hStr, mStr] = utcTime.split(':')
+  const h = parseInt(hStr, 10)
+  const m = parseInt(mStr, 10)
+  const now = new Date()
+  const utcDate = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate(), h, m, 0))
+  const abbr = getTimezoneAbbr(iana)
+  const formatter = new Intl.DateTimeFormat('en-GB', {
+    timeZone: iana,
+    hour: '2-digit',
+    minute: '2-digit',
+    hour12: false,
   })
   return `${formatter.format(utcDate)} ${abbr}`
 }
@@ -489,6 +511,38 @@ export function getPrimaryTimezone(): string {
     // ignore
   }
   return 'UTC'
+}
+
+/**
+ * Get the browser's local IANA timezone, or null when unavailable.
+ */
+export function getBrowserTimezone(): string | null {
+  try {
+    const resolved = Intl.DateTimeFormat().resolvedOptions().timeZone
+    return resolved || null
+  } catch {
+    return null
+  }
+}
+
+/**
+ * Get the timezone used for editing wall-clock date/time values (e.g. the
+ * mailbox invitation picker). Prefers the configured primary timezone, but
+ * falls back to the browser's local timezone instead of UTC, so prefilled
+ * wall-clock times match the user's local expectation. An explicit 'UTC'
+ * primary choice is still respected.
+ */
+export function getEditingTimezone(): string {
+  try {
+    const raw = localStorage.getItem('coordination-timezones')
+    if (raw) {
+      const parsed = JSON.parse(raw) as { primary?: string }
+      if (parsed.primary) return parsed.primary
+    }
+  } catch {
+    // ignore
+  }
+  return getBrowserTimezone() || 'UTC'
 }
 
 // ─── DST Transition Detection ──────────────────────────────────────────────

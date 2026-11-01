@@ -1,11 +1,12 @@
-import '@testing-library/jest-dom'
+import '@testing-library/jest-dom/vitest'
 import type { ReactNode } from 'react'
 import { describe, it, expect, vi, beforeEach } from 'vitest'
-import { fireEvent, render, screen, waitFor } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react'
 import { MemoryRouter } from 'react-router-dom'
 import TimeManagementPage from '../TimeManagementPage'
 import {
   buildDiffuseTimeBackgroundFill,
+  findTimeItemDurationByTitle,
   inferRequestedTimezoneForAiResponse,
   isExplicitPrimaryTimezoneChangeRequest,
 } from '../time-management-page-helpers'
@@ -20,6 +21,9 @@ const mockComputeDayLayout = vi.fn()
 
 vi.mock('../../lib/api-client', () => ({
   apiClient: {
+    // Route apiClient.get through the same mock as dedupedGet since fetchEvents'
+    // forced (non-deduped) refresh path calls apiClient.get directly.
+    get: (...args: unknown[]) => mockDedupedGet(...args),
     post: (...args: unknown[]) => mockApiPost(...args),
     put: (...args: unknown[]) => mockApiPut(...args),
     patch: (...args: unknown[]) => mockApiPatch(...args),
@@ -60,6 +64,9 @@ vi.mock('../../lib/use-timezones', () => ({
 
 vi.mock('../../lib/timezone-data', () => ({
   convertUtcTimeToTimezone: (value: string) => value,
+  convertUtcTimeToTimezoneOnDate: (value: string) => value,
+  detectDstTransitions: () => [],
+  getTimezoneAbbrOnDate: () => 'UTC',
   getCurrentTimeInTimezone: () => '00:00',
   findTimezone: () => undefined,
 }))
@@ -114,7 +121,9 @@ vi.mock('@tiptap/extension-details', () => ({
     configure: () => ({}),
   },
   DetailsContent: {},
-  DetailsSummary: {},
+  DetailsSummary: {
+    extend: () => ({}),
+  },
 }))
 
 function installDefaultApiMocks(): void {
@@ -180,7 +189,7 @@ describe('TimeManagementPage', () => {
 
   it('renders the page shell and fetches initial datasets', async () => {
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -192,11 +201,13 @@ describe('TimeManagementPage', () => {
       expect(mockDedupedGet).toHaveBeenCalledWith('/api/calendar-sources')
       expect(mockDedupedGet).toHaveBeenCalledWith('/api/time-management/prefs')
       expect(mockDedupedGet).toHaveBeenCalledWith('/api/time-management/categories')
-      expect(mockDedupedGet).toHaveBeenCalledWith('/api/user-events')
+      expect(mockDedupedGet).toHaveBeenCalledWith('/api/user-events', {
+        params: { windowStart: expect.any(String), windowEnd: expect.any(String) },
+      })
     })
   })
 
-  it('restores a saved wider left panel width after the viewport expands again', async () => {
+  it('starts with the left panel closed even when cached open, then restores saved width when opened', async () => {
     setWindowInnerWidth(1400)
     localStorage.setItem(
       'time-management-v1',
@@ -215,13 +226,19 @@ describe('TimeManagementPage', () => {
     )
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
 
     const panelHeading = await screen.findByRole('heading', { name: 'Time Management Tools' })
     const aside = panelHeading.closest('aside') as HTMLElement
+
+    await waitFor(() => {
+      expect(aside.style.width).toBe('0px')
+    })
+
+    fireEvent.click(screen.getByTitle('Show left panel'))
 
     await waitFor(() => {
       expect(aside.style.width).toBe('500px')
@@ -244,7 +261,7 @@ describe('TimeManagementPage', () => {
 
   it('shows empty-state messaging when no meetings are returned', async () => {
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -252,11 +269,123 @@ describe('TimeManagementPage', () => {
     expect(await screen.findByText('No meetings found on the selected calendars.')).toBeInTheDocument()
   })
 
+  it('uses icon-only header controls in phone layout', async () => {
+    setWindowInnerWidth(500)
+
+    render(
+      <MemoryRouter>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    expect(await screen.findByRole('heading', { name: 'Time Management Tools' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Previous week' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Jump to today' })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Today' })).not.toBeInTheDocument()
+  })
+
+  it('hides the header title only when measured space is scarce and restores it on resize', async () => {
+    setWindowInnerWidth(1280)
+    let headerWidth = 1036
+    let updateHeaderLayout: (() => void) | undefined
+    const disconnect = vi.fn()
+    vi.stubGlobal('ResizeObserver', class {
+      constructor(private readonly callback: () => void) {}
+      observe(element: Element) {
+        if (element.tagName === 'HEADER') updateHeaderLayout = this.callback
+      }
+      disconnect = disconnect
+    })
+    const originalRect = Element.prototype.getBoundingClientRect
+    const rectMock = vi.spyOn(Element.prototype, 'getBoundingClientRect').mockImplementation(function (this: Element) {
+      let width: number | undefined
+      if (this.tagName === 'H1') width = 240
+      if (this.tagName === 'BUTTON' && this.textContent === 'Disable Hidden Mode') width = 150
+      if (['Hide left panel', 'Show left panel'].includes(this.getAttribute('title') ?? '')) width = 100
+      if (this.querySelector(':scope > [aria-label="Previous week"]')) width = 150
+      if (this.tagName === 'SPAN' && this.classList.contains('whitespace-nowrap')) width = 140
+      if (this.getAttribute('data-testid') === 'timezone-selector') width = 160
+      if (this.getAttribute('data-testid') === 'time-zoom-quick-buttons') width = 60
+      return width === undefined ? originalRect.call(this) : new DOMRect(0, 0, width, 32)
+    })
+    const widthMock = vi.spyOn(HTMLElement.prototype, 'clientWidth', 'get').mockImplementation(function (this: HTMLElement) {
+      return this.tagName === 'HEADER' ? headerWidth : 0
+    })
+    const originalStyle = window.getComputedStyle
+    // Computed style declarations are read-only (JSDOM 27+), so override via a proxy.
+    const styleOverrides: Record<string, string> = { columnGap: '8px', paddingLeft: '12px', paddingRight: '12px' }
+    const styleMock = vi.spyOn(window, 'getComputedStyle').mockImplementation((element) => {
+      const style = originalStyle(element)
+      return new Proxy(style, {
+        get(target, prop) {
+          if (typeof prop === 'string' && prop in styleOverrides) return styleOverrides[prop]
+          const value: unknown = Reflect.get(target, prop, target)
+          return typeof value === 'function' ? value.bind(target) : value
+        },
+      })
+    })
+
+    const { unmount } = render(
+      <MemoryRouter>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+    try {
+      const title = await screen.findByRole('heading', { name: 'Time Management' })
+      expect(title).not.toHaveClass('[clip-path:inset(50%)]')
+      expect(updateHeaderLayout).toBeDefined()
+
+      headerWidth = 1021
+      act(() => updateHeaderLayout?.())
+      expect(title).toHaveClass('[clip-path:inset(50%)]')
+      expect(screen.getByRole('button', { name: 'Previous week' }).parentElement).toHaveClass('shrink-0')
+      expect(screen.getByTestId('timezone-selector').parentElement).toHaveClass('min-w-max')
+
+      headerWidth = 1022
+      act(() => updateHeaderLayout?.())
+      expect(title).not.toHaveClass('[clip-path:inset(50%)]')
+
+      headerWidth = 936
+      fireEvent(window, new Event('resize'))
+      expect(title).toHaveClass('[clip-path:inset(50%)]')
+
+      headerWidth = 1336
+      act(() => updateHeaderLayout?.())
+      expect(title).not.toHaveClass('[clip-path:inset(50%)]')
+
+      fireEvent.click(screen.getByRole('button', { name: 'Calendar Modes', expanded: false }))
+      fireEvent.click(screen.getByRole('switch', { name: 'Toggle hidden mode' }))
+      const disableHiddenMode = screen.getByRole('button', { name: 'Disable Hidden Mode' })
+      expect(title).toHaveClass('[clip-path:inset(50%)]')
+      expect(disableHiddenMode).not.toHaveClass('[clip-path:inset(50%)]')
+      expect(disableHiddenMode.parentElement).toHaveClass('flex', 'items-center')
+
+      headerWidth = 1337
+      act(() => updateHeaderLayout?.())
+      expect(title).toHaveClass('[clip-path:inset(50%)]')
+      headerWidth = 1338
+      act(() => updateHeaderLayout?.())
+      expect(title).not.toHaveClass('[clip-path:inset(50%)]')
+
+      headerWidth = 1036
+      fireEvent.click(disableHiddenMode)
+      expect(title).not.toHaveClass('[clip-path:inset(50%)]')
+      expect(screen.queryByRole('button', { name: 'Disable Hidden Mode' })).not.toBeInTheDocument()
+    } finally {
+      unmount()
+      rectMock.mockRestore()
+      widthMock.mockRestore()
+      styleMock.mockRestore()
+      vi.unstubAllGlobals()
+    }
+    expect(disconnect).toHaveBeenCalled()
+  })
+
   it('renders duplicated calendar headers on desktop and only the primary header on tablet', async () => {
     setWindowInnerWidth(1280)
 
     const { unmount } = render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -270,7 +399,7 @@ describe('TimeManagementPage', () => {
     setWindowInnerWidth(900)
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -304,7 +433,7 @@ describe('TimeManagementPage', () => {
     })
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -320,6 +449,50 @@ describe('TimeManagementPage', () => {
       expect(container.scrollTop).toBeCloseTo(expectedTop, 3)
     })
 
+  })
+
+  it('does not let delayed initial centering override user calendar scroll', async () => {
+    let calendarClientHeight = 0
+    let repeatOffsetHeight = 0
+
+    Object.defineProperty(HTMLElement.prototype, 'clientHeight', {
+      configurable: true,
+      get() {
+        const element = this as HTMLElement
+        if (element.dataset?.testid === 'calendar-scroll-container') {
+          return calendarClientHeight
+        }
+        return 0
+      },
+    })
+
+    Object.defineProperty(HTMLElement.prototype, 'offsetHeight', {
+      configurable: true,
+      get() {
+        const element = this as HTMLElement
+        if (element.parentElement?.dataset?.testid === 'calendar-scroll-container') {
+          return repeatOffsetHeight
+        }
+        return 0
+      },
+    })
+
+    render(
+      <MemoryRouter>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    const container = await screen.findByTestId('calendar-scroll-container')
+
+    container.scrollTop = 777
+    repeatOffsetHeight = 1320
+    calendarClientHeight = 620
+    fireEvent.scroll(container)
+
+    await new Promise((resolve) => window.setTimeout(resolve, 900))
+
+    expect(container.scrollTop).toBe(777)
   })
 
   it('syncs enabled connected calendars for the visible week and refreshes events', async () => {
@@ -375,7 +548,7 @@ describe('TimeManagementPage', () => {
     })
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -481,7 +654,7 @@ describe('TimeManagementPage', () => {
     })
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -489,9 +662,9 @@ describe('TimeManagementPage', () => {
     await screen.findByRole('heading', { name: 'Time Management' })
     const calendarContainer = await screen.findByTestId('calendar-scroll-container')
 
-    const sourcesToggle = screen.getByTitle('Expand calendar sources')
+    const sourcesToggle = screen.getByRole('button', { name: 'Calendar Sources', expanded: false })
     fireEvent.click(sourcesToggle)
-    await screen.findByTitle('Collapse calendar sources')
+    await screen.findByRole('button', { name: 'Calendar Sources', expanded: true })
 
     await waitFor(() => {
       expect(calendarContainer.scrollTop).toBeGreaterThan(0)
@@ -600,7 +773,7 @@ describe('TimeManagementPage', () => {
     }))
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -617,8 +790,110 @@ describe('TimeManagementPage', () => {
     fireEvent.click(screen.getAllByText('Night Shift')[1])
 
     await waitFor(() => {
-      expect(document.querySelectorAll('.ring-2.ring-blue-400').length).toBeGreaterThan(1)
+      expect(document.querySelectorAll('[data-time-management-item="true"][data-selected="true"]').length).toBeGreaterThan(1)
     })
+  })
+
+  it('renders the recurrence icon only on the first segment of a split recurring item', async () => {
+    const weekStart = new Date()
+    weekStart.setHours(0, 0, 0, 0)
+    weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7))
+
+    const start = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + 1, 1, 0, 0)).toISOString()
+    const end = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate() + 1, 1, 30, 0)).toISOString()
+
+    mockDedupedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/calendar-sources') {
+        return { data: { sources: [] } }
+      }
+      if (url === '/api/time-management/modes') {
+        return {
+          data: {
+            activeModeId: 'mode-main',
+            modes: [
+              {
+                id: 'mode-main',
+                name: 'Main',
+                main_color: '#2563eb',
+                slot_minutes: 30,
+                sync_calendars: [],
+                time_backgrounds: [],
+                collapsed_background_ids: [],
+                quick_templates: [],
+                show_quick_templates_in_main: false,
+              },
+            ],
+          },
+        }
+      }
+      if (url === '/api/time-management/categories') {
+        return { data: { categories: [] } }
+      }
+      if (url === '/api/user-events') {
+        return {
+          data: {
+            events: [
+              {
+                id: 'event-recurring-split-icon',
+                title: 'Recurring split item',
+                description: null,
+                meeting_link: null,
+                location: null,
+                start_time: start,
+                end_time: end,
+                source_type: 'manual',
+                source_id: 'coord-main',
+                category_ids: [],
+                recurrence_rule: { type: 'weekly' },
+              },
+            ],
+          },
+        }
+      }
+      return { data: {} }
+    })
+
+    mockComputeDayLayout.mockImplementation((dayEvents: Array<{ id: string }>) => ({
+      eventSegments: dayEvents.flatMap((event) => [
+        {
+          eventId: event.id,
+          eventIndex: 0,
+          top: 80,
+          height: 26,
+          leftPercent: 0,
+          widthPercent: 50,
+          isFirstSegment: true,
+        },
+        {
+          eventId: event.id,
+          eventIndex: 0,
+          top: 106,
+          height: 26,
+          leftPercent: 50,
+          widthPercent: 50,
+          isFirstSegment: false,
+        },
+      ]),
+      overflowSegments: [],
+    }))
+
+    render(
+      <MemoryRouter>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    await screen.findByRole('heading', { name: 'Time Management' })
+    const calendarContainer = await screen.findByTestId('calendar-scroll-container')
+    const middleWeek = calendarContainer.querySelector(':scope > div[aria-hidden="false"]')
+
+    await waitFor(() => {
+      expect(middleWeek?.querySelectorAll('[data-time-management-item="true"]')).toHaveLength(2)
+    })
+
+    const itemSegments = Array.from(middleWeek?.querySelectorAll<HTMLElement>('[data-time-management-item="true"]') ?? [])
+    expect(itemSegments[0]?.querySelector('div.absolute.right-1.top-1')).toBeInTheDocument()
+    expect(itemSegments[1]?.querySelector('div.absolute.right-1.top-1')).not.toBeInTheDocument()
   })
 
   it('preserves full duration when dragging a split cross-midnight segment', async () => {
@@ -696,7 +971,7 @@ describe('TimeManagementPage', () => {
     mockApiPut.mockResolvedValue({ data: {} })
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -808,7 +1083,7 @@ describe('TimeManagementPage', () => {
     })
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -838,18 +1113,32 @@ describe('TimeManagementPage', () => {
 
   it('toggles hidden mode and updates the page title with a disable action', async () => {
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
 
     await screen.findByRole('heading', { name: 'Time Management' })
 
-    fireEvent.click(screen.getByTitle('Expand calendar modes'))
-    fireEvent.click(screen.getByRole('button', { name: 'Toggle hidden mode' }))
+    fireEvent.click(screen.getByRole('button', { name: 'Calendar Modes', expanded: false }))
+    const hiddenMode = screen.getByRole('switch', { name: 'Toggle hidden mode' })
+    expect(hiddenMode).not.toBeChecked()
+    expect(hiddenMode).toHaveAccessibleDescription('Hide calendar item names and blur editor text.')
+    fireEvent.click(screen.getByText('Hidden mode'))
 
     await screen.findByRole('heading', { name: 'Content hidden Time Management mode' })
-    fireEvent.click(screen.getByRole('button', { name: '(disable hidden mode)' }))
+    expect(hiddenMode).toBeChecked()
+    expect(hiddenMode).toHaveClass('border-warning-muted', 'bg-warning-subtle')
+    fireEvent.click(screen.getByText('Hide calendar item names and blur editor text.'))
+    await screen.findByRole('heading', { name: 'Time Management' })
+    expect(hiddenMode).not.toBeChecked()
+    fireEvent.click(hiddenMode)
+
+    await screen.findByRole('heading', { name: 'Content hidden Time Management mode' })
+    const disableHiddenMode = screen.getByRole('button', { name: 'Disable Hidden Mode' })
+    expect(disableHiddenMode).toHaveClass('border', 'h-8')
+    expect(disableHiddenMode).not.toHaveClass('underline')
+    fireEvent.click(disableHiddenMode)
 
     await screen.findByRole('heading', { name: 'Time Management' })
   })
@@ -905,7 +1194,7 @@ describe('TimeManagementPage', () => {
 
   it('cancels an active time selection when Escape is pressed', async () => {
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -1024,7 +1313,7 @@ describe('TimeManagementPage', () => {
     mockApiPut.mockResolvedValue({ data: {} })
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -1076,10 +1365,17 @@ describe('TimeManagementPage', () => {
     fireEvent.mouseMove(window, { clientX: 20, clientY: 156 })
 
     await waitFor(() => {
-      expect(screen.getAllByTitle(/01:00-01:30/).length).toBeGreaterThan(0)
+      const resizedItems = screen.getAllByTitle(/01:00-01:30/)
+      expect(resizedItems.length).toBeGreaterThan(0)
+      expect(resizedItems[0]).toHaveClass('transition-none')
+      expect(resizedItems[0]).not.toHaveClass('transition-all')
     })
 
     fireEvent.mouseUp(window)
+
+    await waitFor(() => {
+      expect(screen.getAllByTitle(/01:00-01:30/)[0]).toHaveClass('transition-all')
+    })
 
     await waitFor(() => {
       expect(mockApiPut).toHaveBeenCalledWith('/api/user-events/event-1', {
@@ -1089,8 +1385,134 @@ describe('TimeManagementPage', () => {
     })
   })
 
-  it('allows resizing a start edge beyond 00:00 UTC and saves to previous day on release', async () => {
+  it('keeps a resized duration when a stale silent refetch resolves after the save', async () => {
     const weekStart = new Date()
+    weekStart.setHours(0, 0, 0, 0)
+    weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7))
+
+    const eventStart = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 1, 0, 0)).toISOString()
+    const eventEnd = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 1, 15, 0)).toISOString()
+
+    mockDedupedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/calendar-sources') {
+        return { data: { sources: [] } }
+      }
+      if (url === '/api/time-management/modes') {
+        return {
+          data: {
+            activeModeId: 'mode-main',
+            modes: [
+              {
+                id: 'mode-main',
+                name: 'Main',
+                main_color: '#2563eb',
+                slot_minutes: 15,
+                sync_calendars: [],
+                time_backgrounds: [],
+                collapsed_background_ids: [],
+                quick_templates: [],
+                show_quick_templates_in_main: false,
+              },
+            ],
+          },
+        }
+      }
+      if (url === '/api/time-management/categories') {
+        return { data: { categories: [] } }
+      }
+      if (url === '/api/user-events') {
+        // Always answers with the pre-resize geometry, mimicking a GET issued
+        // before the resize PUT committed server-side.
+        return {
+          data: {
+            events: [
+              {
+                id: 'event-stale-refetch',
+                title: 'Stale refetch item',
+                description: null,
+                meeting_link: null,
+                location: null,
+                start_time: eventStart,
+                end_time: eventEnd,
+                source_type: 'manual',
+                source_id: 'coord-main',
+                category_ids: [],
+                recurrence_rule: { type: 'none' },
+              },
+            ],
+          },
+        }
+      }
+      return { data: {} }
+    })
+
+    mockComputeDayLayout.mockReturnValue({
+      eventSegments: [
+        {
+          eventId: 'event-stale-refetch',
+          eventIndex: 0,
+          top: 104,
+          height: 26,
+          leftPercent: 0,
+          widthPercent: 100,
+          isFirstSegment: true,
+        },
+      ],
+      overflowSegments: [],
+    })
+
+    mockApiPut.mockResolvedValue({ data: {} })
+
+    render(
+      <MemoryRouter>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    await screen.findByRole('heading', { name: 'Time Management' })
+    await screen.findAllByText('Stale refetch item')
+
+    const dayColumns = Array.from(document.querySelectorAll<HTMLDivElement>('div[style*="background-image"]'))
+    const dayColumn = dayColumns[0]
+    if (!dayColumn) {
+      throw new Error('Expected at least one day column')
+    }
+
+    Object.defineProperty(dayColumn, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({
+        x: 0,
+        y: 0,
+        top: 0,
+        left: 0,
+        right: 100,
+        bottom: 2496,
+        width: 100,
+        height: 2496,
+        toJSON: () => ({}),
+      }),
+    })
+
+    fireEvent.mouseDown(dayColumn, { button: 0, clientX: 20, clientY: 130 })
+    fireEvent.mouseMove(window, { clientX: 20, clientY: 156 })
+    fireEvent.mouseUp(window)
+
+    await waitFor(() => {
+      expect(mockApiPut).toHaveBeenCalledWith('/api/user-events/event-stale-refetch', {
+        start_time: eventStart,
+        end_time: new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 1, 30, 0)).toISOString(),
+      })
+    })
+
+    fireEvent.focus(window)
+
+    await new Promise((resolve) => setTimeout(resolve, 400))
+
+    expect(screen.getAllByTitle(/01:00-01:30/).length).toBeGreaterThan(0)
+    expect(screen.queryAllByTitle(/01:00-01:15/).length).toBe(0)
+  })
+
+  it('allows resizing a start edge beyond 00:00 UTC and saves to previous day on release', async () => {    const weekStart = new Date()
     weekStart.setHours(0, 0, 0, 0)
     weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7))
 
@@ -1167,13 +1589,18 @@ describe('TimeManagementPage', () => {
     mockApiPut.mockResolvedValue({ data: {} })
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
 
     await screen.findByRole('heading', { name: 'Time Management' })
-    await screen.findAllByText('Edge drag item')
+    const [itemTitle] = await screen.findAllByText('Edge drag item')
+    const itemContainer = itemTitle.closest<HTMLDivElement>('[data-time-management-item="true"]')
+    expect(itemContainer).toBeTruthy()
+    if (!itemContainer) {
+      throw new Error('Expected the start-edge resize item')
+    }
 
     const dayColumns = Array.from(document.querySelectorAll<HTMLDivElement>('div[style*="background-image"]'))
     expect(dayColumns.length).toBeGreaterThanOrEqual(7)
@@ -1198,9 +1625,38 @@ describe('TimeManagementPage', () => {
       }),
     })
 
+    Object.defineProperty(itemContainer, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({
+        x: 0,
+        y: 100,
+        top: 100,
+        left: 0,
+        right: 100,
+        bottom: 126,
+        width: 100,
+        height: 26,
+        toJSON: () => ({}),
+      }),
+    })
+
+    fireEvent.pointerDown(itemContainer, {
+      pointerId: 1,
+      pointerType: 'mouse',
+      button: 0,
+      clientX: 20,
+      clientY: 100,
+    })
     fireEvent.mouseDown(dayColumn, { button: 0, clientX: 20, clientY: 100 })
+    fireEvent.pointerMove(window, { pointerId: 1, pointerType: 'mouse', clientX: 20, clientY: -52 })
     fireEvent.mouseMove(window, { clientX: 20, clientY: -52 })
-    fireEvent.mouseUp(window)
+
+    expect(
+      Array.from(document.querySelectorAll<HTMLElement>('[data-time-management-item="true"]'))
+        .some((element) => element.style.animation.includes('move-source-ghost'))
+    ).toBe(false)
+
+    fireEvent.mouseUp(window, { clientX: 20, clientY: -52 })
 
     await waitFor(() => {
       expect(mockApiPut).toHaveBeenCalledWith('/api/user-events/event-midnight-edge', {
@@ -1210,7 +1666,7 @@ describe('TimeManagementPage', () => {
     })
   })
 
-  it('resizes recurring items as occurrence-only by default and prompts for series apply', async () => {
+  it.each(['this', 'future', 'cancel'])('asks before persisting a recurring resize and applies scope %s', async (scope) => {
     const weekStart = new Date()
     weekStart.setHours(0, 0, 0, 0)
     weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7))
@@ -1319,7 +1775,7 @@ describe('TimeManagementPage', () => {
     })
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -1356,6 +1812,20 @@ describe('TimeManagementPage', () => {
     fireEvent.mouseMove(window, { clientX: 20, clientY: 156 })
     fireEvent.mouseUp(window)
 
+    await screen.findByRole('dialog', { name: 'Edit recurring item' })
+    expect(mockApiPut.mock.calls.filter(([url]) => url === '/api/user-events/event-recurring-resize')).toHaveLength(0)
+    expect(mockApiPost).not.toHaveBeenCalled()
+    fireEvent.click(screen.getByRole('button', {
+      name: scope === 'this' ? 'This item only' : scope === 'future' ? 'This and future occurrences' : 'Cancel',
+    }))
+    if (scope === 'cancel') {
+      await waitFor(() => expect(screen.queryByRole('dialog', { name: 'Edit recurring item' })).not.toBeInTheDocument())
+      expect(mockApiPut.mock.calls.filter(([url]) => url === '/api/user-events/event-recurring-resize')).toHaveLength(0)
+      expect(mockApiPost).not.toHaveBeenCalled()
+      expect(mockApiDelete).not.toHaveBeenCalled()
+      return
+    }
+
     await waitFor(() => {
       expect(mockApiPut).toHaveBeenCalledWith(
         '/api/user-events/event-recurring-resize',
@@ -1366,7 +1836,7 @@ describe('TimeManagementPage', () => {
       expect(mockApiPost).toHaveBeenCalledWith(
         '/api/user-events',
         expect.objectContaining({
-          recurrence_rule: { type: 'none' },
+          recurrence_rule: scope === 'this' ? { type: 'none' } : expect.objectContaining({ type: 'weekly' }),
         })
       )
     })
@@ -1379,22 +1849,161 @@ describe('TimeManagementPage', () => {
     })
     expect(directResizePayload).toBeUndefined()
 
-    expect(await screen.findByText('Recurring item resized')).toBeInTheDocument()
-    const revertButton = screen.getByRole('button', { name: 'Cancel and revert changes' })
-    expect(revertButton).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Apply only to current week' })).toBeInTheDocument()
-    expect(screen.getByRole('button', { name: 'Apply to all weeks' })).toBeInTheDocument()
+    expect(mockApiDelete).not.toHaveBeenCalled()
+  })
 
-    fireEvent.click(revertButton)
+  it('only resizes from outward borders of a split item, not internal slice boundaries', async () => {
+    const weekStart = new Date()
+    weekStart.setHours(0, 0, 0, 0)
+    weekStart.setDate(weekStart.getDate() - ((weekStart.getDay() + 6) % 7))
+
+    const eventStart = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 13, 30, 0)).toISOString()
+    const eventEnd = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 14, 30, 0)).toISOString()
+    const expectedResizedEnd = new Date(Date.UTC(weekStart.getFullYear(), weekStart.getMonth(), weekStart.getDate(), 15, 0, 0)).toISOString()
+
+    mockDedupedGet.mockImplementation(async (url: string) => {
+      if (url === '/api/calendar-sources') {
+        return { data: { sources: [] } }
+      }
+      if (url === '/api/time-management/modes') {
+        return {
+          data: {
+            activeModeId: 'mode-main',
+            modes: [
+              {
+                id: 'mode-main',
+                name: 'Main',
+                main_color: '#2563eb',
+                slot_minutes: 30,
+                sync_calendars: [],
+                time_backgrounds: [],
+                collapsed_background_ids: [],
+                quick_templates: [],
+                show_quick_templates_in_main: false,
+              },
+            ],
+          },
+        }
+      }
+      if (url === '/api/time-management/categories') {
+        return { data: { categories: [] } }
+      }
+      if (url === '/api/user-events') {
+        return {
+          data: {
+            events: [
+              {
+                id: 'event-sliced-resize',
+                title: 'Sliced Item',
+                description: null,
+                meeting_link: null,
+                location: null,
+                start_time: eventStart,
+                end_time: eventEnd,
+                source_type: 'manual',
+                source_id: 'coord-main',
+                category_ids: [],
+                recurrence_rule: { type: 'none' },
+              },
+            ],
+          },
+        }
+      }
+      return { data: {} }
+    })
+
+    // One item split into two touching slices (e.g. narrowed by an overlap):
+    // 13:30-14:00 (first slice) and 14:00-14:30 (second slice). The boundary
+    // at 14:00 is internal to the item and must not act as a resize edge.
+    mockComputeDayLayout.mockReturnValue({
+      eventSegments: [
+        {
+          eventId: 'event-sliced-resize',
+          eventIndex: 0,
+          top: 702,
+          height: 26,
+          leftPercent: 0,
+          widthPercent: 100,
+          isFirstSegment: true,
+        },
+        {
+          eventId: 'event-sliced-resize',
+          eventIndex: 0,
+          top: 728,
+          height: 26,
+          leftPercent: 0,
+          widthPercent: 100,
+          isFirstSegment: false,
+        },
+      ],
+      overflowSegments: [],
+    })
+
+    render(
+      <MemoryRouter>
+        <TimeManagementPage />
+      </MemoryRouter>
+    )
+
+    await screen.findByRole('heading', { name: 'Time Management' })
+    await waitFor(() => {
+      expect(screen.getAllByText('Sliced Item').length).toBeGreaterThan(0)
+    })
+
+    const dayColumns = Array.from(document.querySelectorAll<HTMLDivElement>('div[style*="background-image"]'))
+    expect(dayColumns.length).toBeGreaterThanOrEqual(7)
+
+    const dayColumn = dayColumns[0]
+    if (!dayColumn) {
+      throw new Error('Expected at least one day column')
+    }
+
+    Object.defineProperty(dayColumn, 'getBoundingClientRect', {
+      configurable: true,
+      value: () => ({
+        x: 0,
+        y: 0,
+        top: 0,
+        left: 0,
+        right: 100,
+        bottom: 1248,
+        width: 100,
+        height: 1248,
+        toJSON: () => ({}),
+      }),
+    })
+
+    // Outward edges keep the resize cursor...
+    fireEvent.mouseMove(dayColumn, { clientX: 20, clientY: 702 })
+    expect(dayColumn.style.cursor).toBe('ns-resize')
+    fireEvent.mouseMove(dayColumn, { clientX: 20, clientY: 754 })
+    expect(dayColumn.style.cursor).toBe('ns-resize')
+
+    // ...but the internal boundary between slices of the same item does not.
+    fireEvent.mouseMove(dayColumn, { clientX: 20, clientY: 728 })
+    expect(dayColumn.style.cursor).toBe('default')
+
+    // Dragging from the internal boundary must not start a resize.
+    fireEvent.mouseDown(dayColumn, { button: 0, clientX: 20, clientY: 728 })
+    fireEvent.mouseMove(window, { clientX: 20, clientY: 741 })
+    fireEvent.mouseUp(window)
+    fireEvent.pointerUp(window)
+
+    expect(
+      mockApiPut.mock.calls.filter((call) => call[0] === '/api/user-events/event-sliced-resize')
+    ).toHaveLength(0)
+
+    // The outward bottom edge still resizes the item.
+    fireEvent.mouseDown(dayColumn, { button: 0, clientX: 20, clientY: 754 })
+    fireEvent.mouseMove(window, { clientX: 20, clientY: 780 })
+    fireEvent.mouseUp(window)
 
     await waitFor(() => {
-      expect(mockApiDelete).toHaveBeenCalledWith('/api/user-events/event-occurrence-resized')
       expect(mockApiPut).toHaveBeenCalledWith(
-        '/api/user-events/event-recurring-resize',
+        '/api/user-events/event-sliced-resize',
         expect.objectContaining({
-          start_time: baseStart,
-          end_time: baseEnd,
-          recurrence_rule: expect.objectContaining({ type: 'weekly' }),
+          start_time: eventStart,
+          end_time: expectedResizedEnd,
         })
       )
     })
@@ -1479,7 +2088,7 @@ describe('TimeManagementPage', () => {
     })
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -1526,25 +2135,29 @@ describe('TimeManagementPage', () => {
 
   it('runs Escape side-panel actions one at a time by priority', async () => {
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
 
     await screen.findByRole('heading', { name: 'Time Management' })
 
-    const monthButton =
-      screen.queryByTitle('Collapse month overview') ?? screen.queryByTitle('Expand month overview')
+    fireEvent.click(screen.getByTitle('Show left panel'))
+    await waitFor(() => {
+      expect(screen.getByTitle('Hide left panel')).toBeInTheDocument()
+    })
+
+    const monthButton = screen.queryByRole('button', { name: 'Month Overview' })
     expect(monthButton).toBeTruthy()
 
     if (!monthButton) {
       throw new Error('Expected month overview toggle button to be present')
     }
 
-    if (monthButton.getAttribute('title') === 'Expand month overview') {
+    if (monthButton.getAttribute('aria-expanded') === 'false') {
       fireEvent.click(monthButton)
       await waitFor(() => {
-        expect(screen.getByTitle('Collapse month overview')).toBeInTheDocument()
+        expect(screen.getByRole('button', { name: 'Month Overview', expanded: true })).toBeInTheDocument()
       })
     }
 
@@ -1552,7 +2165,7 @@ describe('TimeManagementPage', () => {
 
     await waitFor(() => {
       expect(screen.getByTitle('Hide left panel')).toBeInTheDocument()
-      expect(screen.getByTitle('Expand month overview')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Month Overview', expanded: false })).toBeInTheDocument()
     })
 
     fireEvent.keyDown(document.body, { key: 'Escape' })
@@ -1565,18 +2178,24 @@ describe('TimeManagementPage', () => {
 
     await waitFor(() => {
       expect(screen.getByTitle('Hide left panel')).toBeInTheDocument()
-      expect(screen.getByTitle('Expand month overview')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Month Overview', expanded: false })).toBeInTheDocument()
     })
   })
 
   it('closes the side panel when Escape is pressed with no active selection', async () => {
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
 
     await screen.findByRole('heading', { name: 'Time Management' })
+
+    fireEvent.click(screen.getByTitle('Show left panel'))
+    await waitFor(() => {
+      expect(screen.getByTitle('Hide left panel')).toBeInTheDocument()
+    })
+
     expect(screen.getByTitle('Hide left panel')).toBeInTheDocument()
 
     fireEvent.keyDown(document.body, { key: 'Escape' })
@@ -1588,7 +2207,7 @@ describe('TimeManagementPage', () => {
 
   it('recenters the looped calendar scroll when it approaches an edge copy', async () => {
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -1620,25 +2239,30 @@ describe('TimeManagementPage', () => {
 
   it('reopens the side panel when Escape is pressed while the panel is already closed', async () => {
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
 
     await screen.findByRole('heading', { name: 'Time Management' })
 
+    fireEvent.click(screen.getByTitle('Show left panel'))
+    await waitFor(() => {
+      expect(screen.getByTitle('Hide left panel')).toBeInTheDocument()
+    })
+
     const monthButton =
-      screen.queryByTitle('Collapse month overview') ?? screen.queryByTitle('Expand month overview')
+      screen.queryByRole('button', { name: 'Month Overview' })
     expect(monthButton).toBeTruthy()
 
     if (!monthButton) {
       throw new Error('Expected month overview toggle button to be present')
     }
 
-    if (monthButton.getAttribute('title') === 'Expand month overview') {
+    if (monthButton.getAttribute('aria-expanded') === 'false') {
       fireEvent.click(monthButton)
       await waitFor(() => {
-        expect(screen.getByTitle('Collapse month overview')).toBeInTheDocument()
+        expect(screen.getByRole('button', { name: 'Month Overview', expanded: true })).toBeInTheDocument()
       })
     }
 
@@ -1651,31 +2275,36 @@ describe('TimeManagementPage', () => {
 
     await waitFor(() => {
       expect(screen.getByTitle('Hide left panel')).toBeInTheDocument()
-      expect(screen.getByTitle('Expand month overview')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Month Overview', expanded: false })).toBeInTheDocument()
     })
   })
 
   it('collapses side panel sections when closed from the button', async () => {
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
 
     await screen.findByRole('heading', { name: 'Time Management' })
 
+    fireEvent.click(screen.getByTitle('Show left panel'))
+    await waitFor(() => {
+      expect(screen.getByTitle('Hide left panel')).toBeInTheDocument()
+    })
+
     const monthButton =
-      screen.queryByTitle('Collapse month overview') ?? screen.queryByTitle('Expand month overview')
+      screen.queryByRole('button', { name: 'Month Overview' })
     expect(monthButton).toBeTruthy()
 
     if (!monthButton) {
       throw new Error('Expected month overview toggle button to be present')
     }
 
-    if (monthButton.getAttribute('title') === 'Expand month overview') {
+    if (monthButton.getAttribute('aria-expanded') === 'false') {
       fireEvent.click(monthButton)
       await waitFor(() => {
-        expect(screen.getByTitle('Collapse month overview')).toBeInTheDocument()
+        expect(screen.getByRole('button', { name: 'Month Overview', expanded: true })).toBeInTheDocument()
       })
     }
 
@@ -1688,18 +2317,23 @@ describe('TimeManagementPage', () => {
     fireEvent.click(screen.getByTitle('Show left panel'))
 
     await waitFor(() => {
-      expect(screen.getByTitle('Expand month overview')).toBeInTheDocument()
+      expect(screen.getByRole('button', { name: 'Month Overview', expanded: false })).toBeInTheDocument()
     })
   })
 
   it('closes the side panel when Escape is pressed from the full editor modal', async () => {
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
 
     await screen.findByRole('heading', { name: 'Time Management' })
+
+    fireEvent.click(screen.getByTitle('Show left panel'))
+    await waitFor(() => {
+      expect(screen.getByTitle('Hide left panel')).toBeInTheDocument()
+    })
 
     fireEvent.click(screen.getByText('Full view'))
 
@@ -1744,7 +2378,7 @@ describe('TimeManagementPage', () => {
     })
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -1760,7 +2394,7 @@ describe('TimeManagementPage', () => {
     })
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -1787,7 +2421,7 @@ describe('TimeManagementPage', () => {
     })
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -1850,7 +2484,7 @@ describe('TimeManagementPage', () => {
     })
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -1956,7 +2590,7 @@ describe('TimeManagementPage', () => {
     })
 
     const rendered = render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -1968,7 +2602,7 @@ describe('TimeManagementPage', () => {
     authState.isLoading = false
     authState.isAuthenticated = true
     rendered.rerender(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -2050,21 +2684,21 @@ describe('TimeManagementPage', () => {
     })
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
 
     await screen.findByRole('heading', { name: 'Time Management' })
 
-    fireEvent.click(screen.getByTitle('Expand categories'))
+    fireEvent.click(screen.getByRole('button', { name: 'Categories', expanded: false }))
     expect(await screen.findByText('Main category')).toBeInTheDocument()
 
     const categoryFetchCountBeforeSwitch = mockDedupedGet.mock.calls.filter(
       (call) => call[0] === '/api/time-management/categories'
     ).length
 
-    fireEvent.click(screen.getByTitle('Expand calendar modes'))
+    fireEvent.click(screen.getByRole('button', { name: 'Calendar Modes', expanded: false }))
     fireEvent.click(screen.getByRole('button', { name: 'Focus' }))
 
     await waitFor(() => {
@@ -2124,13 +2758,13 @@ describe('TimeManagementPage', () => {
     })
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
 
     await screen.findByRole('heading', { name: 'Time Management' })
-    fireEvent.click(screen.getByTitle('Expand categories'))
+    fireEvent.click(screen.getByRole('button', { name: 'Categories', expanded: false }))
     expect(await screen.findByText('Work')).toBeInTheDocument()
 
     fireEvent.click(screen.getByRole('button', { name: 'Delete Work' }))
@@ -2199,7 +2833,7 @@ describe('TimeManagementPage', () => {
     })
 
     render(
-      <MemoryRouter future={{ v7_relativeSplatPath: true, v7_startTransition: true }}>
+      <MemoryRouter>
         <TimeManagementPage />
       </MemoryRouter>
     )
@@ -2210,5 +2844,42 @@ describe('TimeManagementPage', () => {
       const parsed = JSON.parse(raw as string) as { slotMinutes: number }
       expect(parsed.slotMinutes).toBe(60)
     })
+  })
+})
+
+describe('findTimeItemDurationByTitle', () => {
+  const items = [
+    {
+      id: 'coordination-manager',
+      title: 'Coordination Manager',
+      time: { startUtc: '2026-09-01T09:00:00.000Z', endUtc: '2026-09-01T11:00:00.000Z' },
+    },
+    {
+      id: 'coordination-manager',
+      title: 'Coordination Manager',
+      time: { startUtc: '2026-09-01T09:00:00.000Z', endUtc: '2026-09-01T11:00:00.000Z' },
+    },
+    {
+      id: 'coordination-manager',
+      title: 'Coordination Manager',
+      time: { startUtc: '2026-09-02T13:00:00.000Z', endUtc: '2026-09-02T14:30:00.000Z' },
+    },
+    {
+      id: 'unrelated',
+      title: 'Governance Workgroup',
+      time: { startUtc: '2026-09-01T12:00:00.000Z', endUtc: '2026-09-01T15:00:00.000Z' },
+    },
+  ]
+
+  it('totals matching title occurrences once and ignores unrelated items', () => {
+    expect(findTimeItemDurationByTitle('How many hours did I develop Coordination Manager?', items)).toEqual({
+      title: 'Coordination Manager',
+      occurrenceCount: 2,
+      totalMinutes: 210,
+    })
+  })
+
+  it('returns null when the requested title is not present', () => {
+    expect(findTimeItemDurationByTitle('How many hours did I work on Mailbox?', items)).toBeNull()
   })
 })

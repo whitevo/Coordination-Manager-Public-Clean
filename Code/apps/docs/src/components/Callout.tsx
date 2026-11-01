@@ -4,10 +4,10 @@ import { Info, AlertTriangle, Lightbulb, AlertCircle } from 'lucide-react'
 type Variant = 'info' | 'warning' | 'tip' | 'danger'
 
 const icons: Record<Variant, ReactNode> = {
-  info: <Info className="w-5 h-5 text-blue-400 flex-shrink-0" />,
-  warning: <AlertTriangle className="w-5 h-5 text-amber-400 flex-shrink-0" />,
-  tip: <Lightbulb className="w-5 h-5 text-emerald-400 flex-shrink-0" />,
-  danger: <AlertCircle className="w-5 h-5 text-red-400 flex-shrink-0" />,
+  info: <Info className="w-5 h-5 text-blue-400 shrink-0" />,
+  warning: <AlertTriangle className="w-5 h-5 text-amber-400 shrink-0" />,
+  tip: <Lightbulb className="w-5 h-5 text-emerald-400 shrink-0" />,
+  danger: <AlertCircle className="w-5 h-5 text-red-400 shrink-0" />,
 }
 
 const labels: Record<Variant, string> = {

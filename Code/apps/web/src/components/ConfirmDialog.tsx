@@ -1,4 +1,8 @@
-import React from 'react';
+import { useRef } from 'react';
+import type { ReactNode } from 'react';
+import { Dialog } from './ui/Dialog';
+import { Button } from './ui/Button';
+import type { Intent } from '../lib/design-tokens';
 
 interface ConfirmDialogProps {
   open: boolean;
@@ -6,6 +10,12 @@ interface ConfirmDialogProps {
   message: string;
   confirmText?: string;
   cancelText?: string;
+  /** `danger` only for destructive consequences; wide scope alone is not danger. */
+  intent?: Extract<Intent, 'primary' | 'danger'>;
+  /** Shown next to the confirm action so scope is explicit before acting. */
+  affectedCount?: number;
+  /** Extra detail between the message and the actions (scope lists, opt-outs). */
+  children?: ReactNode;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -16,33 +26,37 @@ export default function ConfirmDialog({
   message,
   confirmText = 'Delete',
   cancelText = 'Cancel',
+  intent = 'danger',
+  affectedCount,
+  children,
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
-  if (!open) return null;
+  // The least destructive action takes initial focus, even when the extra
+  // content holds controls that would otherwise come first.
+  const cancelRef = useRef<HTMLButtonElement>(null);
+  const confirmLabel =
+    typeof affectedCount === 'number' ? `${confirmText} (${affectedCount})` : confirmText;
+
   return (
-    <div className="fixed inset-0 z-[100] flex items-center justify-center bg-black/30" onClick={onCancel}>
-      <div
-        className="bg-card text-card-foreground rounded-lg p-6 max-w-sm w-full mx-4 shadow-xl border border-border"
-        onClick={e => e.stopPropagation()}
-      >
-        <h2 className="text-lg font-bold mb-2">{title}</h2>
-        <p className="mb-6 text-sm text-muted-foreground whitespace-pre-line">{message}</p>
-        <div className="flex gap-2 justify-end">
-          <button
-            onClick={onCancel}
-            className="px-3 py-2 rounded-md text-sm font-medium bg-muted text-muted-foreground hover:bg-muted/80"
-          >
+    <Dialog
+      open={open}
+      onClose={onCancel}
+      title={title}
+      description={message}
+      initialFocusRef={cancelRef}
+      actions={
+        <>
+          <Button ref={cancelRef} emphasis="ghost" intent="neutral" onClick={onCancel}>
             {cancelText}
-          </button>
-          <button
-            onClick={onConfirm}
-            className="px-3 py-2 rounded-md text-sm font-medium bg-red-600 text-white hover:bg-red-700"
-          >
-            {confirmText}
-          </button>
-        </div>
-      </div>
-    </div>
+          </Button>
+          <Button emphasis="solid" intent={intent} onClick={onConfirm}>
+            {confirmLabel}
+          </Button>
+        </>
+      }
+    >
+      {children}
+    </Dialog>
   );
 }

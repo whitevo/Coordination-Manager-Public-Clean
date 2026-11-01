@@ -13,7 +13,7 @@ export default function TermsOfServicePage() {
       <p className="text-sm text-muted-foreground mb-4">
         Redirecting to the canonical terms source.
       </p>
-      <a href={CANONICAL_TERMS_URL} className="text-blue-600 hover:underline">
+      <a href={CANONICAL_TERMS_URL} className="text-primary hover:underline">
         Continue to /docs/legal/terms-of-service
       </a>
     </div>

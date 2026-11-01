@@ -13,7 +13,7 @@ export function ZoomReviewPage() {
         <table>
           <tbody>
             <tr><td><strong>App Name</strong></td><td>Coordination Manager</td></tr>
-            <tr><td><strong>Developer</strong></td><td><a href="https://github.com/whitevo/Coordination-Manager" target="_blank" rel="noopener noreferrer">whitevo</a></td></tr>
+            <tr><td><strong>Developer</strong></td><td><a href="https://github.com/whitevo/Coordination-Manager-Public-Clean" target="_blank" rel="noopener noreferrer">whitevo</a></td></tr>
             <tr><td><strong>App Type</strong></td><td>OAuth (General App)</td></tr>
             <tr><td><strong>Production URL</strong></td><td><a href="https://coordinationmanager.com" target="_blank" rel="noopener noreferrer">https://coordinationmanager.com</a></td></tr>
             <tr><td><strong>Review Landing Page</strong></td><td><a href="https://coordinationmanager.com/zoom-review" target="_blank" rel="noopener noreferrer">https://coordinationmanager.com/zoom-review</a></td></tr>

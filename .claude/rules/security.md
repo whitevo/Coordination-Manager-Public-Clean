@@ -16,9 +16,9 @@
 - Strip CR/LF from user input before logging (prevent log injection)
 
 ## Authentication
-- Use requireAuth middleware for protected endpoints
-- Use optionalAuth for public endpoints that benefit from user context
-- Rate limit all public-facing endpoints (socket-based, not header-based)
+- Use authMiddleware (middleware/auth.ts) for protected endpoints
+- Use optionalAuthMiddleware for public endpoints that benefit from user context
+- Rate limit all public-facing endpoints per client via `getRateLimitKey` (trusted-proxy `req.ip` in production, never raw client-supplied headers)
 - Captcha required for traveler/guest account creation
 - NEVER store authorization data in raw_user_meta_data (user-writable)
 - USE raw_app_meta_data for roles/permissions (service-role only)
@@ -52,7 +52,7 @@
 
 ## Supply Chain
 - Pin GitHub Actions to commit SHAs (not mutable tags)
-- Run pnpm audit in CI (fail on high/critical)
+- CI fails on high/critical advisories via the OSV audit in scripts/security-check.ps1 (pnpm audit runs locally and in the weekly non-blocking drift workflow)
 - Enable blockExoticSubdeps in pnpm config
-- Use onlyBuiltDependencies to restrict install scripts
+- Use allowBuilds (pnpm-workspace.yaml) to restrict install scripts
 - Use --frozen-lockfile in CI for reproducible builds

@@ -1,6 +1,7 @@
 import { useState, useEffect, useRef, useCallback } from 'react'
 import { Search, Smile, Clock, Star, Heart, Leaf, Coffee, Gamepad2, Hash, Loader2, RefreshCw, Server } from 'lucide-react'
 import { apiClient } from '../../lib/api-client'
+import { Button, IconButton } from '../ui'
 
 // ─── Types ────────────────────────────────────────────────────────────
 
@@ -265,7 +266,7 @@ export default function EmojiPicker({ onSelect, onClose, className }: EmojiPicke
             value={searchQuery}
             onChange={e => setSearchQuery(e.target.value)}
             placeholder="Search emojis..."
-            className="w-full pl-8 pr-3 py-1.5 text-xs border border-input rounded-lg bg-background text-foreground focus:ring-1 focus:ring-ring outline-none"
+            className="w-full pl-8 pr-3 py-1.5 text-xs border border-input rounded-lg bg-background text-foreground focus:ring-1 focus:ring-ring outline-hidden"
           />
         </div>
       </div>
@@ -274,35 +275,38 @@ export default function EmojiPicker({ onSelect, onClose, className }: EmojiPicke
       {!lowerQuery && (
         <div className="flex items-center gap-0.5 px-2 py-1 border-b border-border overflow-x-auto scrollbar-thin">
           {recentEmojis.length > 0 && (
-            <button
-              type="button"
+            <IconButton
+              size="micro"
+              emphasis={activeCategory === -1 ? 'outline' : 'ghost'}
+              intent={activeCategory === -1 ? 'primary' : 'neutral'}
+              aria-pressed={activeCategory === -1}
               onClick={() => setActiveCategory(-1)}
-              className={`p-1.5 rounded transition-colors flex-shrink-0 ${activeCategory === -1 ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:text-foreground hover:bg-muted'}`}
-              title="Recently Used"
-            >
-              <Clock className="w-3.5 h-3.5" />
-            </button>
+              label="Recently Used"
+              icon={<Clock />}
+            />
           )}
           {EMOJI_CATEGORIES.map((cat, i) => (
-            <button
+            <IconButton
               key={cat.label}
-              type="button"
+              size="micro"
+              emphasis={activeCategory === i ? 'outline' : 'ghost'}
+              intent={activeCategory === i ? 'primary' : 'neutral'}
+              aria-pressed={activeCategory === i}
               onClick={() => setActiveCategory(i)}
-              className={`p-1.5 rounded transition-colors flex-shrink-0 ${activeCategory === i ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:text-foreground hover:bg-muted'}`}
-              title={cat.label}
-            >
-              {cat.icon}
-            </button>
+              label={cat.label}
+              icon={cat.icon}
+            />
           ))}
           {guildGroupKeys.length > 0 && (
-            <button
-              type="button"
+            <IconButton
+              size="micro"
+              emphasis={activeCategory >= EMOJI_CATEGORIES.length ? 'outline' : 'ghost'}
+              intent={activeCategory >= EMOJI_CATEGORIES.length ? 'primary' : 'neutral'}
+              aria-pressed={activeCategory >= EMOJI_CATEGORIES.length}
               onClick={() => setActiveCategory(EMOJI_CATEGORIES.length)}
-              className={`p-1.5 rounded transition-colors flex-shrink-0 ${activeCategory >= EMOJI_CATEGORIES.length ? 'bg-primary/10 text-primary' : 'text-muted-foreground hover:text-foreground hover:bg-muted'}`}
-              title="Server Emojis"
-            >
-              <Server className="w-3.5 h-3.5" />
-            </button>
+              label="Server Emojis"
+              icon={<Server />}
+            />
           )}
         </div>
       )}
@@ -465,14 +469,15 @@ export default function EmojiPicker({ onSelect, onClose, className }: EmojiPicke
                   })
                 )}
                 {guildEmojisLoaded && guildGroupKeys.length > 0 && (
-                  <button
-                    type="button"
+                  <Button
+                    emphasis="ghost"
+                    size="micro"
                     onClick={() => { setGuildEmojisLoaded(false); loadGuildEmojis() }}
-                    className="flex items-center gap-1.5 text-xs text-muted-foreground hover:text-foreground transition-colors mt-1"
+                    className="mt-1"
+                    icon={<RefreshCw className="w-3 h-3" />}
                   >
-                    <RefreshCw className="w-3 h-3" />
                     Refresh server emojis
-                  </button>
+                  </Button>
                 )}
               </>
             )}

@@ -241,6 +241,168 @@ describe('authMiddleware', () => {
     expect(res.body.userRoles).toEqual(['user'])
   })
 
+  it('ignores redirect and wallet links in user-writable user_metadata', async () => {
+    mockGetUser.mockResolvedValue({
+      data: {
+        user: {
+          id: MOCK_USER_ID,
+          email: MOCK_EMAIL,
+          user_metadata: { wallet_address: 'addr1victim', redirect_to_user_id: 'victim-admin-id' },
+          app_metadata: {},
+        },
+      },
+      error: null,
+    })
+    mockMaybeSingle.mockResolvedValue({ data: { roles: ['user'], wallet_address: null }, error: null })
+
+    const app = buildApp(authMiddleware as express.RequestHandler)
+    const res = await request(app).get('/test').set('Authorization', 'Bearer valid-token')
+
+    expect(res.status).toBe(200)
+    expect(res.body.userId).toBe(MOCK_USER_ID)
+    expect(res.body.userRoles).toEqual(['user'])
+    expect(mockMaybeSingle).toHaveBeenCalledTimes(1)
+  })
+
+  it('follows a server-set app_metadata redirect for a merged wallet session', async () => {
+    mockGetUser.mockResolvedValue({
+      data: {
+        user: {
+          id: MOCK_USER_ID,
+          email: 'wallet-addr1abc@cardano.wallet',
+          user_metadata: {},
+          app_metadata: { redirect_to_user_id: 'google-user-id' },
+        },
+      },
+      error: null,
+    })
+    mockMaybeSingle
+      .mockResolvedValueOnce({ data: null, error: null })
+      .mockResolvedValueOnce({ data: { id: 'google-user-id', email: 'owner@example.com', roles: ['user'] }, error: null })
+
+    const app = buildApp(authMiddleware as express.RequestHandler)
+    const res = await request(app).get('/test').set('Authorization', 'Bearer valid-token')
+
+    expect(res.status).toBe(200)
+    expect(res.body.userId).toBe('google-user-id')
+    expect(res.body.userEmail).toBe('owner@example.com')
+    expect(res.body.rawAuthUserId).toBe(MOCK_USER_ID)
+  })
+
+  describe('phantom profile cleanup', () => {
+    const WALLET = 'addr1wallet'
+    const OWNER_ID = 'owner-user-id'
+
+    function mockWalletSession() {
+      mockGetUser.mockResolvedValue({
+        data: {
+          user: {
+            id: MOCK_USER_ID,
+            email: 'wallet-addr1wallet@cardano.wallet',
+            user_metadata: {},
+            app_metadata: { account_type: 'cardano', wallet_address: WALLET },
+          },
+        },
+        error: null,
+      })
+      mockThen.mockImplementation((resolve: (v: unknown) => void) => resolve({ error: null }))
+    }
+
+    it('deletes an empty auto-created phantom row once and redirects', async () => {
+      mockWalletSession()
+      mockMaybeSingle
+        .mockResolvedValueOnce({
+          data: { roles: ['user'], wallet_address: null, email: null, google_id: null, account_type: 'cardano' },
+          error: null,
+        })
+        .mockResolvedValueOnce({ data: { id: OWNER_ID, email: 'owner@example.com', roles: ['user'] }, error: null })
+
+      const app = buildApp(authMiddleware as express.RequestHandler)
+      const res = await request(app).get('/test').set('Authorization', 'Bearer valid-token')
+
+      expect(res.status).toBe(200)
+      expect(res.body.userId).toBe(OWNER_ID)
+      expect(mockDelete).toHaveBeenCalledTimes(1)
+      expect(mockEq).toHaveBeenCalledWith('id', MOCK_USER_ID)
+    })
+
+    it('does not delete a non-phantom row (has email or google_id) but still redirects', async () => {
+      mockWalletSession()
+      mockMaybeSingle
+        .mockResolvedValueOnce({
+          data: { roles: ['user'], wallet_address: null, email: 'real@example.com', google_id: 'g-1', account_type: 'google' },
+          error: null,
+        })
+        .mockResolvedValueOnce({ data: { id: OWNER_ID, email: 'owner@example.com', roles: ['user'] }, error: null })
+
+      const app = buildApp(authMiddleware as express.RequestHandler)
+      const res = await request(app).get('/test').set('Authorization', 'Bearer valid-token')
+
+      expect(res.status).toBe(200)
+      expect(res.body.userId).toBe(OWNER_ID)
+      expect(mockDelete).not.toHaveBeenCalled()
+    })
+
+    it('does not delete when the redirect target cannot be resolved', async () => {
+      mockWalletSession()
+      mockMaybeSingle
+        .mockResolvedValueOnce({
+          data: { roles: ['user'], wallet_address: null, email: null, google_id: null, account_type: 'cardano' },
+          error: null,
+        })
+        .mockResolvedValueOnce({ data: null, error: null })
+
+      const app = buildApp(authMiddleware as express.RequestHandler)
+      const res = await request(app).get('/test').set('Authorization', 'Bearer valid-token')
+
+      expect(res.status).toBe(200)
+      expect(res.body.userId).toBe(MOCK_USER_ID)
+      expect(mockDelete).not.toHaveBeenCalled()
+    })
+
+    it('does not block the request when the delete fails', async () => {
+      mockWalletSession()
+      mockThen.mockImplementation((resolve: (v: unknown) => void) => resolve({ error: { message: 'boom\nline2' } }))
+      const warn = vi.spyOn(console, 'warn').mockImplementation(() => {})
+      mockMaybeSingle
+        .mockResolvedValueOnce({
+          data: { roles: ['user'], wallet_address: null, email: null, google_id: null, account_type: 'cardano' },
+          error: null,
+        })
+        .mockResolvedValueOnce({ data: { id: OWNER_ID, email: 'owner@example.com', roles: ['user'] }, error: null })
+
+      const app = buildApp(authMiddleware as express.RequestHandler)
+      const res = await request(app).get('/test').set('Authorization', 'Bearer valid-token')
+
+      expect(res.status).toBe(200)
+      expect(res.body.userId).toBe(OWNER_ID)
+      expect(warn).toHaveBeenCalledTimes(1)
+      expect(String(warn.mock.calls[0][1])).not.toMatch(/[\r\n]/)
+    })
+  })
+
+  it('accepts a case-insensitive Bearer scheme', async () => {
+    mockGetUser.mockResolvedValue({
+      data: { user: { id: MOCK_USER_ID, email: MOCK_EMAIL, user_metadata: {}, app_metadata: {} } },
+      error: null,
+    })
+    mockMaybeSingle.mockResolvedValue({ data: { roles: ['user'], wallet_address: null }, error: null })
+
+    const app = buildApp(authMiddleware as express.RequestHandler)
+    const res = await request(app).get('/test').set('Authorization', 'bearer lower-token')
+
+    expect(res.status).toBe(200)
+    expect(mockGetUser).toHaveBeenCalledWith('lower-token')
+  })
+
+  it('rejects an Authorization header that is not an anchored Bearer token', async () => {
+    const app = buildApp(authMiddleware as express.RequestHandler)
+    const res = await request(app).get('/test').set('Authorization', 'Token Bearer abc')
+
+    expect(res.status).toBe(401)
+    expect(mockGetUser).not.toHaveBeenCalled()
+  })
+
   it('preserves rawAuthUserId before any redirect', async () => {
     mockGetUser.mockResolvedValue({
       data: {

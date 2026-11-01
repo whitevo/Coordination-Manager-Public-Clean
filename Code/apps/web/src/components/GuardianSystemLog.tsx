@@ -1,11 +1,13 @@
-import { useState, useEffect, useCallback } from 'react'
+import { useState, useEffect, useCallback, useId } from 'react'
 import { apiClient } from '../lib/api-client'
-import { AlertTriangle, ChevronDown, ChevronRight, RefreshCw, Trash2, VolumeX, Gavel, Flag, ExternalLink } from 'lucide-react'
+import { AlertTriangle, RefreshCw, Trash2, VolumeX, Gavel, Flag, ExternalLink, UserCheck, TimerOff } from 'lucide-react'
+import { Button, Disclosure } from './ui'
 
 interface SystemLogEntry {
   id: string
   created_at: string
-  action: 'flag' | 'delete' | 'mute' | 'ban'
+  /** unban / unmute are moderator undo actions from the flagged table. */
+  action: 'flag' | 'delete' | 'mute' | 'ban' | 'unban' | 'unmute'
   failure_reason: string | null
   author_id: string | null
   author_username: string | null
@@ -28,9 +30,11 @@ interface Props {
 }
 
 function actionIcon(action: SystemLogEntry['action']) {
-  if (action === 'delete') return <Trash2 className="h-3.5 w-3.5 text-amber-500" />
-  if (action === 'mute') return <VolumeX className="h-3.5 w-3.5 text-yellow-500" />
-  if (action === 'ban') return <Gavel className="h-3.5 w-3.5 text-red-500" />
+  if (action === 'delete') return <Trash2 className="h-3.5 w-3.5 text-warning" />
+  if (action === 'mute') return <VolumeX className="h-3.5 w-3.5 text-warning" />
+  if (action === 'ban') return <Gavel className="h-3.5 w-3.5 text-danger" />
+  if (action === 'unban') return <UserCheck className="h-3.5 w-3.5 text-warning" />
+  if (action === 'unmute') return <TimerOff className="h-3.5 w-3.5 text-warning" />
   return <Flag className="h-3.5 w-3.5 text-muted-foreground" />
 }
 
@@ -38,6 +42,8 @@ function actionLabel(action: SystemLogEntry['action']) {
   if (action === 'delete') return 'Delete message'
   if (action === 'mute') return 'Mute user'
   if (action === 'ban') return 'Ban user'
+  if (action === 'unban') return 'Unban user'
+  if (action === 'unmute') return 'Remove timeout'
   return 'Flag'
 }
 
@@ -53,6 +59,7 @@ export interface GuardianSystemLogRef {
 }
 const GuardianSystemLog = forwardRef<GuardianSystemLogRef, Props>(({ guildIdLookup, onRefreshAll, externalLoading }, ref) => {
   const [expanded, setExpanded] = useState(false)
+  const systemLogPanelId = `${useId()}-system-log`
   const [entries, setEntries] = useState<SystemLogEntry[]>([])
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
@@ -79,35 +86,38 @@ const GuardianSystemLog = forwardRef<GuardianSystemLogRef, Props>(({ guildIdLook
   return (
     <div className="bg-card border border-border rounded-lg">
       <div className="flex items-center justify-between p-4 border-b border-border">
-        <button
-          onClick={() => setExpanded(e => !e)}
-          className="flex items-center gap-2 text-sm font-medium text-foreground hover:text-primary transition-colors"
-        >
-          {expanded ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
-          <AlertTriangle className={`h-4 w-4 ${count && count > 0 ? 'text-rose-500' : 'text-muted-foreground'}`} />
-          System Log
-          <span className="text-muted-foreground font-normal">
-            ({count === null ? '...' : count}{count === 50 ? '+' : ''})
-          </span>
-          <span className="text-xs text-muted-foreground font-normal ml-2">
-            -- failed bot actions (permission gaps, intent vs result mismatches)
-          </span>
-        </button>
-        <button
+        <Disclosure
+          className="mr-2 min-w-0 flex-1"
+          icon={<AlertTriangle className={count && count > 0 ? 'text-danger' : 'text-muted-foreground'} />}
+          title={
+            <>
+              System Log{' '}
+              <span className="text-muted-foreground font-normal">
+                ({count === null ? '...' : count}{count === 50 ? '+' : ''})
+              </span>
+            </>
+          }
+          description="-- failed bot and moderator undo actions (permission gaps, intent vs result mismatches)"
+          expanded={expanded}
+          onToggle={setExpanded}
+          panelId={systemLogPanelId}
+        />
+        <Button
+          emphasis="outline"
+          size="micro"
           onClick={onRefreshAll ?? load}
           disabled={loading || externalLoading}
-          className="inline-flex items-center gap-1 text-xs text-muted-foreground hover:text-foreground px-2 py-1 rounded border border-border hover:bg-accent disabled:opacity-50"
           title={onRefreshAll ? 'Refresh -- updates this panel first, then the rest of the page' : 'Refresh'}
+          icon={<RefreshCw className={`h-3 w-3 ${(loading || externalLoading) ? 'animate-spin' : ''}`} />}
         >
-          <RefreshCw className={`h-3 w-3 ${(loading || externalLoading) ? 'animate-spin' : ''}`} />
           Refresh
-        </button>
+        </Button>
       </div>
 
       {expanded && (
-        <div className="p-4">
+        <div id={systemLogPanelId} className="p-4">
           {error && (
-            <div className="text-sm text-rose-600 dark:text-rose-400 mb-2">{error}</div>
+            <div className="text-sm text-danger mb-2">{error}</div>
           )}
           {!error && entries.length === 0 && !loading && (
             <div className="text-xs text-muted-foreground italic py-2">
@@ -124,7 +134,7 @@ const GuardianSystemLog = forwardRef<GuardianSystemLogRef, Props>(({ guildIdLook
                 return (
                   <li
                     key={e.id}
-                    className="rounded border border-rose-200 dark:border-rose-900/50 bg-rose-50/40 dark:bg-rose-950/20 p-3 text-xs"
+                    className="rounded border border-danger-muted/50 bg-danger-subtle p-3 text-xs"
                   >
                     <div className="flex items-start justify-between gap-3 flex-wrap">
                       <div className="flex items-center gap-2 flex-wrap">
@@ -141,7 +151,7 @@ const GuardianSystemLog = forwardRef<GuardianSystemLogRef, Props>(({ guildIdLook
                           </span>
                         )}
                         {e.matched_rule_group_name && (
-                          <span className="px-1.5 py-0.5 rounded bg-red-100 dark:bg-red-900/30 text-red-700 dark:text-red-300 text-[10px] font-medium">
+                          <span className="px-1.5 py-0.5 rounded bg-danger-subtle text-danger text-[10px] font-medium">
                             {e.matched_rule_group_name}
                           </span>
                         )}
@@ -164,13 +174,13 @@ const GuardianSystemLog = forwardRef<GuardianSystemLogRef, Props>(({ guildIdLook
                       </div>
                     </div>
                     {e.failure_reason && (
-                      <div className="mt-1.5 font-mono text-[11px] text-rose-700 dark:text-rose-300 whitespace-pre-wrap break-words">
+                      <div className="mt-1.5 font-mono text-[11px] text-danger whitespace-pre-wrap wrap-break-word">
                         {e.failure_reason}
                       </div>
                     )}
                     {/* Helpful hint for the most common failure */}
                     {e.failure_reason && /missing permissions/i.test(e.failure_reason) && (
-                      <div className="mt-1.5 text-[11px] text-amber-700 dark:text-amber-300">
+                      <div className="mt-1.5 text-[11px] text-warning">
                         {'-->'} Demon X likely lacks the required permission in this channel.
                         Grant it via Server Settings &rarr; Roles &rarr; Demon X, or via the
                         channel-level permission overrides.

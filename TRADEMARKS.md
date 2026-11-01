@@ -129,7 +129,7 @@ Questions about this Policy, requests for permission, and reports of suspected m
 
 **legal@coordinationmanager.com**
 
-(or, if no response within 14 days, open a confidential issue at <https://github.com/whitevo/Coordination-Manager/security/advisories>).
+(or, if no response within 14 days, open a confidential issue at <https://github.com/whitevo/Coordination-Manager-Public-Clean/security/advisories>).
 
 ---
 

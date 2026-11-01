@@ -37,16 +37,13 @@ These are **manual dashboard actions** -- they cannot be automated via code.
 
 | Setting | Action |
 |---------|--------|
-| Privileged Intents | Disable MessageContent if bot only uses slash commands |
+| Privileged Intents | `MessageContent` is required by the guardian (message scanning) and by the main bot's DM link-key flow; keep it enabled for those bots. Review `GuildMembers` too (the main bot uses it) |
 | Bot Permissions | Verify minimum permissions (currently 3072: Send Messages + Read Message History) |
 | Bot Token | Regenerate if ever exposed in commits or logs |
 
 ## Secret Rotation Schedule
 
-| Secret | Frequency |
-|--------|-----------|
-| SUPABASE_SERVICE_ROLE_KEY | Every 6 months or after suspected leak |
-| JWT_SECRET | Every 6 months |
-| DISCORD_BOT_TOKEN | After any suspected exposure |
-| GOOGLE_CLIENT_SECRET | After any suspected exposure |
-| BOT_API_SECRET | Every 6 months |
+No repo document sets a fixed interval: `SECURITY.md` says secrets are rotated
+"according to risk", and `docs/private/security-key-rotation-runbook.md` lists the triggers
+and the per-secret inventory. Use the Secrets lifecycle section of the security-automation
+reference (listed in SKILL.md), which follows the runbook.

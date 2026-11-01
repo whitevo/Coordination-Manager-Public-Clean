@@ -48,7 +48,7 @@ router.put('/', async (req: AuthenticatedRequest, res: Response) => {
     }
 
     // Basic email validation
-    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailAddress) || emailAddress.length > 320) {
+    if (!/^[^\s@]+@[^\s@.]+(?:\.[^\s@.]+)+$/.test(emailAddress) || emailAddress.length > 320) {
       return res.status(400).json({ error: 'Invalid email address format' })
     }
 
